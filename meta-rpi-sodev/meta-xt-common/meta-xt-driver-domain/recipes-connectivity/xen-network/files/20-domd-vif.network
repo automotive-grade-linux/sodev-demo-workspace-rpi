@@ -1,0 +1,9 @@
+[Match]
+Driver=vif xen-netfront
+
+[Network]
+# Dom0-link xen-netfront: static .0.11 (NOT bridged) -> keep the xen infra
+# untouched (bridging this xen device is the suspected xenbus disruptor). DomD
+# forwards (ip_forward=1) between this link and xenbr0 so PC<->Dom0 works via
+# routing (dom0-domd-vif-up installs the Dom0-side return route).
+Address=192.168.0.11/24

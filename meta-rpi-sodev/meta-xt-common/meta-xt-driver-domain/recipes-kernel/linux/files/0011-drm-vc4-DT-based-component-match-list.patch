@@ -1,0 +1,85 @@
+From 1063165c9973e97b103acab83df2e4ba5a3fb9ea Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 23 Jun 2026 00:00:11 +0900
+Subject: [PATCH] drm/vc4: DT-based component match list
+
+Replace the firmware/probe-timing-dependent component match (which races
+on a direct-map DomD) with a DT-compatible-based match list built from each
+sub-driver's of_match_table.
+
+Fix OF node refcount handling: of_find_compatible_node()
+already drops the iterator's reference on the next call, and
+component_match_add() does NOT take a reference on the stored node, so the
+previous `component_match_add(); of_node_put();` double-put the node
+(refcount underflow on module reload, CONFIG_DRM_VC4=m). Use the in-tree
+canonical pattern: of_node_get() to hold a reference for the match list and
+component_match_add_release(component_release_of, ...) to drop it at teardown
+(same effect as drm_of_component_match_add(), without pulling in drm_of.h).
+
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/vc4/vc4_drv.c | 45 ++++++++++++++++++++++++++++-------
+ 1 file changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/vc4/vc4_drv.c b/drivers/gpu/drm/vc4/vc4_drv.c
+index 038e551654ea..8779f7be9927 100644
+--- a/drivers/gpu/drm/vc4/vc4_drv.c
++++ b/drivers/gpu/drm/vc4/vc4_drv.c
+@@ -270,16 +270,45 @@ static void vc4_match_add_drivers(struct device *dev,
+ {
+ 	int i;
+ 
++	/*
++	 * Build the match list from DT compatibles rather than from bound
++	 * platform devices. The original code used
++	 * platform_find_device_by_driver(), which only returns devices already
++	 * bound to their driver. Under Xen dom0less the master can race ahead
++	 * of sub-driver probes, leaving the match list incomplete and
++	 * deferred_probe_timeout firing with only HVS bound. Walking DT
++	 * compatibles makes the match list reflect the DT structure
++	 * regardless of probe timing.
++	 */
+ 	for (i = 0; i < count; i++) {
+-		struct device_driver *drv = &drivers[i]->driver;
+-		struct device *p = NULL, *d;
+-
+-		while ((d = platform_find_device_by_driver(p, drv))) {
+-			put_device(p);
+-			component_match_add(dev, match, component_compare_dev, d);
+-			p = d;
++		const struct of_device_id *of_ids =
++			drivers[i]->driver.of_match_table;
++		int j;
++
++		if (!of_ids)
++			continue;
++
++		for (j = 0; of_ids[j].compatible[0]; j++) {
++			struct device_node *node = NULL;
++
++			while ((node = of_find_compatible_node(node, NULL,
++							       of_ids[j].compatible))) {
++				if (!of_device_is_available(node))
++					continue;
++				/*
++				 * Hold a reference for the match list and let
++				 * component_release_of() drop it at teardown.
++				 * of_find_compatible_node() already puts the
++				 * iterator's reference on the next call, so a
++				 * bare of_node_put() here would be a double put.
++				 */
++				of_node_get(node);
++				component_match_add_release(dev, match,
++							    component_release_of,
++							    component_compare_of,
++							    node);
++			}
+ 		}
+-		put_device(p);
+ 	}
+ }
+ 
+-- 
+2.43.0
+

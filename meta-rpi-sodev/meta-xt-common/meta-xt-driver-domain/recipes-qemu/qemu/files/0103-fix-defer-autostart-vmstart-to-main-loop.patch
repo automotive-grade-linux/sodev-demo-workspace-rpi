@@ -1,0 +1,72 @@
+From a1d5857348c40d00c177c35135b14b5c3569fe64 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] defer autostart vm_start to first main-loop iteration
+
+Root cause (structural): when qemu runs as a Xen disaggregated device-model
+spawned by libxl__spawn_qdisk_backend (machine "xenpv", argv has only
+"-monitor /dev/null", no "-S", no QMP "-mon ...,mode=control"), autostart
+defaults to 1.  qmp_x_exit_preconfig() therefore calls qmp_cont() ->
+vm_start() -> vm_prepare_start() *synchronously inside qemu_init(), before
+the main loop is running*.  In that pre-main-loop context several subsystems
+are not yet in their running state, and vm_prepare_start() dies silently
+(first at qapi_event_send_resume()'s RESUME emit, then -- once that is
+guarded -- inside cpu_enable_ticks()).  Each guard merely exposes the next
+pre-main-loop hazard: the real defect is "synchronous vm_start before the
+main loop".
+
+A full device-model (libxl__build_device_model_args_new) avoids this by
+starting qemu with "-S" (paused) plus a QMP control monitor, and libxl
+issues QMP "cont" only after the main loop is up.  This patch gives the
+autostart path the same property without needing -S/QMP: instead of calling
+qmp_cont() inline, it schedules a one-shot bottom half on the main-loop
+AioContext.  qemu_init() then returns, main()/qemu_main_loop() starts
+main_loop_wait(), and on the very first iteration the BH runs qmp_cont() ->
+vm_start() with the main loop fully up.  This eliminates the whole class of
+before-main-loop deaths (RESUME abort, cpu_enable_ticks, ...) at the root.
+
+aio_bh_schedule_oneshot() allocates, schedules and (after one run) frees the
+BH itself, so there is nothing to manage here.
+
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+
+diff --git a/softmmu/vl.c b/softmmu/vl.c
+--- a/softmmu/vl.c
++++ b/softmmu/vl.c
+@@ -2736,6 +2736,15 @@
+     }
+ }
+ 
++/*
++ * One-shot bottom half used to defer the autostart vm_start until
++ * the main loop is actually running.  See qmp_x_exit_preconfig() below.
++ */
++static void rpi5_autostart_cont_bh(void *opaque)
++{
++    qmp_cont(NULL);
++}
++
+ void qmp_x_exit_preconfig(Error **errp)
+ {
+     if (phase_check(PHASE_MACHINE_INITIALIZED)) {
+@@ -2764,7 +2773,18 @@
+             }
+         }
+     } else if (autostart) {
+-        qmp_cont(NULL);
++        /*
++         * Do NOT call qmp_cont() inline here.  qmp_x_exit_preconfig()
++         * runs inside qemu_init(), before the main loop.  Calling qmp_cont() ->
++         * vm_start() -> vm_prepare_start() now would run on a pre-main-loop
++         * context where subsystems (QAPI event emit, timers) are not ready and
++         * qemu dies silently.  Instead schedule a one-shot bottom half on the
++         * main-loop AioContext; it runs on the first main_loop_wait()
++         * iteration, i.e. with the main loop up, mirroring the "-S then QMP
++         * cont after main loop" full-device-model startup.
++         */
++        aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                                rpi5_autostart_cont_bh, NULL);
+     }
+ }
+ 

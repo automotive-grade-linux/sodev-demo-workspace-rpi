@@ -1,0 +1,68 @@
+From c0e5f731067db5aece26a446cf4a07ecc3f2e598 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 18 Nov 2021 21:39:08 +0200
+Subject: [PATCH] xen/grant-table: Use unpopulated contiguous pages instead of
+ real RAM ones
+
+Depends on CONFIG_XEN_UNPOPULATED_ALLOC. If enabled then unpopulated
+contiguous pages will be allocated for grant mapping into instead of
+ballooning out real RAM pages.
+
+Also fallback to allocate DMAable pages (balloon out real RAM pages)
+if we failed to allocate unpopulated contiguous pages. Use recently
+introduced is_xen_unpopulated_page() in gnttab_dma_free_pages() to know
+what API to use for freeing pages.
+
+On review: https://lore.kernel.org/xen-devel/1655740136-3974-3-git-send-email-olekstysh@gmail.com/
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Submitted [https://lore.kernel.org/xen-devel/1655740136-3974-3-git-send-email-olekstysh@gmail.com/]
+Origin: https://github.com/xen-troops/linux commit c0e5f731067db5aece26a446cf4a07ecc3f2e598
+---
+ drivers/xen/grant-table.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/xen/grant-table.c b/drivers/xen/grant-table.c
+index 478d2ad725ac..d9518918c1d7 100644
+--- a/drivers/xen/grant-table.c
++++ b/drivers/xen/grant-table.c
+@@ -1066,6 +1066,23 @@ int gnttab_dma_alloc_pages(struct gnttab_dma_alloc_args *args)
+ 	if (args->nr_pages < 0 || args->nr_pages > (INT_MAX >> PAGE_SHIFT))
+ 		return -ENOMEM;
+ 
++	if (IS_ENABLED(CONFIG_XEN_UNPOPULATED_ALLOC)) {
++		ret = xen_alloc_unpopulated_contiguous_pages(args->dev, args->nr_pages,
++				args->pages);
++		if (ret < 0)
++			goto fallback;
++
++		ret = gnttab_pages_set_private(args->nr_pages, args->pages);
++		if (ret < 0)
++			goto fail;
++
++		args->vaddr = page_to_virt(args->pages[0]);
++		args->dev_bus_addr = page_to_phys(args->pages[0]);
++
++		return ret;
++	}
++
++fallback:
+ 	size = args->nr_pages << PAGE_SHIFT;
+ 	if (args->coherent)
+ 		args->vaddr = dma_alloc_coherent(args->dev, size,
+@@ -1122,6 +1139,13 @@ int gnttab_dma_free_pages(struct gnttab_dma_alloc_args *args)
+ 
+ 	gnttab_pages_clear_private(args->nr_pages, args->pages);
+ 
++	if (IS_ENABLED(CONFIG_XEN_UNPOPULATED_ALLOC) &&
++			is_xen_unpopulated_page(args->pages[0])) {
++		xen_free_unpopulated_contiguous_pages(args->dev, args->nr_pages,
++				args->pages);
++		return 0;
++	}
++
+ 	for (i = 0; i < args->nr_pages; i++)
+ 		args->frames[i] = page_to_xen_pfn(args->pages[i]);
+ 
+-- 
+2.43.0
+

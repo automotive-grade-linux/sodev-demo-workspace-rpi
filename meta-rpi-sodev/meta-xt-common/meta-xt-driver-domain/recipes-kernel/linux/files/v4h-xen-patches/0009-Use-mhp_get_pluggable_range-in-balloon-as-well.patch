@@ -1,0 +1,38 @@
+From ebf2384503d65723a786e9d93bed529cea1d204b Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Wed, 8 Jun 2022 11:03:50 +0300
+Subject: [PATCH] Use mhp_get_pluggable_range() in balloon as well
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/linux commit ebf2384503d65723a786e9d93bed529cea1d204b
+---
+ drivers/xen/balloon.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/xen/balloon.c b/drivers/xen/balloon.c
+index 8c44a25a7d2b..e551fad114fb 100644
+--- a/drivers/xen/balloon.c
++++ b/drivers/xen/balloon.c
+@@ -240,6 +240,7 @@ static void release_memory_resource(struct resource *resource)
+ static struct resource *additional_memory_resource(phys_addr_t size)
+ {
+ 	struct resource *res;
++	struct range mhp_range;
+ 	int ret;
+ 
+ 	res = kzalloc(sizeof(*res), GFP_KERNEL);
+@@ -249,8 +250,9 @@ static struct resource *additional_memory_resource(phys_addr_t size)
+ 	res->name = "System RAM";
+ 	res->flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+ 
++	mhp_range = mhp_get_pluggable_range(true);
+ 	ret = allocate_resource(&iomem_resource, res,
+-				size, 0, -1,
++				size, mhp_range.start, mhp_range.end,
+ 				PAGES_PER_SECTION * PAGE_SIZE, NULL, NULL);
+ 	if (ret < 0) {
+ 		pr_err("Cannot allocate new System RAM resource\n");
+-- 
+2.43.0
+

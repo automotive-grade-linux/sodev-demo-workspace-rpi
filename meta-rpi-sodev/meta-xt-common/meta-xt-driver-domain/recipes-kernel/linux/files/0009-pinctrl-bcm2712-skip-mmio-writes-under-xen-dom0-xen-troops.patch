@@ -1,0 +1,137 @@
+From 48c6968302ac9efe8ca77982d5c8b05d256f5d23 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 20 Jun 2026 14:39:20 +0900
+Subject: [PATCH] pinctrl: brcmstb: skip MMIO read/write under Xen Dom0
+ (xen-troops)
+
+6.18 port of the 6.12 pinctrl-bcm2712 Xen Dom0 guard. In 6.18 the BCM2712
+pinctrl driver was refactored into a shared pinctrl-brcmstb core (this
+file) plus a bcm2712 variant, and the bcm2712_reg_rd/wr helpers were
+inlined as direct readl/writel at 6 sites. Re-introduce centralized
+brcmstb_reg_rd/wr wrappers that skip the TZ-protected pad/mux MMIO under
+xen_initial_domain() (read -> 0 == BRCMSTB_PULL_NONE / fsel 0, write ->
+no-op), so pinctrl_select_state() becomes a no-op under Xen Dom0 and the
+firmware-applied pad config stays in place. The Async SError otherwise
+raised on RPi5+Xen is avoided. force_write=1 (cmdline:
+pinctrl_brcmstb.force_write=1) restores the original behaviour for A/B
+testing.
+
+Scope note: the guard suppresses ALL reads/writes on the whole controller
+under xen_initial_domain(), not just the TZ-protected pad/mux register
+range. This is by design for the Xen Dom0 / DomD split, where the driver
+domain (DomD) owns the pinctrl HW and Dom0 must not touch it; Dom0 relies
+entirely on the firmware-applied pad config and performs no runtime
+pinmux/pull changes. A future refinement could scope the skip to the
+specific TZ-protected register offsets so a Dom0-owned device needing
+runtime reconfiguration still works; that is not required for this
+split.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/pinctrl/bcm/pinctrl-brcmstb.c | 43 +++++++++++++++++++++++----
+ 1 file changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pinctrl/bcm/pinctrl-brcmstb.c b/drivers/pinctrl/bcm/pinctrl-brcmstb.c
+index f46b27155c3c..b26b022f0142 100644
+--- a/drivers/pinctrl/bcm/pinctrl-brcmstb.c
++++ b/drivers/pinctrl/bcm/pinctrl-brcmstb.c
+@@ -24,7 +24,9 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/cleanup.h>
++#include <linux/moduleparam.h>
+ 
++#include <xen/xen.h>
+ #include "pinctrl-brcmstb.h"
+ 
+ #define BRCMSTB_PULL_NONE	0
+@@ -51,6 +53,35 @@ struct brcmstb_pinctrl {
+ 	spinlock_t fsel_lock;
+ };
+ 
++/*
++ * BCM2712 pad/mux registers are TZ-protected (read AND write) on the RPi5 +
++ * Xen Dom0 configuration; touching them raises an Async SError. Route all
++ * register access through these wrappers and skip the MMIO under
++ * xen_initial_domain(): reads return 0 (== BRCMSTB_PULL_NONE / fsel 0) and
++ * writes are dropped, so pinctrl_select_state() becomes a no-op while the
++ * firmware-applied pad config stays in place. force_write=1 restores the
++ * original behaviour for A/B testing. 6.18 port of the xen-troops 6.12
++ * pinctrl-bcm2712 guard (the driver was refactored into pinctrl-brcmstb;
++ * the bcm2712_reg_rd/wr helpers became these brcmstb_reg_rd/wr wrappers).
++ */
++static bool force_write;
++module_param(force_write, bool, 0444);
++MODULE_PARM_DESC(force_write, "Force MMIO writes even under Xen Dom0 (debug only)");
++
++static u32 brcmstb_reg_rd(struct brcmstb_pinctrl *pc, unsigned int reg)
++{
++	if (xen_initial_domain() && !force_write)
++		return 0;
++	return readl(pc->base + reg);
++}
++
++static void brcmstb_reg_wr(struct brcmstb_pinctrl *pc, unsigned int reg, u32 val)
++{
++	if (xen_initial_domain() && !force_write)
++		return;
++	writel(val, pc->base + reg);
++}
++
+ static unsigned int brcmstb_pinctrl_fsel_get(struct brcmstb_pinctrl *pc,
+ 					     unsigned int pin)
+ {
+@@ -64,7 +95,7 @@ static unsigned int brcmstb_pinctrl_fsel_get(struct brcmstb_pinctrl *pc,
+ 
+ 	bit &= ~MUX_BIT_VALID;
+ 
+-	val = readl(pc->base + BIT_TO_REG(bit));
++	val = brcmstb_reg_rd(pc, BIT_TO_REG(bit));
+ 	fsel = (val >> BIT_TO_SHIFT(bit)) & pc->pin_funcs[pin].func_mask;
+ 	func = pc->pin_funcs[pin].funcs[fsel];
+ 
+@@ -113,7 +144,7 @@ static int brcmstb_pinctrl_fsel_set(struct brcmstb_pinctrl *pc,
+ 
+ 	guard(spinlock_irqsave)(&pc->fsel_lock);
+ 
+-	val = readl(pc->base + BIT_TO_REG(bit));
++	val = brcmstb_reg_rd(pc, BIT_TO_REG(bit));
+ 	cur = (val >> BIT_TO_SHIFT(bit)) & fsel_mask;
+ 
+ 	dev_dbg(pc->dev, "read %04x: %08x (%u => %s)\n",
+@@ -127,7 +158,7 @@ static int brcmstb_pinctrl_fsel_set(struct brcmstb_pinctrl *pc,
+ 		dev_dbg(pc->dev, "write %04x: %08x (%u <= %s)\n",
+ 			BIT_TO_REG(bit), val, pin,
+ 			pc->func_names[fsel]);
+-		writel(val, pc->base + BIT_TO_REG(bit));
++		brcmstb_reg_wr(pc, BIT_TO_REG(bit), val);
+ 	}
+ 
+ 	return 0;
+@@ -291,7 +322,7 @@ static unsigned int brcmstb_pull_config_get(struct brcmstb_pinctrl *pc,
+ 	if (bit == PAD_BIT_INVALID)
+ 		return BRCMSTB_PULL_NONE;
+ 
+-	val = readl(pc->base + BIT_TO_REG(bit));
++	val = brcmstb_reg_rd(pc, BIT_TO_REG(bit));
+ 	return (val >> BIT_TO_SHIFT(bit)) & BRCMSTB_PULL_MASK;
+ }
+ 
+@@ -308,10 +339,10 @@ static int brcmstb_pull_config_set(struct brcmstb_pinctrl *pc,
+ 
+ 	guard(spinlock_irqsave)(&pc->fsel_lock);
+ 
+-	val = readl(pc->base + BIT_TO_REG(bit));
++	val = brcmstb_reg_rd(pc, BIT_TO_REG(bit));
+ 	val &= ~(BRCMSTB_PULL_MASK << BIT_TO_SHIFT(bit));
+ 	val |= (arg << BIT_TO_SHIFT(bit));
+-	writel(val, pc->base + BIT_TO_REG(bit));
++	brcmstb_reg_wr(pc, BIT_TO_REG(bit), val);
+ 
+ 	return 0;
+ }
+-- 
+2.43.0
+

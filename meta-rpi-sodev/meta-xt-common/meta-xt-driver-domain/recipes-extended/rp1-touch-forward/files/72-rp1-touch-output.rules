@@ -1,0 +1,52 @@
+# Route the NATIVE RP1 USB touch panel (passed through to DomD) to the AAOS output
+# (HDMI-A-2) in weston, and force-enumerate it on a <5A PSU. Weston maps a touchscreen
+# to a specific output via the WL_OUTPUT udev property; without this the panel lands on
+# the primary output (HDMI-A-1 = the DomU cluster) and AAOS (HDMI-A-2) never sees touch.
+
+# 1. RP1->DomD HW passthrough: the NATIVE RP1 USB touch panel enumerates in DomD
+# under its real panel name. Mirror the V4H AGL SoDeV reference DomD rules
+# (/etc/udev/rules.d/99-touchscreen-mouseif.rules + touchscreen.rules):
+#
+#   (a) The wch.cn panel exposes a SECOND, REL/mouse interface (ID_INPUT_MOUSE=1).
+#       libinput would turn it into a roaming pointer on the primary output
+#       (HDMI-A-1) -- this is exactly the "touch reacts on HDMI-A-1" symptom.
+#       Ignore that interface (LIBINPUT_IGNORE_DEVICE) so only the touchscreen
+#       interface remains.  [V4H 99-touchscreen-mouseif.rules]
+#   (b) Route the (auto-classified) touchscreen interface to the AAOS output.
+#       V4H sets WL_OUTPUT=HDMI-A-1 for its layout; here AAOS is on HDMI-A-2.
+#       [V4H touchscreen.rules]
+#
+# wch.cn (27c0:0859, usb@300000) is the currently wired panel; ILITEK
+# (222a:5440, usb@200000) is the alternate stable panel.
+SUBSYSTEM=="input", ATTRS{name}=="wch.cn TouchScreen", ENV{ID_INPUT_MOUSE}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+SUBSYSTEM=="input", ATTRS{name}=="ILITEK*", ENV{ID_INPUT_MOUSE}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ILITEK*", ENV{WL_OUTPUT}="HDMI-A-2"
+
+#   (c) Name-independent fallback -- this is what actually routes the touch.
+#       An exact-match rule on "wch.cn TouchScreen" cannot reach the native
+#       touchscreen interface at all, so no such rule is used for routing above
+#       (the exact-match rules there only tag the MOUSE interface for libinput to
+#       ignore). The touchscreen interface enumerates as
+#       "wch.cn TouchScreen Touchscreen" (a trailing word appended by the HID
+#       layer) and is therefore MISSED -> WL_OUTPUT stays unset -> weston routes
+#       it to the primary output HDMI-A-1 (AGL cluster) and AAOS never gets touch
+#       (the cursor "leaks" to the cluster). ID_INPUT_TOUCHSCREEN is assigned by
+#       60-input-id (which runs before this rule) and is independent of the panel
+#       name, so it robustly catches every touchscreen interface (wch.cn, ILITEK,
+#       or the "... Touchscreen"-suffixed variant).
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHSCREEN}=="1", ENV{WL_OUTPUT}="HDMI-A-2"
+
+# 2. USB bus-power force-enumerate (touch panel did not enumerate).
+#   The wch.cn panel advertises bMaxPower >100mA, but RP1's USB bus is held at
+#   the low-current (100mA/port) budget: usb_max_current_enable=1 in config.txt
+#   only lifts the cap when a 5A USB-PD PSU is detected, and on a <5A supply the
+#   firmware keeps 100mA. So the kernel rejects the panel's only configuration
+#   ("usb 3-2.4: No support over 100mA / no configuration chosen") -> the panel
+#   never enumerates -> no /dev/input touchscreen -> AAOS gets no touch.
+#   The panel's REAL draw is within budget (it runs fine once forced), so set its
+#   single configuration regardless of the advertised bMaxPower. This makes touch
+#   work at boot without requiring a 5A PSU. (Verified live: forcing
+#   bConfigurationValue=1 enumerated the panel and AAOS touch responded.)
+#   wch.cn = 27c0:0859 (wired panel); ILITEK = 222a:5440 (alternate panel).
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="27c0", ATTR{idProduct}=="0859", ATTR{bConfigurationValue}="1"
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="222a", ATTR{idProduct}=="5440", ATTR{bConfigurationValue}="1"

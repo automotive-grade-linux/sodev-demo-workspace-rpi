@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=DomD toolstack preparation for the Zephyr-Dom0 topology
+# DomD (a dom0less control domain, capabilities=0x1) is the toolstack that
+# runs `xl create` against the thin Zephyr Dom0 xenstore server. All four
+# prerequisites below were determined on real HW (see the
+# README in meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr):
+#   1. /var/lib/xen + /var/log/xen/console  (libxl userdata lock / logs). The
+#      image recipe now creates both, since DomD boots from a persistent ext4
+#      rootfs on SD p2 rather than the RAM initramfs this unit was written for.
+#      Creating them here is kept because it is idempotent and this unit is the
+#      one thing xl-create-* orders after -- a rootfs missing them would fail
+#      every `xl create` with no other diagnostic.
+#   2. cpupool name seed  (the Zephyr Dom0 never runs xen-init-dom0, so
+#      /local/pool/0/name is missing and libxl cannot resolve the default pool)
+#   3. /tool/xenconsoled/domid = 1  (points the console backend at DomD;
+#      without it libxl allocates the console evtchn toward Dom0)
+#   4. console seeder  (satisfies libxl's console tty / backend state waits AND
+#      owns xenconsoled: it (re)starts xenconsoled per newly created guest so the
+#      guests' PV console rings are drained -- see domd-console-seeder.sh)
+# xl-create-doma/domu Require+After this unit.
+After=xendriverdomain.service
+Wants=xendriverdomain.service
+
+[Service]
+Type=simple
+# Seeding must complete before the unit turns "active" for the Requires= chain,
+# hence ExecStartPre; the long-running ExecStart is the console seeder loop.
+ExecStartPre=/bin/mkdir -p /var/lib/xen /var/log/xen/console
+ExecStartPre=/bin/sh -c 'xenstore-write /local/pool/0/name Pool-0'
+ExecStartPre=/bin/sh -c 'xenstore-write /tool/xenconsoled/domid 1'
+# xenconsoled is owned SOLELY by the console seeder (ExecStart below). It
+# (re)starts xenconsoled once per newly created guest so xenconsoled's startup
+# enum_domains picks the guest up -- the Zephyr xenstore never fires
+# xenconsoled's @introduceDomain watch, so a long-lived instance would miss
+# every guest created after it (see the [verified on hardware] note in
+# domd-console-seeder.sh). A pre-start here is therefore removed: it would only
+# create a throwaway instance that the seeder kills and restarts at the first
+# guest -- a second, redundant management site and a needless stop/start window
+# with no draining benefit. Single-ownership by the seeder removes that
+# competition. (The stock xenconsoled.service stays masked - it Requires the
+# local xenstored; --log=guest gives the seeder per-guest console logs.)
+ExecStart=/usr/libexec/domd-console-seeder.sh 1
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

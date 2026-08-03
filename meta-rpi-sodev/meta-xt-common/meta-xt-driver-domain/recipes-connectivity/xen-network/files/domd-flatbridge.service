@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=DomD flat L2 bridge (late activation, post-guest-creation)
+# Do NOT order this unit after a systemd TARGET. Found on hardware: with
+# After=multi-user.target the unit gates on that target's own activation job
+# completing, and DomD's multi-user activation can stay in-flight (one slow or hung
+# oneshot elsewhere is enough), so the unit never ran at all while domd-sshd-fix
+# (After=network.target) started at uptime 16s -- xenstore-instrumented proof.
+# An earlier revision ordered on graphical.target and failed the same way for a
+# second reason that no longer exists: weston.service used to be masked in favour of
+# a hand-written PID 1, so weston.socket could not start and graphical.target never
+# completed. weston is a normal systemd unit now, but target ordering stays out
+# because the first failure mode is independent of weston.
+# Order after a real unit instead. The "post-guest-creation" timing that the target
+# ordering used to approximate is enforced by the script's own wait-for-vif-emu loop
+# (~180s), which is the actual precondition.
+# WantedBy=multi-user.target below is only an activation anchor, not an ordering
+# gate, so it does not reintroduce the problem above.
+After=xendriverdomain.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/domd-flatbridge-up
+
+[Install]
+WantedBy=multi-user.target

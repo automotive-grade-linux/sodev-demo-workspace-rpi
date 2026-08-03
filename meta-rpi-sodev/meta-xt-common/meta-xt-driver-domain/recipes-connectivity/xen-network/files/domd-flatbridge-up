@@ -1,0 +1,121 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Activate the flat L2 bridge once the guests (and their qemu taps) exist.
+# The bridge is activated LATE, after the guests (and their qemu taps) exist. Doing
+# it at boot instead enslaved eth0 and the netfront into xenbr0 and broke xenbus
+# about seven seconds in, so no guest was ever created and both screens stayed
+# black. Activating it post-boot keeps the xenstore-critical window on the plain
+# static network configuration, and then joins eth0 and
+# the DomU/DomA qemu taps into xenbr0=.10.10 so PC(.1)/DomU(.12)/DomA(.13) share
+# one L2. Dom0's xen-netfront is intentionally NOT enslaved here (that is the
+# suspected xenbus breaker; handled/verified separately via routing).
+log() { echo "domd-flatbridge-up: $*"; }
+
+# Addresses. These two lines are rewritten at do_install time from
+# sodev-net.inc's XT_DOMD_XENBR0_IP and XT_PC_UPLINK_GW_IP (see the sed in
+# xen-network.bb), so the topology stays in one place. Edit sodev-net.inc, not
+# the values here.
+XENBR0_ADDR=192.168.10.10/24
+UPLINK_GW=192.168.10.1
+# Self-report progress into xenstore (readable from Dom0 as
+# /local/domain/1/data/flatbridge even when DomD console output is
+# backpressured and sshd is down -- the exact situation this instruments).
+XSKEY=/local/domain/1/data/flatbridge
+xsr() { xenstore-write "$XSKEY" "$(xenstore-read "$XSKEY" 2>/dev/null);$*" 2>/dev/null || true; }
+xenstore-write "$XSKEY" "start uptime=$(cut -d. -f1 /proc/uptime)" 2>/dev/null || true
+# Wait for the first guest tap to appear. multi-user.target fires much earlier
+# than the old graphical anchor, so this wait now carries the whole
+# post-guest-creation timing requirement. Skipped entirely in a guest-less build,
+# where no tap can ever appear and the wait would just add its full length to
+# DomD's boot -- multi-user.target Wants this unit.
+#
+# The 90 x 2 s bound (~180 s) has no measured basis: on hardware the first tap
+# has always appeared within a few seconds of the guest being created, and the
+# bound is only there so a build where no guest ever starts still reaches the
+# rest of this script. Treat it as a conservative ceiling, not a requirement.
+if [ -f /etc/xen/doma.cfg ] || [ -f /etc/xen/domu.cfg ]; then
+    i=0
+    while [ $i -lt 90 ]; do
+        [ -e /sys/class/net/vif-emu ] && break
+        i=$((i+1)); sleep 2
+    done
+fi
+# The bridge device itself is created by systemd-networkd from
+# /etc/systemd/network/xenbr0.netdev -- this script only moves the address onto it.
+# Bail out BEFORE touching eth0 if it is missing: the sequence below flushes eth0's
+# 192.168.10.11 first, so continuing without a bridge to move the address to would
+# leave DomD with no address at all (observed on hardware when an image recipe
+# deleted xenbr0.netdev).
+if [ ! -e /sys/class/net/xenbr0 ]; then
+    log "FATAL: xenbr0 does not exist (missing /etc/systemd/network/xenbr0.netdev?); keeping eth0 as-is"
+    xsr "xenbr0-missing"
+    exit 1
+fi
+ip link set xenbr0 up 2>/dev/null
+xsr "xenbr0-up"
+# PC->Dom0 SSH is routed THROUGH DomD (PC -> xenbr0 .10.10 -> eth1 .0.11 ->
+# Dom0 vif .0.1), so DomD must forward. This used to come implicitly from
+# IPMasquerade=ipv4 in 50-xenbr0.network; that was removed (the .0.1 address
+# there shadowed Dom0's vif end), so enable forwarding explicitly here.
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 && log "ip_forward=1 (PC->Dom0 routing)"
+xsr "ipfwd=$(cat /proc/sys/net/ipv4/ip_forward)"
+# move DomD's address from eth0(.10.11) onto xenbr0(.10.10) and enslave the
+# physical RP1 NIC, so PC and the guests share one L2 segment.
+ip addr flush dev eth0 2>/dev/null
+ip link set eth0 master xenbr0 2>/dev/null && log "eth0 -> xenbr0"
+ip addr add "$XENBR0_ADDR" dev xenbr0 2>/dev/null
+xsr "addr-set eth0master=$([ -e /sys/class/net/eth0/master ] && echo y || echo n)"
+ip link set eth0 up 2>/dev/null
+ip route replace default via "$UPLINK_GW" dev xenbr0 2>/dev/null
+# DomA's DHCP lease (.10.13) is served by the system dnsmasq.service: its
+# /etc/dnsmasq.conf (dnsmasq bbappend) carries the flat-bridge range and the
+# static guest mappings, and it binds wildcard so it answers once xenbr0 is
+# up. Do NOT spawn a second dnsmasq here: the two instances race for port 67
+# and the loser dies with "Address already in use". Observed on hardware: the
+# instance carrying the stale subnet won the port and DomA never got a lease.
+# enslave the DomU/DomA qemu taps as they appear. DomU's tap (vif-emu2) is
+# created later than the DomA taps, so retry for up to ~90s; enslaving is
+# idempotent (skip any tap that already has a bridge master).
+#
+# Break out as soon as all three are enslaved. Without that early exit this loop
+# always ran its full 45 iterations, and because multi-user.target/graphical.target
+# wait on this unit the reported boot time was ~102 s even though every tap was in
+# the bridge by t+12 s -- measured on hardware: the taps were enslaved at 15:35:19
+# and the unit only printed "done" at 15:36:49.
+# Only wait for taps that this build can actually produce. ENABLE_DOMU=no and
+# ENABLE_ANDROID=no are supported configurations (XT_DOMU_CFG_INSTALL,
+# XT_DOMA_BBMASK), and in those the missing tap never appears -- waiting the full
+# 45 iterations for it would put back exactly the 90 s of dead time this loop was
+# fixed to avoid, and then log a spurious warning. Expectation is derived from the
+# xl configs present in this rootfs, which is what decides whether a guest is
+# created at all.
+#
+# Like the tap wait above, the 45 x 2 s bound is a conservative ceiling and not a
+# measured requirement -- the one hardware measurement here (taps enslaved at
+# t+12 s) justifies the early break, not the size of the bound. It only decides
+# how long a build whose taps never appear delays the targets that wait on this
+# unit before logging the warning below.
+expected=""
+[ -f /etc/xen/doma.cfg ] && expected="$expected vif-emu vif-emu1"
+[ -f /etc/xen/domu.cfg ] && expected="$expected vif-emu2"
+if [ -z "$expected" ]; then
+    log "no guest xl config present; nothing to enslave"
+else
+    n=0
+    while [ $n -lt 45 ]; do
+        pending=0
+        for t in $expected; do
+            if [ ! -e /sys/class/net/$t ]; then
+                pending=$((pending+1))
+            elif [ ! -e /sys/class/net/$t/master ]; then
+                ip link set $t master xenbr0 2>/dev/null && log "$t -> xenbr0"
+                [ -e /sys/class/net/$t/master ] || pending=$((pending+1))
+            fi
+        done
+        [ "$pending" -eq 0 ] && break
+        n=$((n+1)); sleep 2
+    done
+    [ "$pending" -eq 0 ] || log "WARNING: $pending of [$expected ] not enslaved after ~90s"
+fi
+xsr "done addrs=$(ip -br -4 a | tr '\n' '|')"
+log "done (DomD=${XENBR0_ADDR%%/*} on xenbr0)"

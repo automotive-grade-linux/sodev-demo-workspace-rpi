@@ -1,0 +1,50 @@
+From ad0d48eecda2bd7d5035770d713e67176000f90d Mon Sep 17 00:00:00 2001
+From: Khem Raj <raj.khem@gmail.com>
+Date: Fri, 7 Feb 2025 16:09:20 +0000
+Subject: [PATCH] linux-user: Do not define struct sched_attr if libc headers
+ do
+
+QEMU 7.0.0 linux-user/syscall.c carries its own `struct sched_attr` with the
+comment "sched_attr is not defined in glibc". That was true for the glibc that
+shipped with scarthgap. wrynose's glibc 2.43 now defines `struct sched_attr`
+(field-identical) in <bits/sched.h>, pulled in by the <sched.h> include at the
+top of this file, so the local definition becomes a redefinition:
+
+  ../sources/qemu-7.0.0/linux-user/syscall.c:343:8:
+      error: redefinition of 'struct sched_attr'
+
+glibc guards its definition with the SCHED_ATTR_SIZE_VER0 macro, so wrap QEMU's
+local definition in `#ifndef SCHED_ATTR_SIZE_VER0`. When glibc provides the
+struct the local copy is skipped; on older toolchains the local definition is
+still emitted. The two definitions are byte-identical (size, sched_policy,
+sched_flags, sched_nice, sched_priority, sched_runtime, sched_deadline,
+sched_period, sched_util_min, sched_util_max), so all later uses of
+`struct sched_attr` in this file are unaffected.
+
+Upstream-Status: Backport [27a8d899c7a1 "linux-user: Do not define struct
+sched_attr if libc headers do"]
+
+Signed-off-by: Khem Raj <raj.khem@gmail.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+---
+ linux-user/syscall.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -340,6 +340,7 @@
+ _syscall3(int, sys_sched_setaffinity, pid_t, pid, unsigned int, len,
+           unsigned long *, user_mask_ptr);
+ /* sched_attr is not defined in glibc */
++#ifndef SCHED_ATTR_SIZE_VER0
+ struct sched_attr {
+     uint32_t size;
+     uint32_t sched_policy;
+@@ -352,6 +353,7 @@
+     uint32_t sched_util_min;
+     uint32_t sched_util_max;
+ };
++#endif /* SCHED_ATTR_SIZE_VER0 */
+ #define __NR_sys_sched_getattr __NR_sched_getattr
+ _syscall4(int, sys_sched_getattr, pid_t, pid, struct sched_attr *, attr,
+           unsigned int, size, unsigned int, flags);

@@ -1,0 +1,113 @@
+From 20830d5096e533973a745bd958f8f9de2e71e109 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] skip RESUME QAPI event when no QMP client (xenpv autostart)
+
+This patch is written against the pristine vm_prepare_start() so it applies
+cleanly on the upstream source tree.  Use this together with the deferred
+autostart patch.
+
+Rationale: when qemu runs as a Xen disaggregated
+device-model spawned via libxl__spawn_qdisk_backend (machine "xenpv", only
+"-monitor /dev/null", NO QMP monitor) with autostart=1,
+qmp_x_exit_preconfig() calls qmp_cont() -> vm_prepare_start() synchronously
+inside qemu_init(), before the main loop is running.  vm_prepare_start()
+then emits a RESUME event; in this pre-main-loop, no-QMP-monitor context the
+RESUME path aborts.  A RESUME event is purely a QMP-client notification, so
+with no QMP monitor it is a no-op by design and is safely skipped.
+
+This complements the deferred-autostart patch, which moves vm_start to after
+the main loop is up (so RESUME would be safe anyway), and this guard keeps
+RESUME a no-op whenever there genuinely is no QMP client.  Both kept for
+defence in depth.
+
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [guards the RESUME QAPI emit when qemu runs with no QMP
+monitor, which is how libxl spawns a disaggregated device model; the emit is a
+QMP-client notification and is a no-op by design in that configuration]
+
+diff --git a/include/monitor/monitor.h b/include/monitor/monitor.h
+--- a/include/monitor/monitor.h
++++ b/include/monitor/monitor.h
+@@ -16,6 +16,7 @@ extern QemuOptsList qemu_mon_opts;
+ Monitor *monitor_cur(void);
+ Monitor *monitor_set_cur(Coroutine *co, Monitor *mon);
+ bool monitor_cur_is_qmp(void);
++bool monitor_has_qmp_client(void);
+
+ void monitor_init_globals(void);
+ void monitor_init_globals_core(void);
+diff --git a/monitor/monitor.c b/monitor/monitor.c
+--- a/monitor/monitor.c
++++ b/monitor/monitor.c
+@@ -392,6 +392,32 @@ monitor_qapi_event_queue_no_reenter(QAPIEvent event, QDict *qdict)
+     }
+ }
+
++/*
++ * Return true if at least one QMP monitor is currently registered.
++ * QAPI events are notifications addressed to QMP clients only; if there is
++ * no QMP monitor, emission is a no-op and we can safely skip the whole
++ * queue/lock/timer machinery.  Used both to keep qapi_event_emit() from
++ * touching monitor_lock / the rate-limit QEMUTimer, and to let callers (e.g.
++ * vm_prepare_start()) avoid building/emitting an event altogether when qemu
++ * runs as a Xen disaggregated device-model (xenpv, -monitor /dev/null,
++ * autostart=1) and a RESUME event would otherwise be emitted before the main
++ * loop is up.
++ */
++bool monitor_has_qmp_client(void)
++{
++    Monitor *mon;
++    bool found = false;
++
++    QEMU_LOCK_GUARD(&monitor_lock);
++    QTAILQ_FOREACH(mon, &mon_list, entry) {
++        if (monitor_is_qmp(mon)) {
++            found = true;
++            break;
++        }
++    }
++    return found;
++}
++
+ void qapi_event_emit(QAPIEvent event, QDict *qdict)
+ {
+     /*
+@@ -409,6 +435,16 @@ void qapi_event_emit(QAPIEvent event, QDict *qdict)
+     static __thread bool reentered;
+     MonitorQapiEvent *ev;
+
++    /*
++     * No QMP client to notify: skip entirely.  This avoids the
++     * monitor_lock / rate-limit timer path in
++     * monitor_qapi_event_queue_no_reenter(), which is unsafe before the
++     * main loop is running (Xen xenpv device-model, autostart vm_start).
++     */
++    if (!monitor_has_qmp_client()) {
++        return;
++    }
++
+     if (!reentered) {
+         QSIMPLEQ_INIT(&event_queue);
+     }
+diff --git a/softmmu/cpus.c b/softmmu/cpus.c
+--- a/softmmu/cpus.c
++++ b/softmmu/cpus.c
+@@ -695,7 +695,16 @@ int vm_prepare_start(void)
+     }
+
+     /* We are sending this now, but the CPUs will be resumed shortly later */
+-    qapi_event_send_resume();
++    /*
++     * A RESUME event is purely a QMP-client notification.  When qemu
++     * runs as a Xen disaggregated device-model (xenpv, -monitor /dev/null, no
++     * QMP monitor) with autostart=1, this path can run before the main loop is
++     * up; emitting RESUME there is unsafe and pointless.  Skip the whole event
++     * (build + emit) when there is no QMP client to notify.
++     */
++    if (monitor_has_qmp_client()) {
++        qapi_event_send_resume();
++    }
+
+     cpu_enable_ticks();
+     runstate_set(RUN_STATE_RUNNING);

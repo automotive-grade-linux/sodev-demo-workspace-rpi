@@ -1,0 +1,15 @@
+# Deterministically name the RP1 gigabit-ethernet NIC "eth0" on DomD.
+# RP1 is a PCIe endpoint passed through to DomD; systemd's default predictable-
+# naming policy (99-default.link) can name it end0 or enP*s* non-deterministically.
+# The whole DomD network design keys on RP1 == eth0 == 192.168.10.11 (10-eth0.network
+# static, flatbridge enslave, dnsmasq, SSH); a drift to end0 would leave the static
+# config unapplied and break L2 / Dom0 routing / SSH. Matching the cdns,macb driver
+# (bcm2712-raspberrypi5-domd.dts ethernet@c040100000 compatible="cdns,macb") pins the
+# name here, independent of the kernel cmdline net.ifnames setting. Sorted before
+# 99-default.link, so this match wins.
+[Match]
+Driver=macb
+Type=ether
+
+[Link]
+Name=eth0
