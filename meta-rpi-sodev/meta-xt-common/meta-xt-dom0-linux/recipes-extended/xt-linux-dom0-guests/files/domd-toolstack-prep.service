@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=No-op domd-toolstack-prep stub (thin-Linux Dom0)
+# The shared xl-create-{domu,doma}.service (from xt-xen-cfg-domu, also installed
+# into the DomD rootfs image for the zephyr flavour) carry
+# Requires=domd-toolstack-prep.service -- in the zephyr flavour that unit seeds the
+# non-standard Zephyr xenstore inside the DomD rootfs. A drop-in CANNOT clear
+# that requirement: an empty "Requires=" in a drop-in does NOT remove a dependency
+# set in the main unit file (verified empirically on systemd 255 -- the main-file
+# entry survives the reset). So on a thin-Linux Dom0, where the real toolstack
+# (xenstored) is used and no Zephyr seeder exists, Requires=domd-toolstack-prep
+# would be unresolvable and xl-create-{domu,doma} would refuse to start.
+# Ship this no-op stub so the requirement is satisfiable; the real toolstack
+# ordering is supplied by the xl-create-*.service.d/10-linux-dom0.conf drop-ins
+# (Requires/After xenstored.service + xl-attach-disks.service).
+ConditionPathExists=/proc/xen
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target

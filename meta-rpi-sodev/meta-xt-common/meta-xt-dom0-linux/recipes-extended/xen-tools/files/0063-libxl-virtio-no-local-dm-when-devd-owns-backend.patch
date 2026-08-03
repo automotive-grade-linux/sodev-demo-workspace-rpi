@@ -1,0 +1,67 @@
+From 74ceefbe8d79e7abc1dbdae35384f61d235833b1 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] libxl: virtio: no local DM when the devd path owns the
+ backend
+
+In the DomD-as-toolstack topology (Zephyr Dom0 = thin xenstore server,
+DomD = dom0less control domain running `xl create`), creating a guest with a
+QEMU virtio backend in DomD spawns the SAME device model twice:
+
+ * patch 0015's delegation path fires because
+   backend_domid(1) != LIBXL_TOOLSTACK_DOMID(0) -> dm_args/dm_envs are saved
+   to xenstore and DomD's `xl devd` spawns the backend qemu (this one works:
+   it passed patch 0016's 10s state wait by writing the RELATIVE
+   device-model/<domid>/state = /local/domain/1/... path), and
+ * libxl__need_xenpv_qemu ALSO returns true because
+   libxl__device_virtio_dm_needed compares backend_domid against the
+   toolstack's OWN domid (libxl__get_domid), which in DomD is also 1 ->
+   libxl__spawn_local_dm launches a second qemu with identical arguments.
+
+The second qemu loses the race for every exclusive resource the args name
+(the raw-partition write lock, the vhost-vsock guest-cid, the virtio-serial
+unix socket paths) and exits immediately -> spawn_middle_death ->
+device_model_spawn_outcome "spawn failed (rc=-3)" and the whole xl create
+aborts, observed on RPi5 hardware:
+
+  libxl_dm.c:3136:device_model_spawn_outcome: Domain 2:domain 2 device
+  model: spawn failed (rc=-3)
+
+(Even if the second qemu won the race, the local-DM readiness wait uses
+DEVICE_MODEL_XS_PATH(LIBXL_TOOLSTACK_DOMID=0,...) = /local/domain/0/... while
+qemu writes the relative /local/domain/<own>/... path, so in a non-dom0
+toolstack it would then hang to the 60s timeout.)
+
+In the earlier Linux-Dom0 topology the two conditions were mutually exclusive
+(toolstack domid 0 != backend domid 1 -> no local DM, devd qemu only). Make
+that invariant explicit: a virtio backend needs a LOCAL device model only
+when the backend domain IS the toolstack domain, i.e. exactly when the 0015
+devd-delegation path does NOT handle it. Upstream behaviour (backend in the
+dom0 toolstack: 0 == 0) is unchanged.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/tools/libs/light/libxl_virtio.c	2026-07-06 23:26:28.176272217 +0900
++++ b/tools/libs/light/libxl_virtio.c	2026-07-06 23:26:28.184382426 +0900
+@@ -42,8 +42,18 @@
+ {
+     libxl_device_virtio *elem = e;
+ 
++    /*
++     * A QEMU virtio backend needs a device model spawned by THIS libxl
++     * (local DM) only when the backend domain is the toolstack domain
++     * itself.  When backend_domid != LIBXL_TOOLSTACK_DOMID the delegation
++     * path (dm_args saved to xenstore, qemu spawned by the backend
++     * domain's `xl devd`) owns the device model; comparing against our own
++     * runtime domid here would double-spawn it whenever the toolstack runs
++     * inside the backend domain (driver-domain toolstack topology).
++     */
+     return elem->backend_type == LIBXL_VIRTIO_BACKEND_QEMU &&
+-           elem->backend_domid == domid;
++           elem->backend_domid == domid &&
++           elem->backend_domid == LIBXL_TOOLSTACK_DOMID;
+ }
+ 
+ static int libxl__device_from_virtio(libxl__gc *gc, uint32_t domid,

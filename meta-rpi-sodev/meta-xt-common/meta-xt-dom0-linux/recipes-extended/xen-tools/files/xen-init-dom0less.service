@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Initialize xenstore for dom0less domains
+After=xenstored.service xenconsoled.service
+Requires=xenstored.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'mkdir -p /var/log/xen'
+ExecStart=/usr/lib/xen/bin/init-dom0less
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

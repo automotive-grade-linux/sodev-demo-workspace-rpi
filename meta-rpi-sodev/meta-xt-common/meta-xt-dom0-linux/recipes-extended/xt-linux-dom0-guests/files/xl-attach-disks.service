@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Attach SD p2 (DomD rootfs) / p3 (DomU rootfs) / p4 (AAOS disk) to the dom0less DomD via xl block-attach
+# Linux Dom0 (DOM0_OS=linux) flavour only. DomD is dom0less (fixed domid 1, built
+# from /chosen/domD in boot.cmd) in BOTH flavours, but here Dom0 owns the SD, so
+# Dom0 attaches DomD's own root plus the guest backing partitions at runtime:
+#     p2 -> xvda (DomD rootfs, boot.cmd bootargs root=/dev/xvda rootwait rw)
+#     p3 -> xvdb (DomU rootfs, domu.cfg  -drive file=/dev/xvdb)
+#     p4 -> xvdc (AAOS disk,  doma.cfg  -drive file=/dev/xvdc)
+# p2 is on the critical path: DomD's kernel blocks in rootwait until xvda appears,
+# so DomD userspace does not start until this unit has run. That is why the root
+# attach is the FIRST ExecStart and why a missing p2 is a hard failure here rather
+# than a skip -- without it DomD can never boot.
+# In the zephyr flavour DomD owns the SD via SDHCI passthrough and mounts
+# /dev/mmcblk0p2 directly, so this unit is NOT shipped there (it lives only in the
+# thin-Linux Dom0 image). Dom0 itself never mounts p2; blkback exports the raw
+# partition to DomD.
+# The p3/p4 attaches stay guarded on partition existence, so a guest-less or
+# DomU-only build is a clean no-op for those.
+Requires=proc-xen.mount xenstored.service
+After=proc-xen.mount xenstored.service xenconsoled.service xen-init-dom0less.service
+# /libxl/<domid>/type is created by Dom0's init-dom0less, not by DomD, so waiting on
+# it below cannot deadlock against DomD's rootfs.
+Wants=xen-init-dom0less.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# systemd expands $VAR in Exec lines as unit environment variables (empty if
+# undefined), so every shell-level $ must be escaped as $$.
+# Wait until DomD (domid 1) is visible to xl (xenstore registration done).
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 30); do xl list 1 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "DomD (domid 1) not visible to xl"; exit 1'
+# "xl list 1" turns true as soon as the domain struct exists, but
+# libxl_device_disk_add reads /libxl/1/type, which init-dom0less registers
+# slightly later. Wait (up to 120s) for it before block-attach.
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do xenstore-read /libxl/1/type >/dev/null 2>&1 && exit 0; sleep 1; done; echo "/libxl/1/type not registered"; exit 1'
+# Idempotent attaches (devid: xvda=51712, xvdb=51728, xvdc=51744). Skipping a
+# duplicate would create a second devid.
+# p2 = DomD root: mandatory in this flavour, so fail loudly instead of skipping.
+ExecStart=/bin/sh -c '[ -b /dev/mmcblk0p2 ] || { echo "FATAL: no /dev/mmcblk0p2 - DomD root cannot be attached, DomD will stay blocked in rootwait"; exit 1; }; xenstore-exists /local/domain/0/backend/vbd/1/51712 || xl block-attach 1 "phy:/dev/mmcblk0p2,xvda,w"'
+# p3/p4 = guest backing stores: optional, so an absent partition is a clean skip.
+ExecStart=/bin/sh -c '[ -b /dev/mmcblk0p3 ] || { echo "no /dev/mmcblk0p3 (DomU); skip xvdb"; exit 0; }; xenstore-exists /local/domain/0/backend/vbd/1/51728 || xl block-attach 1 "phy:/dev/mmcblk0p3,xvdb,w"'
+ExecStart=/bin/sh -c '[ -b /dev/mmcblk0p4 ] || { echo "no /dev/mmcblk0p4 (DomA); skip xvdc"; exit 0; }; xenstore-exists /local/domain/0/backend/vbd/1/51744 || xl block-attach 1 "phy:/dev/mmcblk0p4,xvdc,w"'
+# Wait for each attached DomD blkfront to connect (state=4) before qemu opens
+# /dev/xvd{b,c}. Only wait for devices that actually got attached. A timeout warns
+# and continues (observable as a qemu-side failure). xvda is included so the journal
+# records whether DomD picked up its root device.
+ExecStart=/bin/sh -c 'for d in 51712 51728 51744; do xenstore-exists /local/domain/1/device/vbd/$$d 2>/dev/null || continue; for i in $$(seq 1 30); do [ "$$(xenstore-read /local/domain/1/device/vbd/$$d/state 2>/dev/null)" = "4" ] && break; sleep 1; done; st=$$(xenstore-read /local/domain/1/device/vbd/$$d/state 2>/dev/null); [ "$$st" = "4" ] || echo "WARN: vbd $$d frontend state=$$st (not connected)"; done'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
