@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Launch DomU (AGL Cluster IC) via xl create (DomD toolstack, the disaggregated topology)
+# Adapted to the dom0less DomD configuration:
+#   - There is no xl-created DomD to depend on (Xen builds it dom0less from
+#     boot.cmd), so this unit waits on domd-toolstack-prep instead.
+#   - Started AFTER DomA (vhost_xen domid latch). Ordering is After= only, so DomU
+#     still starts if DomA fails (e.g. out of memory on an 8GB configuration).
+# Runs INSIDE DomD (toolstack domain). xl-attach-disks
+# (Dom0-blkback) is gone: qemu reads /dev/mmcblk0p3 directly (DomD owns the SD).
+Requires=domd-toolstack-prep.service
+After=domd-toolstack-prep.service xl-create-doma.service
+
+[Service]
+# In the earlier topology the device-model qemu was spawned by
+# `xl devd` (xendriverdomain.service) and inherited its hack-xdg drop-in env.
+# In the disaggregated topology THIS unit's xl/libxl spawns the dm directly, so provide the same env
+# here: the wayland vars let any SDL/display path connect to weston's global
+# socket, which weston.socket publishes at ${runtimedir}/wayland-0 = /run/wayland-0,
+# V3D_DEBUG=db is the Mesa V3D double-buffer perf knob, and they are harmless for
+# the headless dm case.
+Environment="XDG_RUNTIME_DIR=/run"
+Environment="WAYLAND_DISPLAY=wayland-0"
+Environment="SDL_VIDEODRIVER=wayland"
+Environment="V3D_DEBUG=db"
+Type=oneshot
+RemainAfterExit=yes
+# Note: systemd expands $VAR on Exec lines as a unit environment variable (empty if
+#       undefined), so every $ passed to the shell must be escaped as $$.
+# Mount SD p1 (FAT) at /mnt (domu.cfg kernel=/mnt/linux-domu).
+ExecStartPre=/bin/sh -c '[ -f /mnt/linux-domu ] || mount /dev/mmcblk0p1 /mnt'
+# Wait for DomD weston to be ready (qemu SDL needs the wayland connection).
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do [ "$$(xenstore-read /local/domain/1/drivers/weston-up/status 2>/dev/null)" = "ready" ] && exit 0; sleep 1; done; echo "DomD weston-up not ready after 120s"; exit 1'
+ExecStart=/usr/sbin/xl create /etc/xen/domu.cfg
+ExecStop=/usr/sbin/xl shutdown -w DomU
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

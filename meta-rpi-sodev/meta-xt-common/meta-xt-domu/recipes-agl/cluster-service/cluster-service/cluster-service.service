@@ -1,0 +1,13 @@
+[Unit]
+Description=AGL Cluster Service
+After=basic.target
+Requires=basic.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/cluster_service
+Restart=on-failure
+
+[Install]
+WantedBy=basic.target

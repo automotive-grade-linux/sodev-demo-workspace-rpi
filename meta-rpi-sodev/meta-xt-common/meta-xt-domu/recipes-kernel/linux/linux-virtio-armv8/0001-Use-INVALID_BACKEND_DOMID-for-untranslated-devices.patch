@@ -1,0 +1,44 @@
+From 81d4871c2ee7354a35077016202c22b62df40d5d Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Mon, 24 Oct 2022 10:21:03 +0300
+Subject: Use INVALID_BACKEND_DOMID for the untranslated devices
+
+To avoid a harmless info message to be printed by of_map_id()
+if there are any:
+OF: /pcie@10000000: no iommu-map translation for id 0x18 on (null)
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/linux commit 81d4871c2ee7354a35077016202c22b62df40d5d
+---
+ drivers/xen/grant-dma-ops.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/xen/grant-dma-ops.c b/drivers/xen/grant-dma-ops.c
+index 9784a77fa3c9..f0ba957e1393 100644
+--- a/drivers/xen/grant-dma-ops.c
++++ b/drivers/xen/grant-dma-ops.c
+@@ -26,6 +26,8 @@ struct xen_grant_dma_data {
+ 	bool broken;
+ };
+ 
++#define INVALID_BACKEND_DOMID   ~0U
++
+ static DEFINE_XARRAY_FLAGS(xen_grant_dma_devices, XA_FLAGS_LOCK_IRQ);
+ 
+ #define XEN_GRANT_DMA_ADDR_OFF	(1ULL << 63)
+@@ -341,6 +343,11 @@ static int xen_dt_grant_init_backend_domid(struct device *dev,
+ 
+ 	of_node_put(iommu_spec.np);
+ 
++	if (iommu_spec.args[0] == INVALID_BACKEND_DOMID) {
++		dev_dbg(dev, "Invalid ID\n");
++		return -EINVAL;
++	}
++
+ 	/*
+ 	 * The endpoint ID here means the ID of the domain where the
+ 	 * corresponding backend is running
+-- 
+2.34.1
+
