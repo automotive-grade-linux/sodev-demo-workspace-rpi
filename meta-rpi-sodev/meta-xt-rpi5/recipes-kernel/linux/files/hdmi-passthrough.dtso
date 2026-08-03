@@ -1,0 +1,31 @@
+/*
+ * Copyright (c) 2025 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+*/
+/dts-v1/;
+/plugin/;
+
+&hdmi0       { xen,passthrough; };
+&hdmi1       { xen,passthrough; };
+&v3d         { xen,passthrough; };
+&vc4         { xen,passthrough; };
+&fb          { xen,passthrough; };
+&mailbox     { xen,passthrough; };
+&cpu_l2_irq  { xen,passthrough; };
+&aon_intr    { xen,passthrough; };
+&disp_intr   { xen,passthrough; };
+&bsc_irq     { xen,passthrough; };
+&dma32       { xen,passthrough; };
+
+&hvs	       { xen,passthrough; };
+&pixelvalve0   { xen,passthrough; };
+&pixelvalve1   { xen,passthrough; };
+&mop		   { xen,passthrough; };
+&moplet        { xen,passthrough; };
+&dvp		   { xen,passthrough; };
+&pm 		   { xen,passthrough; };
+&ddc0		   { xen,passthrough; };
+&ddc1		   { xen,passthrough; };
+&dma40	 	   { xen,passthrough; };
+

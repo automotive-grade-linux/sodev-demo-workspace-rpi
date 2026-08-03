@@ -1,0 +1,257 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+*/
+/dts-v1/;
+/plugin/;
+
+&chosen {
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+	xenpolicy {
+		compatible = "xen,xsm-policy", "multiboot-module";
+	};
+	dom0 {
+		compatible = "multiboot,kernel", "multiboot,module";
+	};
+	domD {
+		compatible = "xen,domain";
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+		/* DomD memory is 4 GB (0x400000 KB). Two qemu device-models
+		 * (DomU + DomA) plus weston and the VHAL backend running
+		 * concurrently caused xl devd to be OOM-killed at the previous
+		 * 2 GB size. (A second reason no longer applies: DomD used to
+		 * run out of a 426 MB RAM initramfs unpacked into the rootfs
+		 * tmpfs, which needed ~1 GB of headroom on its own. DomD now
+		 * mounts SD p2, so that memory is free -- but 4 GB is kept
+		 * because the OOM above was measured with the device-models
+		 * alone.) With the
+		 * 16 GB board unlocked (total_memory=16372) the layout
+		 * Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 fits
+		 * (Dom0 was 1024 until dom0_mem was cut to 512M: this Dom0
+		 * is either Zephyr, which addresses only 128 MB of SRAM, or
+		 * a thin Linux with no compositor).
+		 * The extra memory is supplied by extending static bank3 to
+		 * 2 GB at HPA 0x100000000 and adding a 1 GB bank4 at HPA
+		 * 0x180000000, both kept within firmware DRAM bank boundaries
+		 * (2 GB granularity). static-mem is reserved before Dom0
+		 * allocation (init_staticmem_pages), so there is no overlap
+		 * with heap-allocated domains or with U-Boot module loads
+		 * (all < 4 GB).
+		 *
+		 * BOARD SKU. The values in THIS overlay are the 16 GB map and
+		 * are the build default (moulin BOARD_RAM=16g, build.sh
+		 * --ram=16g). For the 8 GB board the boot scripts override
+		 * `memory` and `xen,static-mem` at run time -- see the
+		 * `if test "${board_ram}" = "8g"` block in
+		 * meta-xt-rpi5/recipes-bsp/xt-rpi-u-boot-scr/files/
+		 * boot.cmd.xen.{zephyr,linux}-dom0.in, which drops bank4 to
+		 * give DomD 3072 MB, with DomA taking the other 1024 MB via
+		 * xt-xen-cfg-doma's BOARD_RAM substitution in doma.cfg. An
+		 * earlier 8g map shrank DomD alone to 2048 MB -- the size the
+		 * xl devd OOM above was measured at -- and reproduced that
+		 * failure on hardware: AAOS crash-looped in binder and never
+		 * set sys.boot_completed, while DomD itself still had 1.3 GiB
+		 * free and was never OOM-killed. The remaining banks stay
+		 * place_modules() puts the DomD kernel/DTB, and
+		 * 0x20000000/0x80000000 sit inside the VPU 32-bit DMA window
+		 * that carries vc4's CMA. Keeping the 16 GB values here means
+		 * a hand-built DTB (no boot script) still gets the verified
+		 * default. Do NOT edit these to the 8 GB values -- the SKU is
+		 * a build option, not a source edit. */
+		memory = <0x0 0x400000>;
+		vpl011 = <0x1>;
+		direct-map;
+		cpus = <0x2>;
+		/*
+		 * The first bank is kept at 0x50000000. Moving it to
+		 * 0x80000000 was tried and did not change the behaviour of the
+		 * firmware mailbox, so the mailbox problem is not a
+		 * memory-layout problem; it is handled by the kernel cmdline
+		 * injection and the firmware-node dma-ranges below instead.
+		 * 0x50000000 stays because it is the layout that has been
+		 * booted and measured.
+		 *
+		 * static-mem banks (HPA / size in bytes):
+		 *   0x50000000 (384M) + 0x20000000 (128M) + 0x80000000 (512M)
+		 *   + 0x100000000 (2 GB) + 0x180000000 (1 GB) = 4 GB total.
+		 * The 0x80000000-0xa0000000 bank overlaps extended region 6
+		 * (0x68000000-0x1ffe00000), but that region only reserves guest
+		 * IPA while the static-mem HPA allocation takes precedence.
+		 */
+		xen,static-mem = <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x80000000 0x0 0x20000000 0x1 0x0 0x0 0x80000000 0x1 0x80000000 0x0 0x40000000>;
+		xen,enhanced = "enabled";
+		xen,tee = "optee";
+	};
+};
+
+/*
+ * OP-TEE reserved-memory: explicit, no-map secure carve-outs.
+ *
+ * RPi5/BCM2712 has NO TZASC (TrustZone Address Space Controller), so there is
+ * no hardware firewall protecting the secure DRAM. On this SoC the
+ * reserved-memory no-map entries are therefore the ONLY non-secure-side
+ * protection for the OP-TEE regions: they stop Dom0/DomD Linux (and its page
+ * allocator) from mapping or reusing the secure carve-outs. We reserve them
+ * explicitly in this host overlay instead of relying on firmware / OP-TEE to
+ * inject them into the Xen host DT.
+ *
+ * Regions match TF-A (BL32_BASE / BL32_MEM_SIZE) and OP-TEE
+ * (CFG_TZDRAM_START / CFG_TZDRAM_SIZE, shared-memory base):
+ *   optee_core 0x1D000000 + 0x02000000 (32 MiB) secure OS + TAs (TZDRAM)
+ *   optee_shm  0x08000000 + 0x00400000 ( 4 MiB) OP-TEE static shared memory
+ *
+ * Root is targeted via &{/} (a path reference) rather than a label so it never
+ * depends on a symbol being present in the base DTB __symbols__ (see the GPU
+ * note below); reserved-memory then merges into the base host node at fdt apply.
+ * This is the same idiom the sibling bcm2712-raspberrypi5-xen-scmi.dtso uses to
+ * add its scmi_shm reserved-memory entry. Cells are 2/2 to match the base
+ * bcm2712.dtsi root and its rmem node; declaring them on &{/} keeps the empty
+ * "ranges" consistent (the merge into the 2/2 root writes identical values).
+ */
+&{/} {
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		optee_core@1d000000 {
+			reg = <0x00 0x1d000000 0x00 0x02000000>;
+			no-map;
+		};
+
+		optee_shm@8000000 {
+			reg = <0x00 0x08000000 0x00 0x00400000>;
+			no-map;
+		};
+	};
+};
+
+/*
+ * HACK uart regs to be xen page aligned to avoid XEN fail in dom0less mode
+ * when vuart "vpl011" is used for DomU
+ */
+&uart10 {
+	reg = <0x7d001000 0x1000>;
+	/*
+	 * uart10's console RX interrupt is INTID 152 (SPI 120) on D0-stepping
+	 * BCM2712, not the C0 default SPI 121 in the base DTB. The correction is
+	 * made by overlays/bcm2712d0.dtbo, which the VideoCore firmware auto-
+	 * applies on D0 boards before this overlay is layered on (see the
+	 * "overlays/bcm2712d0.dtbo" p1 item in rpi5-sodev.yaml), so no interrupt
+	 * override is needed here -- Xen reads the firmware-corrected SPI 120 and
+	 * its pl011 console IRQ fires. This matches upstream's xen.dtso.
+	 */
+};
+
+/*
+ * RP1 (USB + Ethernet) -> DomD, toward the Zephyr-Dom0 architecture. The PCIe
+ * RC and the whole RP1 chip now move to DomD so the HDMI-A-2 USB touch panel
+ * (rp1_usb1) reaches DomD's qemu/weston, and Ethernet follows for a future
+ * Zephyr Dom0. These nodes are deliberately NOT marked xen,passthrough here:
+ * a label missing from the base DTB __symbols__ would make `fdt apply` fail and
+ * drop the GPU markers too. Instead boot.cmd marks them with
+ * `fdt set ... xen,passthrough` at runtime (path-based + failure-tolerant), the
+ * same proven mechanism used for the extra GPU devices. Moved to DomD (via
+ * boot.cmd + domd.cfg iomem/irqs + the DomD partial DT):
+ *   &pcie2 &rp1_eth &rp1_usb0 &rp1_usb1 &rp1_gpio &rp1_clocks
+ *   &pcie_rescal &bcm_reset &mip0
+ * Kept in Dom0: &gio_aon (AON GPIO / power button).
+ *
+ * Consequence: Dom0 loses end0/eth0 -> manage via UART (/dev/ttyACM0); restore
+ * Dom0 connectivity later via a DomD netback bridge + Dom0 netfront vif. mip0
+ * still gets its 64-SPI interrupt override in the &mip0 block below.
+ */
+
+&mip0 {
+			interrupts =
+			<0x0 128 0x1>,
+			<0x0 129 0x1>,
+			<0x0 130 0x1>,
+			<0x0 131 0x1>,
+			<0x0 132 0x1>,
+			<0x0 133 0x1>,
+			<0x0 134 0x1>,
+			<0x0 135 0x1>,
+			<0x0 136 0x1>,
+			<0x0 137 0x1>,
+			<0x0 138 0x1>,
+			<0x0 139 0x1>,
+			<0x0 140 0x1>,
+			<0x0 141 0x1>,
+			<0x0 142 0x1>,
+			<0x0 143 0x1>,
+
+			<0x0 144 0x1>,
+			<0x0 145 0x1>,
+			<0x0 146 0x1>,
+			<0x0 147 0x1>,
+			<0x0 148 0x1>,
+			<0x0 149 0x1>,
+			<0x0 150 0x1>,
+			<0x0 151 0x1>,
+			<0x0 152 0x1>,
+			<0x0 153 0x1>,
+			<0x0 154 0x1>,
+			<0x0 155 0x1>,
+			<0x0 156 0x1>,
+			<0x0 157 0x1>,
+			<0x0 158 0x1>,
+			<0x0 159 0x1>,
+
+			<0x0 160 0x1>,
+			<0x0 161 0x1>,
+			<0x0 162 0x1>,
+			<0x0 163 0x1>,
+			<0x0 164 0x1>,
+			<0x0 165 0x1>,
+			<0x0 166 0x1>,
+			<0x0 167 0x1>,
+			<0x0 168 0x1>,
+			<0x0 169 0x1>,
+			<0x0 170 0x1>,
+			<0x0 171 0x1>,
+			<0x0 172 0x1>,
+			<0x0 173 0x1>,
+			<0x0 174 0x1>,
+			<0x0 175 0x1>,
+
+			<0x0 176 0x1>,
+			<0x0 177 0x1>,
+			<0x0 178 0x1>,
+			<0x0 179 0x1>,
+			<0x0 180 0x1>,
+			<0x0 181 0x1>,
+			<0x0 182 0x1>,
+			<0x0 183 0x1>,
+			<0x0 184 0x1>,
+			<0x0 185 0x1>,
+			<0x0 186 0x1>,
+			<0x0 187 0x1>,
+			<0x0 188 0x1>,
+			<0x0 189 0x1>,
+			<0x0 190 0x1>,
+			<0x0 191 0x1>
+			;
+};
+
+/*
+ * Mark the GPU devices with the xen,passthrough property (same pattern as the
+ * V4H r8a779g3-xen.dts). At boot Xen reads the host DT and removes the
+ * IRQ/iomem of xen,passthrough devices from Dom0 so they can be passed through
+ * to DomD, allowing the dom0less GPU passthrough to be combined with the
+ * xl create + real block-device root path.
+ */
+&v3d         { xen,passthrough; };
+&mailbox     { xen,passthrough; };
+&hdmi0       { xen,passthrough; };
+&hdmi1       { xen,passthrough; };
+&hvs         { xen,passthrough; };
+&pixelvalve0 { xen,passthrough; };
+&pixelvalve1 { xen,passthrough; };
+&firmwarekms { xen,passthrough; };

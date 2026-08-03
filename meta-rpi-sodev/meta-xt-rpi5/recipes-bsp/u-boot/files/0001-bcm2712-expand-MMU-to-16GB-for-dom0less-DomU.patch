@@ -1,0 +1,45 @@
+From 5f966805f8d2da94169af59b02c209027707cec4 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] bcm2712: expand U-Boot MMU mapping to 16 GB for dom0less DomU
+
+Expand the BCM2712 first mem_map region from 1 GB to 16 GB (RPi5 16GB SKU).
+
+Without this, fatload/access to any DRAM address >= the mapped size triggers
+a Synchronous Abort (Translation fault, level 1) in U-Boot. The previous
+revision of this patch expanded the region to 4 GB ("8GB" patch, misnamed)
+which was enough for the dom0less module load addresses (< 0xB0000000) but
+left DRAM at 0x100000000-0x400000000 unmapped.
+
+BCM2712 ARM PA map: DRAM occupies 0x0-0x400000000 on the 16 GB SKU; the
+first MMIO window (AXI/uSD) starts at 0x1000000000 (64 GB), so mapping the
+full 16 GB as MT_NORMAL does not overlap any device region (same blanket
+mapping pattern as upstream bcm2711_mem_map which maps ~4 GB regardless of
+fitted RAM).
+
+Note: this only affects what U-Boot itself may access. The memory size that
+Xen sees is governed by the /memory node (firmware DT banks, re-written by
+U-Boot arch_fixup_fdt with CONFIG_NR_DRAM_BANKS banks) - see the companion
+rpi5-16gb-dram-banks.cfg fragment.
+
+Upstream-Status: Inappropriate [RPi5 16GB SKU / Xen dom0less specific]
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+---
+diff --git a/arch/arm/mach-bcm283x/init.c b/arch/arm/mach-bcm283x/init.c
+index 284324c7..b7f1a164 100644
+--- a/arch/arm/mach-bcm283x/init.c
++++ b/arch/arm/mach-bcm283x/init.c
+@@ -70,10 +70,10 @@ static struct mm_region bcm2711_mem_map[MEM_MAP_MAX_ENTRIES] = {
+ 
+ static struct mm_region bcm2712_mem_map[MEM_MAP_MAX_ENTRIES] = {
+ 	{
+-		/* First 1GB of DRAM */
++		/* First 16GB of DRAM (was 1GB; RPi5 16GB SKU, Xen dom0less modules at 0x40000000+) */
+ 		.virt = 0x00000000UL,
+ 		.phys = 0x00000000UL,
+-		.size = 0x40000000UL,
++		.size = 0x400000000UL,
+ 		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+ 			 PTE_BLOCK_INNER_SHARE
+ 	}, {

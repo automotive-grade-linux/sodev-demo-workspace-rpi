@@ -1,0 +1,10 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+*/
+/dts-v1/;
+/plugin/;
+
+&rp1_usb0       { xen,passthrough; };
+&rp1_usb1       { xen,passthrough; };

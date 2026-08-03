@@ -1,0 +1,50 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+*/
+/dts-v1/;
+/plugin/;
+
+&passthrough {
+	pcie1: pcie@1000110000 {
+		compatible = "brcm,bcm2712-pcie";
+		device_type = "pci";
+		linux,pci-domain = <1>;
+		max-link-speed = <2>;
+		num-lanes = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		#interrupt-cells = <1>;
+		reg = <0x10 0x00110000  0x0 0x9310>;
+		interrupt-parent = <&gic>;
+		interrupts = <0x00 0xdf 0x04 0x00 0xe0 0x04>;
+		interrupt-names = "pcie", "msi";
+		interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+		interrupt-map = <0x00 0x00 0x00 0x01 &gic 0x00 0xdb 0x04>,
+				<0x00 0x00 0x00 0x02 &gic 0x00 0xdc 0x04>,
+				<0x00 0x00 0x00 0x03 &gic 0x00 0xdd 0x04>,
+				<0x00 0x00 0x00 0x04 &gic 0x00 0xde 0x04>;
+		msi-controller;
+		/*
+		 * HACK: But the mip1: msi-controller@131000 doesn't have IRQs defined
+		 * in the standard way and instead uses custom properties:
+		 * brcm,msi-base-spi to define GIC IRQ offset, and brcm,msi-num-spis
+		 * to define number of GIC IRQs to use. The Xen doesn't understand this
+		 * and so can't map interrupts to DomU in case of 'xen,passthrough'.
+		 */
+//		msi-parent = <&mip1>;
+		msi-parent = <&pcie1>;
+		ranges = <0x02000000 0x00 0x00000000 0x1b 0x00000000 0x00 0xfffffffc>;
+		dma-ranges = <0x03000000 0x10 0x00000000 0x00 0x00000000 0x10 0x00000000>;
+		resets = <&reset_controller119500>, <&reset_controller1504318 43>;
+		reset-names = "rescal", "bridge";
+		brcm,clkreq-mode = "safe";
+		brcm,fifo-qos-map = <0x3030303>;
+		xen,path = "/axi/pcie@1000110000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x10 0x110000 0x0 0xA000 0x10 0x110000>,
+			  <0x1b 0x00 0x0 0x600000 0x1b 0x00>;
+		status = "okay";
+	};
+};
