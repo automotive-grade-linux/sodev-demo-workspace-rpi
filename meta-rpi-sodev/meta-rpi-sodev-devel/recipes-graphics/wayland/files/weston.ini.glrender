@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Single-HDMI DIAGNOSTIC weston config (PROFILE=agl-aaos), gl-renderer.
+# This is an ALTERNATE desktop-shell profile for GPU-path investigation, NOT a
+# backup/copy of the shipping weston.ini: the shipping config (installed by
+# meta-xt-driver-domain) uses kiosk-shell.so with dual-output app-id routing,
+# whereas this one uses desktop-shell.so and a single connector.
+# We don't pin a specific HDMI connector — operator may plug into
+# either HDMI-A-1 or HDMI-A-2 — so weston picks all connected outputs
+# automatically. For the dual-HDMI demo layout, use the shipping config
+# instead: meta-xt-driver-domain/recipes-graphics/wayland/files/weston.ini,
+# which pins a modeline per output and routes guest surfaces by app-id.
+
+[core]
+backend=drm-backend.so
+shell=desktop-shell.so
+idle-time=0
+
+[keyboard]
+keymap_layout=us
+
+# Both outputs use the connector's preferred mode, deliberately: this file is a
+# diagnostic profile that has to work on whatever panel is plugged in. Do not
+# add a global `mode=<WxH>` here -- pinning 1920x1080 makes a 1920x1200 native
+# panel downgrade, and on this board that also reproduced a simple-egl
+# render-to-scanout failure (dlist size mismatch). A panel that cannot accept
+# its preferred mode needs an explicit modeline for that panel, the way the
+# shipping weston.ini does per output.
+[output]
+name=HDMI-A-1
+mode=preferred
+
+[output]
+name=HDMI-A-2
+mode=preferred

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=SDL2 OpenGL ES demo (DomU)
+After=weston.service weston.socket
+Wants=weston.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=weston
+Group=weston
+# XDG_RUNTIME_DIR is resolved at start time: the weston user's uid is allocated
+# by useradd at image build time and is not guaranteed to be 1000.
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=SDL_VIDEODRIVER=wayland
+ExecStartPre=/bin/sh -c 'd=/run/user/$(id -u weston); for i in $(seq 1 60); do [ -S "$d/wayland-1" ] && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/sh -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u weston); exec /usr/bin/sdl2-demo'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

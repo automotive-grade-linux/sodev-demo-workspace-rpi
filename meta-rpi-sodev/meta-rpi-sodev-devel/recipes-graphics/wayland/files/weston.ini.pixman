@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# weston pixman (software) renderer config.
+#
+# Diagnostic config to bypass the weston gl-renderer / Mesa V3D Gallium path
+# when investigating vertical-stripe noise. If the stripes disappear with the
+# pixman renderer, the cause is in Mesa V3D Gallium; if they remain, it is in
+# weston compositor logic.
+#
+# To switch (on the device):
+#   cp /etc/xdg/weston/weston.ini.pixman /etc/xdg/weston/weston.ini
+#   systemctl restart weston
+# To revert to the gl renderer:
+#   cp /etc/xdg/weston/weston.ini.glrender /etc/xdg/weston/weston.ini
+#   systemctl restart weston
+
+[core]
+backend=drm-backend.so
+shell=desktop-shell.so
+idle-time=0
+# weston 13.x: force the pixman (software) renderer; bypass V3D Mesa Gallium.
+renderer=pixman
+
+[keyboard]
+keymap_layout=us
+
+[output]
+name=HDMI-A-1
+mode=preferred
+
+[output]
+name=HDMI-A-2
+mode=preferred
