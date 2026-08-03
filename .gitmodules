@@ -1,0 +1,8 @@
+[submodule "external/meta-xt-prod-devel-rpi5"]
+	path = external/meta-xt-prod-devel-rpi5
+	url = https://github.com/xen-troops/meta-xt-prod-devel-rpi5
+	branch = v0.4
+[submodule "external/sodev-demo-workspace"]
+	path = external/sodev-demo-workspace
+	url = https://github.com/automotive-grade-linux/sodev-demo-workspace
+	branch = main
