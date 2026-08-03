@@ -1,0 +1,82 @@
+From a605d6535a6961eeab0a7e945979e5f7019dec2d Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] dom0-xt: storage: optional initrd loading callbacks
+
+Add storage_image_initrd_read/_get_size, the image_initrd_path field on dom0_domain_cfg, and the dom0.c wiring that points initrd_info at the config when a path is set. Needed by rpi_5_sodev_doma.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/src/dom0.c b/src/dom0.c
+index ad3e7e4..d736712 100644
+--- a/src/dom0.c
++++ b/src/dom0.c
+@@ -54,6 +54,12 @@ int main(void)
+ 			domain_cfgs[i].init();
+ 		}
+ 		domain_cfgs[i].domain_cfg->image_info = &domain_cfgs[i];
++		/* When the per-domain config carries an initrd path, point
++		 * the xenlib initrd_info at the same dom0_domain_cfg so the
++		 * storage_image_initrd_* callbacks can resolve it. */
++		if (domain_cfgs[i].image_initrd_path) {
++			domain_cfgs[i].domain_cfg->initrd_info = &domain_cfgs[i];
++		}
+ 		i++;
+ 	}
+ 
+diff --git a/src/dom0.h b/src/dom0.h
+index ad28d5a..fb0133d 100644
+--- a/src/dom0.h
++++ b/src/dom0.h
+@@ -24,6 +24,7 @@ struct dom0_domain_cfg {
+ 	void (*init)(void);
+ 	const char *image_kernel_path; /**< disk: domain kernel binary path */
+ 	const char *image_dt_path; /**< disk: domain partial device-tree (PDT) binary path */
++	const char *image_initrd_path; /**< disk: optional initrd binary path */
+ };
+ 
+ #if defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
+@@ -36,6 +37,8 @@ int storage_image_kernel_read(uint8_t *buf, size_t bufsize, uint64_t offset, voi
+ ssize_t storage_image_kernel_get_size(void *image_info, uint64_t *size);
+ int storage_image_dt_read(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info);
+ int storage_image_dt_get_size(void *image_info, size_t *size);
++int storage_image_initrd_read(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info);
++ssize_t storage_image_initrd_get_size(void *image_info, uint64_t *size);
+ #else
+ 
+ static inline int storage_init(void)
+diff --git a/src/storage.c b/src/storage.c
+index 0efb36e..0615151 100644
+--- a/src/storage.c
++++ b/src/storage.c
+@@ -58,6 +58,28 @@ ssize_t storage_image_kernel_get_size(void *image_info, uint64_t *size)
+ 	return r_size;
+ }
+ 
++int storage_image_initrd_read(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info)
++{
++	struct dom0_domain_cfg *dom_cfg = image_info;
++
++	LOG_INF("storage: initrd read %s size: %zd", dom_cfg->image_initrd_path, bufsize);
++	return xrun_read_file(dom_cfg->image_initrd_path, buf, bufsize, offset);
++}
++
++ssize_t storage_image_initrd_get_size(void *image_info, uint64_t *size)
++{
++	struct dom0_domain_cfg *dom_cfg = image_info;
++	ssize_t r_size;
++
++	r_size = xrun_get_file_size(dom_cfg->image_initrd_path);
++	if (r_size >= 0) {
++		*size = r_size;
++		return 0;
++	}
++
++	return r_size;
++}
++
+ int storage_image_dt_read(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info)
+ {
+ 	struct dom0_domain_cfg *dom_cfg = image_info;

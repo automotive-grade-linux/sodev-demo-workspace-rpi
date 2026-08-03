@@ -1,0 +1,216 @@
+From 17bb8b013a43d5bdd645cf92f3bd2a1c0a47ed36 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] dom_cfg/rpi_5: add SoDeV domu/doma configs (HW-verified)
+
+RPi5 SoDeV production guest configs for the Zephyr-Dom0 topology
+(rpi_5_sodev_domu = AGL cluster IC, rpi_5_sodev_doma = AAOS), plus the lab
+vif/network convention for the upstream PV example.
+
+Two changes that were verified on hardware are folded in here: the sodev
+guests use GIC_V2 rather than GIC_V3, because vgic v3 initialisation fails with
+rc=-19 on this board, and the builtin-image load path is retained. That load
+path is not exercised by the SD-boot configuration this series targets; it is
+kept because it is the only way to start a guest whose image is linked into the
+Zephyr binary, which is useful when no storage is attached.
+
+Applies on top of 0002 and 0003.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/src/dom_cfg/rpi_5.c b/src/dom_cfg/rpi_5.c
+--- a/src/dom_cfg/rpi_5.c
++++ b/src/dom_cfg/rpi_5.c
+@@ -65,9 +65,10 @@
+ #endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
+ 
+ #if defined(CONFIG_DOM_CFG_LINUX_PV_DOMAIN)
++/* Lab convention: DomD = 192.168.10.10/24, DomU = 192.168.10.11/24, both on xenbr0. */
+ static const char *params_vif =
+-	"vif=[ 'backend=1,bridge=xenbr0,mac=08:00:27:ff:cb:ce,ip=192.168.0.2 "
+-	"255.255.255.0 192.168.0.1' ]";
++	"vif=[ 'backend=1,bridge=xenbr0,mac=08:00:27:ff:cb:ce,ip=192.168.10.11 "
++	"255.255.255.0 192.168.10.1' ]";
+ 
+ static const char *params_vbd =
+ 	"disk=[ 'backend=1, format=raw, vdev=xvda, "
+@@ -75,6 +76,11 @@
+ 
+ static struct xen_domain_cfg domu_cfg_3 = {
+ 	.name = "linux_pv_domu",
++	/* Upstream PV example template. We do NOT instantiate it (the SoDeV
++	 * demo uses rpi_5_sodev_domu / rpi_5_sodev_doma), so its memory size is
++	 * left at the upstream default. A larger size (>=1 GiB) tripped a Zephyr
++	 * xen-tools region-map fault during earlier triage; keeping the upstream
++	 * value avoids shipping an unvalidated mid-triage number. */
+ 	.mem_kb = 256 * 1024,
+ 	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
+ 	.max_evtchns = 10,
+@@ -83,7 +89,10 @@
+ 	.max_maptrack_frames = 1,
+ 	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
+ 	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
+-	.cmdline = "root=/dev/ram0 rootwait console=hvc0 clk_ignore_unused",
++	/* quiet/systemd.show_status=no/log_color=0/audit=0 stop the boot console
++	 * being filled with ANSI colour bytes and audit syscall records. */
++	.cmdline = "root=/dev/ram0 rootwait console=hvc0 clk_ignore_unused "
++		   "quiet systemd.show_status=no systemd.log_color=0 audit=0",
+ 	.ssidref = 12,
+ 
+ 	.load_image_bytes = storage_image_kernel_read,
+@@ -98,6 +107,126 @@
+ 
+ #endif /* CONFIG_DOM_CFG_LINUX_PV_DOMAIN */
+ 
++#if defined(CONFIG_DOM_CFG_AAOS_DOMAIN)
++/* Android Automotive OS (xenvm_trout_arm64) DomU.
++ *
++ * Unlike linux_pv_domu (initramfs-bundled GKI), Android boots from a
++ * separate kernel + ramdisk pair. The Android boot.img kernel is staged
++ * to /1:/dom0/domu_aaos_kernel and the layered ramdisk
++ * (init_boot ramdisk + vendor_ramdisk + bootconfig trailer, produced by
++ * the ramdisk-prebuilt build) goes to /1:/dom0/domu_aaos_ramdisk.
++ *
++ * The DomD toolstack spawns a device-model qemu (doma.cfg/domu.cfg) that
++ * attaches the super.img / vbmeta.img / userdata.img drives via xenpvh
++ * and drives its virtio-gpu output to weston kiosk-shell on HDMI-A-2.
++ *
++ * Memory: 4 GiB is the lower bound for AAOS. Requires the 16 GiB RPi5 SKU
++ * (full 4-domain topology needs ~10 GiB: Dom0 1G + DomD 4G + DomU 1G + DomA 4G). */
++static struct xen_domain_cfg domu_cfg_4 = {
++	.name = "domu_aaos",
++	.mem_kb = 4ULL * 1024 * 1024, /* 4 GiB */
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 2,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	/* xenpvh: hvc0 console + AOSP vendor cmdline keywords. The vendor
++	 * bootconfig (androidboot.*) is appended to the layered ramdisk by
++	 * the ramdisk-prebuilt build as a #BOOTCONFIG\n trailer; the kernel
++	 * with CONFIG_BOOT_CONFIG=y picks it up when "bootconfig" appears
++	 * here. */
++	.cmdline = "console=hvc0 androidboot.console=hvc0 "
++		   "androidboot.hardware=xenvm_trout bootconfig",
++	.ssidref = 12,
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++	.load_initrd_bytes = storage_image_initrd_read,
++	.get_initrd_size = storage_image_initrd_get_size,
++};
++#endif /* CONFIG_DOM_CFG_AAOS_DOMAIN */
++
++#if defined(CONFIG_DOM_CFG_SODEV)
++/*
++ * ---------------------------------------------------------------------------
++ * RPi5 SoDeV production guests (Zephyr Dom0 "hybrid" architecture).
++ *
++ * DomD (the GPU driver domain with all V3D/HDMI/RP1 passthrough) stays a
++ * dom0less domain created by Xen from the U-Boot boot modules -- its
++ * direct-map/static-mem MMIO passthrough is handled by the proven dom0less
++ * path and is NOT expressed here. Zephyr Dom0 only creates the two virtio
++ * guests below via `xu create`:
++ *
++ *   rpi_5_sodev_domu : AGL Qt6/Flutter Cluster IC (HDMI-A-1)
++ *   rpi_5_sodev_doma : AAOS / xenvm_trout (HDMI-A-2)
++ *
++ * Both are pure virtio-pci guests: every backend (net/blk/gpu/input/snd/
++ * vsock/serial) is a qemu virtio-pci device served by `xl devd` + qemu inside
++ * the dom0less DomD. Therefore neither guest needs iomems/irqs and back_cfg is
++ * left empty (Zephyr PV vif/vbd are not used; parse_one_record_and_fill_cfg is
++ * not called). Field values mirror the deployed /etc/xen/{domu,doma}.cfg.
++ * ---------------------------------------------------------------------------
++ */
++
++/* DomU: AGL cluster IC. 1 GiB / 1 vCPU. root on virtio-blk (/dev/vda backed by
++ * DomD blkback of SD p3). GIC_V2 (BCM2712 = GIC-400, GICv2; the host vGICv3
++ * emulation is unavailable so guests MUST use GIC_V2 - hardware: Xen
++ * "d2: vGICv3 is not supported on this platform" -> create rc=-19). No HW passthrough. */
++static struct xen_domain_cfg rpi_5_sodev_domu = {
++	.name = "rpi_5_sodev_domu",
++	.mem_kb = 1ULL * 1024 * 1024, /* 1 GiB (=deployed domu.cfg memory=1024) */
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 1,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "root=/dev/vda rw rootwait console=hvc0 cma=256M",
++	.ssidref = 12,
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++};
++
++/* DomA: AAOS guest. Direct clone of the domu_aaos template
++ * (split kernel + layered ramdisk; cmdline MUST contain "bootconfig" so the
++ * CONFIG_BOOT_CONFIG kernel reads the #BOOTCONFIG trailer that the prebuilt
++ * appends to the vendor_boot ramdisk). 4 GiB / 2 vCPU. cmdline mirrors the
++ * deployed doma.cfg extra= exactly. dt_passthrough passes the host /firmware
++ * node into the guest (AAOS android,firmware resolution). */
++static char *sodev_doma_dt_passthrough[] = {
++	"/firmware",
++};
++
++static struct xen_domain_cfg rpi_5_sodev_doma = {
++	.name = "rpi_5_sodev_doma",
++	.mem_kb = 4ULL * 1024 * 1024, /* 4 GiB (=deployed doma.cfg memory=4096) */
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 2,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "loglevel=8 init=/init ro rootwait printk.devkmsg=off "
++		   "console=hvc0 bootconfig "
++		   "androidboot.boot_devices=33000000.pcie cma=256M "
++		   "androidboot.force_normal_boot=1 androidboot.slot_suffix=_a",
++	.ssidref = 12,
++
++	.dt_passthrough = sodev_doma_dt_passthrough,
++	.nr_dt_passthrough = ARRAY_SIZE(sodev_doma_dt_passthrough),
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++	.load_initrd_bytes = storage_image_initrd_read,
++	.get_initrd_size = storage_image_initrd_get_size,
++};
++#endif /* CONFIG_DOM_CFG_SODEV */
++
+ static struct xen_domain_cfg domu_cfg_1 = {
+ 	.name = "rpi_5_domu",
+ 	.mem_kb = 16384,
+@@ -212,5 +341,26 @@
+ 		.init = pv_domu_init,
+ 	},
+ #endif /* CONFIG_DOM_CFG_LINUX_PV_DOMAIN */
++#if defined(CONFIG_DOM_CFG_AAOS_DOMAIN)
++	{
++		.domain_cfg = &domu_cfg_4,
++		.image_kernel_path = DISK_BIN_PATH"domu_aaos_kernel",
++		.image_initrd_path = DISK_BIN_PATH"domu_aaos_ramdisk",
++	},
++#endif /* CONFIG_DOM_CFG_AAOS_DOMAIN */
++#if defined(CONFIG_DOM_CFG_SODEV)
++	/* RPi5 SoDeV production guests (hybrid: Zephyr Dom0 creates these two;
++	 * DomD stays dom0less). Kernel/ramdisk staged on SD p1 by the image
++	 * recipe under DISK_BIN_PATH. */
++	{
++		.domain_cfg = &rpi_5_sodev_domu,
++		.image_kernel_path = DISK_BIN_PATH"linux-domu",
++	},
++	{
++		.domain_cfg = &rpi_5_sodev_doma,
++		.image_kernel_path = DISK_BIN_PATH"aaos-android-kernel",
++		.image_initrd_path = DISK_BIN_PATH"aaos-vendor-boot-ramdisk",
++	},
++#endif /* CONFIG_DOM_CFG_SODEV */
+ 	{ 0 },
+ };

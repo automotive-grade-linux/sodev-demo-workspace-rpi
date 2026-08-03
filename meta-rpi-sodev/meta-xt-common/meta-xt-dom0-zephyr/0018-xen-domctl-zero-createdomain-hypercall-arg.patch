@@ -1,0 +1,68 @@
+From 02393e6ca3919b4ca765afef9ab4d97ad11e75a8 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 31 Jul 2026 12:00:00 +0900
+Subject: [PATCH] xen: domctl: zero the createdomain hypercall argument
+
+xen_domctl_createdomain() is the only function in drivers/xen/dom0/domctl.c
+that declares its xen_domctl_t without an initialiser; the other nineteen use
+a designated initialiser, which zeroes the members they do not name. It is
+also the one where that matters.
+
+struct xen_domctl_createdomain ends in struct xen_arch_domainconfig, and
+Zephyr vendors its own copy of that struct. On arm64 the vendored version is
+12 bytes with CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_{SCI_TYPE,VGSX_OSID}=n, while
+Xen 4.21's is 16: Xen carries a trailing uint8_t arm_sci_type (added by its
+generic SCI subsystem) that this tree has no field for. `domctl.u.createdomain
+= *config` copies the shorter struct, so the byte Xen reads as arm_sci_type
+comes from uninitialised stack.
+
+It is harmless in the configuration this series builds -- Xen's
+sci_domain_sanitise_config() returns 0 as soon as no SCI mediator is
+registered, and none is unless CONFIG_SCMI_SMC is selected -- but it becomes a
+sporadic domain-creation failure the moment an SCI mediator is present, since
+sanitising then rejects any arm_sci_type other than the two defined values.
+Zeroing the argument makes the byte read as XEN_DOMCTL_CONFIG_ARM_SCI_NONE,
+which is what this Dom0 means.
+
+While here, the three assignments that follow ended in commas rather than
+semicolons, which made the last of them a comma expression with the do_domctl()
+call. That parses and behaves correctly; it is still a typo.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/drivers/xen/dom0/domctl.c b/drivers/xen/dom0/domctl.c
+index e642ac04a4..2355996a8a 100644
+--- a/drivers/xen/dom0/domctl.c
++++ b/drivers/xen/dom0/domctl.c
+@@ -277,15 +277,25 @@ int xen_domctl_max_vcpus(int domid, int max_vcpus)
+ int xen_domctl_createdomain(int *domid, struct xen_domctl_createdomain *config)
+ {
+ 	int ret;
+-	xen_domctl_t domctl;
++	/*
++	 * Zero the whole hypercall argument. This is the only xen_domctl_t in
++	 * this file without an initialiser, and it is the one that matters:
++	 * struct xen_domctl_createdomain ends in xen_arch_domainconfig, and the
++	 * copy below writes only as many bytes as *this* tree's version of that
++	 * struct has. Xen reads its own, which is longer whenever it carries a
++	 * field we do not vendor -- on Xen 4.21/arm64 that is the trailing
++	 * arm_sci_type byte -- so without this the hypervisor would read
++	 * uninitialised stack for it.
++	 */
++	xen_domctl_t domctl = { 0 };
+ 
+ 	if (!domid || !config) {
+ 		return -EINVAL;
+ 	}
+ 
+-	domctl.cmd = XEN_DOMCTL_createdomain,
+-	domctl.domain = *domid,
+-	domctl.u.createdomain = *config,
++	domctl.cmd = XEN_DOMCTL_createdomain;
++	domctl.domain = *domid;
++	domctl.u.createdomain = *config;
+ 
+ 	ret = do_domctl(&domctl);
+ 	*domid = domctl.domain;
