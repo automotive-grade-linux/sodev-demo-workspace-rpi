@@ -1,0 +1,46 @@
+From 0ed32927b38d69d7ae274a7b14eb38db0dbf675a Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 21 Jul 2026 14:45:00 +0900
+Subject: [PATCH] xen/arm: vgic: serialise pci_irq_level[] store under the
+ target vCPU lock
+
+The domain-global d->arch.vgic.pci_irq_level[] array (added by the
+legacy-PCI level-emulation series, 0013/0019) is written in
+vgic_inject_irq() without any lock, while the reader gic_update_one_lr()
+reads the same slot under the target vCPU's arch.vgic.lock.  The
+unsynchronised store races the LR update: a lost level update (missed
+interrupt) or a stale "true" re-injection (spurious interrupt storm).
+
+Take the target vCPU's vgic.lock around the store only, mirroring the
+lock the reader uses for the same virq.  vgic_get_target_vcpu() is a
+lock-free lookup, so there is no nesting with the injection lock taken
+later in the same function.  Behaviour is otherwise unchanged (the
+falling-edge early return and the injection path are untouched).
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/xen/arch/arm/vgic.c
++++ b/xen/arch/arm/vgic.c
+@@ -781,7 +781,20 @@
+     if ( virq >= GUEST_VIRTIO_PCI_SPI_FIRST &&
+          virq < GUEST_VIRTIO_PCI_SPI_LAST &&
+          !test_bit(virq, d->arch.vgic.allocated_irqs) )
++    {
++        /*
++         * Serialise the domain-global pci_irq_level[] store against
++         * gic_update_one_lr(), which reads the same slot under the target
++         * vCPU's vgic.lock.  Without this lock the store races the LR update
++         * (lost level update / stale re-injection).
++         */
++        struct vcpu *tv = v ? v : vgic_get_target_vcpu(d->vcpu[0], virq);
++        unsigned long pflags;
++
++        spin_lock_irqsave(&tv->arch.vgic.lock, pflags);
+         vgic_pci_irq_level(d, virq) = level;
++        spin_unlock_irqrestore(&tv->arch.vgic.lock, pflags);
++    }
+ 
+     /*
+      * For edge triggered interrupts we always ignore a "falling edge".

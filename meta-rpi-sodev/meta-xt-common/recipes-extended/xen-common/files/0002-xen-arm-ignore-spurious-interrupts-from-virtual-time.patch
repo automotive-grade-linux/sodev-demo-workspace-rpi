@@ -1,0 +1,79 @@
+From 60564791fe323f5f8421ef85596d04bf3cf4badb Mon Sep 17 00:00:00 2001
+From: Mykola Kvach <mykola_kvach@epam.com>
+Date: Fri, 9 Jan 2026 02:14:31 +0200
+Subject: [PATCH 02/24] xen/arm: ignore spurious interrupts from virtual timer
+
+If a spurious virtual timer interrupt occurs (i.e. the interrupt fires
+but CNTV_CTL_EL0 does not report it as pending), Xen masks the virtual
+timer and injects the vtimer IRQ into the guest. For Linux guests, the
+timer interrupt is unmasked only after programming a new CVAL value from
+the timer interrupt handler. When the interrupt is not reported as
+pending, the handler can skip that programming step, leaving the timer
+masked and stalling the affected CPU.
+
+This patch mirrors the Linux arm generic timer handler: if the interrupt
+fires but the pending bit is not set, treat it as spurious and ignore it.
+
+This issue is reproducible under heavy load on the R-Car X5H board
+(Cortex-A720AE r0p0).
+
+Signed-off-by: Mykola Kvach <mykola_kvach@epam.com>
+Reviewed-by: Volodymyr Babchuk <volodymyr_babchuk@epam.com>
+Tested-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Acked-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 60564791fe323f5f8421ef85596d04bf3cf4badb
+---
+ xen/arch/arm/include/asm/perfc_defn.h |  7 ++++---
+ xen/arch/arm/time.c                   | 11 ++++++++++-
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/xen/arch/arm/include/asm/perfc_defn.h b/xen/arch/arm/include/asm/perfc_defn.h
+index effd25b69e..f83989d95a 100644
+--- a/xen/arch/arm/include/asm/perfc_defn.h
++++ b/xen/arch/arm/include/asm/perfc_defn.h
+@@ -69,9 +69,10 @@ PERFCOUNTER(ppis,                 "#PPIs")
+ PERFCOUNTER(spis,                 "#SPIs")
+ PERFCOUNTER(guest_irqs,           "#GUEST-IRQS")
+ 
+-PERFCOUNTER(hyp_timer_irqs,   "Hypervisor timer interrupts")
+-PERFCOUNTER(virt_timer_irqs,  "Virtual timer interrupts")
+-PERFCOUNTER(maintenance_irqs, "Maintenance interrupts")
++PERFCOUNTER(hyp_timer_irqs,             "Hypervisor timer interrupts")
++PERFCOUNTER(virt_timer_irqs,            "Virtual timer interrupts")
++PERFCOUNTER(virt_timer_spurious_irqs,   "Virtual timer spurious interrupts")
++PERFCOUNTER(maintenance_irqs,           "Maintenance interrupts")
+ 
+ PERFCOUNTER(atomics_guest,    "atomics: guest access")
+ PERFCOUNTER(atomics_guest_paused,   "atomics: guest paused")
+diff --git a/xen/arch/arm/time.c b/xen/arch/arm/time.c
+index e74d30d258..897c9fbf91 100644
+--- a/xen/arch/arm/time.c
++++ b/xen/arch/arm/time.c
+@@ -257,6 +257,8 @@ static void htimer_interrupt(int irq, void *dev_id)
+ 
+ static void vtimer_interrupt(int irq, void *dev_id)
+ {
++    register_t ctl;
++
+     /*
+      * Edge-triggered interrupts can be used for the virtual timer. Even
+      * if the timer output signal is masked in the context switch, the
+@@ -270,9 +272,16 @@ static void vtimer_interrupt(int irq, void *dev_id)
+     if ( unlikely(is_idle_vcpu(current)) )
+         return;
+ 
++    ctl = READ_SYSREG(CNTV_CTL_EL0);
++    if ( unlikely(!(ctl & CNTx_CTL_PENDING)) )
++    {
++        perfc_incr(virt_timer_spurious_irqs);
++        return;
++    }
++
+     perfc_incr(virt_timer_irqs);
+ 
+-    current->arch.virt_timer.ctl = READ_SYSREG(CNTV_CTL_EL0);
++    current->arch.virt_timer.ctl = ctl;
+     WRITE_SYSREG(current->arch.virt_timer.ctl | CNTx_CTL_MASK, CNTV_CTL_EL0);
+     vgic_inject_irq(current->domain, current, current->arch.virt_timer.irq, true);
+ }

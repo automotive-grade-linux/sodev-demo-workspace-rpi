@@ -1,0 +1,162 @@
+From 6f4bb4ebfc9d316d82c5703d3c3348f261c6e1aa Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 27 Jul 2023 20:12:47 +0300
+Subject: [PATCH 14/24] libxl: Add "backend_type" property for the Virtio
+ devices
+
+Introduce new configuration option "backend_type" for the Virtio
+devices in order to specify backend implementation to use.
+There are two possible values "qemu" (default) and "standalone".
+
+If backend is in Qemu (backend_type=qemu) and Qemu runs in toolstack
+domain (backend=Domain-0) then Qemu will be launched automatically
+at the guest creation time. For this to work implement "dm_needed"
+callback.
+
+Please note, there is no support for Qemu in other domains for
+the time being, so the combination of "backend=DomD" and
+"backend_type=qemu" just won't work.
+
+Qemu configuration for Virtio devices should be described via
+"device_model_args" property.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 6f4bb4ebfc9d316d82c5703d3c3348f261c6e1aa
+---
+ docs/man/xl.cfg.5.pod.in         |  9 +++++++++
+ tools/libs/light/libxl_types.idl |  7 +++++++
+ tools/libs/light/libxl_virtio.c  | 29 ++++++++++++++++++++++++++++-
+ tools/xl/xl_parse.c              |  3 +++
+ 4 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/docs/man/xl.cfg.5.pod.in b/docs/man/xl.cfg.5.pod.in
+index c866b528a2..b0dd15f57d 100644
+--- a/docs/man/xl.cfg.5.pod.in
++++ b/docs/man/xl.cfg.5.pod.in
+@@ -1680,6 +1680,15 @@ are supported. This option is mandatory.
+ The Virtio device with transport "pci" must be identified by its B<BDF>.
+ See L<xl-pci-configuration(5)> for more details about the format for B<BDF>.
+ 
++=item B<backend_type=STRING>
++
++Specifies the software implementation of the backend implementation to use.
++This option doesn't affect the guest's view of the Virtio device.
++
++Both "qemu" and "standalone" are supported. The only difference is
++that for the former the toolstack assists with configuring and launching
++the device-model. If this option is missing, then "qemu" value will be used.
++
+ =item B<grant_usage=BOOLEAN>
+ 
+ If this option is B<true>, the Xen grants are always enabled.
+diff --git a/tools/libs/light/libxl_types.idl b/tools/libs/light/libxl_types.idl
+index d4dde32a33..a5d12cb68a 100644
+--- a/tools/libs/light/libxl_types.idl
++++ b/tools/libs/light/libxl_types.idl
+@@ -291,6 +291,12 @@ libxl_virtio_transport = Enumeration("virtio_transport", [
+     (2, "PCI"),
+     ])
+ 
++libxl_virtio_backend = Enumeration("virtio_backend", [
++    (0, "UNKNOWN"),
++    (1, "QEMU"),
++    (2, "STANDALONE"),
++    ])
++
+ libxl_passthrough = Enumeration("passthrough", [
+     (0, "default"),
+     (1, "disabled"),
+@@ -789,6 +795,7 @@ libxl_device_vkb = Struct("device_vkb", [
+ libxl_device_virtio = Struct("device_virtio", [
+     ("backend_domid", libxl_domid),
+     ("backend_domname", string),
++    ("backend_type", libxl_virtio_backend),
+     ("type", string),
+     ("u", KeyedUnion(None, libxl_virtio_transport, "transport",
+               [("unknown", None),
+diff --git a/tools/libs/light/libxl_virtio.c b/tools/libs/light/libxl_virtio.c
+index b593fd45de..6593152423 100644
+--- a/tools/libs/light/libxl_virtio.c
++++ b/tools/libs/light/libxl_virtio.c
+@@ -32,9 +32,20 @@ static int libxl__device_virtio_setdefault(libxl__gc *gc, uint32_t domid,
+     libxl_defbool_setdefault(&virtio->grant_usage,
+                              virtio->backend_domid != LIBXL_TOOLSTACK_DOMID);
+ 
++    if (virtio->backend_type == LIBXL_VIRTIO_BACKEND_UNKNOWN)
++        virtio->backend_type = LIBXL_VIRTIO_BACKEND_QEMU;
++
+     return 0;
+ }
+ 
++static int libxl__device_virtio_dm_needed(void *e, unsigned domid)
++{
++    libxl_device_virtio *elem = e;
++
++    return elem->backend_type == LIBXL_VIRTIO_BACKEND_QEMU &&
++           elem->backend_domid == domid;
++}
++
+ static int libxl__device_from_virtio(libxl__gc *gc, uint32_t domid,
+                                      libxl_device_virtio *virtio,
+                                      libxl__device *device)
+@@ -55,7 +66,8 @@ static int libxl__set_xenstore_virtio(libxl__gc *gc, uint32_t domid,
+                                       flexarray_t *back, flexarray_t *front,
+                                       flexarray_t *ro_front)
+ {
+-    const char *transport = libxl_virtio_transport_to_string(virtio->transport);
++    const char *transport = libxl_virtio_transport_to_string(virtio->transport),
++               *backend = libxl_virtio_backend_to_string(virtio->backend_type);
+ 
+     if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_MMIO) {
+         flexarray_append_pair(back, "irq", GCSPRINTF("%u", virtio->u.mmio.irq));
+@@ -73,6 +85,7 @@ static int libxl__set_xenstore_virtio(libxl__gc *gc, uint32_t domid,
+     }
+     flexarray_append_pair(back, "type", GCSPRINTF("%s", virtio->type));
+     flexarray_append_pair(back, "transport", GCSPRINTF("%s", transport));
++    flexarray_append_pair(back, "backend_type", GCSPRINTF("%s", backend));
+     flexarray_append_pair(back, "grant_usage",
+                           libxl_defbool_val(virtio->grant_usage) ? "1" : "0");
+ 
+@@ -156,6 +169,19 @@ static int libxl__virtio_from_xenstore(libxl__gc *gc, const char *libxl_path,
+         }
+     }
+ 
++    tmp = NULL;
++    rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                GCSPRINTF("%s/backend_type", be_path), &tmp);
++    if (rc) goto out;
++
++    if (tmp) {
++        rc = libxl_virtio_backend_from_string(tmp, &virtio->backend_type);
++        if (rc) {
++            LOG(ERROR, "Unable to parse xenstore node %s/backend_type", be_path);
++            goto out;
++        }
++    }
++
+     tmp = NULL;
+     rc = libxl__xs_read_checked(gc, XBT_NULL,
+                                 GCSPRINTF("%s/grant_usage", be_path), &tmp);
+@@ -190,6 +216,7 @@ static LIBXL_DEFINE_UPDATE_DEVID(virtio)
+ #define libxl_device_virtio_compare NULL
+ 
+ DEFINE_DEVICE_TYPE_STRUCT(virtio, VIRTIO, virtios,
++    .dm_needed = libxl__device_virtio_dm_needed,
+     .set_xenstore_config = (device_set_xenstore_config_fn_t)
+                            libxl__set_xenstore_virtio,
+     .from_xenstore = (device_from_xenstore_fn_t)libxl__virtio_from_xenstore,
+diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
+index d5a1427fca..218b5f78dd 100644
+--- a/tools/xl/xl_parse.c
++++ b/tools/xl/xl_parse.c
+@@ -1217,6 +1217,9 @@ static int parse_virtio_config(libxl_device_virtio *virtio, char *token)
+     } else if (MATCH_OPTION("transport", token, oparg)) {
+         rc = libxl_virtio_transport_from_string(oparg, &virtio->transport);
+         if (rc) return rc;
++    } else if (MATCH_OPTION("backend_type", token, oparg)) {
++        rc = libxl_virtio_backend_from_string(oparg, &virtio->backend_type);
++        if (rc) return rc;
+     } else if (MATCH_OPTION("grant_usage", token, oparg)) {
+         libxl_defbool_set(&virtio->grant_usage, strtoul(oparg, NULL, 0));
+     } else if (MATCH_OPTION("bdf", token, oparg)) {

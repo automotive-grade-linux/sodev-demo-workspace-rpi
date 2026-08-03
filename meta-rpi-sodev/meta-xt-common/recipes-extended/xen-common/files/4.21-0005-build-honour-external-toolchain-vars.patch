@@ -1,0 +1,103 @@
+From ef4ca56110a5d1723785f866c022a68c2efff465 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 31 Jul 2026 10:00:00 +0900
+Subject: build: honour externally supplied toolchain variables
+
+Two unrelated-to-the-board build fixes, needed to build Xen from an
+OpenEmbedded cross environment. They were part of the squashed rpi5_dev
+working delta; they are split out here because they are not RPi5 specific and
+are candidates for upstream on their own.
+
+config/StdGNU.mk assigns CC, CXX, CPP and LD with `=`, which overrides
+whatever the caller exported. OE passes a full compiler command line in CC
+(compiler plus -mcpu, --sysroot and friends) and expects it to survive, so
+these become `?=`. AS, AR, RANLIB and the rest already derive from
+CROSS_COMPILE and are left alone.
+
+tools/firmware/Makefile then passes those variables on to the seabios and ovmf
+sub-makes unquoted, e.g. `$(MAKE) -C seabios-dir CC=$(SEABIOSCC)`. With a
+multi-word CC the shell splits it and everything after the first word is
+parsed as a make target, so the sub-make fails with "No rule to make target
+'-mcpu=cortex-a76'". Quote the expansions that can hold a command line: GIT,
+CC and SEABIOSCC. LD and PYTHON stay unquoted because they are single words in
+every configuration this is built in.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [not submitted yet; generic cross-build fix, no RPi5 dependency]
+---
+ config/StdGNU.mk        | 12 ++++++------
+ tools/firmware/Makefile | 12 ++++++------
+ 2 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/config/StdGNU.mk b/config/StdGNU.mk
+index aaa0d007f7..7893ed87b3 100644
+--- a/config/StdGNU.mk
++++ b/config/StdGNU.mk
+@@ -1,15 +1,15 @@
+ AS         = $(CROSS_COMPILE)as
+-LD         = $(CROSS_COMPILE)ld
++LD         ?= $(CROSS_COMPILE)ld
+ ifeq ($(clang),y)
+-CC         = $(CROSS_COMPILE)clang
+-CXX        = $(CROSS_COMPILE)clang++
++CC         ?= $(CROSS_COMPILE)clang
++CXX        ?= $(CROSS_COMPILE)clang++
+ LD_LTO     = $(CROSS_COMPILE)llvm-ld
+ else
+-CC         = $(CROSS_COMPILE)gcc
+-CXX        = $(CROSS_COMPILE)g++
++CC         ?= $(CROSS_COMPILE)gcc
++CXX        ?= $(CROSS_COMPILE)g++
+ LD_LTO     = $(CROSS_COMPILE)ld
+ endif
+-CPP        = $(CC) -E
++CPP        ?= $(CC) -E
+ ADDR2LINE  = $(CROSS_COMPILE)addr2line
+ AR         = $(CROSS_COMPILE)ar
+ RANLIB     = $(CROSS_COMPILE)ranlib
+diff --git a/tools/firmware/Makefile b/tools/firmware/Makefile
+index d69f7c69ea..470a0ed6ec 100644
+--- a/tools/firmware/Makefile
++++ b/tools/firmware/Makefile
+@@ -20,13 +20,13 @@ SEABIOSLD ?= $(LD)
+ SEABIOS_EXTRAVERSION ?= "-Xen"
+ 
+ ovmf-dir:
+-	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(OVMF_UPSTREAM_URL) $(OVMF_UPSTREAM_REVISION) ovmf-dir
++	GIT="$(GIT)" $(XEN_ROOT)/scripts/git-checkout.sh $(OVMF_UPSTREAM_URL) $(OVMF_UPSTREAM_REVISION) ovmf-dir
+ 	cp ovmf-makefile ovmf-dir/Makefile;
+ 
+ seabios-dir:
+-	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(SEABIOS_UPSTREAM_URL) $(SEABIOS_UPSTREAM_REVISION) seabios-dir
++	GIT="$(GIT)" $(XEN_ROOT)/scripts/git-checkout.sh $(SEABIOS_UPSTREAM_URL) $(SEABIOS_UPSTREAM_REVISION) seabios-dir
+ 	cp seabios-config seabios-dir/.config;
+-	$(MAKE) -C seabios-dir olddefconfig CC=$(SEABIOSCC) LD=$(SEABIOSLD)
++	$(MAKE) -C seabios-dir olddefconfig CC="$(SEABIOSCC)" LD=$(SEABIOSLD)
+ 	rm -f seabios-dir/.version
+ 	echo '$(SEABIOS_UPSTREAM_REVISION)' > seabios-dir/.version
+ 
+@@ -41,7 +41,7 @@ ifeq ($(CONFIG_ROMBIOS),y)
+ 	false ; \
+ 	fi
+ endif
+-	$(MAKE) CC=$(CC) PYTHON=$(PYTHON) subdirs-$@
++	$(MAKE) CC="$(CC)" PYTHON=$(PYTHON) subdirs-$@
+ 
+ .PHONY: install
+ install: all
+@@ -116,7 +116,7 @@ seabios-dir-force-update: seabios-dir
+ 
+ subdir-clean-seabios-dir:
+ 	set -e; if test -d seabios-dir/.; then \
+-		$(MAKE) -C seabios-dir CC=$(SEABIOSCC) LD=$(SEABIOSLD) clean; \
++		$(MAKE) -C seabios-dir CC="$(SEABIOSCC)" LD=$(SEABIOSLD) clean; \
+ 	fi
+ 
+ subtree-force-update:
+@@ -128,4 +128,4 @@ ifeq ($(CONFIG_OVMF),y)
+ endif
+ 
+ subdir-all-seabios-dir: seabios-dir
+-	$(MAKE) -C $< CC=$(SEABIOSCC) LD=$(SEABIOSLD) PYTHON=$(PYTHON) EXTRAVERSION=$(SEABIOS_EXTRAVERSION) all;
++	$(MAKE) -C $< CC="$(SEABIOSCC)" LD=$(SEABIOSLD) PYTHON=$(PYTHON) EXTRAVERSION=$(SEABIOS_EXTRAVERSION) all;

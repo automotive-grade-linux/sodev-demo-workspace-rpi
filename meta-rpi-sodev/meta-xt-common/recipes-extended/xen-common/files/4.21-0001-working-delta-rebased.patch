@@ -1,0 +1,696 @@
+From 5b2632a74cb975e3a5654f12d3bfdfafc88ba267 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 18 Jun 2026 23:35:01 +0900
+Subject: xen-troops working delta, rebased onto xen-4.21-xt-gen5
+
+Reapply the EPAM rpi5_dev working delta on top of xen-troops
+xen-4.21-xt-gen5 (Xen 4.21.0). The delta is the difference the rpi5_dev branch
+carries over its own 4.19 base; it is squashed here because the individual
+commits do not rebase onto 4.21 independently (see the conflict notes below).
+
+Conflict resolution highlights (4.19 -> 4.21):
+- public/domctl.h: renumber to coexist with upstreamed 4.21 ops/flags
+  (assign_static_11 87->91; CDF_directmap/staticmem ->(1U<<9)/(1U<<10)).
+- arm/{domain,domctl}.c, common/{domctl,domain}.c: keep the libxl direct-map/
+  static-mem (Stage 1) feature, adapt to 4.21 (domain_create flags arg,
+  internal CDF_directmap/CDF_staticmem now upstream in xen/domain.h).
+- arm/{irq,vgic}.c: keep the two SPI-passthrough behaviours the platform needs
+  (a vGIC SPI-count floor and a trigger-type default), each behind its own
+  Kconfig option; drop R-Car gsx branch (irrelevant to BCM2712).
+- arm/domain_build.c: keep the hardware-domain SPI + device-MMIO capability
+  grants, behind a Kconfig option; drop redundant sci_domain_init() (4.21 has
+  its own SCI/SCMI framework).
+- Drop as redundant/upstreamed: arm/sci/sci.c (moved to firmware/sci.c),
+  the bulk dom0less-build.c additions, the inline SCI sanitise/init checks.
+
+Not re-ported onto 4.21, because this configuration does not need them: the
+dom0less console-drain change and the dt-overlay p2m_mmio_direct_dev override.
+
+Every change to generic ARM behaviour is behind a Kconfig option that defaults
+to n, so a build that does not select them gets unmodified upstream behaviour.
+The options, all UNSUPPORTED-gated and declared in xen/arch/arm/Kconfig, are
+XT_HWDOM_MMIO_DEVICE_ATTR, XT_HWDOM_PASSTHROUGH_CAPS (with
+XT_HWDOM_IOMEM_CAP_START/END), XT_GUEST_MIN_NR_SPIS and
+XT_GUEST_PASSTHROUGH_IRQ_TYPE_DEFAULT; each help text states the failure it
+addresses. They are selected for this board by the recipe's
+xen-config-rpi5-passthrough.cfg fragment.
+
+Three relaxations the rpi5_dev delta carried in route_irq_to_guest(),
+release_guest_irq() and vgic_reserve_virq() are not re-ported: with the SPI
+floor in place each is equivalent to the upstream code it replaced, and the
+release_guest_irq() rewrite additionally rejects the extended SPI range that
+vgic_is_valid_line() accepts under CONFIG_GICV3_ESPI.
+
+Builds clean (arm64, Xen 4.21.0); the base switch is verified by compile+link.
+
+Origin: https://github.com/xen-troops/xen branch rpi5_dev (tip 2214507e72),
+ squashed and rebased onto branch xen-4.21-xt-gen5 (tip d4823d5ef9).
+ Original authors of the squashed commits: Volodymyr Babchuk
+ <volodymyr_babchuk@epam.com> and Ihor Usyk <ihor_usyk@epam.com> (EPAM Systems,
+ GPL-2.0-only).
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream RPi5/BCM2712 working delta; local workaround, not upstreamable as-is]
+---
+ xen/arch/arm/Kconfig        | 83 ++++++++++++++++++++++++++++++++++++++++++++
+ xen/arch/arm/device.c       |  2 +-
+ xen/arch/arm/domain.c       | 23 ++++++++++++-
+ xen/arch/arm/domain_build.c | 67 +++++++++++++++++++++++++++++++++++-
+ xen/arch/arm/domctl.c       | 84 +++++++++++++++++++++++++++++++++++++++++++++
+ xen/arch/arm/irq.c          | 21 ++++++++++++
+ xen/arch/arm/p2m.c          | 10 +++++-
+ xen/arch/arm/vgic.c         | 24 +++++++++++++
+ xen/arch/x86/domain.c       | 12 +++++++
+ xen/common/domain.c         |  8 ++++-
+ xen/common/domctl.c         | 31 +++++++++++++++++
+ xen/common/page_alloc.c     | 20 +++++++----
+ xen/include/public/domctl.h | 39 ++++++++++++++++++++-
+ 13 files changed, 412 insertions(+), 12 deletions(-)
+
+diff --git a/xen/arch/arm/Kconfig b/xen/arch/arm/Kconfig
+index cf6af68299..718c4bd7f4 100644
+--- a/xen/arch/arm/Kconfig
++++ b/xen/arch/arm/Kconfig
+@@ -274,6 +274,89 @@ config PCI_PASSTHROUGH
+ 	help
+ 	  This option enables PCI device passthrough
+ 
++comment "Platform quirks for hardware-domain / driver-domain passthrough"
++
++config XT_HWDOM_MMIO_DEVICE_ATTR
++	bool "Map hardware-domain device MMIO as Device-nGnRE (UNSUPPORTED)" if UNSUPPORTED
++	default n
++	help
++	  Map the device MMIO handed to the hardware domain with the Device-nGnRE
++	  memory attribute instead of Normal-Cacheable, both for the ranges built
++	  into its device tree and for the XENMAPSPACE_dev_mmio hypercall.
++
++	  Some SoCs have peripherals whose registers do not tolerate write-back
++	  cached or reordered accesses and raise an IMP-DEF asynchronous SError
++	  instead; Broadcom BCM2712 (Raspberry Pi 5) is one. Xen's own dom0less
++	  passthrough path already uses Device-nGnRE for such ranges.
++
++	  Say N unless the platform is known to need it.
++
++config XT_HWDOM_PASSTHROUGH_CAPS
++	bool "Grant the hardware domain SPI and device-MMIO forwarding caps (UNSUPPORTED)" if UNSUPPORTED
++	default n
++	help
++	  Add the full SPI range and a platform device-MMIO window to the hardware
++	  domain's irq_caps and iomem_caps at build time, so its toolstack can
++	  forward them to a driver domain.
++
++	  Devices reserved for a driver domain are marked "xen,passthrough" and are
++	  therefore absent from the hardware domain's capability sets, which makes
++	  XEN_DOMCTL_irq_permission and XEN_DOMCTL_iomem_permission fail with
++	  -EPERM. This grants the right to delegate, not any mapping.
++
++	  This widens what a compromised hardware domain is able to delegate.
++	  Say N unless a driver domain on this platform needs it.
++
++config XT_HWDOM_IOMEM_CAP_START
++	hex "Start of the hardware domain device-MMIO capability window"
++	depends on XT_HWDOM_PASSTHROUGH_CAPS
++	default 0x100000000
++	help
++	  Physical address of the first byte of the window added to the hardware
++	  domain's iomem_caps. The default, 4 GiB, is above RAM on BCM2712.
++
++config XT_HWDOM_IOMEM_CAP_END
++	hex "End of the hardware domain device-MMIO capability window (exclusive)"
++	depends on XT_HWDOM_PASSTHROUGH_CAPS
++	default 0x2000000000
++	help
++	  Physical address one past the last byte of the window added to the
++	  hardware domain's iomem_caps. The default, 128 GiB, covers the whole
++	  address range BCM2712 decodes for its peripherals.
++
++config XT_GUEST_MIN_NR_SPIS
++	int "Minimum vGIC SPI count for non-hardware domains (UNSUPPORTED)" if UNSUPPORTED
++	default 0
++	range 0 988
++	help
++	  Raise a non-hardware domain's vGIC SPI count to at least this value.
++	  0 disables the floor and is the architectural behaviour.
++
++	  A guest given host SPIs through the xl.cfg "irqs=[...]" property keeps
++	  the host IRQ number as its vIRQ, but libxl sizes nr_spis from the
++	  emulated devices alone, so the vGIC can end up smaller than the highest
++	  forwarded line and gic_route_irq_to_guest() trips an ASSERT. Setting this
++	  to the host GIC's line count minus 32 keeps every forwarded vIRQ in range.
++
++	  The proper fix belongs in libxl; this is a platform workaround. On BCM2712
++	  the GIC-400 implements 320 lines, so the value is 288.
++
++config XT_GUEST_PASSTHROUGH_IRQ_TYPE_DEFAULT
++	bool "Default unconfigured guest passthrough SPIs to level-high (UNSUPPORTED)" if UNSUPPORTED
++	default n
++	help
++	  When an SPI is routed to a non-hardware domain and no trigger type has
++	  ever been programmed for it, assume active-high level.
++
++	  This happens when the owning device is marked "xen,passthrough": the
++	  hardware domain never probes it, so no request_irq() reaches Xen and
++	  gic_set_irq_type() never runs, leaving the type invalid and the route
++	  rejected with -EINVAL.
++
++	  Level-high is the GICv2 reset state and is correct for every BCM2712 SPI,
++	  but it is not correct in general. Say N unless the platform's SPIs are
++	  known to be level-high.
++
+ endmenu
+ 
+ menu "ARM errata workaround via the alternative framework"
+diff --git a/xen/arch/arm/device.c b/xen/arch/arm/device.c
+index 3cdfa7686c..d160b3736d 100644
+--- a/xen/arch/arm/device.c
++++ b/xen/arch/arm/device.c
+@@ -24,7 +24,7 @@ int map_irq_to_domain(struct domain *d, unsigned int irq,
+     res = irq_permit_access(d, irq);
+     if ( res )
+     {
+-        printk(XENLOG_ERR "Unable to permit to %pd access to IRQ %u\n", d, irq);
++        printk(XENLOG_ERR "Unable to permit to %pd access to IRQ %u (rc=%d)\n", d, irq, res);
+         return res;
+     }
+ 
+diff --git a/xen/arch/arm/domain.c b/xen/arch/arm/domain.c
+index e36719bce4..c191e44e9f 100644
+--- a/xen/arch/arm/domain.c
++++ b/xen/arch/arm/domain.c
+@@ -612,9 +612,16 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+ {
+     unsigned int max_vcpus;
+     unsigned int flags_required = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap);
++    /*
++     * xen-troops libxl direct-map (Stage 1): also accept the direct-map /
++     * static-mem CDF flags on ARM (x86 rejects them in its own
++     * arch_sanitise_domain_config()).
++     */
+     unsigned int flags_optional = (XEN_DOMCTL_CDF_iommu | XEN_DOMCTL_CDF_vpmu |
+                                    XEN_DOMCTL_CDF_xs_domain |
+-                                   XEN_DOMCTL_CDF_trap_unmapped_accesses );
++                                   XEN_DOMCTL_CDF_trap_unmapped_accesses |
++                                   XEN_DOMCTL_CDF_directmap |
++                                   XEN_DOMCTL_CDF_staticmem);
+     unsigned int sve_vl_bits = sve_decode_vl(config->arch.sve_vl);
+ 
+     if ( (config->flags & ~flags_optional) != flags_required )
+@@ -795,6 +802,20 @@ int arch_domain_create(struct domain *d,
+     if ( (rc = sci_domain_init(d, config)) != 0 )
+         goto fail;
+ 
++    /*
++     * Clear DomD vGIC SPI reservations.
++     * Use config->arch.nr_spis directly (libxl sets 219) since
++     * d->arch.vgic.nr_spis may be 0 at this point (timing of vgic_init).
++     * SGI 0-15 and PPI 16-31 remain untouched.
++     */
++    if ( config && !is_hardware_domain(d) && d->arch.vgic.allocated_irqs )
++    {
++        unsigned int irq;
++        unsigned int max_irq = NR_LOCAL_IRQS + config->arch.nr_spis;
++        for ( irq = NR_LOCAL_IRQS; irq < max_irq; irq++ )
++            clear_bit(irq, d->arch.vgic.allocated_irqs);
++    }
++
+     return 0;
+ 
+ fail:
+diff --git a/xen/arch/arm/domain_build.c b/xen/arch/arm/domain_build.c
+index fb8fbb1650..e2ee2d5b4f 100644
+--- a/xen/arch/arm/domain_build.c
++++ b/xen/arch/arm/domain_build.c
+@@ -1774,7 +1774,22 @@ static int __init handle_node(struct domain *d, struct kernel_info *kinfo,
+ 
+ static int __init prepare_dtb_hwdom(struct domain *d, struct kernel_info *kinfo)
+ {
+-    const p2m_type_t default_p2mt = p2m_mmio_direct_c;
++    /*
++     * Memory attribute for the hardware domain's device MMIO.
++     *
++     * Upstream maps it Normal-Cacheable (p2m_mmio_direct_c). On BCM2712 that
++     * produces IMP-DEF asynchronous SErrors (ESR=0xbffb936f) the first time
++     * Linux does a writel() to a register-style block -- observed on the main
++     * pinctrl at 0x10_7d504100 -- because its pad-config registers do not
++     * tolerate write-back cached or reordered accesses. Device-nGnRE is what
++     * both bare-metal Linux and Xen's own dom0less passthrough path
++     * (handle_passthrough_prop() in dom0less-build.c) use for the same
++     * registers.
++     *
++     * This is a SoC property, not an architectural one, so it is opt-in.
++     */
++    const p2m_type_t default_p2mt = IS_ENABLED(CONFIG_XT_HWDOM_MMIO_DEVICE_ATTR)
++                                    ? p2m_mmio_direct_dev : p2m_mmio_direct_c;
+     const void *fdt;
+     int new_size;
+     int ret;
+@@ -2028,6 +2043,56 @@ int __init construct_hwdom(struct kernel_info *kinfo,
+     if ( rc < 0 )
+         return rc;
+ 
++#ifdef CONFIG_XT_HWDOM_PASSTHROUGH_CAPS
++    /*
++     * Widen the hardware domain's forwarding capabilities so its toolstack can
++     * hand host SPIs and device MMIO to a driver domain.
++     *
++     * A device left to a driver domain is marked "xen,passthrough" in the host
++     * device tree, so handle_node() skips it and neither its interrupts nor its
++     * register range end up in the hardware domain's irq_caps/iomem_caps. The
++     * capability check in XEN_DOMCTL_irq_permission /
++     * XEN_DOMCTL_iomem_permission is against the *caller's* caps, so libxl in
++     * the hardware domain then fails with -EPERM when it tries to forward them
++     * (observed for IRQ 65 and for the HVS registers at 0x10_7c580000).
++     *
++     * Granting the whole SPI range plus the SoC's device-MMIO window lets the
++     * hardware domain delegate; it does not map anything into it. Enabling this
++     * does widen what a compromised hardware domain could delegate, which is
++     * why it is opt-in.
++     */
++    {
++        unsigned int irq;
++
++        for ( irq = NR_LOCAL_IRQS; irq < gic_number_lines(); irq++ )
++        {
++            int ipr = irq_permit_access(d, irq);
++
++            if ( ipr )
++                printk(XENLOG_WARNING "%pd: irq_permit_access(IRQ%u) rc=%d\n",
++                       d, irq, ipr);
++        }
++    }
++
++    /*
++     * The device-MMIO window. BCM2712 places the SoC peripherals the driver
++     * domain needs high in a 40-bit space (the HVS at 0x10_7c580000, roughly
++     * 66 GiB), well above the 4 GiB where RAM ends, so the window granted here
++     * is [4 GiB, 128 GiB) -- everything above RAM and below the top of the
++     * address space the SoC decodes. A window that stopped at 8 GiB, as an
++     * earlier revision of this change did, covers none of those devices.
++     */
++    {
++        unsigned long mfn_start = CONFIG_XT_HWDOM_IOMEM_CAP_START >> PAGE_SHIFT;
++        unsigned long mfn_end   = (CONFIG_XT_HWDOM_IOMEM_CAP_END >> PAGE_SHIFT) - 1;
++        int ipr = iomem_permit_access(d, mfn_start, mfn_end);
++
++        if ( ipr )
++            printk(XENLOG_WARNING "%pd: iomem_permit_access([%#lx..%#lx]) rc=%d\n",
++                   d, mfn_start, mfn_end, ipr);
++    }
++
++#endif
+     if ( acpi_disabled )
+     {
+         rc = prepare_dtb_hwdom(d, kinfo);
+diff --git a/xen/arch/arm/domctl.c b/xen/arch/arm/domctl.c
+index ad914c915f..3bcfe9f7f3 100644
+--- a/xen/arch/arm/domctl.c
++++ b/xen/arch/arm/domctl.c
+@@ -108,10 +108,18 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
+             return rc;
+ 
+         if ( !irq_access_permitted(current->domain, irq) )
++        {
++            printk(XENLOG_WARNING "bind_pt_irq -> EPERM (caller d%d lacks capability)\n",
++                   current->domain->domain_id);
+             return -EPERM;
++        }
+ 
+         if ( !vgic_reserve_virq(d, virq) )
++        {
++            printk(XENLOG_WARNING "bind_pt_irq -> EBUSY (vgic_reserve_virq(d%d, vIRQ%u) failed; already allocated?)\n",
++                   d->domain_id, virq);
+             return -EBUSY;
++        }
+ 
+         rc = route_irq_to_guest(d, virq, irq, "routed IRQ");
+         if ( rc )
+@@ -179,6 +187,82 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
+     }
+     case XEN_DOMCTL_dt_overlay:
+         return dt_overlay_domctl(d, &domctl->u.dt_overlay);
++
++#ifdef CONFIG_STATIC_MEMORY
++    case XEN_DOMCTL_assign_static_11:
++    {
++        /*
++         * xen-troops libxl direct-map (Stage 1):
++         * Runtime equivalent of dom0less assign_static_memory_11().
++         * Claim a host-reserved static-memory range [pbase, pbase+psize)
++         * (already marked PGC_static at boot by init_staticmem_pages())
++         * and directly map it into the domain at GPA == PA.
++         *
++         * Only valid for a direct-mapped, static-mem domain that is still
++         * being constructed (toolstack create path, before
++         * creation_finished).
++         */
++        paddr_t pbase = domctl->u.assign_static_11.pbase;
++        paddr_t psize = domctl->u.assign_static_11.psize;
++        mfn_t smfn;
++        unsigned int nr_pages;
++        int rc;
++
++        if ( !is_domain_direct_mapped(d) || !is_domain_using_staticmem(d) )
++            return -EINVAL;
++
++        if ( d->creation_finished )
++            return -EPERM;
++
++        if ( !IS_ALIGNED(pbase, PAGE_SIZE) || !IS_ALIGNED(psize, PAGE_SIZE) ||
++             psize == 0 )
++            return -EINVAL;
++
++        if ( (psize >> PAGE_SHIFT) > UINT_MAX )
++            return -EINVAL;
++
++        nr_pages = psize >> PAGE_SHIFT;
++        smfn = maddr_to_mfn(pbase);
++
++        /*
++         * acquire_domstatic_pages() claims the PGC_static pages and
++         * assigns them to the domain (on failure it unwinds itself).
++         */
++        rc = acquire_domstatic_pages(d, smfn, nr_pages, 0);
++        if ( rc )
++        {
++            printk(XENLOG_ERR
++                   "%pd: assign_static_11: failed to acquire static memory "
++                   "%#"PRIpaddr"-%#"PRIpaddr" (rc=%d)\n",
++                   d, pbase, pbase + psize, rc);
++            return rc;
++        }
++
++        /* GPA == PA: 1:1 map into the guest p2m. */
++        rc = guest_physmap_add_pages(d, gaddr_to_gfn(pbase), smfn, nr_pages);
++        if ( rc )
++        {
++            /*
++             * The pages remain assigned to the domain and will be
++             * reclaimed when the (failed) domain is destroyed.  Mirror
++             * dom0less, which treats a mapping failure as fatal for the
++             * domain rather than attempting partial rollback.
++             */
++            printk(XENLOG_ERR
++                   "%pd: assign_static_11: failed to 1:1 map "
++                   "%#"PRIpaddr"-%#"PRIpaddr" (rc=%d)\n",
++                   d, pbase, pbase + psize, rc);
++            return rc;
++        }
++
++        printk(XENLOG_INFO
++               "%pd: assign_static_11: direct-mapped STATIC %#"PRIpaddr
++               "-%#"PRIpaddr"\n", d, pbase, pbase + psize);
++
++        return 0;
++    }
++#endif /* CONFIG_STATIC_MEMORY */
++
+     default:
+         return subarch_do_domctl(domctl, d, u_domctl);
+     }
+diff --git a/xen/arch/arm/irq.c b/xen/arch/arm/irq.c
+index 73e58a5108..79052e05e3 100644
+--- a/xen/arch/arm/irq.c
++++ b/xen/arch/arm/irq.c
+@@ -528,6 +528,27 @@ int route_irq_to_guest(struct domain *d, unsigned int virq,
+ 
+     spin_lock_irqsave(&desc->lock, flags);
+ 
++#ifdef CONFIG_XT_GUEST_PASSTHROUGH_IRQ_TYPE_DEFAULT
++    /*
++     * Supply a trigger type for an SPI that is being routed to a non-hardware
++     * domain but was never configured by anyone.
++     *
++     * A device marked "xen,passthrough" in the host device tree is not probed
++     * by the hardware domain, so no request_irq() reaches Xen and
++     * gic_set_irq_type() never runs; desc->arch.type stays IRQ_TYPE_INVALID and
++     * the check below rejects the route with -EINVAL ("IRQ %u has not been
++     * configured"). Observed on BCM2712 as rc=-5 out of xc_domain_irq_permission
++     * for IRQ 65.
++     *
++     * BCM2712's GIC-400 SPIs are all active-high level lines, which is also the
++     * ARM GICv2 reset state, so level-high is the correct fallback for this SoC.
++     * It is not correct in general, hence the Kconfig gate.
++     */
++    if ( !is_hardware_domain(d) && irq >= NR_LOCAL_IRQS &&
++         desc->arch.type == IRQ_TYPE_INVALID )
++        desc->arch.type = IRQ_TYPE_LEVEL_HIGH;
++#endif
++
+     if ( !irq_type_set_by_domain(d) && desc->arch.type == IRQ_TYPE_INVALID )
+     {
+         printk(XENLOG_G_ERR "IRQ %u has not been configured\n", irq);
+diff --git a/xen/arch/arm/p2m.c b/xen/arch/arm/p2m.c
+index 63ed1b74f0..649e4c9f45 100644
+--- a/xen/arch/arm/p2m.c
++++ b/xen/arch/arm/p2m.c
+@@ -222,7 +222,15 @@ int map_dev_mmio_page(struct domain *d, gfn_t gfn, mfn_t mfn)
+     if ( !iomem_access_permitted(d, mfn_x(mfn), mfn_x(mfn)) )
+         return 0;
+ 
+-    res = p2m_insert_mapping(d, gfn, 1, mfn, p2m_mmio_direct_c);
++    /*
++     * Same SoC property as prepare_dtb_hwdom()'s default_p2mt: device MMIO
++     * that reaches the hardware domain through XENMAPSPACE_dev_mmio (Linux
++     * ioremap of a PCIe BAR page, for instance) must be Device-nGnRE on
++     * BCM2712. See the comment there for the failure mode.
++     */
++    res = p2m_insert_mapping(d, gfn, 1, mfn,
++                             IS_ENABLED(CONFIG_XT_HWDOM_MMIO_DEVICE_ATTR)
++                             ? p2m_mmio_direct_dev : p2m_mmio_direct_c);
+     if ( res < 0 )
+     {
+         printk(XENLOG_G_ERR "Unable to map MFN %#"PRI_mfn" in %pd\n",
+diff --git a/xen/arch/arm/vgic.c b/xen/arch/arm/vgic.c
+index e966162efe..88a5875323 100644
+--- a/xen/arch/arm/vgic.c
++++ b/xen/arch/arm/vgic.c
+@@ -253,6 +253,30 @@ int domain_vgic_init(struct domain *d, unsigned int nr_spis)
+      */
+     nr_spis = ROUNDUP(nr_spis, 32);
+ 
++#if CONFIG_XT_GUEST_MIN_NR_SPIS > 0
++    /*
++     * Raise a guest's SPI count to a platform floor.
++     *
++     * A guest that is given host SPIs with the xl.cfg "irqs=[...]" property
++     * keeps the vIRQ equal to the host IRQ, but libxl derives nr_spis from the
++     * emulated devices only, so the vGIC can end up sized below the highest
++     * forwarded line. gic_route_irq_to_guest() then trips
++     * ASSERT(virq < vgic_num_irqs(d)). Raising the floor to the host's line
++     * count keeps every forwarded vIRQ inside the vGIC and inside the
++     * allocated_irqs bitmap.
++     *
++     * The proper fix belongs in libxl (compute nr_spis from irqs=[]); until
++     * that lands this floor is opt-in per platform. On BCM2712 the GIC-400
++     * implements 320 lines, so 288 (+32 local) covers the whole range.
++     */
++    if ( !is_hardware_domain(d) && nr_spis < CONFIG_XT_GUEST_MIN_NR_SPIS )
++    {
++        printk(XENLOG_WARNING "%pd: raising nr_spis %u -> %u (platform floor)\n",
++               d, nr_spis, CONFIG_XT_GUEST_MIN_NR_SPIS);
++        nr_spis = CONFIG_XT_GUEST_MIN_NR_SPIS;
++    }
++
++#endif
+     /* Limit the number of virtual SPIs supported to (1020 - 32) = 988  */
+     if ( nr_spis > (1020 - NR_LOCAL_IRQS) )
+ #ifndef CONFIG_GICV3_ESPI
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index d488f08aff..f95fea334d 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -627,6 +627,18 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+     unsigned int altp2m_mode = MASK_EXTR(config->altp2m.opts,
+                                          XEN_DOMCTL_ALTP2M_mode_mask);
+ 
++    /*
++     * xen-troops libxl direct-map (Stage 1): the direct-map /
++     * static-mem CDF flags are an ARM-only feature.  The common
++     * sanitise_domain_config() whitelists them, so reject them here on
++     * x86 to keep them confined to ARM.
++     */
++    if ( config->flags & (XEN_DOMCTL_CDF_directmap | XEN_DOMCTL_CDF_staticmem) )
++    {
++        dprintk(XENLOG_INFO, "direct-map/static-mem not supported on x86\n");
++        return -EINVAL;
++    }
++
+     if ( hvm ? !hvm_enabled : !IS_ENABLED(CONFIG_PV) )
+     {
+         dprintk(XENLOG_INFO, "%s support not available\n", hvm ? "HVM" : "PV");
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 75c7da16e2..aa791a57c5 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -756,7 +756,13 @@ static int sanitise_domain_config(struct xen_domctl_createdomain *config)
+            XEN_DOMCTL_CDF_s3_integrity | XEN_DOMCTL_CDF_oos_off |
+            XEN_DOMCTL_CDF_xs_domain | XEN_DOMCTL_CDF_iommu |
+            XEN_DOMCTL_CDF_nested_virt | XEN_DOMCTL_CDF_vpmu |
+-           XEN_DOMCTL_CDF_trap_unmapped_accesses) )
++           XEN_DOMCTL_CDF_trap_unmapped_accesses |
++           /*
++            * ARM only (xen-troops libxl direct-map): pass the new flags
++            * through the common whitelist; arch_sanitise_domain_config()
++            * accepts them on ARM and rejects them on x86.
++            */
++           XEN_DOMCTL_CDF_directmap | XEN_DOMCTL_CDF_staticmem) )
+     {
+         dprintk(XENLOG_INFO, "Unknown CDF flags %#x\n", config->flags);
+         return -EINVAL;
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 579924048b..f5e6b0e031 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -418,7 +418,38 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+             break;
+         }
+ 
++        /*
++         * xen-troops libxl direct-map (Stage 1): translate the public
++         * direct-map / static-mem CDF flags into the internal CDF_* flags
++         * consumed by domain_create() (stored in d->cdf, read by
++         * is_domain_direct_mapped() / is_domain_using_staticmem()).
++         * directmap requires staticmem (mirrors dom0less-build.c).  The
++         * feature is ARM-only; on x86 the public flags are rejected in
++         * arch_sanitise_domain_config(), and CDF_directmap is undefined
++         * there, so guard the derivation with CONFIG_ARM.
++         */
++#ifdef CONFIG_ARM
++        {
++            unsigned int cdf = 0;
++
++            if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_staticmem )
++                cdf |= CDF_staticmem;
++
++            if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_directmap )
++            {
++                if ( !(cdf & CDF_staticmem) )
++                {
++                    ret = -EINVAL;
++                    break;
++                }
++                cdf |= CDF_directmap;
++            }
++
++            d = domain_create(domid, &op->u.createdomain, cdf);
++        }
++#else
+         d = domain_create(domid, &op->u.createdomain, false);
++#endif
+         if ( IS_ERR(d) )
+         {
+             ret = PTR_ERR(d);
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index 588b5b99cb..dd796c5e51 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -3030,11 +3030,16 @@ static bool prepare_staticmem_pages(struct page_info *pg, unsigned long nr_mfns,
+ /*
+  * Acquire nr_mfns contiguous reserved pages, starting at #smfn, of
+  * static memory.
+- * This function needs to be reworked if used outside of boot.
++ *
++ * xen-troops libxl direct-map (Stage 1): the __init annotation was
++ * dropped so this can be invoked at runtime from the
++ * XEN_DOMCTL_assign_static_11 domctl.  The helpers it relies on
++ * (prepare_staticmem_pages / assign_domstatic_pages /
++ * unprepare_staticmem_pages) are already non-__init and runtime-safe.
+  */
+-static struct page_info * __init acquire_staticmem_pages(mfn_t smfn,
+-                                                         unsigned long nr_mfns,
+-                                                         unsigned int memflags)
++static struct page_info *acquire_staticmem_pages(mfn_t smfn,
++                                                 unsigned long nr_mfns,
++                                                 unsigned int memflags)
+ {
+     unsigned long i;
+     struct page_info *pg;
+@@ -3080,9 +3085,12 @@ static int assign_domstatic_pages(struct domain *d, struct page_info *pg,
+ /*
+  * Acquire nr_mfns contiguous pages, starting at #smfn, of static memory,
+  * then assign them to one specific domain #d.
++ *
++ * xen-troops libxl direct-map (Stage 1): __init dropped to allow
++ * runtime use from XEN_DOMCTL_assign_static_11.
+  */
+-int __init acquire_domstatic_pages(struct domain *d, mfn_t smfn,
+-                                   unsigned int nr_mfns, unsigned int memflags)
++int acquire_domstatic_pages(struct domain *d, mfn_t smfn,
++                            unsigned int nr_mfns, unsigned int memflags)
+ {
+     struct page_info *pg;
+ 
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 5aef5e3ece..b2769aefd7 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -68,9 +68,22 @@ struct xen_domctl_createdomain {
+ #define XEN_DOMCTL_CDF_vpmu           (1U << 7)
+ /* Should we trap guest accesses to unmapped addresses? */
+ #define XEN_DOMCTL_CDF_trap_unmapped_accesses  (1U << 8)
++/*
++ * ARM only (xen-troops libxl direct-map, Stage 1):
++ * Request that the domain's RAM be directly mapped (GPA == PA), and that
++ * its memory be taken from a host-reserved static-memory range.  These
++ * mirror the dom0less "direct-map"/"xen,static-mem" device-tree
++ * properties for the libxl (xl create) creation path.  directmap implies
++ * staticmem (enforced in common/domctl.c).  x86 rejects both in
++ * arch_sanitise_domain_config().
++ * (Renumbered to (1U<<9)/(1U<<10) on the 4.21 rebase: (1U<<8) is now
++ * XEN_DOMCTL_CDF_trap_unmapped_accesses upstream.)
++ */
++#define XEN_DOMCTL_CDF_directmap      (1U << 9)
++#define XEN_DOMCTL_CDF_staticmem      (1U << 10)
+ 
+ /* Max XEN_DOMCTL_CDF_* constant.  Used for ABI checking. */
+-#define XEN_DOMCTL_CDF_MAX XEN_DOMCTL_CDF_trap_unmapped_accesses
++#define XEN_DOMCTL_CDF_MAX XEN_DOMCTL_CDF_staticmem
+ 
+     uint32_t flags;
+ 
+@@ -992,6 +1005,20 @@ struct xen_domctl_paging_mempool {
+     uint64_aligned_t size; /* Size in bytes. */
+ };
+ 
++#if defined(__aarch64__) || defined(__arm__)
++/*
++ * XEN_DOMCTL_assign_static_11 (ARM only, xen-troops libxl direct-map):
++ * Claim a host-reserved static-memory range and 1:1 (GPA == PA) map it
++ * into a direct-mapped domain.  pbase/psize must be page-aligned.
++ */
++struct xen_domctl_assign_static_11 {
++    uint64_aligned_t pbase; /* IN: physical base address (page-aligned). */
++    uint64_aligned_t psize; /* IN: size in bytes (page-aligned, multiple of PAGE_SIZE). */
++};
++typedef struct xen_domctl_assign_static_11 xen_domctl_assign_static_11_t;
++DEFINE_XEN_GUEST_HANDLE(xen_domctl_assign_static_11_t);
++#endif
++
+ #if defined(__i386__) || defined(__x86_64__)
+ struct xen_domctl_vcpu_msr {
+     uint32_t         index;
+@@ -1370,6 +1397,15 @@ struct xen_domctl {
+ #define XEN_DOMCTL_gsi_permission                88
+ #define XEN_DOMCTL_set_llc_colors                89
+ #define XEN_DOMCTL_get_domain_state              90 /* stable interface */
++/*
++ * XEN_DOMCTL_assign_static_11 (ARM only, xen-troops libxl direct-map):
++ * Claim a host-reserved static-memory range [pbase, pbase+psize) and
++ * directly map it into the (direct-map) domain at GPA == PA.  Runtime
++ * equivalent of dom0less assign_static_memory_11().  pbase/psize must be
++ * page-aligned.  See struct xen_domctl_assign_static_11 below.
++ * (Renumbered 87->91 on the 4.21 rebase: 87..90 are now upstream ops.)
++ */
++#define XEN_DOMCTL_assign_static_11              91
+ #define XEN_DOMCTL_gdbsx_guestmemio            1000
+ #define XEN_DOMCTL_gdbsx_pausevcpu             1001
+ #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
+@@ -1435,6 +1471,7 @@ struct xen_domctl {
+         struct xen_domctl_paging_mempool    paging_mempool;
+ #if defined(__arm__) || defined(__aarch64__)
+         struct xen_domctl_dt_overlay        dt_overlay;
++        struct xen_domctl_assign_static_11  assign_static_11;
+ #endif
+         struct xen_domctl_set_llc_colors    set_llc_colors;
+         struct xen_domctl_get_domain_state  get_domain_state;

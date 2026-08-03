@@ -1,0 +1,49 @@
+From b622387970b00b9ce76dd4e55dbb3535255dabae Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Tue, 17 Oct 2023 13:35:05 +0300
+Subject: [PATCH 20/24] libxl: Allow virtio-pci backends from different domains
+
+As we already expose PCI host bridge per virtio backend domain,
+we can now drop the limitation that denies having virtio-pci backends
+from different domains for the same guest.
+
+For the upstream this should be squashed with:
+"libxl/arm: Add basic virtio-pci support"
+and subsequent commits for the toolstack.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit b622387970b00b9ce76dd4e55dbb3535255dabae
+---
+ tools/libs/light/libxl_create.c | 11 -----------
+ 1 file changed, 11 deletions(-)
+
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index 6e477bf8b0..88649559fe 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1077,7 +1077,6 @@ int libxl__domain_config_setdefault(libxl__gc *gc,
+     libxl_ctx *ctx = libxl__gc_owner(gc);
+     int ret, i;
+     bool pod_enabled = false;
+-    libxl_domid virtio_pci_domid = INVALID_DOMID;
+     libxl_domain_create_info *c_info = &d_config->c_info;
+ 
+     libxl_physinfo physinfo;
+@@ -1279,16 +1278,6 @@ int libxl__domain_config_setdefault(libxl__gc *gc,
+             LOGD(ERROR, domid, "Unable to set virtio defaults for device %d", i);
+             goto error_out;
+         }
+-
+-        if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI) {
+-            if (virtio_pci_domid == INVALID_DOMID) {
+-                virtio_pci_domid = virtio->backend_domid;
+-            } else if (virtio_pci_domid != virtio->backend_domid) {
+-                ret = ERROR_INVAL;
+-                LOGD(ERROR, domid, "Cannot enable virtio-pci backends from different domains");
+-                goto error_out;
+-            }
+-        }
+     }
+ 
+     ret = 0;

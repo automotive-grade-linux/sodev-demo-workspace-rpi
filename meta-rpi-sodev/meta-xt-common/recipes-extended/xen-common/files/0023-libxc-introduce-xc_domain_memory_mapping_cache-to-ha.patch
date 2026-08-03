@@ -1,0 +1,106 @@
+From 928dac191f9de027df3cd4f8ce1181ea2623dc22 Mon Sep 17 00:00:00 2001
+From: Stefano Stabellini <sstabellini@kernel.org>
+Date: Tue, 26 Feb 2019 15:00:25 -0800
+Subject: [PATCH 23/24] libxc: introduce xc_domain_memory_mapping_cache to
+ handle cachebility
+
+Introduce a new xc_domain_memory_mapping_cache which takes
+the parameter with cacheability information. The same parameter values
+are the same for the XEN_DOMCTL_memory_mapping hypercall (0 is device
+memory, 1 is normal memory). Pass CACHEABILITY_DEVMEM by default -- no
+changes in behavior.
+
+Signed-off-by: Stefano Stabellini <stefanos@xilinx.com>
+Signed-off-by: Dmytro Firsov <dmytro_firsov@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 928dac191f9de027df3cd4f8ce1181ea2623dc22
+---
+ tools/include/xenctrl.h         |  8 ++++++++
+ tools/libs/ctrl/xc_domain.c     | 24 ++++++++++++++++++++++--
+ tools/libs/light/libxl_create.c |  4 ++--
+ 3 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/tools/include/xenctrl.h b/tools/include/xenctrl.h
+index d5dbf69c89..51a2ee255c 100644
+--- a/tools/include/xenctrl.h
++++ b/tools/include/xenctrl.h
+@@ -1720,6 +1720,14 @@ int xc_domain_memory_mapping(xc_interface *xch,
+                              unsigned long nr_mfns,
+                              uint32_t add_mapping);
+ 
++int xc_domain_memory_mapping_cache(xc_interface *xch,
++                                   uint32_t domid,
++                                   unsigned long first_gfn,
++                                   unsigned long first_mfn,
++                                   unsigned long nr_mfns,
++                                   uint32_t add_mapping,
++                                   uint32_t cache_policy);
++
+ int xc_domain_ioport_mapping(xc_interface *xch,
+                              uint32_t domid,
+                              uint32_t first_gport,
+diff --git a/tools/libs/ctrl/xc_domain.c b/tools/libs/ctrl/xc_domain.c
+index 2ddc3f4f42..84880cd544 100644
+--- a/tools/libs/ctrl/xc_domain.c
++++ b/tools/libs/ctrl/xc_domain.c
+@@ -1900,6 +1900,24 @@ int xc_domain_memory_mapping(
+     unsigned long first_mfn,
+     unsigned long nr_mfns,
+     uint32_t add_mapping)
++{
++    return xc_domain_memory_mapping_cache(xch,
++                                          domid,
++                                          first_gfn,
++                                          first_mfn,
++                                          nr_mfns,
++                                          add_mapping,
++                                          CACHEABILITY_DEVMEM);
++}
++
++int xc_domain_memory_mapping_cache(
++    xc_interface *xch,
++    uint32_t domid,
++    unsigned long first_gfn,
++    unsigned long first_mfn,
++    unsigned long nr_mfns,
++    uint32_t add_mapping,
++    uint32_t cache_policy)
+ {
+     struct xen_domctl domctl = {};
+     xc_domaininfo_t info;
+@@ -1920,6 +1938,7 @@ int xc_domain_memory_mapping(
+     domctl.cmd = XEN_DOMCTL_memory_mapping;
+     domctl.domain = domid;
+     domctl.u.memory_mapping.add_mapping = add_mapping;
++    domctl.u.memory_mapping.cache_policy = cache_policy;
+     max_batch_sz = nr_mfns;
+     do
+     {
+@@ -1955,8 +1974,9 @@ int xc_domain_memory_mapping(
+      * Errors here are ignored.
+      */
+     if ( ret && add_mapping != DPCI_REMOVE_MAPPING )
+-        xc_domain_memory_mapping(xch, domid, first_gfn, first_mfn, nr_mfns,
+-                                 DPCI_REMOVE_MAPPING);
++        xc_domain_memory_mapping_cache(xch, domid, first_gfn, first_mfn,
++                                       nr_mfns, DPCI_REMOVE_MAPPING,
++                                       CACHEABILITY_DEVMEM);
+ 
+     /* We might get E2BIG so many times that we never advance. */
+     if ( !done && !ret )
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index 88649559fe..f159e99939 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1732,9 +1732,9 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+             ret = ERROR_FAIL;
+             goto error_out;
+         }
+-        ret = xc_domain_memory_mapping(CTX->xch, domid,
++        ret = xc_domain_memory_mapping_cache(CTX->xch, domid,
+                                        io->gfn, io->start,
+-                                       io->number, 1);
++                                       io->number, 1, CACHEABILITY_DEVMEM);
+         if (ret < 0) {
+             LOGED(ERROR, domid,
+                   "failed to map to domain iomem range %"PRIx64"-%"PRIx64

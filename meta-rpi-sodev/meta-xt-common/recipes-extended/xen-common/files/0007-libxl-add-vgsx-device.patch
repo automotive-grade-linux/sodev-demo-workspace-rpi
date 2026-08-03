@@ -1,0 +1,192 @@
+From 1075e13806909cebeb0fd3bb6f1beb4632296ad2 Mon Sep 17 00:00:00 2001
+From: Oleksandr Grytsov <oleksandr_grytsov@epam.com>
+Date: Wed, 31 Jan 2018 21:03:11 +0200
+Subject: [PATCH 07/24] libxl: add vgsx device
+
+Signed-off-by: Oleksandr Grytsov <oleksandr_grytsov@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 1075e13806909cebeb0fd3bb6f1beb4632296ad2
+---
+ tools/libs/light/Makefile                 |  1 +
+ tools/libs/light/libxl_create.c           |  1 +
+ tools/libs/light/libxl_internal.h         |  1 +
+ tools/libs/light/libxl_types.idl          |  8 ++
+ tools/libs/light/libxl_types_internal.idl |  1 +
+ tools/libs/light/libxl_vgsx.c             | 94 +++++++++++++++++++++++
+ 6 files changed, 106 insertions(+)
+ create mode 100644 tools/libs/light/libxl_vgsx.c
+
+diff --git a/tools/libs/light/Makefile b/tools/libs/light/Makefile
+index bc60c46558..1e6935a9e0 100644
+--- a/tools/libs/light/Makefile
++++ b/tools/libs/light/Makefile
+@@ -110,6 +110,7 @@ OBJS-y += libxl_genid.o
+ OBJS-y += _libxl_types.o
+ OBJS-y += libxl_flask.o
+ OBJS-y += _libxl_types_internal.o
++OBJS-y += libxl_vgsx.o
+ 
+ # Device tree overlay is enabled only for ARM architecture.
+ OBJS-$(CONFIG_ARM) += libxl_dt_overlay.o
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index bfc9149096..7ff7185939 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1898,6 +1898,7 @@ const libxl__device_type *device_type_tbl[] = {
+     &libxl__vsnd_devtype,
+     &libxl__virtio_devtype,
+     &libxl__p9_devtype,
++    &libxl__vgsx_devtype,
+     NULL
+ };
+ 
+diff --git a/tools/libs/light/libxl_internal.h b/tools/libs/light/libxl_internal.h
+index b65e0064b9..7bbdbb3e61 100644
+--- a/tools/libs/light/libxl_internal.h
++++ b/tools/libs/light/libxl_internal.h
+@@ -3962,6 +3962,7 @@ extern const libxl__device_type libxl__vdispl_devtype;
+ extern const libxl__device_type libxl__p9_devtype;
+ extern const libxl__device_type libxl__pvcallsif_devtype;
+ extern const libxl__device_type libxl__vsnd_devtype;
++extern const libxl__device_type libxl__vgsx_devtype;
+ 
+ extern const libxl__device_type *device_type_tbl[];
+ 
+diff --git a/tools/libs/light/libxl_types.idl b/tools/libs/light/libxl_types.idl
+index 4a958f69f4..e4a1d043ea 100644
+--- a/tools/libs/light/libxl_types.idl
++++ b/tools/libs/light/libxl_types.idl
+@@ -1071,6 +1071,13 @@ libxl_device_vsnd = Struct("device_vsnd", [
+     ("pcms", Array(libxl_vsnd_pcm, "num_vsnd_pcms"))
+     ])
+ 
++libxl_device_vgsx = Struct("device_vgsx", [
++    ("backend_domid", libxl_domid),
++    ("backend_domname", string),
++    ("devid", libxl_devid),
++    ("osid", uint32)
++    ])
++
+ libxl_domain_config = Struct("domain_config", [
+     ("c_info", libxl_domain_create_info),
+     ("b_info", libxl_domain_build_info),
+@@ -1088,6 +1095,7 @@ libxl_domain_config = Struct("domain_config", [
+     ("pvcallsifs", Array(libxl_device_pvcallsif, "num_pvcallsifs")),
+     ("vdispls", Array(libxl_device_vdispl, "num_vdispls")),
+     ("vsnds", Array(libxl_device_vsnd, "num_vsnds")),
++    ("vgsxs", Array(libxl_device_vgsx, "num_vgsxs")),
+     # a channel manifests as a console with a name,
+     # see docs/misc/channels.txt
+     ("channels", Array(libxl_device_channel, "num_channels")),
+diff --git a/tools/libs/light/libxl_types_internal.idl b/tools/libs/light/libxl_types_internal.idl
+index ab4ee92870..2458045f24 100644
+--- a/tools/libs/light/libxl_types_internal.idl
++++ b/tools/libs/light/libxl_types_internal.idl
+@@ -37,6 +37,7 @@ libxl__device_kind = Enumeration("device_kind", [
+     (18, "VIRTIO"),
+     (19, "VBD3"),
+     (20, "XEN_9PFS"),
++    (21, "VGSX"),
+     ])
+ 
+ libxl__console_backend = Enumeration("console_backend", [
+diff --git a/tools/libs/light/libxl_vgsx.c b/tools/libs/light/libxl_vgsx.c
+new file mode 100644
+index 0000000000..ee1f1a52a4
+--- /dev/null
++++ b/tools/libs/light/libxl_vgsx.c
+@@ -0,0 +1,94 @@
++/*
++ * Copyright (C) 2017 EPAM Systems Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ */
++
++#include "libxl_internal.h"
++
++static int libxl__device_vgsx_setdefault(libxl__gc *gc, uint32_t domid,
++                                         libxl_device_vgsx *vgsx,
++                                         bool hotplug)
++{
++    return libxl__resolve_domid(gc, vgsx->backend_domname,
++                                &vgsx->backend_domid);
++}
++
++static int libxl__vgsx_from_xenstore(libxl__gc *gc, const char *libxl_path,
++                                     libxl_devid devid,
++                                     libxl_device_vgsx *vgsx)
++{
++    const char *tmp;
++    int rc;
++
++    vgsx->devid = devid;
++    rc = libxl__xs_read_mandatory(gc, XBT_NULL,
++                                  GCSPRINTF("%s/backend", libxl_path),
++                                  &tmp);
++    if (rc) return rc;
++
++    rc = libxl__backendpath_parse_domid(gc, tmp, &vgsx->backend_domid);
++    if (rc) return rc;
++
++    return 0;
++}
++
++static void libxl__update_config_vgsx(libxl__gc *gc,
++                                      libxl_device_vgsx *dst,
++                                      libxl_device_vgsx *src)
++{
++    dst->devid = src->devid;
++}
++
++static int libxl_device_vgsx_compare(libxl_device_vgsx *d1,
++                                     libxl_device_vgsx *d2)
++{
++    return COMPARE_DEVID(d1, d2);
++}
++
++static void libxl__device_vgsx_add(libxl__egc *egc, uint32_t domid,
++                                   libxl_device_vgsx *vgsx,
++                                   libxl__ao_device *aodev)
++{
++    libxl__device_add_async(egc, domid, &libxl__vgsx_devtype, vgsx, aodev);
++}
++
++static int libxl__set_xenstore_vgsx(libxl__gc *gc, uint32_t domid,
++                                    libxl_device_vgsx *vgsx,
++                                    flexarray_t *back, flexarray_t *front,
++                                    flexarray_t *ro_front)
++{
++    int rc;
++
++    rc = flexarray_append_pair(front, "osid", GCSPRINTF("%d", vgsx->osid));
++    if (rc) return rc;
++
++    return 0;
++}
++
++static LIBXL_DEFINE_UPDATE_DEVID(vgsx)
++static LIBXL_DEFINE_DEVICE_FROM_TYPE(vgsx)
++static LIBXL_DEFINE_DEVICES_ADD(vgsx)
++
++DEFINE_DEVICE_TYPE_STRUCT(vgsx, VGSX, vgsxs,
++    .update_config = (device_update_config_fn_t) libxl__update_config_vgsx,
++    .from_xenstore = (device_from_xenstore_fn_t) libxl__vgsx_from_xenstore,
++    .set_xenstore_config = (device_set_xenstore_config_fn_t)
++                           libxl__set_xenstore_vgsx
++);
++
++/*
++ * Local variables:
++ * mode: C
++ * c-basic-offset: 4
++ * indent-tabs-mode: nil
++ * End:
++ */

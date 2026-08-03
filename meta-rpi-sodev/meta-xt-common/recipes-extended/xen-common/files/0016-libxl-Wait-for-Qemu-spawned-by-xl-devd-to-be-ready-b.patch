@@ -1,0 +1,268 @@
+From 43b8023f5fb96afa523ae4e7098e5eb2ecacde97 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 31 Aug 2023 15:09:33 +0300
+Subject: [PATCH 16/24] libxl: Wait for Qemu spawned by xl devd to be ready
+ before continue
+
+The toolstack shouldn't unpause guest until "non local" device-model
+(currently Qdisk backend) is up and running. As guest checks
+the availability of the Virtio devices (and discovers them) at
+the early stage and QEMU may not be completely initialized yet by
+that time. If that race happens the Virtio devices that Qemu is
+intended to emulate will never show up in the guest. This race has
+never been observed for Qemu running in the toolstack domain,
+maybe because of the QMP support that toolstack uses for the *local*
+device-model.
+
+So, wait it to be ready by periodically checking the presence of
+"state=running" in Xenstore. Done this right after adding Virtio devices
+which in turn should trigger xl devd in driver domain to spawn Qemu.
+
+TODO: Likely this could be done more nicely than current patch does,
+for example, to not use deprecated func, etc.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Dmytro Firsov <dmytro_firsov@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: libxl__xenstore_child_wait_deprecated() computes its own deadline with gettimeofday() instead of relying on select() updating the timeval in place, which is a Linux-specific behaviour and not guaranteed by POSIX
+Origin: https://github.com/xen-troops/xen commit 43b8023f5fb96afa523ae4e7098e5eb2ecacde97
+---
+ tools/libs/light/libxl_create.c   |  15 ++++++++++++---
+ tools/libs/light/libxl_dm.c       |  16 ++++++++++++++++
+ tools/libs/light/libxl_exec.c     |  84 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/libs/light/libxl_internal.h |  47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 159 insertions(+), 3 deletions(-)
+
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index de20549bd4..196c9bb1fa 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1685,7 +1685,7 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+     libxl__domain_create_state *dcs = CONTAINER_OF(multidev, *dcs, multidev);
+     STATE_AO_GC(dcs->ao);
+     int i;
+-    bool dmargs_saved = false;
++    libxl_domid dm_domid_saved = INVALID_DOMID;
+ 
+     /* convenience aliases */
+     const uint32_t domid = dcs->guest_domid;
+@@ -1779,7 +1779,8 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+         libxl_device_virtio *virtio = &d_config->virtios[i];
+ 
+         if (virtio->backend_type == LIBXL_VIRTIO_BACKEND_QEMU &&
+-            virtio->backend_domid != LIBXL_TOOLSTACK_DOMID && !dmargs_saved) {
++            virtio->backend_domid != LIBXL_TOOLSTACK_DOMID &&
++            dm_domid_saved == INVALID_DOMID) {
+ 
+             ret = libxl__save_qdisk_backend_dm_args(gc, domid,
+                                                     virtio->backend_domid,
+@@ -1788,12 +1789,20 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+                 LOGD(ERROR, domid, "Unable to save dm_args for Qdisk backend");
+                 goto error_out;
+             }
+-            dmargs_saved = true;
++            dm_domid_saved = virtio->backend_domid;
+         }
+ 
+         libxl__device_add(gc, domid, &libxl__virtio_devtype, virtio);
+     }
+ 
++    if (dm_domid_saved != INVALID_DOMID) {
++        ret = libxl__wait_for_qdisk_backend_ready(gc, domid, dm_domid_saved);
++        if (ret < 0) {
++            LOGD(ERROR, domid, "Qdisk backend didn't respond in time");
++            goto error_out;
++        }
++    }
++
+     if (d_config->num_vkbs) {
+         for (i = 0; i < d_config->num_vkbs; i++) {
+             ret = libxl__device_add(gc, domid, &libxl__vkb_devtype,
+diff --git a/tools/libs/light/libxl_dm.c b/tools/libs/light/libxl_dm.c
+index eb6193201e..cf499b9ee5 100644
+--- a/tools/libs/light/libxl_dm.c
++++ b/tools/libs/light/libxl_dm.c
+@@ -3451,6 +3451,22 @@ out:
+     return rc;
+ }
+ 
++#define QDISK_BACKEND_START_TIMEOUT 10
++
++int libxl__wait_for_qdisk_backend_ready(libxl__gc *gc,
++                                        uint32_t domid,
++                                        uint32_t backend_domid)
++{
++    char *dm_path;
++
++    dm_path = DEVICE_MODEL_XS_PATH(gc, backend_domid, domid, "/state");
++
++    return libxl__xenstore_child_wait_deprecated(gc, domid,
++                                                 QDISK_BACKEND_START_TIMEOUT,
++                                                 "Qdisk backend", dm_path,
++                                                 "running", NULL, NULL, NULL);
++}
++
+ void libxl__spawn_qemu_xenpv_backend(libxl__egc *egc,
+                                      libxl__dm_spawn_state *dmss)
+ {
+diff --git a/tools/libs/light/libxl_exec.c b/tools/libs/light/libxl_exec.c
+index 7a59c05..550356a 100644
+--- a/tools/libs/light/libxl_exec.c
++++ b/tools/libs/light/libxl_exec.c
+@@ -389,6 +389,90 @@ static void spawn_middle_death(libxl__egc *egc, libxl__ev_child *childw,
+     ss->detached_cb(egc, ss);
+ }
+ 
++int libxl__xenstore_child_wait_deprecated(libxl__gc *gc,
++                                 uint32_t domid,
++                                 uint32_t timeout, char *what,
++                                 char *path, char *state,
++                                 libxl__spawn_starting *spawning,
++                                 int (*check_callback)(libxl__gc *gc,
++                                                       uint32_t domid,
++                                                       const char *state,
++                                                       void *userdata),
++                                 void *check_callback_userdata)
++{
++    char *p;
++    unsigned int len;
++    int rc = 0;
++    struct xs_handle *xsh;
++    int nfds;
++    fd_set rfds;
++    struct timeval tv;
++    struct timeval deadline, now;
++    long remaining_us;
++    unsigned int num;
++    char **l = NULL;
++
++    xsh = xs_open(0);
++    if (xsh == NULL) {
++        LOG(ERROR, "Unable to open xenstore connection");
++        goto err;
++    }
++
++    xs_watch(xsh, path, path);
++    tv.tv_sec = timeout;
++    tv.tv_usec = 0;
++    gettimeofday(&deadline, NULL);
++    deadline.tv_sec += timeout;
++    nfds = xs_fileno(xsh) + 1;
++    assert(!spawning);
++
++    while (rc > 0 || (!rc && tv.tv_sec > 0)) {
++        p = xs_read(xsh, XBT_NULL, path, &len);
++        if ( NULL == p )
++            goto again;
++
++        if ( NULL != state && strcmp(p, state) )
++            goto again;
++
++        if ( NULL != check_callback ) {
++            rc = (*check_callback)(gc, domid, p, check_callback_userdata);
++            if ( rc > 0 )
++                goto again;
++        }
++
++        free(p);
++        xs_unwatch(xsh, path, path);
++        xs_close(xsh);
++        return rc;
++again:
++        free(p);
++        gettimeofday(&now, NULL);
++        remaining_us = (deadline.tv_sec - now.tv_sec) * 1000000L +
++                       (deadline.tv_usec - now.tv_usec);
++        if (remaining_us <= 0)
++            break;
++        tv.tv_sec = remaining_us / 1000000L;
++        tv.tv_usec = remaining_us % 1000000L;
++        FD_ZERO(&rfds);
++        FD_SET(xs_fileno(xsh), &rfds);
++        rc = select(nfds, &rfds, NULL, NULL, &tv);
++        if (rc > 0) {
++            if (FD_ISSET(xs_fileno(xsh), &rfds)) {
++                l = xs_read_watch(xsh, &num);
++                if (l != NULL)
++                    free(l);
++                else
++                    goto again;
++            }
++        }
++    }
++    LOG(ERROR, "%s not ready", what);
++
++    xs_unwatch(xsh, path, path);
++    xs_close(xsh);
++err:
++    return -1;
++}
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/tools/libs/light/libxl_internal.h b/tools/libs/light/libxl_internal.h
+index dccb7b822b..afc0388b8f 100644
+--- a/tools/libs/light/libxl_internal.h
++++ b/tools/libs/light/libxl_internal.h
+@@ -1978,6 +1978,49 @@ _hidden int libxl__domain_device_construct_rdm(libxl__gc *gc,
+                                    uint64_t rdm_mem_guard,
+                                    struct xc_dom_image *dom);
+ 
++/*
++ * libxl__xenstore_child_wait_deprecated - Wait for daemonic child IPC
++ *
++ * This is a NOT function for waiting for ordinary child processes.
++ * If you want to run (fork/exec/wait) subprocesses from libxl:
++ *  - Make your libxl entrypoint use the ao machinery
++ *  - Use libxl__ev_child_fork, and use the callback programming style
++ *
++ * This function is intended for interprocess communication with a
++ * service process.  If the service process does not respond quickly,
++ * the whole caller may be blocked.  Therefore this function is
++ * deprecated.  This function is currently used only by
++ * libxl__wait_for_device_model_deprecated.
++ *
++ * gc: allocation pool
++ * domid: guest to work with
++ * timeout: how many seconds to wait for the state to appear
++ * what: string describing the spawned process
++ * path: path to the state file in xenstore
++ * state: expected string to wait for in path (optional)
++ * spawning: malloc'd pointer to libxl__spawn_starting (optional)
++ * check_callback: (optional)
++ * check_callback_userdata: data to pass to the callback function
++ *
++ * Returns 0 on success, and < 0 on error.
++ *
++ * This function waits the given timeout for the given path to appear
++ * in xenstore, and optionally for state in path.
++ * If path appears and state matches, check_callback is called.
++ * If check_callback returns > 0, waiting for path or state continues.
++ * Otherwise libxl__xenstore_child_wait_deprecated returns.
++ */
++_hidden int libxl__xenstore_child_wait_deprecated(libxl__gc *gc,
++                                 uint32_t domid,
++                                 uint32_t timeout, char *what,
++                                 char *path, char *state,
++                                 libxl__spawn_starting *spawning,
++                                 int (*check_callback)(libxl__gc *gc,
++                                                       uint32_t domid,
++                                                       const char *state,
++                                                       void *userdata),
++                                 void *check_callback_userdata);
++
+ _hidden const libxl_vnc_info *libxl__dm_vnc(const libxl_domain_config *g_cfg);
+ 
+ _hidden char *libxl__abs_path(libxl__gc *gc, const char *s, const char *path);
+@@ -4154,6 +4197,10 @@ _hidden void libxl__spawn_qemu_xenpv_backend(libxl__egc *egc,
+                                         libxl__dm_spawn_state *dmss);
+ _hidden int libxl__destroy_qemu_xenpv_backend(libxl__gc *gc, uint32_t domid);
+ 
++_hidden int libxl__wait_for_qdisk_backend_ready(libxl__gc *gc,
++                                                uint32_t domid,
++                                                uint32_t backend_domid);
++
+ _hidden int libxl__save_qdisk_backend_dm_args(libxl__gc *gc,
+                                               uint32_t domid,
+                                               uint32_t backend_domid,

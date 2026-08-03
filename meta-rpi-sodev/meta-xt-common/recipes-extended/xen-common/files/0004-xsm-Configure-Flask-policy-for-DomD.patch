@@ -1,0 +1,81 @@
+From 331c10d9501fe6b406ea9f20702b1e0b2d160297 Mon Sep 17 00:00:00 2001
+From: Valerii Chubar <valerii_chubar@epam.com>
+Date: Fri, 14 May 2021 23:36:05 +0300
+Subject: [PATCH 04/24] xsm: Configure Flask policy for DomD
+
+Add security policy file for DomD. Based on the default DomU
+configuration and extended with the following access control and
+interactions rules:
+
+domD -> domU: tclass=hvm (dm)
+domD -> domU: tclass=event (create)
+domD -> domU: tclass=domain2 (resource_map)
+domD -> domU: tclass=mmu (map_read, map_write)
+
+The main reason of that change is to make DomD more privileged
+to be able to run emulators (including Virtio backends).
+
+Signed-off-by: Valerii Chubar <valerii_chubar@epam.com>
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: xen_build_domain(domD_t) added -- DomD is created directly by the hypervisor at boot in the dom0less configuration, the same way domU.te needs it for dom0less guests, so the macro that permits that is required here too
+Origin: https://github.com/xen-troops/xen commit 331c10d9501fe6b406ea9f20702b1e0b2d160297
+---
+ tools/flask/policy/modules/domD.te      | 34 ++++++++++++++++++++++++++
+ tools/flask/policy/modules/modules.conf |  1 +
+ 2 files changed, 35 insertions(+)
+ create mode 100644 tools/flask/policy/modules/domD.te
+
+diff --git a/tools/flask/policy/modules/domD.te b/tools/flask/policy/modules/domD.te
+new file mode 100644
+index 0000000000..a2c32047ad
+--- /dev/null
++++ b/tools/flask/policy/modules/domD.te
+@@ -0,0 +1,34 @@
++###############################################################################
++#
++# Domain creation
++#
++###############################################################################
++
++declare_domain(domD_t)
++domain_self_comms(domD_t)
++create_domain(dom0_t, domD_t)
++manage_domain(dom0_t, domD_t)
++domain_comms(dom0_t, domD_t)
++domain_comms(domD_t, domD_t)
++migrate_domain_out(dom0_t, domD_t)
++domain_self_comms(domD_t)
++xen_build_domain(domD_t)
++
++# This is required for PCI (or other device) passthrough
++delegate_devices(dom0_t, domD_t)
++
++# Domain type can be created using the default (system) role
++role system_r types { domD_t };
++
++use_device_iommu_nointremap(domD_t, irq_t)
++use_device_iommu_nointremap(domD_t, iomem_t)
++use_device_iommu_nointremap(domD_t, device_t)
++use_device_iommu_nointremap(domD_t, ioport_t)
++
++domain_comms(domD_t, domU_t)
++allow domD_t domU_t:mmu { map_read map_write };
++allow domD_t domU_t:domain2 resource_map;
++allow domD_t domU_t_channel:event create;
++allow domD_t domU_t:hvm dm;
++allow domD_t xen_t:xen physinfo;
++allow domD_t domU_t:domain getdomaininfo;
+diff --git a/tools/flask/policy/modules/modules.conf b/tools/flask/policy/modules/modules.conf
+index 1b6975551a..d00ce0fc6b 100644
+--- a/tools/flask/policy/modules/modules.conf
++++ b/tools/flask/policy/modules/modules.conf
+@@ -24,6 +24,7 @@ guest_features = on
+ # This is required if you want to be able to create domains without specifying
+ # their XSM label in the configuration.
+ domU = on
++domD = on
+ 
+ # Example types with restrictions
+ isolated_domU = on

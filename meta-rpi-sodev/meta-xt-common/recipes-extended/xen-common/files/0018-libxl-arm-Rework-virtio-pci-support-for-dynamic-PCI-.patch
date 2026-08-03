@@ -1,0 +1,679 @@
+From 91332f509bc577b896d6d58fcff0966b68499aa0 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Tue, 17 Oct 2023 13:27:59 +0300
+Subject: [PATCH 18/24] libxl/arm: Rework virtio-pci support for dynamic PCI
+ host allocation
+
+In order to enable more use-cases such as having multiple
+device-models (Qemu) running in different backend domains which provide
+virtio-pci devices for the same guest, we allocate and expose one
+PCI host bridge for every virtio backend domain for that guest.
+
+For that purpose, reserve separate virtio-pci resources (memory and irqs)
+up to 8 possible PCI hosts (to be aligned with MAX_NR_IOREQ_SERVERS)
+and allocate a host per backend domain. The PCI host details including
+its host_id to be written to dedicated Xenstore node for the device-model
+to retrieve.
+
+Also do not use vPCI resources for virtio-pci at all and restore vPCI
+device-tree node as it was before the introduction of basic virtio-pci
+support.
+
+With that we won't break the PCI passthrough if both features are enabled
+for the same guest.
+
+For the upstream this should be squashed with:
+"libxl/arm: Add basic virtio-pci support"
+and subsequent commits for the toolstack.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 91332f509bc577b896d6d58fcff0966b68499aa0
+---
+ tools/libs/light/libxl_arm.c      | 245 +++++++++++++++++++++++-------
+ tools/libs/light/libxl_create.c   |  14 ++
+ tools/libs/light/libxl_dm.c       |  70 +++++++++
+ tools/libs/light/libxl_internal.h |   4 +
+ tools/libs/light/libxl_types.idl  |  15 ++
+ tools/libs/light/libxl_virtio.c   |  10 ++
+ xen/include/public/arch-arm.h     |  20 ++-
+ 7 files changed, 325 insertions(+), 53 deletions(-)
+
+diff --git a/tools/libs/light/libxl_arm.c b/tools/libs/light/libxl_arm.c
+index e4d9775870..d61f7ddb0e 100644
+--- a/tools/libs/light/libxl_arm.c
++++ b/tools/libs/light/libxl_arm.c
+@@ -20,6 +20,11 @@
+  */
+ #define VIRTIO_MMIO_DEV_SIZE   xen_mk_ullong(0x200)
+ 
++#define VIRTIO_PCI_HOST_MEM_SIZE            xen_mk_ullong(0x800000)
++#define VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE   xen_mk_ullong(0x800000)
++#define VIRTIO_PCI_HOST_NUM_SPIS            4
++#define VIRTIO_PCI_MAX_HOSTS                8
++
+ static uint64_t alloc_virtio_mmio_base(libxl__gc *gc, uint64_t *virtio_mmio_base)
+ {
+     uint64_t base = *virtio_mmio_base;
+@@ -80,15 +85,101 @@ static const char *gicv_to_string(libxl_gic_version gic_version)
+     }
+ }
+ 
++static int alloc_virtio_pci_host(libxl__gc *gc,
++                                 uint32_t backend_domid,
++                                 uint32_t *host_id,
++                                 unsigned int *num_hosts,
++                                 libxl_virtio_pci_host *hosts)
++{
++    unsigned int i;
++
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
++                 GUEST_VIRTIO_PCI_TOTAL_ECAM_SIZE / GUEST_VIRTIO_PCI_HOST_ECAM_SIZE);
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
++                 GUEST_VIRTIO_PCI_MEM_SIZE / VIRTIO_PCI_HOST_MEM_SIZE);
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
++                 GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE / VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE);
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
++                 (GUEST_VIRTIO_PCI_SPI_LAST - GUEST_VIRTIO_PCI_SPI_FIRST) / VIRTIO_PCI_HOST_NUM_SPIS);
++
++    if (*num_hosts > VIRTIO_PCI_MAX_HOSTS)
++        return ERROR_INVAL;
++
++    for (i = 0; i < *num_hosts; i++) {
++        if (hosts[i].backend_domid == backend_domid) {
++            *host_id = hosts[i].id;
++
++            LOG(DEBUG, "Reuse host #%u: "
++                        "ECAM: 0x%"PRIx64"-0x%"PRIx64" "
++                        "MEM: 0x%"PRIx64"-0x%"PRIx64" "
++                        "PREFETCH_MEM: 0x%"PRIx64"-0x%"PRIx64" "
++                        "IRQ: %u-%u",
++                        hosts[i].id,
++                        hosts[i].ecam_base,
++                        hosts[i].ecam_base + hosts[i].ecam_size - 1,
++                        hosts[i].mem_base,
++                        hosts[i].mem_base + hosts[i].mem_size - 1,
++                        hosts[i].prefetch_mem_base,
++                        hosts[i].prefetch_mem_base + hosts[i].prefetch_mem_size - 1,
++                        hosts[i].irq_first,
++                        hosts[i].irq_first + hosts[i].num_irqs - 1);
++
++            return 0;
++        }
++    }
++
++    if (i == VIRTIO_PCI_MAX_HOSTS) {
++        LOG(ERROR, "Ran out of reserved resources for virtio-pci host\n");
++        return ERROR_FAIL;
++    }
++
++    hosts[i].backend_domid = backend_domid;
++    hosts[i].id = i;
++    hosts[i].ecam_base = GUEST_VIRTIO_PCI_ECAM_BASE +
++        i * GUEST_VIRTIO_PCI_HOST_ECAM_SIZE;
++    hosts[i].ecam_size = GUEST_VIRTIO_PCI_HOST_ECAM_SIZE;
++    hosts[i].mem_base = GUEST_VIRTIO_PCI_MEM_ADDR +
++        i * VIRTIO_PCI_HOST_MEM_SIZE;
++    hosts[i].mem_size = VIRTIO_PCI_HOST_MEM_SIZE;
++    hosts[i].prefetch_mem_base = GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR +
++        i * VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE;
++    hosts[i].prefetch_mem_size = VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE;
++    hosts[i].irq_first = GUEST_VIRTIO_PCI_SPI_FIRST +
++        i * VIRTIO_PCI_HOST_NUM_SPIS;
++    hosts[i].num_irqs = VIRTIO_PCI_HOST_NUM_SPIS;
++
++    *host_id = hosts[i].id;
++
++    (*num_hosts)++;
++
++    LOG(DEBUG, "Allocate host #%u: "
++                "ECAM: 0x%"PRIx64"-0x%"PRIx64" "
++                "MEM: 0x%"PRIx64"-0x%"PRIx64" "
++                "PREFETCH_MEM: 0x%"PRIx64"-0x%"PRIx64" "
++                "IRQ: %u-%u",
++                hosts[i].id,
++                hosts[i].ecam_base,
++                hosts[i].ecam_base + hosts[i].ecam_size - 1,
++                hosts[i].mem_base,
++                hosts[i].mem_base + hosts[i].mem_size - 1,
++                hosts[i].prefetch_mem_base,
++                hosts[i].prefetch_mem_base + hosts[i].prefetch_mem_size - 1,
++                hosts[i].irq_first,
++                hosts[i].irq_first + hosts[i].num_irqs - 1);
++
++    return 0;
++}
++
+ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+                                       libxl_domain_config *d_config,
+                                       struct xen_domctl_createdomain *config)
+ {
+     uint32_t nr_spis = 0, cfg_nr_spis = d_config->b_info.arch_arm.nr_spis;
+     unsigned int i;
+-    uint32_t vuart_irq, virtio_mmio_irq_last;
++    uint32_t vuart_irq, virtio_mmio_irq_last, virtio_pci_irq_last = 0;
+     bool vuart_enabled = false, virtio_mmio_enabled = false;
+-    unsigned int num_virtio_pcidevs = 0;
++    unsigned int num_virtio_pci_hosts = 0;
++    libxl_virtio_pci_host virtio_pci_hosts[VIRTIO_PCI_MAX_HOSTS] = {0};
+     uint64_t virtio_mmio_base = GUEST_VIRTIO_MMIO_BASE;
+     uint32_t virtio_mmio_irq = GUEST_VIRTIO_MMIO_SPI_FIRST;
+     int rc;
+@@ -120,14 +211,17 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+         libxl_device_virtio *virtio = &d_config->virtios[i];
+ 
+         if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO) {
+-            num_virtio_pcidevs ++;
+-            continue;
++            rc = alloc_virtio_pci_host(gc,
++                                       virtio->backend_domid,
++                                       &virtio->u.pci.host_id,
++                                       &num_virtio_pci_hosts,
++                                       virtio_pci_hosts);
++        } else {
++            rc = alloc_virtio_mmio_params(gc, &virtio->u.mmio.base,
++                                          &virtio->u.mmio.irq,
++                                          &virtio_mmio_base, &virtio_mmio_irq);
+         }
+ 
+-        rc = alloc_virtio_mmio_params(gc, &virtio->u.mmio.base,
+-                                      &virtio->u.mmio.irq,
+-                                      &virtio_mmio_base, &virtio_mmio_irq);
+-
+         if (rc)
+             return rc;
+     }
+@@ -148,8 +242,16 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+         nr_spis = max(nr_spis, virtio_mmio_irq_last - 32 + 1);
+     }
+ 
+-    if (num_virtio_pcidevs)
+-        nr_spis = max(nr_spis, (uint32_t)(GUEST_VIRTIO_PCI_SPI_LAST - 32 + 1));
++    if (num_virtio_pci_hosts) {
++        libxl_virtio_pci_host *host = &virtio_pci_hosts[num_virtio_pci_hosts - 1];
++
++        /*
++         * Assumes that latest allocated host contains the highest allocated
++         * irq range.
++         */
++        virtio_pci_irq_last = host->irq_first + host->num_irqs - 1;
++        nr_spis = max(nr_spis, virtio_pci_irq_last - 32 + 1);
++    }
+ 
+     for (i = 0; i < d_config->b_info.num_irqs; i++) {
+         uint32_t irq = d_config->b_info.irqs[i];
+@@ -175,8 +277,8 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+             (irq >= GUEST_VIRTIO_MMIO_SPI_FIRST && irq <= virtio_mmio_irq_last)) {
+             LOG(ERROR, "Physical IRQ %u conflicting with Virtio MMIO IRQ range\n", irq);
+             return ERROR_FAIL;
+-        } else if (num_virtio_pcidevs &&
+-            (irq >= GUEST_VIRTIO_PCI_SPI_FIRST && irq <= GUEST_VIRTIO_PCI_SPI_LAST)) {
++        } else if (num_virtio_pci_hosts &&
++            (irq >= GUEST_VIRTIO_PCI_SPI_FIRST && irq <= virtio_pci_irq_last)) {
+             LOG(ERROR, "Physical IRQ %u conflicting with Virtio PCI IRQ range\n", irq);
+             return ERROR_FAIL;
+         }
+@@ -190,6 +292,14 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+             nr_spis = spi + 1;
+     }
+ 
++    if (num_virtio_pci_hosts) {
++        d_config->b_info.num_virtio_pci_hosts = num_virtio_pci_hosts;
++        d_config->b_info.virtio_pci_hosts = libxl__calloc(NOGC,
++            num_virtio_pci_hosts, sizeof(*d_config->b_info.virtio_pci_hosts));
++        memcpy(d_config->b_info.virtio_pci_hosts, virtio_pci_hosts,
++            sizeof(*d_config->b_info.virtio_pci_hosts) * num_virtio_pci_hosts);
++    }
++
+     LOG(DEBUG, "Configure the domain");
+ 
+     /* Check if a user provided a value or not */
+@@ -899,10 +1009,9 @@ static int make_vpl011_uart_node(libxl__gc *gc, void *fdt,
+     return 0;
+ }
+ 
+-/* The caller is responsible to complete / close the fdt node */
+-static int make_vpci_node_common(libxl__gc *gc, void *fdt,
+-                                 const struct arch_info *ainfo,
+-                                 struct xc_dom_image *dom)
++static int make_vpci_node(libxl__gc *gc, void *fdt,
++                          const struct arch_info *ainfo,
++                          struct xc_dom_image *dom)
+ {
+     int res;
+     const uint64_t vpci_ecam_base = GUEST_VPCI_ECAM_BASE;
+@@ -941,14 +1050,17 @@ static int make_vpci_node_common(libxl__gc *gc, void *fdt,
+         GUEST_VPCI_PREFETCH_MEM_SIZE);
+     if (res) return res;
+ 
++    res = fdt_end_node(fdt);
++    if (res) return res;
++
+     return 0;
+ }
+ 
+-#define PCI_NUM_IRQ   4
+ #define PCI_IRQ_MAP_MIN_STRIDE   8
+ #define PCI_IOMMU_MAP_STRIDE 4
+ 
+-static int create_vpci_irq_map(libxl__gc *gc, void *fdt)
++static int create_virtio_pci_irq_map(libxl__gc *gc, void *fdt,
++                                     libxl_virtio_pci_host *host)
+ {
+     uint32_t *full_irq_map, *irq_map;
+     size_t len;
+@@ -973,14 +1085,13 @@ static int create_vpci_irq_map(libxl__gc *gc, void *fdt)
+         return res;
+ 
+     cells = res;
+-    len = sizeof(uint32_t) * PCI_NUM_IRQ * PCI_NUM_IRQ *
++    len = sizeof(uint32_t) * host->num_irqs * host->num_irqs *
+           (PCI_IRQ_MAP_MIN_STRIDE + cells);
+     irq_map = full_irq_map = libxl__malloc(gc, len);
+ 
+-    for (slot = 0; slot < PCI_NUM_IRQ; slot++) {
+-        for (pin = 0; pin < PCI_NUM_IRQ; pin++) {
+-            uint32_t irq = GUEST_VIRTIO_PCI_SPI_FIRST +
+-                ((pin + slot) % PCI_NUM_IRQ);
++    for (slot = 0; slot < host->num_irqs; slot++) {
++        for (pin = 0; pin < host->num_irqs; pin++) {
++            uint32_t irq = host->irq_first + ((pin + slot) % host->num_irqs);
+             unsigned int i = 0;
+ 
+             /* PCI address (3 cells) */
+@@ -1016,19 +1127,21 @@ static int create_vpci_irq_map(libxl__gc *gc, void *fdt)
+     return 0;
+ }
+ 
+-static int create_vpci_iommu_map(libxl__gc *gc, void *fdt,
+-                                 libxl_domain_config *d_config)
++/* XXX Consider reusing libxl__realloc() to avoid an extra loop */
++static int create_virtio_pci_iommu_map(libxl__gc *gc, void *fdt,
++                                       libxl_virtio_pci_host *host,
++                                       libxl_domain_config *d_config)
+ {
+-    uint32_t *full_iommu_map = NULL;
+-    uint32_t *iommu_map;
+-    unsigned int i, ntranslated = 0;
++    uint32_t *full_iommu_map, *iommu_map;
++    unsigned int i, len, ntranslated = 0;
+     int res;
+ 
+     for (i = 0; i < d_config->num_virtios; i++) {
+         libxl_device_virtio *virtio = &d_config->virtios[i];
+ 
+         if (libxl_defbool_val(virtio->grant_usage) &&
+-            virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI) {
++            virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI &&
++            virtio->u.pci.host_id == host->id) {
+             ntranslated++;
+         }
+     }
+@@ -1036,10 +1149,8 @@ static int create_vpci_iommu_map(libxl__gc *gc, void *fdt,
+     if (!ntranslated)
+         return 0;
+ 
+-    full_iommu_map = malloc(ntranslated * sizeof(uint32_t) * PCI_IOMMU_MAP_STRIDE);
+-    if (!full_iommu_map)
+-        return -ENOMEM;
+-
++    len = ntranslated * sizeof(uint32_t) * PCI_IOMMU_MAP_STRIDE;
++    full_iommu_map = libxl__malloc(gc, len);
+     iommu_map = full_iommu_map;
+ 
+     /* See Linux Documentation/devicetree/bindings/pci/pci-iommu.txt */
+@@ -1047,7 +1158,8 @@ static int create_vpci_iommu_map(libxl__gc *gc, void *fdt,
+         libxl_device_virtio *virtio = &d_config->virtios[i];
+ 
+         if (libxl_defbool_val(virtio->grant_usage) &&
+-            virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI) {
++            virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI &&
++            virtio->u.pci.host_id == host->id) {
+             uint16_t bdf = (virtio->u.pci.bus << 8) |
+                 (virtio->u.pci.dev << 3) | virtio->u.pci.func;
+             unsigned int j = 0;
+@@ -1068,30 +1180,65 @@ static int create_vpci_iommu_map(libxl__gc *gc, void *fdt,
+         }
+     }
+ 
+-    res = fdt_property(fdt, "iommu-map", full_iommu_map,
+-                       ntranslated * sizeof(uint32_t) * PCI_IOMMU_MAP_STRIDE);
++    res = fdt_property(fdt, "iommu-map", full_iommu_map, len);
+     if (res) return res;
+ 
+-    free(full_iommu_map);
+-
+     return 0;
+ }
+ 
+-static int make_vpci_node_virtio(libxl__gc *gc, void *fdt,
+-                                 libxl_domain_config *d_config)
++/* TODO Consider reusing make_vpci_node() */
++static int make_virtio_pci_node(libxl__gc *gc, void *fdt,
++                                libxl_virtio_pci_host *host,
++                                libxl_domain_config *d_config)
+ {
+     int res;
++    const char *name = GCSPRINTF("pcie@%"PRIx64, host->ecam_base);
++
++    res = fdt_begin_node(fdt, name);
++    if (res) return res;
++
++    res = fdt_property_compat(gc, fdt, 1, "pci-host-ecam-generic");
++    if (res) return res;
++
++    res = fdt_property_string(fdt, "device_type", "pci");
++    if (res) return res;
++
++    res = fdt_property_regs(gc, fdt, GUEST_ROOT_ADDRESS_CELLS,
++        GUEST_ROOT_SIZE_CELLS, 1, host->ecam_base, host->ecam_size);
++    if (res) return res;
++
++    res = fdt_property_values(gc, fdt, "bus-range", 2, 0, 1);
++    if (res) return res;
++
++    res = fdt_property_cell(fdt, "#address-cells", 3);
++    if (res) return res;
++
++    res = fdt_property_cell(fdt, "#size-cells", 2);
++    if (res) return res;
++
++    res = fdt_property_string(fdt, "status", "okay");
++    if (res) return res;
++
++    res = fdt_property_vpci_ranges(gc, fdt, GUEST_ROOT_ADDRESS_CELLS,
++        GUEST_ROOT_SIZE_CELLS, 2,
++        GUEST_VIRTIO_PCI_ADDR_TYPE_MEM, host->mem_base, host->mem_size,
++        GUEST_VIRTIO_PCI_ADDR_TYPE_PREFETCH_MEM, host->prefetch_mem_base,
++        host->prefetch_mem_size);
++    if (res) return res;
+ 
+     /* The same property as for virtio-mmio device */
+     res = fdt_property(fdt, "dma-coherent", NULL, 0);
+     if (res) return res;
+ 
+     /* Legacy PCI interrupts (#INTA - #INTD) */
+-    res = create_vpci_irq_map(gc, fdt);
++    res = create_virtio_pci_irq_map(gc, fdt, host);
+     if (res) return res;
+ 
+     /* xen,grant-dma bindings */
+-    res = create_vpci_iommu_map(gc, fdt, d_config);
++    res = create_virtio_pci_iommu_map(gc, fdt, host, d_config);
++    if (res) return res;
++
++    res = fdt_end_node(fdt);
+     if (res) return res;
+ 
+     return 0;
+@@ -1463,7 +1610,6 @@ static int libxl__prepare_dtb(libxl__gc *gc, libxl_domain_config *d_config,
+     libxl_domain_build_info *const info = &d_config->b_info;
+     bool iommu_needed = false;
+     unsigned int i;
+-    unsigned int num_virtio_pcidevs = 0;
+ 
+     const libxl_version_info *vers;
+     const struct arch_info *ainfo;
+@@ -1592,10 +1738,8 @@ next_resize:
+             if (libxl_defbool_val(virtio->grant_usage))
+                 iommu_needed = true;
+ 
+-            if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO) {
+-                num_virtio_pcidevs ++;
++            if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO)
+                 continue;
+-            }
+ 
+             FDT( make_virtio_mmio_node_device(gc, fdt, virtio->u.mmio.base,
+                                               virtio->u.mmio.irq, virtio->type,
+@@ -1603,13 +1747,10 @@ next_resize:
+                                               libxl_defbool_val(virtio->grant_usage)) );
+         }
+ 
+-        if (d_config->num_pcidevs || num_virtio_pcidevs) {
+-            FDT( make_vpci_node_common(gc, fdt, ainfo, dom) );
+-
+-            if (num_virtio_pcidevs)
+-                FDT( make_vpci_node_virtio(gc, fdt, d_config) );
++        for (i = 0; i < d_config->b_info.num_virtio_pci_hosts; i++) {
++            libxl_virtio_pci_host *host = &d_config->b_info.virtio_pci_hosts[i];
+ 
+-            FDT( fdt_end_node(fdt) );
++            FDT( make_virtio_pci_node(gc, fdt, host, d_config) );
+         }
+ 
+         /*
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index 196c9bb1fa..6e477bf8b0 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1775,6 +1775,20 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+         libxl__device_add(gc, domid, &libxl__pvcallsif_devtype,
+                           &d_config->pvcallsifs[i]);
+ 
++    /*
++     * This should be done before spawning device model, but after
++     * the creation of "device-model" directory in Xenstore.
++     */
++    for (i = 0; i < d_config->b_info.num_virtio_pci_hosts; i++) {
++        libxl_virtio_pci_host *host = &d_config->b_info.virtio_pci_hosts[i];
++
++        ret = libxl__save_dm_virtio_pci_host(gc, domid, host);
++        if (ret) {
++            LOGD(ERROR, domid, "Unable to save virtio_pci_host for device model");
++            goto error_out;
++        }
++    }
++
+     for (i = 0; i < d_config->num_virtios; i++) {
+         libxl_device_virtio *virtio = &d_config->virtios[i];
+ 
+diff --git a/tools/libs/light/libxl_dm.c b/tools/libs/light/libxl_dm.c
+index cf499b9ee5..6fd6fe6015 100644
+--- a/tools/libs/light/libxl_dm.c
++++ b/tools/libs/light/libxl_dm.c
+@@ -3396,6 +3396,76 @@ static int libxl__get_qdisk_backend_dm_args(libxl__gc *gc,
+     return 0;
+ }
+ 
++int libxl__save_dm_virtio_pci_host(libxl__gc *gc,
++                                   uint32_t domid,
++                                   libxl_virtio_pci_host *host)
++{
++    const char *dm_path;
++    char **dir;
++    xs_transaction_t t = XBT_NULL;
++    unsigned int n;
++    int rc;
++
++    dm_path = GCSPRINTF("/local/domain/%d/device-model", host->backend_domid);
++
++    dir = libxl__xs_directory(gc, XBT_NULL, dm_path, &n);
++    if (!dir)
++        return ERROR_INVAL;
++
++    dm_path = DEVICE_MODEL_XS_PATH(gc, host->backend_domid, domid, "/virtio_pci_host");
++
++    for (;;) {
++        rc = libxl__xs_transaction_start(gc, &t);
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/id", dm_path),
++                                     GCSPRINTF("%u", host->id));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/ecam_base", dm_path),
++                                     GCSPRINTF("%#"PRIx64, host->ecam_base));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/ecam_size", dm_path),
++                                     GCSPRINTF("%#"PRIx64, host->ecam_size));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/mem_base", dm_path),
++                                     GCSPRINTF("%#"PRIx64, host->mem_base));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/mem_size", dm_path),
++                                     GCSPRINTF("%#"PRIx64, host->mem_size));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/prefetch_mem_base", dm_path),
++                                     GCSPRINTF("%#"PRIx64, host->prefetch_mem_base));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/prefetch_mem_size", dm_path),
++                                     GCSPRINTF("%#"PRIx64, host->prefetch_mem_size));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/irq_first", dm_path),
++                                     GCSPRINTF("%u", host->irq_first));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/num_irqs", dm_path),
++                                     GCSPRINTF("%u", host->num_irqs));
++        if (rc) goto out;
++
++        rc = libxl__xs_transaction_commit(gc, &t);
++        if (!rc) break;
++        if (rc < 0) goto out;
++    }
++
++    return 0;
++
++out:
++    libxl__xs_transaction_abort(gc, &t);
++    return rc;
++}
++
+ int libxl__save_qdisk_backend_dm_args(libxl__gc *gc,
+                                       uint32_t domid,
+                                       uint32_t backend_domid,
+diff --git a/tools/libs/light/libxl_internal.h b/tools/libs/light/libxl_internal.h
+index afc0388b8f..33e92b94f0 100644
+--- a/tools/libs/light/libxl_internal.h
++++ b/tools/libs/light/libxl_internal.h
+@@ -4206,6 +4206,10 @@ _hidden int libxl__save_qdisk_backend_dm_args(libxl__gc *gc,
+                                               uint32_t backend_domid,
+                                               const libxl_domain_build_info *guest_info);
+ 
++_hidden int libxl__save_dm_virtio_pci_host(libxl__gc *gc,
++                                           uint32_t domid,
++                                           libxl_virtio_pci_host *host);
++
+ /*----- Domain creation -----*/
+ 
+ 
+diff --git a/tools/libs/light/libxl_types.idl b/tools/libs/light/libxl_types.idl
+index a5d12cb68a..081c7c2b37 100644
+--- a/tools/libs/light/libxl_types.idl
++++ b/tools/libs/light/libxl_types.idl
+@@ -581,6 +581,19 @@ libxl_altp2m_mode = Enumeration("altp2m_mode", [
+     (3, "limited"),
+     ], init_val = "LIBXL_ALTP2M_MODE_DISABLED")
+ 
++libxl_virtio_pci_host = Struct("virtio_pci_host", [
++    ("backend_domid",     libxl_domid),
++    ("id",                uint32),
++    ("ecam_base",         uint64),
++    ("ecam_size",         uint64),
++    ("mem_base",          uint64),
++    ("mem_size",          uint64),
++    ("prefetch_mem_base", uint64),
++    ("prefetch_mem_size", uint64),
++    ("irq_first",         uint32),
++    ("num_irqs",          uint32),
++    ])
++
+ libxl_domain_build_info = Struct("domain_build_info",[
+     ("max_vcpus",       integer),
+     ("avail_vcpus",     libxl_bitmap),
+@@ -656,6 +669,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
+     ("apic",             libxl_defbool),
+     ("dm_restrict",      libxl_defbool),
+     ("tee",              libxl_tee_type),
++    ("virtio_pci_hosts", Array(libxl_virtio_pci_host, "num_virtio_pci_hosts")),
+     ("u", KeyedUnion(None, libxl_domain_type, "type",
+                 [("hvm", Struct(None, [("firmware",         string),
+                                        ("bios",             libxl_bios_type),
+@@ -808,6 +822,7 @@ libxl_device_virtio = Struct("device_virtio", [
+                                       ("dev", uint8),
+                                       ("bus", uint8),
+                                       ("domain", uint16),
++                                      ("host_id", uint32),
+                                      ])),
+               ])),
+     ("grant_usage", libxl_defbool),
+diff --git a/tools/libs/light/libxl_virtio.c b/tools/libs/light/libxl_virtio.c
+index cf8744473c..95f37b6cf6 100644
+--- a/tools/libs/light/libxl_virtio.c
++++ b/tools/libs/light/libxl_virtio.c
+@@ -83,6 +83,7 @@ static int libxl__set_xenstore_virtio(libxl__gc *gc, uint32_t domid,
+         flexarray_append_pair(back, "bdf", GCSPRINTF("%04x:%02x:%02x.%01x",
+                               virtio->u.pci.domain, virtio->u.pci.bus,
+                               virtio->u.pci.dev, virtio->u.pci.func));
++        flexarray_append_pair(back, "host_id", GCSPRINTF("%u", virtio->u.pci.host_id));
+     }
+     flexarray_append_pair(back, "type", GCSPRINTF("%s", virtio->type));
+     flexarray_append_pair(back, "transport", GCSPRINTF("%s", transport));
+@@ -168,6 +169,15 @@ static int libxl__virtio_from_xenstore(libxl__gc *gc, const char *libxl_path,
+             virtio->u.pci.dev = dev;
+             virtio->u.pci.func = func;
+         }
++
++        tmp = NULL;
++        rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                    GCSPRINTF("%s/host_id", be_path), &tmp);
++        if (rc) goto out;
++
++        if (tmp) {
++            virtio->u.pci.host_id = strtoul(tmp, NULL, 0);
++        }
+     }
+ 
+     tmp = NULL;
+diff --git a/xen/include/public/arch-arm.h b/xen/include/public/arch-arm.h
+index 5b64aeadc5..5ac01a120f 100644
+--- a/xen/include/public/arch-arm.h
++++ b/xen/include/public/arch-arm.h
+@@ -471,6 +471,19 @@ typedef uint64_t xen_callback_t;
+ #define GUEST_VPCI_MEM_ADDR                 xen_mk_ullong(0x23000000)
+ #define GUEST_VPCI_MEM_SIZE                 xen_mk_ullong(0x10000000)
+ 
++/*
++ * 16 MB is reserved for virtio-pci configuration space based on calculation
++ * 8 bridges * 2 buses x 32 devices x 8 functions x 4 KB = 16 MB
++ */
++#define GUEST_VIRTIO_PCI_ECAM_BASE          xen_mk_ullong(0x33000000)
++#define GUEST_VIRTIO_PCI_TOTAL_ECAM_SIZE    xen_mk_ullong(0x01000000)
++#define GUEST_VIRTIO_PCI_HOST_ECAM_SIZE     xen_mk_ullong(0x00200000)
++
++/* 64 MB is reserved for virtio-pci memory */
++#define GUEST_VIRTIO_PCI_ADDR_TYPE_MEM    xen_mk_ullong(0x02000000)
++#define GUEST_VIRTIO_PCI_MEM_ADDR         xen_mk_ullong(0x34000000)
++#define GUEST_VIRTIO_PCI_MEM_SIZE         xen_mk_ullong(0x04000000)
++
+ /*
+  * 16MB == 4096 pages reserved for guest to use as a region to map its
+  * grant table in.
+@@ -481,6 +494,11 @@ typedef uint64_t xen_callback_t;
+ #define GUEST_MAGIC_BASE  xen_mk_ullong(0x39000000)
+ #define GUEST_MAGIC_SIZE  xen_mk_ullong(0x01000000)
+ 
++/* 64 MB is reserved for virtio-pci Prefetch memory */
++#define GUEST_VIRTIO_PCI_ADDR_TYPE_PREFETCH_MEM    xen_mk_ullong(0x42000000)
++#define GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR         xen_mk_ullong(0x3a000000)
++#define GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE         xen_mk_ullong(0x04000000)
++
+ #define GUEST_RAM_BANKS   2
+ 
+ /*
+@@ -535,7 +553,7 @@ typedef uint64_t xen_callback_t;
+ #define GUEST_FFA_SCHEDULE_RECV_INTR_ID   9
+ 
+ #define GUEST_VIRTIO_PCI_SPI_FIRST   44
+-#define GUEST_VIRTIO_PCI_SPI_LAST    48
++#define GUEST_VIRTIO_PCI_SPI_LAST    76
+ 
+ /* PSCI functions */
+ #define PSCI_cpu_suspend 0
