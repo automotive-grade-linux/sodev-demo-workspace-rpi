@@ -1,0 +1,45 @@
+From 14d9705a2ae7a6b77e83f0ca16baa5eb5ec56b46 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 29 May 2026 16:38:00 +0900
+Subject: [PATCH] vhost_xen: EXPORT_SYMBOL_GPL for module use
+
+When VHOST_XEN=y (built-in) and VHOST_NET=m (module), vhost_net.ko
+cannot link to vhost_xen_unmap_desc unless it's exported. V4H linux-renesas
+environment built both as the same type so it didn't hit this. On RPi5 the
+config merge results in mismatch. Add EXPORT_SYMBOL_GPL() for the three
+functions called from external modules.
+
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/vhost/xen.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
+index 30ec142718d2..4d3927e73feb 100644
+--- a/drivers/vhost/xen.c
++++ b/drivers/vhost/xen.c
+@@ -315,6 +315,7 @@ void vhost_xen_unmap_desc_all(struct vhost_virtqueue *vq)
+ 		vhost_xen_put_map(map);
+ 	}
+ }
++EXPORT_SYMBOL_GPL(vhost_xen_unmap_desc_all);
+ 
+ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+ 		int access)
+@@ -371,6 +372,7 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+ 
+ 	return (void *)(map->vaddr + offset);
+ }
++EXPORT_SYMBOL_GPL(vhost_xen_map_desc);
+ 
+ void vhost_xen_unmap_desc(struct vhost_virtqueue *vq, void *ptr, u32 size)
+ {
+@@ -390,6 +392,7 @@ void vhost_xen_unmap_desc(struct vhost_virtqueue *vq, void *ptr, u32 size)
+ 		vhost_xen_put_map(map);
+ 	}
+ }
++EXPORT_SYMBOL_GPL(vhost_xen_unmap_desc);
+ 
+ static const struct vhost_xen_ops vhost_xen_grant_ops = {
+ 	.alloc_map = vhost_xen_grant_alloc_map,

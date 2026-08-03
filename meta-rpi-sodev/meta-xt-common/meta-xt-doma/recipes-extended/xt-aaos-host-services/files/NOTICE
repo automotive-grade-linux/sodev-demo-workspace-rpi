@@ -1,0 +1,36 @@
+AAOS host-side backend daemons for DomA (RPi5 Xen SoDeV)
+=========================================================
+
+The following files redistributed by this recipe originate in the Android Open
+Source Project (AOSP) and are licensed under the Apache License, Version 2.0.
+
+Prebuilt aarch64 binaries:
+
+  * vehicle_hal_grpc_server   (AAOS VehicleHAL + power-state gRPC backend)
+  * dumpstate_grpc_server     (AAOS dumpstate gRPC backend)
+
+Source and configuration:
+
+  * gnss_replay.py            (mock GNSS host agent; modified -- see the file)
+  * aaos.dumpstate.xml        (dumpstate configuration)
+
+Copyright (C) The Android Open Source Project
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these files except in compliance with the License. You may obtain a copy of the
+License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+-----------------------------------------------------------------------------
+NOTE (staging): This NOTICE accompanies the prebuilt binaries per Apache-2.0
+section 4(d). It is a staged artifact (like the binaries themselves) and is not
+committed to the PR repository. When building the AAOS host services from a real
+AOSP tree, replace this file with the authoritative NOTICE emitted by that
+build (out/target/.../NOTICE or the components' own NOTICE files) so that all
+upstream copyright attributions are propagated verbatim.

@@ -1,0 +1,85 @@
+From 8e7b63525a1d3b00089202dbf3cbe60e1ef8cc2d Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Wed, 9 Aug 2023 10:18:52 +0300
+Subject: [PATCH] vhost_xen: Change a logic to get the guest domid
+
+The Xenstore entry "drivers/dom0-qemu-command-monitor/..." which
+represents Qemu command line is not present anymore since we
+changed a way to configure and spawn Qemu. So get the guest domid
+from "device-model" directory once it gets state "running".
+
+Again, the proper solution would be to pass guest domid from Qemu directly
+by extending some of VHOST ioctls (for example, VHOST_SET_MEM_TABLE).
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Acked-by: Volodymyr Babchuk <volodymyr_babchuk@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/linux commit ebd802dae723c6e035867b29263743328ec540e6
+---
+ drivers/vhost/xen.c | 45 +++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
+index bdeca47a3121..3b2ae7a3f7f6 100644
+--- a/drivers/vhost/xen.c
++++ b/drivers/vhost/xen.c
+@@ -407,24 +407,49 @@ static const struct vhost_xen_ops vhost_xen_foreign_ops = {
+ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 		const char *path, const char *token)
+ {
+-	char *str, *p;
++	char **dm_dir;
++	unsigned int n = 0;
+ 
+-	str = (char *)xenbus_read(XBT_NIL, "drivers/dom0-qemu-command-monitor",
+-			"value", NULL);
+-	if (XENBUS_IS_ERR_READ(str))
++	dm_dir = xenbus_directory(XBT_NIL, "device-model", "", &n);
++	if (IS_ERR(dm_dir))
+ 		return;
+ 
+-	p = strstr(str, "-xen-domid ");
+-	if (p) {
+-		guest_domid = simple_strtoul(p + strlen("-xen-domid "), NULL, 0);
+-		pr_info("%s: Get new domid: %u\n", __func__, guest_domid);
++	if (n == 0) {
++		if (guest_domid != DOMID_INVALID) {
++			guest_domid = DOMID_INVALID;
++			pr_info("%s: Reset current domid\n", __func__);
++		}
++	} else if (n == 1) {
++		char *dm_str, *dm_path;
++		domid_t domid;
++
++		domid = simple_strtoul(dm_dir[0], NULL, 0);
++
++		dm_path = kasprintf(GFP_KERNEL, "device-model/%d", domid);
++		if (!dm_path)
++			goto out;
++
++		dm_str = (char *)xenbus_read(XBT_NIL, dm_path, "state", NULL);
++		if (IS_ERR(dm_str)) {
++			kfree(dm_path);
++			goto out;
++		}
++
++		if (!strcmp(dm_str, "running")) {
++			guest_domid = domid;
++			pr_info("%s: Set new domid: %u\n", __func__, guest_domid);
++		}
++
++		kfree(dm_path);
++		kfree(dm_str);
+ 	}
+ 
+-	kfree(str);
++out:
++	kfree(dm_dir);
+ }
+ 
+ static struct xenbus_watch vhost_xen_qemu_args = {
+-	.node = "drivers/dom0-qemu-command-monitor/value",
++	.node = "device-model",
+ 	.callback = vhost_xen_get_guest_domid,
+ };
+ 

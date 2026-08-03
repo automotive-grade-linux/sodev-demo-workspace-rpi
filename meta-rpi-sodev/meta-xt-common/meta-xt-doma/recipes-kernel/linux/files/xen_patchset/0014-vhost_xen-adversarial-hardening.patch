@@ -1,0 +1,111 @@
+From 1777479d8d1283746207c10493468581c57a1680 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 21 Jul 2026 10:00:00 +0900
+Subject: [PATCH] vhost_xen: adversarial-review hardening (BV, MV1-MV4)
+
+Hardening from an adversarial review of the vhost_xen Xen-mapping paths.
+Applied as a trailing patch on top of the vhost_xen series so the existing
+0004-0013 quilt/git-am sequence stays byte-identical.
+
+ - BV  (vhost.c translate_desc): the CONFIG_VHOST_XEN early path writes
+        iov[0] and returns 1 without consulting iov_size, so a guest
+        chaining >UIO_MAXIOV indirect descriptors drives an OOB write past
+        the fixed iov[] array. Reject when no iovec slot is left
+        (iov_size == 0).
+ - MV2 (xen.c vhost_xen_map_desc): bound the guest-controlled size before
+        gnttab_alloc_pages(count), to avoid a ~4GB allocation attempt
+        (DomD OOM).
+ - MV1 (xen.c): on the map-failure path free the map with
+        vhost_xen_put_map() (unmap-then-free) instead of free_map(), which
+        left partially-mapped grants mapped while returning their pages
+        (cross-domain leak).
+ - MV3 (xen.c): READ_ONCE/WRITE_ONCE the global guest_domid (read from the
+        vhost worker, written from the xenwatch callback / sysfs param).
+ - MV4 (net.c): unmap the descriptors on the RX overrun-discard path
+        before continuing (they were mapped by get_rx_bufs), matching the
+        success path.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/vhost/net.c   |  4 ++++
+ drivers/vhost/vhost.c |  2 ++
+ drivers/vhost/xen.c   | 16 +++++++++++-----
+ 3 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index 2af217946abd..589137e30644 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -1254,6 +1254,10 @@ static void handle_rx(struct vhost_net *net)
+ 			err = sock->ops->recvmsg(sock, &msg,
+ 						 1, MSG_DONTWAIT | MSG_TRUNC);
+ 			pr_debug("Discarded rx packet: len %zd\n", sock_len);
++#ifdef CONFIG_VHOST_XEN
++			/* MV4: unmap the descriptors mapped for this discarded packet */
++			vhost_net_unmap_desc(vq, in);
++#endif
+ 			continue;
+ 		}
+ 		/* We don't need to be notified again. */
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index 4d97b6c50518..7b90042bb5c9 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -2665,6 +2665,8 @@ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 	int ret = 0;
+ 
+ #ifdef CONFIG_VHOST_XEN
++	if (!iov_size)
++		return -ENOBUFS;
+ 	iov->iov_len = len;
+ 	iov->iov_base = vhost_xen_map_desc(vq, addr, len, access);
+ 	if (IS_ERR(iov->iov_base))
+diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
+index 8ccbb086e33e..fb54996604f7 100644
+--- a/drivers/vhost/xen.c
++++ b/drivers/vhost/xen.c
+@@ -328,7 +328,14 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+ 	int count = XEN_PFN_UP(offset + size);
+ 	int ret;
+ 
+-	if (!xen_domain() || guest_domid == DOMID_INVALID)
++	/*
++	 * MV2: bound guest-controlled size; avoids an unbounded
++	 * gnttab_alloc_pages(count) attempt (up to ~4GB) => DomD OOM.
++	 */
++	if (size > (16u << 20))
++		return ERR_PTR(-EINVAL);
++
++	if (!xen_domain() || READ_ONCE(guest_domid) == DOMID_INVALID)
+ 		return ERR_PTR(-ENODEV);
+ 
+ 	if ((nogrant && (addr & XEN_GRANT_DMA_ADDR_OFF)) ||
+@@ -342,12 +347,12 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+ 	if (!map)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	map->domid = guest_domid;
++	map->domid = READ_ONCE(guest_domid);
+ 	ret = vhost_xen_ops->map_pages(map, addr, access == VHOST_ACCESS_RO);
+ 	if (ret) {
+ 		pr_err("%s: Failed to map pages from dom%d (ret=%d)\n",
+ 				__func__, map->domid, ret);
+-		vhost_xen_ops->free_map(map);
++		vhost_xen_put_map(map);
+ 		return ERR_PTR(ret);
+ 	}
+ 
+@@ -527,7 +532,7 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 			pr_warn("%s: no qualifying device-model among %u entries; keeping dom%u\n",
+ 				__func__, n, guest_domid);
+ 	} else if (new_domid != guest_domid) {
+-		guest_domid = new_domid;
++		WRITE_ONCE(guest_domid, new_domid);
+ 		if (new_domid == DOMID_INVALID)
+ 			pr_info("%s: Reset current domid\n", __func__);
+ 		else
+-- 
+2.34.1
+

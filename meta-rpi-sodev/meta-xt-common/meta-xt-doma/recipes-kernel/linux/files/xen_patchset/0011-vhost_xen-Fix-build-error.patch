@@ -1,0 +1,24 @@
+From e6829176efa69308c2597c5fe3639181a4350094 Mon Sep 17 00:00:00 2001
+From: Yuya Hamamachi <yuya.hamamachi.sx@renesas.com>
+Date: Fri, 31 Oct 2025 00:16:02 +0900
+Subject: [PATCH] vhost_xen: Fix build error
+
+Signed-off-by: Yuya Hamamachi <yuya.hamamachi.sx@renesas.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/linux commit 78da67e5d603010602fb1af5ae496fe147d50e8c
+---
+ drivers/vhost/xen.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
+index 3b2ae7a3f7f6..30ec142718d2 100644
+--- a/drivers/vhost/xen.c
++++ b/drivers/vhost/xen.c
+@@ -18,6 +18,7 @@
+ #include <xen/xenbus.h>
+ #include <xen/interface/memory.h>
+ #include <asm/xen/hypercall.h>
++#include <linux/vmalloc.h>
+ 
+ #include "vhost.h"
+ 

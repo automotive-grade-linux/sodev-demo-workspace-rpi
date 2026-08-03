@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Launch DomA (AAOS) via xl create (DomD toolstack, the disaggregated topology)
+# Adapted to the dom0less DomD configuration:
+#   - There is no xl-created DomD to depend on (Xen builds it dom0less from
+#     boot.cmd), so this unit waits on domd-toolstack-prep plus a direct xenstore
+#     poll of the driver-domain status nodes.
+#   - vhost_xen binds to a single guest domid, and it picks the LOWEST live
+#     domain that has a running device-model (see the xen_patchset 0013
+#     rebinding patch). DomA is the only guest that uses a vhost device -- its
+#     VHAL rides vhost-vsock on CID 2 -- so DomA has to be the one holding the
+#     lower domid, which means creating it BEFORE DomU
+#     (Before=xl-create-domu.service; vsock is also removed from domu.cfg as a
+#     second safeguard).
+# This unit now runs INSIDE DomD (the toolstack domain).
+# DomA's own disks need no Dom0 blkback chain: DomD owns the SD via SDHCI
+# passthrough and qemu reads /dev/mmcblk0p4 directly. (xl-attach-disks.service
+# still exists in the linux flavour, but only to hand DomD its own p2 root as
+# xvda -- it attaches nothing for DomA.) domd-toolstack-prep seeds
+# the Zephyr xenstore (cpupool name, xenconsoled domid), creates /var/lib/xen +
+# /var/log/xen/console and runs the console seeder that xl create's console
+# waits depend on.
+Requires=domd-toolstack-prep.service
+After=domd-toolstack-prep.service
+Before=xl-create-domu.service
+
+[Service]
+# In the earlier topology the device-model qemu was spawned by
+# `xl devd` (xendriverdomain.service) and inherited its hack-xdg drop-in env.
+# In the disaggregated topology THIS unit's xl/libxl spawns the dm directly, so provide the same env
+# here: the wayland vars let any SDL/display path connect to weston's global
+# socket, which weston.socket publishes at ${runtimedir}/wayland-0 = /run/wayland-0,
+# V3D_DEBUG=db is the Mesa V3D double-buffer perf knob, and they are harmless for
+# the headless dm case.
+Environment="XDG_RUNTIME_DIR=/run"
+Environment="WAYLAND_DISPLAY=wayland-0"
+Environment="SDL_VIDEODRIVER=wayland"
+Environment="V3D_DEBUG=db"
+Type=oneshot
+RemainAfterExit=yes
+# Note: systemd expands $VAR on Exec lines as a unit environment variable (empty if
+#       undefined), so every $ passed to the shell must be escaped as $$.
+# Mount SD p1 (FAT) at /mnt (doma.cfg kernel=/mnt/aaos-android-kernel).
+ExecStartPre=/bin/sh -c '[ -f /mnt/aaos-android-kernel ] || mount /dev/mmcblk0p1 /mnt'
+# Clean up stale device-model entries: remove only
+# /local/domain/<DomD>/device-model/<id> for domids that no longer exist (live
+# domains are left untouched). The logic lives in a script rather than inline,
+# because the awk field reference it needs requires a backslash-escaped `$`, which
+# systemd refuses -- it logged "Ignoring unknown escape sequences" for this line on
+# every boot.
+ExecStartPre=/usr/libexec/doma-devmodel-sweep
+# Wait for DomD weston to be ready (DomD weston-notification.service writes
+# /local/domain/1/drivers/weston-up/status=ready; qemu SDL needs the wayland
+# connection). Mounting the p2 ext4 rootfs plus a full systemd boot before weston
+# is ready takes a while, hence the generous 120s timeout.
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do [ "$$(xenstore-read /local/domain/1/drivers/weston-up/status 2>/dev/null)" = "ready" ] && exit 0; sleep 1; done; echo "DomD weston-up not ready after 120s"; exit 1'
+# Do not pass -F (with Type=oneshot, -F keeps xl in the foreground and would block
+# subsequent units forever).
+ExecStart=/usr/sbin/xl create /etc/xen/doma.cfg
+ExecStop=/usr/sbin/xl shutdown -w DomA
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
