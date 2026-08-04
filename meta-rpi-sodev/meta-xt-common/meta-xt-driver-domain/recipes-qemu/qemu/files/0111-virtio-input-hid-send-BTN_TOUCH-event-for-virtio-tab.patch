@@ -1,0 +1,72 @@
+From 35d9edda150b5ff452944be71b2f43ccfb864073 Mon Sep 17 00:00:00 2001
+Message-Id: <35d9edda150b5ff452944be71b2f43ccfb864073.1761234549.git.leonid_komarianskyi@epam.com>
+From: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Date: Wed, 22 Oct 2025 17:48:06 +0300
+Subject: [PATCH] virtio-input-hid: send BTN_TOUCH event for virtio-tablet-pci
+
+Currently, virtio-tablet-pci device sends BTN_MOUSE event, that is not
+what the quest domain expects. E.g., Android expects BTN_TOUCH event if
+ABS_X and ABS_Y are present:
+https://source.android.com/docs/core/interaction/input/touch-devices#touch-device-classification
+
+This leads to an issue when no clicks from the mouse device, no real
+touch events from the touchpad are not working in the guest domain.
+Changing event to BTN_TOUCH fixes the issue for virtio-tablet-pci.
+
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 35d9edda150b5ff452944be71b2f43ccfb864073
+---
+ hw/input/virtio-input-hid.c | 8 +++++++-
+ qapi/ui.json                | 2 +-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/hw/input/virtio-input-hid.c b/hw/input/virtio-input-hid.c
+index a7a244a95d..ca0da1055d 100644
+--- a/hw/input/virtio-input-hid.c
++++ b/hw/input/virtio-input-hid.c
+@@ -30,6 +30,7 @@ static const unsigned short keymap_button[INPUT_BUTTON__MAX] = {
+     [INPUT_BUTTON_WHEEL_DOWN]        = BTN_GEAR_DOWN,
+     [INPUT_BUTTON_SIDE]              = BTN_SIDE,
+     [INPUT_BUTTON_EXTRA]             = BTN_EXTRA,
++    [INPUT_BUTTON_TOUCH]             = BTN_TOUCH,
+ };
+ 
+ static const unsigned short axismap_rel[INPUT_AXIS__MAX] = {
+@@ -80,6 +81,8 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+     InputKeyEvent *key;
+     InputMoveEvent *move;
+     InputBtnEvent *btn;
++    bool is_tablet = vhid->handler && ((QemuInputHandler *)vhid->handler)->name &&
++        !strcmp(((QemuInputHandler *)vhid->handler)->name, VIRTIO_ID_NAME_TABLET);
+ 
+     switch (evt->type) {
+     case INPUT_EVENT_KIND_KEY:
+@@ -111,7 +114,10 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+             virtio_input_send(vinput, &event);
+         } else if (keymap_button[btn->button]) {
+             event.type  = cpu_to_le16(EV_KEY);
+-            event.code  = cpu_to_le16(keymap_button[btn->button]);
++            if (btn->button == INPUT_BUTTON_LEFT && is_tablet)
++                event.code = cpu_to_le16(BTN_TOUCH);
++            else
++                event.code = cpu_to_le16(keymap_button[btn->button]);
+             event.value = cpu_to_le32(btn->down ? 1 : 0);
+             virtio_input_send(vinput, &event);
+         } else {
+diff --git a/qapi/ui.json b/qapi/ui.json
+index 13a8bb82aa..adfdfb364a 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -992,7 +992,7 @@
+ ##
+ { 'enum'  : 'InputButton',
+   'data'  : [ 'left', 'middle', 'right', 'wheel-up', 'wheel-down', 'side',
+-  'extra', 'wheel-left', 'wheel-right' ] }
++  'extra', 'wheel-left', 'wheel-right', 'touch' ] }
+ 
+ ##
+ # @InputAxis:
+-- 
+2.34.1
+

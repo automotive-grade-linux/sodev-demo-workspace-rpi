@@ -1,0 +1,50 @@
+From ffa8dedfca0e11050653f16db96f84a1634a69aa Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 23 Jun 2026 00:00:00 +0900
+Subject: [PATCH] Revert "xen/ioreq: Do not let bufioreq to be used on other
+ than x86 arches" for the RPi5 virtio-pci device-model
+
+Upstream commit 2fbd7e609e1 (Oleksandr Tyshchenko) made
+ioreq_server_create() reject any non-x86 ioreq server that requests
+buffered I/O (bufioreq_handling != 0), with the rationale that "there
+is no caller which requires to send buffered I/O request on Arm".
+
+That premise does not hold for this disaggregated demo: the DomD
+device-model (qemu, hw/xen/xen_common.h:xen_create_ioreq_server())
+unconditionally passes HVM_IOREQSRV_BUFIOREQ_ATOMIC when creating its
+ioreq server for the DomU/DomA virtio-pci backends. On 4.19 the
+xen-troops fork carried this revert, so create_ioreq_server() accepted
+the ATOMIC request and the device-model came up (the buffered ioreq
+page is allocated but unused on Arm, which is harmless). The revert was
+lost during the 4.21 (xen-4.21-xt-gen5) rebase, so the same qemu now
+gets -EINVAL from create_ioreq_server() -> the device-model exits ->
+the guest PCIe host bridge (pcie.0) is never created -> "Bus 'pcie.0'
+not found" -> DomU/DomA stay black.
+
+Re-apply the 4.19 behaviour by dropping the Arm bufioreq rejection. The
+remaining `bufioreq_handling > HVM_IOREQSRV_BUFIOREQ_ATOMIC` range check
+is kept.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [intentional downstream revert of upstream hardening 2fbd7e609e -- re-permits bufioreq on Arm for this virtio-heavy disaggregated config; a deliberate security relaxation for the demo, not for upstream (upstream keeps the restriction)]
+---
+ xen/common/ioreq.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/xen/common/ioreq.c b/xen/common/ioreq.c
+index f5fd30ce12..7f7dd9459a 100644
+--- a/xen/common/ioreq.c
++++ b/xen/common/ioreq.c
+@@ -647,9 +647,6 @@ static int ioreq_server_create(struct domain *d, int bufioreq_handling,
+     unsigned int i;
+     int rc;
+ 
+-    if ( !IS_ENABLED(CONFIG_X86) && bufioreq_handling )
+-        return -EINVAL;
+-
+     if ( bufioreq_handling > HVM_IOREQSRV_BUFIOREQ_ATOMIC )
+         return -EINVAL;
+
+--
+2.34.1

@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: MIT
+// Derived from the DomA partial device tree of the V4H AGL SoDeV reference
+// (github.com/automotive-grade-linux/sodev-demo-workspace), adapted for RPi5.
+
+/dts-v1/;
+
+/* The dt-bindings/interrupt-controller/arm-gic.h include from the SoDeV reference
+ * is dropped here: no symbol from it is used, and its absence would fail the
+ * yocto dtc-native compile due to the missing header path. */
+
+/ {
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	passthrough {
+		compatible = "simple-bus";
+		ranges;
+		#address-cells = <2>;
+		#size-cells = <2>;
+	};
+
+	firmware {
+		android {
+			compatible = "android,firmware";
+
+			vbmeta {
+				compatible = "android,vbmeta";
+				/* partitions witch can be mount in the first stage */
+				parts = "vbmeta,boot,vendor_boot";
+				by_name_prefix="/dev/block/by-name";
+			};
+		};
+	};
+};
+

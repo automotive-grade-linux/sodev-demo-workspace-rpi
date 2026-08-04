@@ -1,0 +1,106 @@
+From 02b27580d0714f1ab3360cfe9a1041e14b0eb0f9 Mon Sep 17 00:00:00 2001
+From: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Date: Wed, 4 Apr 2018 20:22:27 +0300
+Subject: [PATCH 06/24] libxl: Add DTB passthrough nodes list
+
+Some platforms need more nodes from partial device tree in
+addition to "passthrough" node which are given to domain by
+default.
+
+Specify in domain configuration file which values should be added
+by providing "dtb_passthrough_nodes" list of strings separated by
+comas.
+
+Signed-off-by: Iurii Konovalenko <iurii.konovalenko@globallogic.com>
+Signed-off-by: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 02b27580d0714f1ab3360cfe9a1041e14b0eb0f9
+---
+ tools/libs/light/libxl_arm.c     | 20 ++++++++++++++++----
+ tools/libs/light/libxl_types.idl |  1 +
+ tools/xl/xl_parse.c              |  7 +++++++
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/tools/libs/light/libxl_arm.c b/tools/libs/light/libxl_arm.c
+index 7e9f8a1bc3..e4407d6e3f 100644
+--- a/tools/libs/light/libxl_arm.c
++++ b/tools/libs/light/libxl_arm.c
+@@ -1236,9 +1236,10 @@ static int copy_node_by_path(libxl__gc *gc, const char *path,
+  *  - /passthrough node
+  *  - /aliases node
+  */
+-static int copy_partial_fdt(libxl__gc *gc, void *fdt, void *pfdt)
++static int copy_partial_fdt(libxl__gc *gc, void *fdt, void *pfdt,
++                            const libxl_domain_build_info *info)
+ {
+-    int r;
++    int i, r;
+ 
+     r = copy_node_by_path(gc, "/passthrough", fdt, pfdt);
+     if (r < 0) {
+@@ -1252,6 +1253,16 @@ static int copy_partial_fdt(libxl__gc *gc, void *fdt, void *pfdt)
+         return r;
+     }
+ 
++    for (i = 0; i < libxl_string_list_length(&info->dt_passthrough_nodes);
++         i++) {
++        r = copy_node_by_path(gc, info->dt_passthrough_nodes[i], fdt, pfdt);
++        if (r < 0 && r != -FDT_ERR_NOTFOUND) {
++            LOG(ERROR, "Can't copy the node \"%s\" from the partial FDT",
++                info->dt_passthrough_nodes[i]);
++            return r;
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -1264,7 +1275,8 @@ static int check_partial_fdt(libxl__gc *gc, void *fdt, size_t size)
+     return ERROR_FAIL;
+ }
+ 
+-static int copy_partial_fdt(libxl__gc *gc, void *fdt, void *pfdt)
++static int copy_partial_fdt(libxl__gc *gc, void *fdt, void *pfdt,
++                            const libxl_domain_build_info *info)
+ {
+     /*
+      * We should never be here when the partial device tree is not
+@@ -1431,7 +1443,7 @@ next_resize:
+             FDT( make_xen_iommu_node(gc, fdt) );
+ 
+         if (pfdt)
+-            FDT( copy_partial_fdt(gc, fdt, pfdt) );
++            FDT( copy_partial_fdt(gc, fdt, pfdt, info) );
+ 
+         FDT( fdt_end_node(fdt) );
+ 
+diff --git a/tools/libs/light/libxl_types.idl b/tools/libs/light/libxl_types.idl
+index d64a573ff3..4a958f69f4 100644
+--- a/tools/libs/light/libxl_types.idl
++++ b/tools/libs/light/libxl_types.idl
+@@ -638,6 +638,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
+     # Note that the partial device tree should avoid to use the phandle
+     # 65000 which is reserved by the toolstack.
+     ("device_tree",      string),
++    ("dt_passthrough_nodes", libxl_string_list),
+     ("acpi",             libxl_defbool),
+     ("bootloader",       string),
+     ("bootloader_args",  libxl_string_list),
+diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
+index af86d3186d..1cc41f1bff 100644
+--- a/tools/xl/xl_parse.c
++++ b/tools/xl/xl_parse.c
+@@ -2620,6 +2620,13 @@ skip_vfb:
+         }
+     }
+ 
++    e = xlu_cfg_get_list_as_string_list(config, "dt_passthrough_nodes",
++                                        &b_info->dt_passthrough_nodes, 1);
++    if (e && e != ESRCH) {
++            fprintf(stderr,"xl: Unable to parse dt_passthrough_nodes\n");
++            exit(-ERROR_FAIL);
++    }
++
+     if (!xlu_cfg_get_list(config, "usbctrl", &usbctrls, 0, 0)) {
+         d_config->num_usbctrls = 0;
+         d_config->usbctrls = NULL;

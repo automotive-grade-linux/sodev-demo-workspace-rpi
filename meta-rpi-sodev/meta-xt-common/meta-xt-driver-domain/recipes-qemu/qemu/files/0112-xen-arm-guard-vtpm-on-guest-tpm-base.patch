@@ -1,0 +1,39 @@
+From a9ccb2c2c8430fe9966211582dc411a323673b08 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 20 Jun 2026 00:00:00 +0000
+Subject: [PATCH] xen/arm: guard vTPM device-model on GUEST_TPM_BASE (Xen 4.21)
+
+Xen 4.21 dropped GUEST_TPM_BASE / GUEST_TPM_SIZE (the ARM vTPM guest
+memory layout) from public/arch-arm.h. qemu 7.0.0's hw/arm/xen_arm.c
+xen_enable_tpm() references GUEST_TPM_BASE inside an "#ifdef CONFIG_TPM"
+block, so when CONFIG_TPM is enabled the build fails against 4.21 headers:
+
+    hw/arm/xen_arm.c:368: error: 'GUEST_TPM_BASE' undeclared
+
+vTPM is not used by this RPi5/Xen demo. Build the vTPM device-model
+wiring only when BOTH CONFIG_TPM and the guest layout define are present,
+so the same qemu source compiles against Xen 4.19 (define present) and
+Xen 4.21 (define absent). On 4.21 vTPM is simply compiled out.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/arm/xen_arm.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/xen_arm.c b/hw/arm/xen_arm.c
+--- a/hw/arm/xen_arm.c
++++ b/hw/arm/xen_arm.c
+@@ -349,7 +349,10 @@ void qmp_xen_set_global_dirty_log(bool enable, Error **errp)
+
+ static void xen_enable_tpm(void)
+ {
+-#ifdef CONFIG_TPM
++/* Xen 4.21 removed GUEST_TPM_BASE/GUEST_TPM_SIZE (ARM vTPM guest layout)
++ * from public/arch-arm.h. vTPM is unused in this demo; build the vTPM
++ * device-model wiring only when the guest layout define is present. */
++#if defined(CONFIG_TPM) && defined(GUEST_TPM_BASE)
+     Error *errp = NULL;
+     DeviceState *dev;
+     SysBusDevice *busdev;

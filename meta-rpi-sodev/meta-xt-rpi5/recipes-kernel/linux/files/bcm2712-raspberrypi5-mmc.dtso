@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+*/
+/dts-v1/;
+/plugin/;
+
+&passthrough {
+	mmc@1000fff000 {
+		compatible = "brcm,bcm2712-sdhci";
+		interrupt-parent = <&gic>;
+		interrupts = <0x0 0x111 0x4>;
+		reg-names = "host", "cfg", "busisol", "lcpll";
+		reg = <0x10 0xfff000 0x0 0x260 0x10 0xfff400 0x0 0x200
+		       0x10 0x15040b0 0x0 0x4 0x10 0x15200f0 0x0 0x24>;
+		clocks = <&clk_emmc2>;
+		clock-names = "sw_sdio";
+		cd-gpios = <&gpio7d517c00 0x5 0x1>;
+		sd-uhs-sdr104;
+		sd-uhs-ddr50;
+		sd-uhs-sdr50;
+		bus-width = <0x4>;
+		vmmc-supply = <&sd_vcc_reg>;
+		vqmmc-supply = <&sd_io_1v8_reg>;
+		mmc-ddr-3_3v;
+		sdhci-caps = <0x0 0x0>;
+		sdhci-caps-mask = <0xc000 0x0>;
+		xen,path = "/soc/mmc@fff000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x10 0xfff000 0x0 0x1000 0x10 0xfff000
+			   0x10 0x1504000 0x0 0x1000 0x10 0x1504000
+			   0x10 0x1520000 0x0 0x1000 0x10 0x1520000>;
+		status = "okay";
+	};
+
+	clk_emmc2: clk_emmc2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0x0>;
+		clock-output-names = "emmc2-clock";
+		clock-frequency = <0xbebc200>;
+	};
+
+	sd_io_1v8_reg: sd_io_1v8_reg {
+		compatible = "regulator-gpio";
+		states = <0x1b7740 0x1 0x325aa0 0x0>;
+		gpios = <&gpio7d517c00 0x3 0x0>;
+		regulator-settling-time-us = <0x1388>;
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-max-microvolt = <0x325aa0>;
+		regulator-min-microvolt = <0x1b7740>;
+		regulator-name = "vdd-sd-io";
+		status = "okay";
+	};
+
+	gpio7d517c00: gpio@107d517c00 {
+		compatible = "brcm,brcmstb-gpio";
+		#gpio-cells = <0x2>;
+		gpio-controller;
+		reg = <0x10 0x7d517c00 0x00 0x40>;
+		brcm,gpio-direct;
+		brcm,gpio-bank-widths = <0x11 0x6>;
+		xen,path = "/soc/gpio@7d517c00";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x10 0x7d517000 0x0 0x1000 0x10 0x7d517000>;
+	};
+
+	sd_vcc_reg: sd_vcc_reg {
+		compatible = "regulator-fixed";
+		gpios = <&gpio7d517c00 0x4 0x0>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-max-microvolt = <0x325aa0>;
+		regulator-min-microvolt = <0x325aa0>;
+		regulator-name = "vcc-sd";
+		status = "okay";
+	};
+};

@@ -1,0 +1,88 @@
+From 442d3aaa623a277bfcf056f257b01ef5ae875cb6 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 21 Jul 2022 14:51:01 +0300
+Subject: [PATCH 10/24] libxl: Pass max_vcpus to Qemu in case of PVH domain
+ (Arm) as well
+
+The number of vCPUs used for the IOREQ configuration (machine->smp.cpus)
+should really match the system value as for each vCPU we setup a dedicated
+evtchn for the communication with Xen at the runtime. This is needed
+for the IOREQ to be properly configured and work if the involved domain
+has more than one vCPU assigned.
+
+Note that Qemu should set mc->max_cpus to GUEST_MAX_VCPUS in
+xen_arm_machine_class_init().
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: the C comment above the vfb/p9 condition reworded; the condition itself is unchanged
+Origin: https://github.com/xen-troops/xen commit 442d3aaa623a277bfcf056f257b01ef5ae875cb6
+---
+ tools/libs/light/libxl_dm.c | 38 ++++++++++++++++++++++++-------------
+ 1 file changed, 25 insertions(+), 13 deletions(-)
+
+diff --git a/tools/libs/light/libxl_dm.c b/tools/libs/light/libxl_dm.c
+index 511ec76a65..268e9c9fa0 100644
+--- a/tools/libs/light/libxl_dm.c
++++ b/tools/libs/light/libxl_dm.c
+@@ -1301,18 +1301,6 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
+         if (!libxl__acpi_defbool_val(b_info)) {
+             flexarray_append(dm_args, "-no-acpi");
+         }
+-        if (b_info->max_vcpus > 1) {
+-            flexarray_append(dm_args, "-smp");
+-            if (b_info->avail_vcpus.size) {
+-                int nr_set_cpus = 0;
+-                nr_set_cpus = libxl_bitmap_count_set(&b_info->avail_vcpus);
+-
+-                flexarray_append(dm_args, GCSPRINTF("%d,maxcpus=%d",
+-                                                    nr_set_cpus,
+-                                                    b_info->max_vcpus));
+-            } else
+-                flexarray_append(dm_args, GCSPRINTF("%d", b_info->max_vcpus));
+-        }
+         for (i = 0; i < num_nics; i++) {
+             if (nics[i].nictype == LIBXL_NIC_TYPE_VIF_IOEMU) {
+                 char *smac = GCSPRINTF(LIBXL_MAC_FMT,
+@@ -1553,6 +1541,22 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
+     for (i = 0; b_info->extra && b_info->extra[i] != NULL; i++)
+         flexarray_append(dm_args, b_info->extra[i]);
+ 
++    if (b_info->type == LIBXL_DOMAIN_TYPE_HVM ||
++        b_info->type == LIBXL_DOMAIN_TYPE_PVH) {
++        if (b_info->max_vcpus > 1) {
++            flexarray_append(dm_args, "-smp");
++            if (b_info->avail_vcpus.size) {
++                int nr_set_cpus = 0;
++                nr_set_cpus = libxl_bitmap_count_set(&b_info->avail_vcpus);
++
++                flexarray_append(dm_args, GCSPRINTF("%d,maxcpus=%d",
++                                                    nr_set_cpus,
++                                                    b_info->max_vcpus));
++            } else
++                flexarray_append(dm_args, GCSPRINTF("%d", b_info->max_vcpus));
++        }
++    }
++
+     flexarray_append(dm_args, "-machine");
+     switch (b_info->type) {
+     case LIBXL_DOMAIN_TYPE_PVH:
+@@ -3726,7 +3730,15 @@ int libxl__need_xenpv_qemu(libxl__gc *gc, libxl_domain_config *d_config)
+         goto out;
+     }
+ 
+-    if (d_config->num_vfbs > 0) {
++    /*
++     * On ARM, the xenpv machine backs PV frontends via QEMU. Both the
++     * virtual framebuffer (vfb) and the 9pfs (p9s) frontends need a
++     * xenpv QEMU device model.
++     *
++     * So start a xenpv QEMU when either a vfb or a 9pfs frontend is
++     * configured (matches the check below).
++     */
++    if (d_config->num_vfbs > 0 || d_config->num_p9s > 0) {
+         ret = 1;
+         goto out;
+     }

@@ -1,0 +1,32 @@
+From b56b37e87ffaf6d70dd9fe589ec959e4a9dfddc0 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xrun: compile without CONFIG_SDHC (DomD owns the SD)
+
+With the SoC SDHCI passed through to DomD (DomD-as-toolstack), the Zephyr
+Dom0 disables CONFIG_SDHC and CONFIG_SDHC_BUFFER_ALIGNMENT no longer exists.
+Provide a safe fallback so the xrun storage path keeps compiling; it is unused
+at runtime in this topology.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/src/storage.c b/src/storage.c
+index 4452fd7..8ee601d 100644
+--- a/src/storage.c
++++ b/src/storage.c
+@@ -11,6 +11,13 @@
+ 
+ #include <storage.h>
+ 
++/* SDHC is disabled (the SD is passed through to DomD),
++ * so CONFIG_SDHC_BUFFER_ALIGNMENT does not exist; keep compiling with a safe
++ * default (the storage path is unused at runtime in this topology). */
++#ifndef CONFIG_SDHC_BUFFER_ALIGNMENT
++#define CONFIG_SDHC_BUFFER_ALIGNMENT 4
++#endif
++
+ LOG_MODULE_REGISTER(storage);
+ 
+ #if CONFIG_XRUN_STORAGE_DMA_DEBOUNCE > 0

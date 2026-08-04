@@ -1,0 +1,67 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Bring up the Dom0<->DomD vif and make Dom0 reachable from the flat segment
+# via ROUTING (the netfront is NOT bridged).
+#
+# DomD is a dom0less domain (domid 1) created by Xen at boot; unlike an
+# xl-created guest it gets no vif from a config file, so the Dom0 toolstack
+# must attach one (xen-netback creates vif<domid>.0). This link is a private
+# point-to-point segment 192.168.0.0/24: Dom0 end = 192.168.0.1, DomD end
+# (its xen-netfront enX0, via 20-domd-vif.network) = 192.168.0.11.
+#
+# IMPORTANT: the netfront is deliberately NOT enslaved into DomD's xenbr0.
+# Bridging the xen-netfront wedges DomD's xenbus (verified on HW: SSH banner
+# hangs, guests stuck, ping-only). Instead DomD forwards (ip_forward=1) between
+# xenbr0 (192.168.10.0/24) and this link, and Dom0 installs a return route to
+# the flat segment (below). PC reaches Dom0 with
+#   ip route add 192.168.0.0/24 via <DomD-on-xenbr0 192.168.10.10>
+#   ssh root@192.168.0.1
+# (Touch is now native in DomD via RP1 USB passthrough; the old point-to-point
+# touch forwarder is gone -- only this vif bring-up remains.)
+DOMID=1
+VIF="vif${DOMID}.0"
+IPADDR="192.168.0.1/24"
+PEER="192.168.0.11"
+# flat-segment DomD gateway (xenbr0 addr) for Dom0's return route.
+DOMD_FLAT="192.168.10.10"
+
+# 1) Wait for the dom0less DomD's libxl METADATA, not just `xl list`.
+#    `xl network-attach` aborts early with
+#      "xenstore read failed: /libxl/1/type: No such file or directory"
+#    until the dom0less xenstore tree (/libxl/<domid>/...) has been pre-built,
+#    which lands a little AFTER the domain itself is listable. Polling on
+#    /libxl/<domid>/type is what makes this work hands-free at boot (a plain
+#    `xl list` wait raced ahead of the metadata and the attach failed).
+i=0
+while [ "$i" -lt 180 ]; do
+    xenstore-read "/libxl/${DOMID}/type" >/dev/null 2>&1 && break
+    i=$((i + 1)); sleep 1
+done
+
+# 2) Attach the vif + give the Dom0 end its point-to-point IP, retrying until
+#    DomD answers. `xl network-attach` returns non-zero because the default
+#    vif-bridge hotplug script can't find xenbr0 (there is no bridge in this
+#    architecture), but the xen-netback driver still creates vif<domid>.0, so
+#    we configure that interface ourselves. DomD auto-assigns 192.168.0.11/24
+#    to its netfront (20-domd-vif.network).
+i=0
+while [ "$i" -lt 40 ]; do
+    if ! ip link show "$VIF" >/dev/null 2>&1; then
+        xl network-attach "$DOMID" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    if ip link show "$VIF" >/dev/null 2>&1; then
+        ip addr add "$IPADDR" dev "$VIF" 2>/dev/null || true
+        ip link set "$VIF" up 2>/dev/null || true
+        # Return route to the flat 192.168.10.0/24 segment via DomD's end of
+        # this point-to-point link (PEER=192.168.0.11), so Dom0 can reply to
+        # PC (192.168.10.x) SSH through DomD's IP forwarding. NAT is not usable
+        # (DomD kernel ships no iptables/nft), so this route is what makes the
+        # PC<->Dom0 path bidirectional. DOMD_FLAT (${DOMD_FLAT}) is the address
+        # PC routes 192.168.0.0/24 through.
+        ip route replace 192.168.10.0/24 via "$PEER" dev "$VIF" 2>/dev/null || true
+        ping -c1 -W1 "$PEER" >/dev/null 2>&1 && exit 0
+    fi
+    i=$((i + 1)); sleep 1
+done
+exit 0

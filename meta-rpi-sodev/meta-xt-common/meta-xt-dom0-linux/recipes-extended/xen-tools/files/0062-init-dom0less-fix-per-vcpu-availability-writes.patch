@@ -1,0 +1,57 @@
+From 2a787cd9a14341beccc4774d23f9957b14cc7437 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] init-dom0less: fix the per-vcpu availability writes
+
+create_xenstore() has two bugs in its per-vcpu loop, invisible for
+single-vCPU dom0less domains (the loop body never runs when
+vcpu_max_id == 0) and fatal the moment a dom0less domain has two
+vCPUs:
+
+1. The node path is built as "cpu/%u/availability/" -- the trailing
+   slash is an invalid xenstore path, so the write fails, the
+   transaction aborts and init-dom0less exits 1 (with the misleading
+   err(3) output "writing to xenstore: Success", errno being 0).
+   The domain is then never introduced: no xenbus, no consoles.
+
+2. The value is derived from info->cpupool, which is the cpupool ID
+   the domain belongs to (0), not a vCPU bitmap. Every vCPU therefore
+   gets "availability" = "offline", and the guest's xen cpu_hotplug
+   driver dutifully hot-unplugs the boot CPU as soon as the node
+   appears ("psci: CPU0 killed"). With the driver domain's vCPU0 gone
+   its ioreq event channels are never delivered, and every ioreq-
+   served guest freezes at its first emulated access, blocked-in-Xen.
+
+   (Bug 1 masked bug 2: while the write failed, the poisonous
+   "offline" value never reached the store.)
+
+Write "cpu/<n>/availability" = "online" for every vCPU, matching what
+the regular xl create path puts in the store. Also iterate to
+vcpu_max_id inclusive so the last vCPU gets its node too.
+
+Observed on Xen 4.21 + a Linux thin Dom0 driving a 2-vCPU dom0less
+driver domain (Raspberry Pi 5). Candidate for upstream submission.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+
+--- a/tools/helpers/init-dom0less.c
++++ b/tools/helpers/init-dom0less.c
+@@ -181,13 +181,12 @@
+     if (!do_xs_write_dom(xsh, t, domid, "vm", vm_val_str)) goto err;
+     if (!do_xs_write_dom(xsh, t, domid, "name", dom_name_str)) goto err;
+     if (!do_xs_write_dom(xsh, t, domid, "cpu", "")) goto err;
+-    for (i = 0; i < info->vcpu_max_id; i++) {
+-        rc = snprintf(cpu_str, STR_MAX_LENGTH, "cpu/%u/availability/", i);
++    for (i = 0; i <= info->vcpu_max_id; i++) {
++        rc = snprintf(cpu_str, STR_MAX_LENGTH, "cpu/%u/availability", i);
+         if (rc < 0 || rc >= STR_MAX_LENGTH)
+             goto err;
+         rc = -EIO;
+-        if (!do_xs_write_dom(xsh, t, domid, cpu_str,
+-                             (info->cpupool & (1 << i)) ? "online" : "offline"))
++        if (!do_xs_write_dom(xsh, t, domid, cpu_str, "online"))
+             goto err;
+     }
+ 

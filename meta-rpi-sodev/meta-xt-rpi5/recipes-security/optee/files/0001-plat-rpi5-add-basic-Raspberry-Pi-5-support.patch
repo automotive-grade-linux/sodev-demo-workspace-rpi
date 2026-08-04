@@ -1,0 +1,175 @@
+From 62961cf5363a009081b8e283fa91d5715fd5f374 Mon Sep 17 00:00:00 2001
+From: Volodymyr Babchuk <volodymyr_babchuk@epam.com>
+Date: Thu, 23 May 2024 01:33:36 +0300
+Subject: [PATCH] plat: rpi5: add basic Raspberry Pi 5 support
+
+RPi5 is based on new BCM2712 SoC which is based on quad Cortex-A76.
+
+BCM2712 still does not provide secure memory so we are free to locate
+OP-TEE anything we want. It would be most beneficial to locate OP-TEE
+right after TF-A, at address 0x80000, but RPi5 loader places kernel
+there and it's location can't be changed.
+
+According to PCB silkscreen, RPi5 boards can have 1GB, 2GB, 4GB or 8GB
+of memory. To be compatible with any variant, OP-TEE is placed close
+to the end of the first gigabyte.
+
+BCM2712 uses PL011 as debug UART so we enable its driver.
+
+According to specification, BCM2712 includes cryptography extensions,
+but this basic port does not enable them.
+
+Signed-off-by: Volodymyr Babchuk <volodymyr_babchuk@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/optee_os commit 62961cf5363a009081b8e283fa91d5715fd5f374
+---
+ core/arch/arm/plat-rpi5/conf.mk           | 21 +++++++++++
+ core/arch/arm/plat-rpi5/main.c            | 44 ++++++++++++++++++++++
+ core/arch/arm/plat-rpi5/platform_config.h | 46 +++++++++++++++++++++++
+ core/arch/arm/plat-rpi5/sub.mk            |  2 +
+ 4 files changed, 113 insertions(+)
+ create mode 100644 core/arch/arm/plat-rpi5/conf.mk
+ create mode 100644 core/arch/arm/plat-rpi5/main.c
+ create mode 100644 core/arch/arm/plat-rpi5/platform_config.h
+ create mode 100644 core/arch/arm/plat-rpi5/sub.mk
+
+diff --git a/core/arch/arm/plat-rpi5/conf.mk b/core/arch/arm/plat-rpi5/conf.mk
+new file mode 100644
+index 000000000..4bc963508
+--- /dev/null
++++ b/core/arch/arm/plat-rpi5/conf.mk
+@@ -0,0 +1,21 @@
++include core/arch/arm/cpu/cortex-armv8-0.mk
++
++$(call force,CFG_TEE_CORE_NB_CORE,4)
++$(call force,CFG_ARM64_core,y)
++$(call force,CFG_WITH_LPAE,y)
++$(call force,CFG_AUTO_MAX_PA_BITS,y)
++$(call force,CFG_LPAE_ADDR_SPACE_BITS,40)
++
++CFG_SHMEM_START     ?= 0x08000000
++CFG_SHMEM_SIZE      ?= 0x00400000
++CFG_TZDRAM_START    ?= 0x1D000000
++CFG_TZDRAM_SIZE     ?= 0x02000000
++CFG_TEE_RAM_VA_SIZE ?= 0x00700000
++CFG_DT              ?= y
++CFG_DTB_MAX_SIZE    ?= 0x20000
++
++$(call force,CFG_PL011,y)
++$(call force,CFG_SECURE_TIME_SOURCE_CNTPCT,y)
++$(call force,CFG_WITH_ARM_TRUSTED_FW,y)
++
++CFG_NUM_THREADS ?= 4
+diff --git a/core/arch/arm/plat-rpi5/main.c b/core/arch/arm/plat-rpi5/main.c
+new file mode 100644
+index 000000000..0d55fc5c0
+--- /dev/null
++++ b/core/arch/arm/plat-rpi5/main.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: BSD-2-Clause
++/*
++ * Copyright (c) 2016, Sequitur Labs Inc. All rights reserved.
++ * Copyright (c) 2024, EPAM Systems.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ * this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <console.h>
++#include <drivers/pl011.h>
++#include <platform_config.h>
++
++register_phys_mem_pgdir(MEM_AREA_IO_NSEC,
++			CONSOLE_UART_BASE, PL011_REG_SIZE);
++
++static struct pl011_data console_data __nex_bss;
++
++void plat_console_init(void)
++{
++	pl011_init(&console_data, CONSOLE_UART_BASE, CONSOLE_UART_CLK_IN_HZ,
++		   CONSOLE_BAUDRATE);
++	register_serial_console(&console_data.chip);
++}
+diff --git a/core/arch/arm/plat-rpi5/platform_config.h b/core/arch/arm/plat-rpi5/platform_config.h
+new file mode 100644
+index 000000000..05281f6fb
+--- /dev/null
++++ b/core/arch/arm/plat-rpi5/platform_config.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2016, Sequitur Labs Inc. All rights reserved.
++ * Copyright (c) 2024, EPAM Systems.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ * this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef PLATFORM_CONFIG_H
++#define PLATFORM_CONFIG_H
++
++#include <mm/generic_ram_layout.h>
++
++/* Make stacks aligned to data cache line length */
++#define STACK_ALIGNMENT		64
++
++/* PL011 UART */
++#define CONSOLE_UART_BASE	0x107d001000ULL /* UART0 */
++#define CONSOLE_BAUDRATE	0		/* VPU will set UART for us */
++#define CONSOLE_UART_CLK_IN_HZ  0
++
++#define DRAM0_BASE		0x00000000
++#define DRAM0_SIZE		0x200000000
++
++#endif /* PLATFORM_CONFIG_H */
+diff --git a/core/arch/arm/plat-rpi5/sub.mk b/core/arch/arm/plat-rpi5/sub.mk
+new file mode 100644
+index 000000000..8ddc2fd45
+--- /dev/null
++++ b/core/arch/arm/plat-rpi5/sub.mk
+@@ -0,0 +1,2 @@
++global-incdirs-y += .
++srcs-y += main.c
+-- 
+2.45.1
+

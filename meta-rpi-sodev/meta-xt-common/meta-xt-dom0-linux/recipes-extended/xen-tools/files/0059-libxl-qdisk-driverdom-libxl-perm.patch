@@ -1,0 +1,93 @@
+From a99077668e5d2bb07bfe0c414784698024a8f3eb Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 8 Jun 2026 00:00:00 +0000
+Subject: [PATCH] libxl: set up driver-domain device-model xenstore tree for
+ disaggregated qemu
+
+When the guest device-model (qemu) runs in a driver domain (a virtio
+backend_domid != toolstack/dom0), the driver domain runs "xl devd", which:
+ (a) requires /local/domain/<be>/device-model to exist - libxl__save_dm_virtio_
+     pci_host() does xs_directory() on it and aborts (ERROR_INVAL) otherwise;
+ (b) records the spawned qdisk backend pid via libxl__spawn_record_pid() writing
+     the relative path "libxl/<domid>/qdisk-backend-pid", which - for the driver
+     domain's (unprivileged) xenstore connection - resolves to
+     /local/domain/<be>/libxl/<domid>/qdisk-backend-pid.
+
+Both paths live in the driver domain's tree, which is owned by the toolstack
+(dom0) with no access for the domain itself (/local/domain/<be> = (n0)), so the
+driver domain gets EACCES and the device-model spawn fails (rc=-3); the virtio
+backends never connect and the guest cannot display.
+
+Create both nodes here in libxl__domain_make() (which runs in the toolstack,
+before any virtio backend - and thus the driver-domain qemu spawn - exists) with
+RW permission for the driver domain. Resolved on HW (RPi5 dom0less driver domain
+DomD): without this the qdisk-backend-pid write fails with "Permission denied".
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ tools/libs/light/libxl_create.c | 52 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -818,6 +818,58 @@
+     libxl__xs_mknod(gc, t, GCSPRINTF("%s/device", libxl_path),
+                     noperm, ARRAY_SIZE(noperm));
+ 
++        /*
++         * For a disaggregated device-model (qemu running in a
++         * driver domain, i.e. a virtio backend_domid != toolstack/dom0), the
++         * driver domain runs "xl devd", which (a) needs
++         * /local/domain/<be>/device-model to exist (checked by
++         * libxl__save_dm_virtio_pci_host) and (b) records the qdisk backend
++         * pid at /local/domain/<be>/libxl/<domid>/qdisk-backend-pid (a
++         * relative path resolved against the driver domain home). Both live
++         * in the driver domain tree, owned by the toolstack (dom0), so create
++         * them now with RW for the driver domain (this runs in the toolstack),
++         * before any virtio backend (which triggers the spawn) is written.
++         */
++        {
++            int rpi5_v;
++            for ( rpi5_v = 0; rpi5_v < d_config->num_virtios; rpi5_v++ ) {
++                libxl_device_virtio *rpi5_vio = &d_config->virtios[rpi5_v];
++                uint32_t rpi5_be = rpi5_vio->backend_domid;
++                struct xs_permissions rpi5_dmperm[2];
++
++                if ( rpi5_vio->backend_type != LIBXL_VIRTIO_BACKEND_QEMU )
++                    continue;
++                if (rpi5_be == LIBXL_TOOLSTACK_DOMID &&
++                    rpi5_vio->backend_domname &&
++                    libxl__resolve_domid(gc, rpi5_vio->backend_domname,
++                                         &rpi5_be) < 0)
++                    continue;
++                if ( rpi5_be == LIBXL_TOOLSTACK_DOMID )
++                    continue;
++
++                rpi5_dmperm[0].id = 0;
++                rpi5_dmperm[0].perms = XS_PERM_NONE;
++                rpi5_dmperm[1].id = rpi5_be;
++                rpi5_dmperm[1].perms = XS_PERM_READ | XS_PERM_WRITE;
++                libxl__xs_mknod(gc, t,
++                    GCSPRINTF("/local/domain/%u/libxl", rpi5_be),
++                    rpi5_dmperm, ARRAY_SIZE(rpi5_dmperm));
++                libxl__xs_mknod(gc, t,
++                    GCSPRINTF("/local/domain/%u/device-model", rpi5_be),
++                    rpi5_dmperm, ARRAY_SIZE(rpi5_dmperm));
++                /* Also pre-create the backend root
++                 * DomD-owned, so the intermediate dirs xenstored auto-creates
++                 * under it (backend/<kind>/<domU>) inherit DomD perms and the
++                 * driver domain's "xl devd" can traverse/watch them. (QEMU
++                 * harness confirmed an un-traversable backend root is the first
++                 * cause of the spawn watch never firing.) */
++                libxl__xs_mknod(gc, t,
++                    GCSPRINTF("/local/domain/%u/backend", rpi5_be),
++                    rpi5_dmperm, ARRAY_SIZE(rpi5_dmperm));
++                break;
++            }
++        }
++
+     xs_write(ctx->xsh, t, GCSPRINTF("%s/vm", dom_path), vm_path, strlen(vm_path));
+     rc = libxl__domain_rename(gc, *domid, 0, info->name, t);
+     if (rc)

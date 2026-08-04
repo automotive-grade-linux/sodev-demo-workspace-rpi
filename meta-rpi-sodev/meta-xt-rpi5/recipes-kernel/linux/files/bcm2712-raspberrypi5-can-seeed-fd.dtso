@@ -1,0 +1,134 @@
+/*
+ * Copyright (c) 2025 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+*/
+/dts-v1/;
+/plugin/;
+
+&passthrough {
+	can1_osc: mcp251xfd-spi0-1-osc {
+		#clock-cells = <0x00>;
+		clock-frequency = <40000000>;
+		compatible = "fixed-clock";
+	};
+
+	can0_osc: mcp251xfd-spi0-0-osc {
+		#clock-cells = <0x00>;
+		clock-frequency = <40000000>;
+		compatible = "fixed-clock";
+	};
+};
+
+
+&gpiod0000 {
+	can1_pins: mcp251xfd_spi0_1_pins {
+		brcm,function = <0x00>;
+		brcm,pins = <0x18>;
+	};
+
+	can0_pins: mcp251xfd_spi0_0_pins {
+		brcm,function = <0x00>;
+		brcm,pins = <0x19>;
+	};
+
+	spi0_pins: rp1_spi0_gpio9 {
+		function = "spi0";
+		pins = "gpio9", "gpio10", "gpio11";
+		drive-strength = <0x0c>;
+		bias-disable;
+		slew-rate = <0x01>;
+	};
+
+	spi0_cs_pins: rp1_spi0_cs_gpio7 {
+		function = "spi0";
+		pins = "gpio7", "gpio8";
+		bias-pull-up;
+	};
+
+	i2c1_pins: rp1_i2c1_2_3 {
+		function = "i2c1";
+		pins = "gpio2", "gpio3";
+		drive-strength = <0x0c>;
+		bias-pull-up;
+	};
+};
+
+&rp1 {
+	rp1_dma: dma@188000 {
+		snps,data-width = <0x04>;
+		snps,priority = <0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07>;
+		clock-names = "core-clk", "cfgr-clk";
+		interrupts = <0x28 0x04>;
+		clocks = <&clocks18000 0x0e &clocks18000 0x0c>;
+		snps,axi-max-burst-len = <0x04>;
+		snps,dma-masters = <0x01>;
+		compatible = "snps,axi-dma-1.01a";
+		status = "okay";
+		snps,block-size = <0x40000 0x40000 0x40000 0x40000 0x40000 0x40000 0x40000 0x40000>;
+		reg = <0xc0 0x40188000 0x00 0x1000>;
+		snps,dma-targets = <0x40>;
+		dma-channels = <0x08>;
+		#dma-cells = <0x01>;
+	};
+
+	rp1_spi0: spi@50000 {
+		pinctrl-names = "default";
+		#address-cells = <0x01>;
+		num-cs = <0x02>;
+		pinctrl-0 = <&spi0_pins>, <&spi0_cs_pins>;
+		clock-names = "ssi_clk";
+		interrupts = <0x13 0x04>;
+		clocks = <&clocks18000 0x0c>;
+		#size-cells = <0x00>;
+		dma-names = "tx", "rx";
+		compatible = "snps,dw-apb-ssi";
+		status = "okay";
+		reg = <0xc0 0x40050000 0x00 0x130>;
+		dmas = <&rp1_dma 0x0d>,
+		       <&rp1_dma 0x0c>;
+		cs-gpios = <&gpiod0000 0x08 0x01>, <&gpiod0000 0x07 0x01>;
+
+		can1: mcp251xfd@1 {
+			pinctrl-names = "default";
+			pinctrl-0 = <&can1_pins>;
+			interrupts = <0x18 0x08>;
+			clocks = <&can1_osc>;
+			spi-max-frequency = <20000000>;
+			interrupt-parent = <&gpiod0000>;
+			compatible = "microchip,mcp251xfd";
+			reg = <0x01>;
+		};
+
+		can0: mcp251xfd@0 {
+			pinctrl-names = "default";
+			pinctrl-0 = <&can0_pins>;
+			interrupts = <0x19 0x08>;
+			clocks = <&can0_osc>;
+			spi-max-frequency = <20000000>;
+			interrupt-parent = <&gpiod0000>;
+			compatible = "microchip,mcp251xfd";
+			reg = <0x00>;
+		};
+	};
+
+	i2c@74000 {
+		pinctrl-names = "default";
+		#address-cells = <0x01>;
+		pinctrl-0 = <&i2c1_pins>;
+		i2c-scl-rising-time-ns = <65>;
+		i2c-scl-falling-time-ns = <100>;
+		interrupts = <0x08 0x04>;
+		clocks = <&clocks18000 0x0c>;
+		#size-cells = <0x00>;
+		clock-frequency = <0x186a0>;
+		compatible = "snps,designware-i2c";
+		status = "okay";
+		reg = <0xc0 0x40074000 0x00 0x1000>;
+
+		pcf85063@51 {
+			compatible = "nxp,pcf85063";
+			reg = <0x51>;
+		};
+	};
+};

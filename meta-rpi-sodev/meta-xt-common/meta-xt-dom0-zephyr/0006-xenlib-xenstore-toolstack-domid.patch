@@ -1,0 +1,114 @@
+From 68a142d36ba3edc6c57dc9fef139f4cd58a98ae3 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: xenstore toolstack domid support
+
+Let xenstore accept a control/toolstack domid distinct from Dom0, so that a
+disaggregated driver domain can act as the toolstack, via is_privileged()
+instead of a hardcoded domid==0 owner check.
+
+Also fix handle_set_perms(): it dereferenced `entry` in is_owner(entry, ...)
+before the NULL check (dead condition + NULL deref when the node is absent);
+now returns ENOENT when the entry does not exist.
+
+toolstack_domid starts at CONFIG_XENSTORE_TOOLSTACK_DOMID (1, the first
+dom0less domain on this board) and xss_set_toolstack_domid() corrects it once
+the real domid is known. This patch only adds the variable and the setter; the
+next patch in the series calls the setter from the dom0less enumeration in
+xen-dom-mgmt, so nothing relies on the Kconfig default being right. Until that
+call is in place a build that places DomD at a domid other than 1 would grant
+xenstore privilege -- including XS_INTRODUCE and XS_RELEASE -- to whichever
+domain happened to get domid 1.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/Kconfig b/Kconfig
+index 200cdec..07c06c4 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -9,6 +9,15 @@ config XEN_STORE_SRV
+ 	  Enable xenstore server library. It should be included
+ 	  if you are running Zephyr as Dom0.
+ 
++config XENSTORE_TOOLSTACK_DOMID
++	int "Domid of the privileged toolstack domain (DomD)"
++	depends on XEN_STORE_SRV
++	default 1
++	help
++	  Domid that is granted Dom0-equivalent xenstore privilege so it can act
++	  as the toolstack domain (DomD in the Zephyr-Dom0 / DomD-as-toolstack
++	  configuration). Defaults to 1, the first dom0less domain on RPi5.
++
+ config XEN_LIBFDT
+ 	bool "Enable libfdt support"
+ 	help
+diff --git a/xenstore-srv/include/xenstore_srv.h b/xenstore-srv/include/xenstore_srv.h
+index 43a422b..cd5138a 100644
+--- a/xenstore-srv/include/xenstore_srv.h
++++ b/xenstore-srv/include/xenstore_srv.h
+@@ -68,6 +68,16 @@ int stop_domain_stored(struct xen_domain *domain);
+  */
+ int xs_init_root(void);
+ 
++/**
++ * Sets the domid of the privileged toolstack domain (DomD), which is granted
++ * Dom0-equivalent xenstore privilege. Initialized from
++ * CONFIG_XENSTORE_TOOLSTACK_DOMID; call this to correct it at runtime once
++ * DomD's domid is known.
++ *
++ * @param domid The domid of the toolstack domain.
++ */
++void xss_set_toolstack_domid(uint32_t domid);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 2dfe538..c19478f 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -218,12 +218,30 @@ static bool is_owner(struct xs_entry *entry, uint32_t caller_domid)
+ 	return false;
+ }
+ 
++/*
++ * The toolstack domain (DomD in the Zephyr-Dom0 / DomD-as-toolstack configuration) is granted Dom0-equivalent
++ * xenstore privilege so it can run libxl/xl on behalf of the system. Defaults
++ * to domid 1 (the first dom0less domain on RPi5) via Kconfig and can be
++ * corrected at runtime once DomD's domid is known (see xss_set_toolstack_domid).
++ */
++static uint32_t toolstack_domid = CONFIG_XENSTORE_TOOLSTACK_DOMID;
++
++static inline bool is_privileged(uint32_t domid)
++{
++	return (domid == 0) || (domid == toolstack_domid);
++}
++
++void xss_set_toolstack_domid(uint32_t domid)
++{
++	toolstack_domid = domid;
++}
++
+ static bool check_perms(struct xs_entry *entry, uint32_t perms, uint32_t caller_domid)
+ {
+ 	struct xs_permissions *iter, *default_perms;
+ 
+-	/* Caller is Dom0 or owner */
+-	if (caller_domid == 0 || is_owner(entry, caller_domid)) {
++	/* Caller is Dom0, the toolstack domain, or owner */
++	if (is_privileged(caller_domid) || is_owner(entry, caller_domid)) {
+ 		return true;
+ 	}
+ 
+@@ -1436,7 +1454,8 @@ static void handle_set_perms(struct xenstore *xenstore, uint32_t id,
+ 	k_mutex_lock(&xsel_mutex, K_FOREVER);
+ 	entry = key_to_entry_check_perm(path, xenstore->domain->domid, XS_PERM_NONE);
+ 	k_free(path);
+-	if (!entry && is_owner(entry, xenstore->domain->domid)) {
++	if (!entry) {
++		send_errno(xenstore, id, ENOENT);
+ 		k_mutex_unlock(&xsel_mutex);
+ 		return;
+ 	}

@@ -1,0 +1,68 @@
+From a0a1e50a5f5ddfab1f069ff13aaafeef18b697e1 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] dom0-xt: doma: built-in ramdisk slot
+
+Add a built-in ramdisk slot for the AAOS (DomA) domain config.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/Kconfig b/Kconfig
+index c8899ab..c067b99 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -123,6 +123,25 @@ config DOM_CFG_DOMU1_DTB_BIN_FILE
+ 	string "Location for Domain-U1 device-tree"
+ 	depends on DOM_CFG_DOMU1_ENABLE
+ 
++# DomA (AAOS) ramdisk builtin slot. The stock builtin
++# mechanism embeds only kernel+DTB; AAOS needs a separate (layered) ramdisk.
++# Set this to the packed AAOS vendor_boot ramdisk to embed it in zephyr.bin
++# (used by the "DomD owns SD" architecture where Zephyr Dom0 is SD-less).
++config DOM_CFG_DOMA_RAMDISK_ENABLE
++	bool "Embed a built-in DomA (AAOS) ramdisk"
++	help
++	  Enable to .incbin an AAOS ramdisk into zephyr.bin. Leave disabled
++	  (the default shipping path boots DomA via FATFS, not a builtin
++	  ramdisk); when disabled the domain_bins.S incbin slot is omitted.
++
++config DOM_CFG_DOMA_RAMDISK_BIN_FILE
++	string "Location for DomA (AAOS) builtin ramdisk binary"
++	depends on DOM_CFG_DOMA_RAMDISK_ENABLE
++	help
++	  Absolute or west-relative path to the AAOS ramdisk .incbin'd into
++	  zephyr.bin. Must be a non-empty, resolvable path: an empty value
++	  makes the assembler fail on `.incbin ""` (it is NOT silently skipped).
++
+ endif #DOM_CFG_BUILTIN_IMAGES
+ 
+ config DOM_COVERAGE_ENABLE
+diff --git a/src/domain_bins.S b/src/domain_bins.S
+index 17648f7..d18981d 100644
+--- a/src/domain_bins.S
++++ b/src/domain_bins.S
+@@ -54,4 +54,22 @@ __dtb_domu1_start:
+ __dtb_domu1_end:
+ #endif /* CONFIG_DOM_CFG_DOMU1_DTB_BIN_FILE */
+ 
++/* DomA (AAOS) ramdisk. The stock builtin mechanism only
++ * embeds kernel+DTB per domain; AAOS boots kernel + a separate (layered)
++ * ramdisk, so add a ramdisk incbin slot. Needed for the "DomD owns SD"
++ * architecture where Zephyr Dom0 is SD-less and must carry every guest image
++ * it xu-creates in zephyr.bin (the large rootfs/super stays on SD served by
++ * DomD; only the kernel+ramdisk needed to BUILD the domain are embedded). */
++#if defined(CONFIG_DOM_CFG_DOMA_RAMDISK_ENABLE)
++.section .data.doma_ramdisk,"a"
++.align 8
++
++GDATA(__img_doma_ramdisk_start)
++GDATA(__img_doma_ramdisk_end)
++
++__img_doma_ramdisk_start:
++.incbin		CONFIG_DOM_CFG_DOMA_RAMDISK_BIN_FILE
++__img_doma_ramdisk_end:
++#endif /* CONFIG_DOM_CFG_DOMA_RAMDISK_ENABLE */
++
+ #endif /* CONFIG_DOM_CFG_BUILTIN_IMAGES */

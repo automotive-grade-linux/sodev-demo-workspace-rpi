@@ -1,0 +1,10 @@
+[Match]
+Name=eth0
+
+[Network]
+# RP1 eth0: static .10.11 (NOT bridged during the xenstore-critical window)
+# -> PC(.1) can SSH DomD here. The late flat-bridge (domd-flatbridge.service, ordered
+# after xendriverdomain and gated on its own wait-for-vif-emu loop) moves this
+# address onto xenbr0 and enslaves eth0 only once the guest vifs exist.
+Address=192.168.10.11/24
+Gateway=192.168.10.10

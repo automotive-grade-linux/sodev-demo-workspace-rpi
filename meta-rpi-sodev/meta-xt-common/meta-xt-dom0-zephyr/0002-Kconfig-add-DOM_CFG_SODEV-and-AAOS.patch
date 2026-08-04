@@ -1,0 +1,58 @@
+From 0c1a23f0e0e107ba083d2d24e1f1f510b567950f Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] dom0-xt: Kconfig: add DOM_CFG_SODEV and AAOS domain symbols
+
+Add DOM_CFG_SODEV (gates the SoDeV DomU/DomA guests) and DOM_CFG_AAOS_DOMAIN (upstream single-AAOS example). Neither exists at the pinned rev.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/Kconfig b/Kconfig
+index 039ace4..04b5607 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -70,6 +70,29 @@ config DOM_CFG_LINUX_PV_DOMAIN
+ 	  It is expected to be placed on the storage device, connected to
+ 	  Dom0.
+ 
++config DOM_CFG_AAOS_DOMAIN
++	bool "Enable AAOS (Android Automotive OS) DomU"
++	help
++	  Adds an Android Automotive OS (xenvm_trout_arm64) DomU that loads
++	  a separate boot.img kernel and a layered ramdisk
++	  (init_boot ramdisk + vendor_ramdisk + bootconfig trailer) from
++	  /1:/dom0/domu_aaos_{kernel,ramdisk}. Pairs with the DomD-side
++	  DomD device-model qemu (spawned by the DomD toolstack per doma.cfg).
++	  Targets PROFILE=agl-aaos in the rpi5.yaml moulin profile.
++
++config DOM_CFG_SODEV
++	bool "Enable RPi5 SoDeV production guests (Zephyr Dom0 hybrid)"
++	help
++	  Adds the RPi5 SoDeV production guests created by a Zephyr Dom0 in the
++	  hybrid architecture, where DomD stays a dom0less GPU driver domain and
++	  Zephyr Dom0 only creates the two virtio guests via `xu create`:
++	    rpi_5_sodev_domu : AGL Qt6/Flutter Cluster IC (HDMI-A-1)
++	    rpi_5_sodev_doma : AAOS / xenvm_trout (HDMI-A-2)
++	  Kernel/ramdisk images are staged on SD p1 under the FATFS storage path
++	  (linux-domu, aaos-android-kernel, aaos-vendor-boot-ramdisk). Independent
++	  of DOM_CFG_AAOS_DOMAIN (the upstream single-AAOS example), so the AGL
++	  cluster can exist without enabling the Android example guest.
++
+ endif #DOM_STORAGE_FATFS_ENABLE
+ 
+ config DOM_CFG_BUILTIN_IMAGES
+diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
+index b56aa78..4e74787 100644
+--- a/boards/rpi_5.conf
++++ b/boards/rpi_5.conf
+@@ -24,7 +24,7 @@ CONFIG_FILE_SYSTEM_SHELL=y
+ CONFIG_NOCACHE_MEMORY=y
+ CONFIG_FS_MULTI_PARTITION=y
+ CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="1"
+-CONFIG_DOM_STORAGE_FATFS_DIR="dom0/"
++CONFIG_DOM_STORAGE_FATFS_DIR=""
+ CONFIG_XEN_LIBFDT=y
+ 
+ CONFIG_DOM_CFG_LINUX_PV_DOMAIN=y

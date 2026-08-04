@@ -1,0 +1,57 @@
+From c64ea6425928b1cee978caae96f67d15456e5a0b Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: guard xu console against unmanaged (toolstack-introduced) domains
+
+`xu console <domid>` on a toolstack-introduced guest (a DomU/DomA created by
+the DomD `xl` toolstack) crashed the whole Zephyr Dom0 (NULL/unmapped-ring
+dereference -> CPU exception -> "Halting system").
+
+Such a guest is tracked in domain_list via xs_introduce() (sys_dlist_append),
+but its console ring is never mapped by this Dom0: xen_init_domain_console()
+runs only in the Dom0-driven domain_create() path (xen_start_domain_console),
+so domain->console.intf stays NULL (the domain struct is memset to 0). The
+attach handler only checked !domain and domain->f_dom0less, not the
+console-init state, so it armed the shell bypass and the display thread then
+dereferenced the unmapped ring and faulted.
+
+Guard xen_attach_domain_console(): after taking &domain->console, refuse the
+attach when console->intf is NULL (return -ENODEV) and point the operator at
+the owning toolstack (`xl console` on the driver domain). A Dom0-created
+domain has intf mapped (non-NULL), so a valid attach is unaffected. Also
+release the get_domain() borrow (put_domain) on the f_dom0less early return,
+which previously leaked it.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-console-srv/src/xen_console.c b/xen-console-srv/src/xen_console.c
+index 6022114..6bef87b 100644
+--- a/xen-console-srv/src/xen_console.c
++++ b/xen-console-srv/src/xen_console.c
+@@ -477,10 +477,24 @@ int xen_attach_domain_console(const struct shell *shell,
+ 
+ 	if (domain->f_dom0less) {
+ 		LOG_ERR("dom0less domain#%u console operation not supported", domain->domid);
++		put_domain(domain);
+ 		return -ENOTSUP;
+ 	}
+ 
+ 	console = &domain->console;
++	/* A toolstack-introduced guest (e.g. DomU/DomA created by the DomD
++	 * xl toolstack) is tracked in domain_list via xs_introduce() but its console
++	 * ring was never mapped by this Dom0 (xen_init_domain_console() runs only in
++	 * the Dom0-driven domain_create() path, so console.intf stays NULL). Attaching
++	 * would arm the shell bypass and then dereference the unmapped ring, faulting
++	 * the whole Zephyr Dom0. Refuse gracefully and point at the owning toolstack. */
++	if (!console->intf) {
++		shell_error(shell,
++			    "domain#%u console is not managed by Dom0 (use the owning toolstack, e.g. 'xl console %u' on the driver domain)",
++			    domain->domid, domain->domid);
++		put_domain(domain);
++		return -ENODEV;
++	}
+ 	k_mutex_lock(&global_console_lock, K_FOREVER);
+ 	if (current_console) {
+ 		/* Actually, this should never happen */

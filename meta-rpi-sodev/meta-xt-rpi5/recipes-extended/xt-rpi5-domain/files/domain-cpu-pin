@@ -1,0 +1,20 @@
+#!/bin/sh
+# Pin Dom0 and the dom0less DomD to the boot-time CPU map.
+#
+#   CPU map:  Dom0 -> pcpu 0    DomD(domid 1) -> pcpu 0-1
+#             DomU -> pcpu 1     DomA -> pcpu 2-3
+#
+# DomU/DomA pin themselves at create via `cpus=` in their xl cfgs. Dom0 (the
+# control domain) and the dom0less DomD (domid 1, built by Xen with no xl cfg)
+# cannot, so pin them here once the toolstack + DomD are up. Reducing the
+# cross-domain CPU contention during the parallel guest boot is the goal.
+xl vcpu-pin 0 all 0 2>/dev/null || true
+
+# Wait for the dom0less DomD (domid 1) to exist, then pin it to cpu 0-1.
+i=0
+while [ "$i" -lt 60 ]; do
+    xl list 1 >/dev/null 2>&1 && break
+    i=$((i + 1)); sleep 1
+done
+xl vcpu-pin 1 all 0-1 2>/dev/null || true
+exit 0

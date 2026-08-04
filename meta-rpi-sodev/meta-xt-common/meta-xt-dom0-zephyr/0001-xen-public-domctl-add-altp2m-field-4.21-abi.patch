@@ -1,0 +1,31 @@
+From 3743922992e324f5eed5d1ece8dc6a32deb1567d Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xen/public/domctl: add altp2m field for the Xen 4.21 (0x17) ABI
+
+The vendored domctl.h predates upstream Xen 4.20's altp2m addition to struct xen_domctl_createdomain. The missing 4 bytes shift 'arch' early, so arch.gic_version (GIC_V3=2) is misread as cpupool_id=2 -> cpupool_find_by_id(2)=NULL -> -ESRCH (rc=-3) on domain create against Xen >= 4.20. Add the altp2m field to match the 0x17 wire layout.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/include/zephyr/xen/public/domctl.h b/include/zephyr/xen/public/domctl.h
+index f1f91a6736..4280d0dc33 100644
+--- a/include/zephyr/xen/public/domctl.h
++++ b/include/zephyr/xen/public/domctl.h
+@@ -83,6 +83,15 @@ struct xen_domctl_createdomain {
+ 
+ 	uint32_t grant_opts;
+ 
++	/* Xen 4.20+ (0x17) ABI: altp2m config. Absent in the old vendored
++	 * header, which shifted `arch` 4 bytes early so arch.gic_version
++	 * (GIC_V3=2) was misread by Xen as cpupool_id=2 ->
++	 * cpupool_find_by_id(2)=NULL -> -ESRCH (rc=-3). */
++	struct {
++		uint16_t opts;
++		uint16_t nr;
++	} altp2m;
++
+ 	/* Per-vCPU buffer size in bytes.  0 to disable. */
+ 	uint32_t vmtrace_size;
+ 

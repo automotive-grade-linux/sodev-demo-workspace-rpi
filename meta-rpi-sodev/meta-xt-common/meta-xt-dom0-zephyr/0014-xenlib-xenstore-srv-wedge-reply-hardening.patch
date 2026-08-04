@@ -1,0 +1,569 @@
+From 549bee5dd3066bef508b8653d9aa09741b53126f Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: xenstore-srv: wedge/reply hardening
+
+Harden the xenstore server reply path against ring-wedge conditions.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 5b4ba0d..1b67632 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -41,6 +41,18 @@ LOG_MODULE_REGISTER(xenstore);
+  * while domain is not reading responses.
+  */
+ #define XENSTORE_MAX_OUT_BUF_NUM 100
++/*
++ * Stop consuming new requests when the out queue reaches this level; the
++ * remaining headroom absorbs the replies/watch events a single request can
++ * still generate before the hard quota above kills the connection.
++ *
++ * The 36 is a chosen margin, roughly a third of the quota, not a derived
++ * bound: nothing here caps how many out-buffers one request's watch fan-out
++ * can add short of XENSTORE_MAX_OUT_BUF_NUM itself, so there is no
++ * ring-size or message-size constant to compute it from. Raise it if a
++ * single request is ever seen to overshoot the quota from this level.
++ */
++#define XENSTORE_OUT_BUF_INPUT_GATE (XENSTORE_MAX_OUT_BUF_NUM - 36)
+ #define INIT_XENSTORE_UUID_BUF_SIZE 40
+ 
+ struct xs_permissions {
+@@ -114,6 +118,12 @@ static int get_stack_idx(void)
+ 	 * better to be safe than sorry.
+ 	 */
+ 	__ASSERT_NO_MSG(ret >= 0);
++	if (ret < 0 || ret >= CONFIG_DOMU_MAX) {
++		/* All slots busy (e.g. duplicate introduce): fail instead of
++		 * spawning a thread on an out-of-bounds stack. */
++		k_mutex_unlock(&xs_stack_lock);
++		return -ENOSPC;
++	}
+ 	used_threads |= BIT(ret);
+ 	LOG_DBG("Allocated stack with index %d", ret);
+ 
+@@ -198,7 +208,12 @@ static int construct_path(char *payload, uint32_t domid, char **path)
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (is_abs_path(payload)) {
++	if (is_abs_path(payload) || payload[0] == '@') {
++		/* '@' special watch paths (@introduceDomain,
++		 * @releaseDomain) are global names, not node paths. Prefixing
++		 * them with /local/domain/<id>/ makes the stored watch key
++		 * never match the fired "@..." path, so the watch silently
++		 * never fires (HW-observed: xenconsoled missed new guests). */
+ 		memcpy(*path, payload, path_len);
+ 	} else {
+ 		snprintf(*path, path_len + XENSTORE_MAX_LOCALPATH_LEN,
+@@ -382,6 +397,14 @@ static int ring_write(struct xenstore *xenstore, const void *data, size_t len)
+ 	z_barrier_dmem_fence_full();
+ 
+ 	if (check_indexes(cons, prod)) {
++		/*
++		 * The guest owns cons and we own prod, so when the pair stops
++		 * being consistent only our side of it is observable from
++		 * here. Log both before bailing out; there is no other record
++		 * of what the ring looked like at that moment.
++		 */
++		LOG_ERR("dom%u rsp ring corrupt: cons=%u prod=%u intf=%p",
++			xenstore->domain->domid, cons, prod, (void *)intf);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -403,6 +422,29 @@ static void invalidate_client(struct xenstore *xenstore, const char *reason, int
+ {
+ 	LOG_ERR("Domain#%d xenstore is invalid: %s (err=%d)",
+ 		xenstore->domain->domid, reason, err);
++	/* All invalidate call sites run in the domain's own
++	 * worker thread (handle_input/handle_output). Calling the synchronous
++	 * stop_domain_stored() from there k_thread_join()s the CURRENT thread,
++	 * which blocks forever - HW-observed as a permanently wedged DomD
++	 * xenstore connection (thread alive+pending, request ring never
++	 * consumed again, every later xenstore client blocked in the guest
++	 * kernel). Signal the loop to exit instead; full teardown stays the
++	 * job of the external caller (domain destroy path). */
++	if (k_current_get() == &xenstore->thrd) {
++		atomic_set(&xenstore->thrd_stop, 1);
++		/* NOTE (lifecycle): we cannot reclaim from here — the thread is
++		 * still running on its own stack and still using the ring it would
++		 * have to unmap. The worker loop will exit and run
++		 * cleanup_domain_watches(); the ring mapping, event channel and
++		 * thread-stack slot are then reclaimed by the eventual
++		 * stop_domain_stored() call on the external teardown path
++		 * (xs_release_domain from DomD's `xl destroy`, whose k_thread_join
++		 * returns immediately since the thread has already exited). The
++		 * toolstack (DomD) MUST issue `xl destroy` when a guest dies so this
++		 * reclaim runs; a guest that crashes without an XS_RELEASE holds one
++		 * of CONFIG_DOMU_MAX slots until released. */
++		return;
++	}
+ 	stop_domain_stored(xenstore->domain);
+ }
+ 
+@@ -458,45 +500,68 @@ static bool can_read(struct xenstore *xenstore)
+ 	return (intf->req_prod != intf->req_cons);
+ }
+ 
+-static void send_reply_sz(struct xenstore *xenstore, uint32_t req_id,
+-			  enum xsd_sockmsg_type type, const void *data,
+-			  size_t len)
++/* Returns 0 on success, -ENOMEM if the reply could not be queued.
++ *
++ * This function is reachable while a global mutex is held
++ * (fire_watcher runs under xsel+wel+pfl; handle_read/handle_set_perms error
++ * paths under xsel), so it MUST NOT block -- sleeping here holds those locks
++ * and stalls every other domain's worker with it. In particular, do not add a
++ * retry loop around the allocation below: the out-queue is bounded by
++ * XENSTORE_MAX_OUT_BUF_NUM (~400KB against a 2MB heap), so a k_malloc failure
++ * here means the heap was exhausted by something else, which waiting will not
++ * fix.
++ *
++ * On failure we distinguish by message type:
++ *   - XS_WATCH_EVENT is unsolicited and deferrable: return -ENOMEM and let the
++ *     caller (process_pending_watch_events) retry the event later. Never kill
++ *     the connection for a transient watch-event allocation failure.
++ *   - A solicited reply CANNOT be dropped (the guest's serialized xenbus would
++ *     wedge waiting for it), so invalidate the connection — a visible,
++ *     diagnosable, recoverable-by-`xl destroy` kill rather than a silent hang.
++ *     invalidate_client() on the domain's own worker only sets thrd_stop (it
++ *     never blocks), so this is safe under a held lock.
++ */
++static int send_reply_sz(struct xenstore *xenstore, uint32_t req_id,
++			 enum xsd_sockmsg_type type, const void *data,
++			 size_t len)
+ {
+ 	struct buffered_data *bdata;
+ 	struct xsd_sockmsg header;
+ 	size_t total_size = len + sizeof(header);
+ 
+-	if (xenstore->used_out_bufs > XENSTORE_MAX_OUT_BUF_NUM) {
+-		/*
+-		 * TODO: check if we can act more softly than invalidating the client.
+-		 * Now we invalidate the client, to prevent Denial of Service attacks,
+-		 * using several domains, that potentially can eat all Dom0 memory.
+-		 */
++	if (xenstore->used_out_bufs >= XENSTORE_MAX_OUT_BUF_NUM) {
++		if (type == XS_WATCH_EVENT) {
++			/* Deferrable: caller retries when the queue drains. */
++			return -ENOMEM;
++		}
+ 		invalidate_client(xenstore,
+ 				  "The maximum number of output buffers is exceeded",
+ 				  -EIO);
+-		return;
++		return -ENOMEM;
+ 	}
+ 
+ 	if (len > XENSTORE_PAYLOAD_MAX) {
+ 		LOG_ERR("Failed to reply: payload size too big (%zu max=%d)",
+ 			len, XENSTORE_PAYLOAD_MAX);
+ 		send_errno(xenstore, req_id, E2BIG);
+-		return;
++		return 0;
+ 	}
+ 
+ 	bdata = k_malloc(sizeof(*bdata));
+-	if (!bdata) {
+-		LOG_ERR("Failed to allocate memory for output buffer");
+-		return;
++	if (bdata) {
++		bdata->used = 0;
++		bdata->buffer = k_malloc(total_size);
++		if (!bdata->buffer) {
++			k_free(bdata);
++			bdata = NULL;
++		}
+ 	}
+-
+-	bdata->used = 0;
+-	bdata->buffer = k_malloc(total_size);
+-	if (!bdata->buffer) {
+-		k_free(bdata);
+-		LOG_ERR("Failed to allocate memory to store output data");
+-		return;
++	if (!bdata) {
++		if (type == XS_WATCH_EVENT) {
++			return -ENOMEM;
++		}
++		invalidate_client(xenstore, "no memory for reply", -ENOMEM);
++		return -ENOMEM;
+ 	}
+ 
+ 	bdata->total_size = total_size;
+@@ -508,6 +573,7 @@ static void send_reply_sz(struct xenstore *xenstore, uint32_t req_id,
+ 
+ 	sys_slist_append(&xenstore->out_list, &bdata->node);
+ 	xenstore->used_out_bufs++;
++	return 0;
+ }
+ 
+ static void send_reply(struct xenstore *xenstore, uint32_t id,
+@@ -549,7 +615,7 @@ static void handle_directory(struct xenstore *xenstore, uint32_t id,
+ 	rc = construct_path(payload, xenstore->domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -574,6 +640,15 @@ static void handle_directory(struct xenstore *xenstore, uint32_t id,
+ 		reply_sz += str_byte_size(iter->key);
+ 	}
+ 
++	if (reply_sz == 0) {
++		/* Leaf node: an empty list is a normal XS_DIRECTORY answer;
++		 * k_malloc(0) returns NULL and used to turn this into a bogus
++		 * ENOMEM error. */
++		k_mutex_unlock(&xsel_mutex);
++		send_reply_sz(xenstore, id, XS_DIRECTORY, "", 0);
++		return;
++	}
++
+ 	dir_list = k_malloc(reply_sz);
+ 	if (!dir_list) {
+ 		LOG_ERR("Failed to allocate memory for dir list");
+@@ -616,6 +691,7 @@ static int fire_watcher(struct xen_domain *domain, char *pending_path)
+ 		char *payload, *epath_buf = pending_path;
+ 		size_t token_len, payload_len;
+ 		size_t epath_len = pendkey_len + 1;
++		int rc;
+ 
+ 		if ((iter->domain->domid != domain->domid) ||
+ 		     memcmp(iter->key, epath_buf, strlen(iter->key))) {
+@@ -646,9 +722,16 @@ static int fire_watcher(struct xen_domain *domain, char *pending_path)
+ 		memcpy(payload, epath_buf, epath_len);
+ 		memcpy(payload + epath_len, iter->token, token_len);
+ 
+-		send_reply_sz(&domain->xenstore, 0, XS_WATCH_EVENT, payload, payload_len);
++		rc = send_reply_sz(&domain->xenstore, 0, XS_WATCH_EVENT, payload,
++				   payload_len);
+ 
+ 		k_free(payload);
++		if (rc < 0) {
++			/* Out of buffers/memory: propagate so the caller defers
++			 * this event and retries when the guest drains. Never
++			 * kill the connection for a transient watch-event failure. */
++			return rc;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -1268,7 +1351,7 @@ static void _handle_write(struct xenstore *xenstore, uint32_t id,
+ 	rc = construct_path(payload, domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -1281,7 +1364,7 @@ static void _handle_write(struct xenstore *xenstore, uint32_t id,
+ 	rc = xss_do_write(path, data, domain->domid, NULL, 0);
+ 	if (rc) {
+ 		LOG_ERR("Failed to write to xenstore (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		goto free_data;
+ 	}
+ 
+@@ -1310,6 +1393,11 @@ static void process_pending_watch_events(struct xen_domain *domain)
+ {
+ 	struct pending_watch_event_entry *iter, *next;
+ 
++	/* xsel_mutex must be held: fire_watcher() walks the
++	 * xenstore tree via key_to_entry_check_perm(), which races with node
++	 * removal (free_node) from other domains' workers otherwise. Order
++	 * xsel -> wel -> pfl matches handle_watch (xsel -> pfl). */
++	k_mutex_lock(&xsel_mutex, K_FOREVER);
+ 	k_mutex_lock(&wel_mutex, K_FOREVER);
+ 	k_mutex_lock(&pfl_mutex, K_FOREVER);
+ 	SYS_DLIST_FOR_EACH_CONTAINER_SAFE (&pending_watch_event_list, iter, next, node) {
+@@ -1320,10 +1408,17 @@ static void process_pending_watch_events(struct xen_domain *domain)
+ 		}
+ 
+ 		rc = fire_watcher(domain, iter->key);
+-		if (rc < 0) {
+-			LOG_ERR("Failed to send watch event, err = %d", rc);
++		if (rc == -ENOMEM) {
++			/* Out-buffer quota: retry after the guest drains. */
++			LOG_WRN("Watch event delivery deferred (out of buffers)");
+ 			goto out;
+ 		}
++		if (rc < 0) {
++			/* Permanent failure (e.g. -EACCES): keeping the entry
++			 * would head-of-line-block every later event for this
++			 * domain and leak the list. Drop it. */
++			LOG_ERR("Dropping undeliverable watch event (err = %d)", rc);
++		}
+ 
+ 		k_free(iter->key);
+ 		sys_dlist_remove(&iter->node);
+@@ -1333,6 +1428,7 @@ static void process_pending_watch_events(struct xen_domain *domain)
+ out:
+ 	k_mutex_unlock(&pfl_mutex);
+ 	k_mutex_unlock(&wel_mutex);
++	k_mutex_unlock(&xsel_mutex);
+ }
+ 
+ static void handle_control(struct xenstore *xenstore, uint32_t id,
+@@ -1400,7 +1496,7 @@ static void handle_get_perms(struct xenstore *xenstore, uint32_t id,
+ 	rc = construct_path(payload, xenstore->domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -1448,7 +1544,7 @@ static void handle_set_perms(struct xenstore *xenstore, uint32_t id,
+ 	rc = construct_path(payload, xenstore->domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -1464,7 +1560,7 @@ static void handle_set_perms(struct xenstore *xenstore, uint32_t id,
+ 	rc = set_perms_by_strings(entry, perm_string, perms_str_size);
+ 	k_mutex_unlock(&xsel_mutex);
+ 	if (rc) {
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -1496,7 +1592,7 @@ static void handle_read(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	rc = construct_path(payload, xenstore->domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -1546,10 +1642,19 @@ int xss_rm(const char *path)
+ static void handle_rm(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	       uint32_t len)
+ {
++	/*
++	 * xss_do_rm() returns 0 on success, so a non-zero return is the error
++	 * path. Getting this backwards costs more than a wrong reply: the
++	 * success path would send nothing at all, and because the guest's
++	 * xenbus serialises requests, one reply-less XS_RM wedges every later
++	 * xenstore client of that domain. Every branch below must reply.
++	 */
+ 	if (xss_do_rm(payload, xenstore->domain->domid)) {
+-		notify_watchers(payload, xenstore->domain->domid);
+-		send_reply_read(xenstore, id, XS_RM, "");
++		send_errno(xenstore, id, ENOENT);
++		return;
+ 	}
++	notify_watchers(payload, xenstore->domain->domid);
++	send_reply_read(xenstore, id, XS_RM, "");
+ }
+ 
+ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+@@ -1560,7 +1663,13 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	struct watch_entry *wentry;
+ 	struct pending_watch_event_entry *pentry;
+ 	size_t path_len = 0, full_plen;
+-	bool path_is_relative = !is_abs_path(payload);
++	/* '@' special watches (@introduceDomain/@releaseDomain)
++	 * are global names, not per-domain node paths. is_abs_path() only tests a
++	 * leading '/', so without the '@' exclusion they were stored is_relative=1
++	 * and fire_watcher()'s relative-path trim (epath += loc_len) corrupted or
++	 * underflowed the delivered event payload — matching the construct_path()
++	 * '@' special-case is required for the @-watch mechanism to work. */
++	bool path_is_relative = !is_abs_path(payload) && payload[0] != '@';
+ 	int rc;
+ 	struct xen_domain *domain = xenstore->domain;
+ 
+@@ -1690,7 +1799,7 @@ static void handle_unwatch(struct xenstore *xenstore, uint32_t id,
+ 	rc = construct_path(payload, domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+-		send_errno(xenstore, id, rc);
++		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
+@@ -1888,6 +1997,12 @@ static void handle_release(struct xenstore *xenstore, uint32_t id,
+ 		return;
+ 	}
+ 	domid = atoi(payload);
++	if (domid == 0 || domid == xenstore->domain->domid) {
++		/* Releasing dom0 or the caller itself would tear down the very
++		 * connection (and worker thread) processing this request. */
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
+ 
+ 	LOG_INF("XS_RELEASE dom#%u (from dom#%u)", domid, xenstore->domain->domid);
+ 
+@@ -1906,6 +2021,33 @@ static void handle_release(struct xenstore *xenstore, uint32_t id,
+ 	send_reply(xenstore, id, XS_RELEASE, "OK");
+ }
+ 
++/* XS_IS_DOMAIN_INTRODUCED (used by init-dom0less and
++ * xenpaging via libxs). Reply "T"/"F" like upstream xenstored do_is_domain_introduced.
++ * Previously unhandled: the ENOSYS fallback used to be sent with req_id=0,
++ * which the guest kernel dropped - one call permanently wedged the domain's
++ * whole xenstore connection. */
++static void handle_is_domain_introduced(struct xenstore *xenstore, uint32_t id,
++					char *payload, uint32_t sz)
++{
++	uint32_t domid;
++	char name[CONTAINER_NAME_SIZE];
++	bool found;
++
++	if (strnlen(payload, sz) >= sz) {
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++	domid = atoi(payload);
++
++	/* An introduced domain has a served xenstore tree; probe its name node
++	 * via the public API (the domain list itself lives in xen-dom-mgmt).
++	 * Dom0 (this server) is always introduced. */
++	found = (domid == 0) ||
++		(get_domain_name((unsigned short)domid, name, sizeof(name)) >= 0);
++
++	send_reply(xenstore, id, XS_IS_DOMAIN_INTRODUCED, found ? "T" : "F");
++}
++
+ const struct message_handle message_handle_list[XS_TYPE_COUNT] = { [XS_CONTROL] = { handle_control },
+ 					    [XS_DIRECTORY] = { handle_directory },
+ 					    [XS_READ] = { handle_read },
+@@ -1923,7 +2065,7 @@ const struct message_handle message_handle_list[XS_TYPE_COUNT] = { [XS_CONTROL]
+ 					    [XS_SET_PERMS] = { handle_set_perms },
+ 					    [XS_WATCH_EVENT] = { NULL },
+ 					    [XS_ERROR] = { NULL },
+-					    [XS_IS_DOMAIN_INTRODUCED] = { NULL },
++					    [XS_IS_DOMAIN_INTRODUCED] = { handle_is_domain_introduced },
+ 					    [XS_RESUME] = { NULL },
+ 					    [XS_SET_TARGET] = { NULL },
+ 					    [XS_RESET_WATCHES] = { handle_reset_watches },
+@@ -1966,14 +2108,25 @@ static void process_message(struct xenstore *xenstore)
+ 	size_t payload_size = xenstore->in->total_size - sizeof(*header);
+ 
+ 	if ((uint32_t)type >= XS_TYPE_COUNT || !message_handle_list[type].h) {
+-		LOG_ERR("Client unknown operation %i", type);
+-		send_errno(xenstore, 0, ENOSYS);
+-		return;
++		/*
++		 * Two things this arm must get right. The reply carries
++		 * header->req_id, not 0: the guest matches replies by req_id
++		 * and drops an unmatched one, and because its xenbus
++		 * serialises requests the client that never hears back takes
++		 * every later xenstore client of that domain down with it.
++		 * With the id right, libxs degrades gracefully -- xs_directory
++		 * falls back when XS_DIRECTORY_PART is unsupported. And it
++		 * falls through to the input-buffer cleanup below rather than
++		 * returning early, which would leak xenstore->in.
++		 */
++		LOG_ERR("Client unknown operation %i (req_id=%u)",
++			type, header->req_id);
++		send_errno(xenstore, header->req_id, ENOSYS);
++	} else {
++		message_handle_list[type].h(xenstore, header->req_id,
++					    payload, payload_size);
+ 	}
+ 
+-	message_handle_list[type].h(xenstore, header->req_id,
+-				    payload, payload_size);
+-
+ 	k_free(xenstore->in->buffer);
+ 	k_free(xenstore->in);
+ 	xenstore->in = NULL;
+@@ -2011,11 +2164,17 @@ static void handle_input(struct xenstore *xenstore)
+ 
+ 		memcpy(&header, xenstore->in->buffer, sizeof(header));
+ 		if (header.len > XENSTORE_PAYLOAD_MAX) {
+-			LOG_ERR("Failed to handle input: payload size is too big (%u max=%d)",
+-				header.len, XENSTORE_PAYLOAD_MAX);
++			/* The old bare return sent no reply
++			 * (client wedges) AND left the oversized payload in the
++			 * ring, so the next iteration parsed payload bytes as a
++			 * header = permanent stream desync. A well-behaved
++			 * kernel xenbus never sends this; treat it as a broken
++			 * connection like upstream does. */
+ 			k_free(xenstore->in->buffer);
+ 			k_free(xenstore->in);
+ 			xenstore->in = NULL;
++			invalidate_client(xenstore,
++					  "request payload size too big", -EINVAL);
+ 			return;
+ 		}
+ 
+@@ -2077,11 +2236,32 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
+ 			process_pending_watch_events(domain);
+ 		}
+ 
+-		if (!can_read(xenstore) && !can_write(xenstore)) {
+-			k_sem_take(&xenstore->xb_sem, K_FOREVER);
++		/* Backpressure: processing a request while the
++		 * out queue is near XENSTORE_MAX_OUT_BUF_NUM lets a reply/watch
++		 * burst trip the quota check in send_reply_sz(), which used to
++		 * invalidate the whole connection (fatal for the DomD toolstack).
++		 * Leave headroom and let the requests wait in the ring until the
++		 * guest drains responses; the guest notifies us on rsp_cons
++		 * progress, and the timed take is a lost-event safety net. */
++		bool input_ok =
++			xenstore->used_out_bufs < XENSTORE_OUT_BUF_INPUT_GATE;
++
++		if ((!can_read(xenstore) || !input_ok) && !can_write(xenstore)) {
++			/*
++			 * Timed, not K_FOREVER: xb_sem has limit 1, so a give
++			 * that arrives while one is already pending is dropped,
++			 * and the wake-up for the guest draining its responses
++			 * can be the one that is lost. The timeout is a poll
++			 * backstop for that case and its length is arbitrary --
++			 * it only has to stay well inside the guest-side
++			 * xenbus timeouts, which are seconds.
++			 */
++			k_sem_take(&xenstore->xb_sem, K_MSEC(100));
++			input_ok = xenstore->used_out_bufs <
++				   XENSTORE_OUT_BUF_INPUT_GATE;
+ 		}
+ 
+-		if (can_read(xenstore)) {
++		if (can_read(xenstore) && input_ok) {
+ 			handle_input(xenstore);
+ 		}
+ 
+@@ -2115,6 +2286,11 @@ int start_domain_stored(struct xen_domain *domain, xen_pfn_t store_pfn)
+ 			domain->domid, rc);
+ 		return rc;
+ 	}
++	/* Diagnostic: record each ring VA so an overlap with another domain's
++	 * mapping is immediately visible in the console log. */
++	LOG_INF("dom%u xenstore ring mapped: gfn=0x%llx va=%p",
++		domain->domid, (unsigned long long)store_pfn,
++		(void *)xenstore->domint);
+ 
+ 	xenstore->domint->server_features = XENSTORE_SERVER_FEATURE_RECONNECTION;
+ 	if (domain->f_dom0less) {
+@@ -2143,7 +2319,16 @@ int start_domain_stored(struct xen_domain *domain, xen_pfn_t store_pfn)
+ 		}
+ 	}
+ 
+-	xenstore->xs_stack_slot = get_stack_idx();
++	int stack_slot = get_stack_idx();
++
++	if (stack_slot < 0) {
++		/* xs_stack_slot is size_t; keep the signed check here. */
++		LOG_ERR("No xenstore thread stack slot for domain#%u",
++			domain->domid);
++		rc = stack_slot;
++		goto unmap_ring;
++	}
++	xenstore->xs_stack_slot = stack_slot;
+ 	k_thread_create(&xenstore->thrd,
+ 			xenstore_thrd_stack[xenstore->xs_stack_slot],
+ 			XENSTORE_STACK_SIZE_PER_DOM,

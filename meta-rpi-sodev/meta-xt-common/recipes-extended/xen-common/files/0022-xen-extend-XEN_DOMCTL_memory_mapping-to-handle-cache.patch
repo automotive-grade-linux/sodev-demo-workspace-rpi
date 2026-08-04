@@ -1,0 +1,285 @@
+From 516cece92f4cadea7e94c51ddbda34d55c3cbb68 Mon Sep 17 00:00:00 2001
+From: Stefano Stabellini <sstabellini@kernel.org>
+Date: Fri, 4 Jan 2019 12:47:02 -0800
+Subject: [PATCH 22/24] xen: extend XEN_DOMCTL_memory_mapping to handle
+ cacheability
+
+Reuse the existing padding field to pass cacheability information about
+the memory mapping, specifically, whether the memory should be mapped as
+normal memory or as device memory (this is what we have today).
+
+Add a cacheability parameter to map_mmio_regions. 0 means device
+memory, which is what we have today.
+
+On ARM, map device memory as p2m_mmio_direct_dev (as it is already done
+today) and normal memory as p2m_ram_rw.
+
+On x86, return error if the cacheability requested is not device memory.
+
+Signed-off-by: Stefano Stabellini <stefanos@xilinx.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 516cece92f4cadea7e94c51ddbda34d55c3cbb68
+---
+ xen/arch/arm/gic-v2.c               |  3 ++-
+ xen/arch/arm/p2m.c                  | 19 +++++++++++++++++--
+ xen/arch/arm/platforms/exynos5.c    |  4 ++--
+ xen/arch/arm/platforms/omap5.c      |  8 ++++----
+ xen/arch/arm/traps.c                |  3 ++-
+ xen/arch/riscv/stubs.c              |  3 ++-
+ xen/arch/x86/hvm/dom0_build.c       |  7 +++++--
+ xen/arch/x86/mm/p2m.c               |  6 +++++-
+ xen/common/domctl.c                 |  8 +++++---
+ xen/drivers/passthrough/x86/iommu.c |  3 ++-
+ xen/drivers/vpci/header.c           |  3 ++-
+ xen/include/public/domctl.h         |  4 +++-
+ xen/include/xen/p2m-common.h        |  3 ++-
+ 13 files changed, 53 insertions(+), 21 deletions(-)
+
+diff --git a/xen/arch/arm/gic-v2.c b/xen/arch/arm/gic-v2.c
+index b23e72a3d0..33c42b6c36 100644
+--- a/xen/arch/arm/gic-v2.c
++++ b/xen/arch/arm/gic-v2.c
+@@ -685,7 +685,8 @@ static int gicv2_map_hwdom_extra_mappings(struct domain *d)
+ 
+         ret = map_mmio_regions(d, gaddr_to_gfn(v2m_data->addr),
+                                PFN_UP(v2m_data->size),
+-                               maddr_to_mfn(v2m_data->addr));
++                               maddr_to_mfn(v2m_data->addr),
++                               CACHEABILITY_DEVMEM);
+         if ( ret )
+         {
+             printk(XENLOG_ERR "GICv2: Map v2m frame to d%d failed.\n",
+diff --git a/xen/arch/arm/p2m.c b/xen/arch/arm/p2m.c
+index fb03978a19..63ed1b74f0 100644
+--- a/xen/arch/arm/p2m.c
++++ b/xen/arch/arm/p2m.c
+@@ -187,9 +187,24 @@ int unmap_regions_p2mt(struct domain *d,
+ int map_mmio_regions(struct domain *d,
+                      gfn_t start_gfn,
+                      unsigned long nr,
+-                     mfn_t mfn)
++                     mfn_t mfn,
++                     uint32_t cache_policy)
+ {
+-    return p2m_insert_mapping(d, start_gfn, nr, mfn, p2m_mmio_direct_dev);
++    p2m_type_t t;
++
++    switch ( cache_policy )
++    {
++    case CACHEABILITY_MEMORY:
++        t = p2m_ram_rw;
++        break;
++    case CACHEABILITY_DEVMEM:
++        t = p2m_mmio_direct_dev;
++        break;
++    default:
++        return -ENOSYS;
++    }
++
++    return p2m_insert_mapping(d, start_gfn, nr, mfn, t);
+ }
+ 
+ int unmap_mmio_regions(struct domain *d,
+diff --git a/xen/arch/arm/platforms/exynos5.c b/xen/arch/arm/platforms/exynos5.c
+index f7c0952067..c8fd9e6866 100644
+--- a/xen/arch/arm/platforms/exynos5.c
++++ b/xen/arch/arm/platforms/exynos5.c
+@@ -83,11 +83,11 @@ static int exynos5250_specific_mapping(struct domain *d)
+ {
+     /* Map the chip ID */
+     map_mmio_regions(d, gaddr_to_gfn(EXYNOS5_PA_CHIPID), 1,
+-                     maddr_to_mfn(EXYNOS5_PA_CHIPID));
++                     maddr_to_mfn(EXYNOS5_PA_CHIPID), CACHEABILITY_DEVMEM);
+ 
+     /* Map the PWM region */
+     map_mmio_regions(d, gaddr_to_gfn(EXYNOS5_PA_TIMER), 2,
+-                     maddr_to_mfn(EXYNOS5_PA_TIMER));
++                     maddr_to_mfn(EXYNOS5_PA_TIMER), CACHEABILITY_DEVMEM);
+ 
+     return 0;
+ }
+diff --git a/xen/arch/arm/platforms/omap5.c b/xen/arch/arm/platforms/omap5.c
+index 5cf424a23e..92f6596e29 100644
+--- a/xen/arch/arm/platforms/omap5.c
++++ b/xen/arch/arm/platforms/omap5.c
+@@ -98,19 +98,19 @@ static int omap5_specific_mapping(struct domain *d)
+ {
+     /* Map the PRM module */
+     map_mmio_regions(d, gaddr_to_gfn(OMAP5_PRM_BASE), 2,
+-                     maddr_to_mfn(OMAP5_PRM_BASE));
++                     maddr_to_mfn(OMAP5_PRM_BASE), CACHEABILITY_DEVMEM);
+ 
+     /* Map the PRM_MPU */
+     map_mmio_regions(d, gaddr_to_gfn(OMAP5_PRCM_MPU_BASE), 1,
+-                     maddr_to_mfn(OMAP5_PRCM_MPU_BASE));
++                     maddr_to_mfn(OMAP5_PRCM_MPU_BASE), CACHEABILITY_DEVMEM);
+ 
+     /* Map the Wakeup Gen */
+     map_mmio_regions(d, gaddr_to_gfn(OMAP5_WKUPGEN_BASE), 1,
+-                     maddr_to_mfn(OMAP5_WKUPGEN_BASE));
++                     maddr_to_mfn(OMAP5_WKUPGEN_BASE), CACHEABILITY_DEVMEM);
+ 
+     /* Map the on-chip SRAM */
+     map_mmio_regions(d, gaddr_to_gfn(OMAP5_SRAM_PA), 32,
+-                     maddr_to_mfn(OMAP5_SRAM_PA));
++                     maddr_to_mfn(OMAP5_SRAM_PA), CACHEABILITY_DEVMEM);
+ 
+     return 0;
+ }
+diff --git a/xen/arch/arm/traps.c b/xen/arch/arm/traps.c
+index 2bc3e1df04..5951ae8969 100644
+--- a/xen/arch/arm/traps.c
++++ b/xen/arch/arm/traps.c
+@@ -1781,7 +1781,8 @@ static bool try_map_mmio(gfn_t gfn)
+          gfn_to_gaddr(gfn) >= d->arch.vgic.cbase &&
+          (gfn_to_gaddr(gfn) - d->arch.vgic.cbase) < d->arch.vgic.csize )
+         return !map_mmio_regions(d, gfn, d->arch.vgic.csize / PAGE_SIZE,
+-                                 maddr_to_mfn(d->arch.vgic.vbase));
++                                 maddr_to_mfn(d->arch.vgic.vbase),
++                                 CACHEABILITY_DEVMEM);
+ 
+     /*
+      * Device-Tree should already have everything mapped when building
+diff --git a/xen/arch/riscv/stubs.c b/xen/arch/riscv/stubs.c
+index 1a8c86cd8d..cff5f37cde 100644
+--- a/xen/arch/riscv/stubs.c
++++ b/xen/arch/riscv/stubs.c
+@@ -310,7 +310,8 @@ int unmap_mmio_regions(struct domain *d,
+ int map_mmio_regions(struct domain *d,
+                      gfn_t start_gfn,
+                      unsigned long nr,
+-                     mfn_t mfn)
++                     mfn_t mfn,
++                     uint32_t cache_policy)
+ {
+     BUG_ON("unimplemented");
+ }
+diff --git a/xen/arch/x86/hvm/dom0_build.c b/xen/arch/x86/hvm/dom0_build.c
+index 5551f90448..d67eeb17fd 100644
+--- a/xen/arch/x86/hvm/dom0_build.c
++++ b/xen/arch/x86/hvm/dom0_build.c
+@@ -67,8 +67,11 @@ static int __init modify_identity_mmio(struct domain *d, unsigned long pfn,
+ 
+     for ( ; ; )
+     {
+-        rc = map ?   map_mmio_regions(d, _gfn(pfn), nr_pages, _mfn(pfn))
+-                 : unmap_mmio_regions(d, _gfn(pfn), nr_pages, _mfn(pfn));
++        if ( map )
++            rc = map_mmio_regions(d, _gfn(pfn), nr_pages, _mfn(pfn),
++                                  CACHEABILITY_DEVMEM);
++        else
++            rc = unmap_mmio_regions(d, _gfn(pfn), nr_pages, _mfn(pfn));
+         if ( rc == 0 )
+             break;
+         if ( rc < 0 )
+diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
+index e2a00a0efd..1a39f553ec 100644
+--- a/xen/arch/x86/mm/p2m.c
++++ b/xen/arch/x86/mm/p2m.c
+@@ -1698,12 +1698,16 @@ static unsigned int mmio_order(const struct domain *d,
+ int map_mmio_regions(struct domain *d,
+                      gfn_t start_gfn,
+                      unsigned long nr,
+-                     mfn_t mfn)
++                     mfn_t mfn,
++                     uint32_t cache_policy)
+ {
+     int ret = 0;
+     unsigned long i;
+     unsigned int iter, order;
+ 
++    if ( cache_policy != CACHEABILITY_DEVMEM )
++        return -ENOSYS;
++
+     if ( !paging_mode_translate(d) )
+     {
+         ASSERT_UNREACHABLE();
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index fd859dd616..b3007a9639 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -682,6 +682,7 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         unsigned long nr_mfns = op->u.memory_mapping.nr_mfns;
+         unsigned long mfn_end = mfn + nr_mfns - 1;
+         int add = op->u.memory_mapping.add_mapping;
++        uint32_t cache_policy = op->u.memory_mapping.cache_policy;
+ 
+         ret = -EINVAL;
+         if ( mfn_end < mfn || /* wrap? */
+@@ -711,10 +712,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         if ( add )
+         {
+             printk(XENLOG_G_DEBUG
+-                   "memory_map:add: dom%d gfn=%lx mfn=%lx nr=%lx\n",
+-                   d->domain_id, gfn, mfn, nr_mfns);
++                   "memory_map:add: dom%d gfn=%lx mfn=%lx nr=%lx cache=%u\n",
++                   d->domain_id, gfn, mfn, nr_mfns, cache_policy);
+ 
+-            ret = map_mmio_regions(d, _gfn(gfn), nr_mfns, _mfn(mfn));
++            ret = map_mmio_regions(d, _gfn(gfn), nr_mfns, _mfn(mfn),
++                                   cache_policy);
+             if ( ret < 0 )
+                 printk(XENLOG_G_WARNING
+                        "memory_map:fail: dom%d gfn=%lx mfn=%lx nr=%lx ret:%ld\n",
+diff --git a/xen/drivers/passthrough/x86/iommu.c b/xen/drivers/passthrough/x86/iommu.c
+index 0954cc4922..bd9719f2f6 100644
+--- a/xen/drivers/passthrough/x86/iommu.c
++++ b/xen/drivers/passthrough/x86/iommu.c
+@@ -357,7 +357,8 @@ static int __hwdom_init cf_check identity_map(unsigned long s, unsigned long e,
+             /* End the rangeset iteration, as other regions will also fail. */
+             return -EOPNOTSUPP;
+         }
+-        while ( (rc = map_mmio_regions(d, _gfn(s), e - s + 1, _mfn(s))) > 0 )
++        while ( (rc = map_mmio_regions(d, _gfn(s), e - s + 1, _mfn(s),
++                                       CACHEABILITY_DEVMEM)) > 0 )
+         {
+             s += rc;
+             process_pending_softirqs();
+diff --git a/xen/drivers/vpci/header.c b/xen/drivers/vpci/header.c
+index 469f497744..a05a07986d 100644
+--- a/xen/drivers/vpci/header.c
++++ b/xen/drivers/vpci/header.c
+@@ -85,7 +85,8 @@ static int cf_check map_range(
+          * - {un}map_mmio_regions doesn't support preemption.
+          */
+ 
+-        rc = map->map ? map_mmio_regions(map->d, _gfn(s), size, _mfn(map_mfn))
++        rc = map->map ? map_mmio_regions(map->d, _gfn(s), size, _mfn(map_mfn),
++                                         CACHEABILITY_DEVMEM)
+                       : unmap_mmio_regions(map->d, _gfn(s), size, _mfn(map_mfn));
+         if ( rc == 0 )
+         {
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 8f6708c0a7..5aef5e3ece 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -643,12 +643,14 @@ struct xen_domctl_bind_pt_irq {
+ */
+ #define DPCI_ADD_MAPPING         1
+ #define DPCI_REMOVE_MAPPING      0
++#define CACHEABILITY_DEVMEM      0 /* device memory, the default */
++#define CACHEABILITY_MEMORY      1 /* normal memory */
+ struct xen_domctl_memory_mapping {
+     uint64_aligned_t first_gfn; /* first page (hvm guest phys page) in range */
+     uint64_aligned_t first_mfn; /* first page (machine page) in range */
+     uint64_aligned_t nr_mfns;   /* number of pages in range (>0) */
+     uint32_t add_mapping;       /* add or remove mapping */
+-    uint32_t padding;           /* padding for 64-bit aligned structure */
++    uint32_t cache_policy;      /* cacheability of the memory mapping */
+ };
+ 
+ 
+diff --git a/xen/include/xen/p2m-common.h b/xen/include/xen/p2m-common.h
+index f0bd9a6b98..898fc3f08d 100644
+--- a/xen/include/xen/p2m-common.h
++++ b/xen/include/xen/p2m-common.h
+@@ -18,7 +18,8 @@ guest_physmap_remove_page(struct domain *d, gfn_t gfn, mfn_t mfn,
+ int map_mmio_regions(struct domain *d,
+                      gfn_t start_gfn,
+                      unsigned long nr,
+-                     mfn_t mfn);
++                     mfn_t mfn,
++                     uint32_t cache_policy);
+ int unmap_mmio_regions(struct domain *d,
+                        gfn_t start_gfn,
+                        unsigned long nr,

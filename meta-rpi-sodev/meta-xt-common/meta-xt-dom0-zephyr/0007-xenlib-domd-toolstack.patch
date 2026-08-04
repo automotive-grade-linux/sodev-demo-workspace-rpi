@@ -1,0 +1,531 @@
+From afb69e0ce6fe2e7a0985af25d85abee643d0c801 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: DomD-as-toolstack xenstore support
+
+DomD-as-toolstack: let an external privileged control domain (DomD, a
+dom0less domain with capabilities=0x1) create/destroy guests via `xl create`/
+`xl destroy` against the thin Zephyr Dom0 xenstore server. Verified on RPi5:
+DomD `xl create` completes (rc=0) and the guest reaches RUNNING (with a
+DomD-side console seeder that satisfies libxl's console waits).
+
+  * xen-dom-mgmt.c/.h: xs_introduce_domain() / xs_release_domain() — register/
+    release a toolstack-created guest in xenstore (shadow xen_domain, ring map,
+    evtchn bind, xs_initialize_xenstore, domain_list). domid0 reject, DOMU_MAX
+    guard, refcount-respecting release (no hypervisor destroy — DomD owns it).
+  * xenstore_srv.c: handle_introduce (XS_INTRODUCE op8) / handle_release
+    (XS_RELEASE op9) + table entries + wire NUL-bound parse + is_privileged +
+    ESRCH->ENOENT; notify_watchers("@introduceDomain"/"@releaseDomain");
+    transaction handling made non-blocking (running_transaction as a count) so
+    DomD's multiplexed xl+xenconsoled transactions no longer collide.
+
+Depends on 0005 (xenlib initrd) and 0006 (xenstore toolstack-domid).
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -24,6 +24,9 @@
+ #include <xen_console.h>
+ #endif
+ #include <xss.h>
++#ifdef CONFIG_XEN_STORE_SRV
++#include <xenstore_srv.h>
++#endif
+ #ifdef CONFIG_XSTAT
+ #include <xstat.h>
+ #endif
+@@ -1130,14 +1133,25 @@ static int dom0less_init_domain(uint32_t domid, struct xen_domctl_getdomaininfo
+ 	LOG_DBG("dom0less: remote_domid=%d, xenstore.remote_evtchn = %d", domain->domid,
+ 		domain->xenstore.remote_evtchn);
+ 
+-	rc = hvm_get_parameter(HVM_PARAM_MAGIC_BASE_PFN, domid, &magic_base_pfn);
++	/* Read HVM_PARAM_STORE_PFN, NOT
++	 * HVM_PARAM_MAGIC_BASE_PFN. MAGIC_BASE_PFN (index 3) is a xen-troops 4.19-fork
++	 * convenience param that upstream Xen 4.21 rejects with -EINVAL(-22) in
++	 * hvm_allow_get_param (only STORE_PFN, STORE_EVTCHN, CONSOLE_PFN,
++	 * CONSOLE_EVTCHN, CALLBACK_IRQ are allowed). That -22 broke dom0less_init's
++	 * enumeration loop ("attached 0
++	 * domains" on HW), so the dom0less DomD was never introduced to xenstore and
++	 * its Linux xenbus_probe blocked forever (state D). Xen 4.21's dom0less-build
++	 * (alloc_xenstore_page) already stores the xenstore ring page in
++	 * HVM_PARAM_STORE_PFN (for a direct-map domain that is the real MFN), so we
++	 * read it directly and do NOT add XENSTORE_PFN_OFFSET (STORE_PFN already points
++	 * at the ring page, unlike the old MAGIC_BASE which was the magic-region base). */
++	rc = hvm_get_parameter(HVM_PARAM_STORE_PFN, domid, &magic_base_pfn);
+ 	if (rc < 0) {
+-		LOG_ERR("dom0less:domid:%u Get HVM_PARAM_MAGIC_BASE_PFN err (%d)", domid, rc);
++		LOG_ERR("dom0less:domid:%u Get HVM_PARAM_STORE_PFN err (%d)", domid, rc);
+ 		goto err_free;
+ 	}
+ 
+-	LOG_DBG("dom0less:domid:%u MAGIC_BASE_PFN %llx", domid, magic_base_pfn);
+-	magic_base_pfn = magic_base_pfn + XENSTORE_PFN_OFFSET;
++	LOG_DBG("dom0less:domid:%u STORE_PFN %llx", domid, magic_base_pfn);
+ 
+ 	/* init Xenstore */
+ 	rc = start_domain_stored(domain, magic_base_pfn);
+@@ -1178,12 +1192,210 @@ err_free:
+ 	return rc;
+ }
+ 
++/*
++ * Introduce a domain that was created by an external
++ * privileged toolstack (DomD running `xl create`) into Zephyr Dom0's xenstore
++ * server. Unlike domain_create()/dom0less_init_domain(), Zephyr did NOT build
++ * this domain, so no xen_domain bookkeeping exists yet. Mirror the dom0less
++ * introduce flow but drive it from the XS_INTRODUCE (op 8) wire request that
++ * xenstore_srv's handle_introduce() dispatches: allocate a shadow xen_domain,
++ * map the store ring at the caller-supplied gfn, bind the caller-supplied
++ * event channel, seed the guest's xenstore tree and track it in domain_list.
++ * store_pfn/remote_evtchn come straight from the XS_INTRODUCE payload (the
++ * toolstack already allocated them), so no HVM_PARAM read is needed here.
++ * Idempotent: a duplicate introduce for an already-tracked domid succeeds.
++ */
++int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtchn)
++{
++	struct xen_domain *domain, *iter;
++	struct xen_domctl_getdomaininfo dominfo;
++	bool exists = false;
++	int rc;
++
++	/* Never introduce Dom0/self (domid 0). A malformed wire request with an
++	 * empty/zero domid field must not remap the live xenstore server's own
++	 * store ring (which would corrupt Dom0). */
++	if (domid == 0) {
++		LOG_ERR("xs_introduce: refusing to introduce domid 0 (self)");
++		return -EINVAL;
++	}
++
++	/* Idempotency + capacity check under dl_mutex. Scan the list directly
++	 * (NOT get_domain) so we neither perturb refcount nor trip
++	 * put_domain()'s __ASSERT(!f_dom0less) if @domid happens to name a
++	 * dom0less domain. Enforce the same CONFIG_DOMU_MAX cap that
++	 * domain_create() applies, so an unbounded XS_INTRODUCE stream cannot
++	 * exhaust the fixed stack/bookkeeping budget. */
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	if (dom_num >= CONFIG_DOMU_MAX) {
++		k_mutex_unlock(&dl_mutex);
++		LOG_ERR("xs_introduce:domid:%u domain limit %d reached", domid,
++			CONFIG_DOMU_MAX);
++		return -ENOSPC;
++	}
++	SYS_DLIST_FOR_EACH_CONTAINER(&domain_list, iter, node) {
++		if (iter->domid == domid) {
++			exists = true;
++			break;
++		}
++	}
++	k_mutex_unlock(&dl_mutex);
++	if (exists) {
++		/* Already introduced (duplicate XS_INTRODUCE): idempotent success. */
++		return 0;
++	}
++
++	/* Confirm the domain exists at the hypervisor and fetch vcpu/mem info
++	 * (needed by xs_initialize_xenstore for the per-domain xenstore tree). */
++	rc = xen_domctl_getdomaininfo(domid, &dominfo);
++	if (rc) {
++		LOG_ERR("xs_introduce:domid:%u getdomaininfo err (%d)", domid, rc);
++		return -ESRCH;
++	}
++
++	domain = k_malloc(sizeof(*domain));
++	if (!domain) {
++		LOG_ERR("xs_introduce:domid:%u Can not allocate memory for domain", domid);
++		return -ENOMEM;
++	}
++	memset(domain, 0, sizeof(*domain));
++
++	domain->domid = domid;
++	domain->num_vcpus = dominfo.max_vcpu_id + 1;
++	domain->address_size = 64;
++	domain->max_mem_kb = (dominfo.tot_pages * XEN_PAGE_SIZE) / 1024;
++	/* Not a dom0less domain: xenstore ring is CONNECTED and the toolstack
++	 * (not Zephyr) owns HVM_PARAM_STORE_* — start_domain_stored() re-asserts
++	 * HVM_PARAM_STORE_EVTCHN to the same value, which is harmless. */
++	domain->f_dom0less = false;
++	snprintf(domain->name, CONTAINER_NAME_SIZE, "DomU-%u", domid);
++
++	domain->xenstore.remote_evtchn = remote_evtchn;
++
++	rc = start_domain_stored(domain, (xen_pfn_t)store_pfn);
++	if (rc) {
++		LOG_ERR("xs_introduce:domid:%u start Xenstore err (%d)", domid, rc);
++		goto err_free;
++	}
++
++	rc = xs_initialize_xenstore(domid, domain);
++	if (rc) {
++		LOG_ERR("xs_introduce:domid:%u init Xenstore err (%d)", domid, rc);
++		goto err_free_stored;
++	}
++
++	notify_evtchn(domain->xenstore.remote_evtchn);
++
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	domain->refcount = 1;
++	sys_dnode_init(&domain->node);
++	sys_dlist_append(&domain_list, &domain->node);
++	++dom_num;
++	k_mutex_unlock(&dl_mutex);
++
++	LOG_INF("xs_introduce:domid:%u introduced by toolstack", domid);
++	return 0;
++
++err_free_stored:
++	stop_domain_stored(domain);
++err_free:
++	k_free(domain);
++	return rc;
++}
++
++/*
++ * Release a toolstack-introduced domain from Zephyr
++ * Dom0's xenstore server. Counterpart to xs_introduce_domain(): tears down the
++ * xenstore-side state (backends, store ring/thread, xenstore tree, console) and
++ * drops the shadow xen_domain. Driven by the XS_RELEASE (op 9) wire request
++ * that DomD's `xl destroy` issues. IMPORTANT: unlike put_domain(), this does
++ * NOT call xen_domctl_destroydomain() — the hypervisor domain is owned by the
++ * external toolstack (DomD), which destroys it itself; doing it here too would
++ * be a double-destroy. Idempotent: releasing an untracked domid succeeds.
++ */
++int xs_release_domain(uint32_t domid)
++{
++	struct xen_domain *domain = NULL, *iter;
++	int rc;
++
++	/* Find the domain and run the whole release under dl_mutex, exactly like
++	 * put_domain(). Scan directly (NOT get_domain) so we do not bump refcount
++	 * and can inspect f_dom0less before touching it. */
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	SYS_DLIST_FOR_EACH_CONTAINER(&domain_list, iter, node) {
++		if (iter->domid == domid) {
++			domain = iter;
++			break;
++		}
++	}
++	if (!domain) {
++		/* Not tracked (already released / never introduced): idempotent. */
++		k_mutex_unlock(&dl_mutex);
++		return 0;
++	}
++	if (domain->f_dom0less) {
++		/* A dom0less domain (e.g. DomD itself) is owned by dom0less_init, not
++		 * by the toolstack. Never tear it down on a stray XS_RELEASE. */
++		k_mutex_unlock(&dl_mutex);
++		LOG_WRN("xs_release:domid:%u is dom0less, ignoring release", domid);
++		return 0;
++	}
++
++	/* Drop the reference taken by xs_introduce_domain and tear down ONLY when
++	 * the last reference is gone (mirror put_domain's refcount==0 rule) so a
++	 * concurrent get_domain() holder is never left with a dangling pointer.
++	 * Unlike put_domain(), we do NOT call xen_domctl_destroydomain() — the
++	 * hypervisor domain is owned by the external toolstack (DomD), which
++	 * destroys it itself; doing so here would be a double-destroy. The
++	 * teardown helpers do not re-take dl_mutex (same as put_domain). */
++	if (--domain->refcount == 0) {
++		rc = xs_remove_xenstore_backends(domain);
++		if (rc) {
++			LOG_ERR("xs_release:domid:%u remove_backends err (%d)", domid, rc);
++		}
++
++		rc = stop_domain_stored(domain);
++		if (rc) {
++			LOG_ERR("xs_release:domid:%u stop_stored err (%d)", domid, rc);
++		}
++
++		xs_deinitialize_domain_xenstore(domid);
++
++#ifdef CONFIG_XEN_CONSOLE_SRV
++		rc = xen_stop_domain_console(domain);
++		if (rc) {
++			LOG_ERR("xs_release:domid:%u stop_console err (%d)", domid, rc);
++		}
++#endif
++
++		sys_dlist_remove(&domain->node);
++		--dom_num;
++		k_free(domain);
++		LOG_INF("xs_release:domid:%u released by toolstack", domid);
++	} else {
++		LOG_WRN("xs_release:domid:%u still referenced (refcount=%d), teardown deferred",
++			domid, domain->refcount);
++	}
++
++	k_mutex_unlock(&dl_mutex);
++	return 0;
++}
++
+ static int dom0less_init(void)
+ {
+ 	struct xen_domctl_getdomaininfo dominfo;
+ 	uint32_t created_doms = 0;
+ 	uint32_t domid_start = 1;
+ 	int rc;
++#ifdef CONFIG_XEN_STORE_SRV
++	/* Capture the first successfully created dom0less domain's
++	 * domid. On the RPi5 SoDeV topology (a single dom0less DomD)
++	 * that first domain IS the toolstack (DomD, capabilities=0x1), so grant
++	 * it Dom0-equivalent xenstore privilege instead of leaving toolstack_domid
++	 * pinned at its Kconfig default (see xss_set_toolstack_domid). -1 means no
++	 * dom0less domain was created, so the default is left untouched. */
++	int toolstack_domid = -1;
++#endif
+ 
+ 	do {
+ 		rc = dom0less_get_next_domain(domid_start, &dominfo);
+@@ -1197,12 +1409,24 @@ static int dom0less_init(void)
+ 			break;
+ 		}
+ 
++#ifdef CONFIG_XEN_STORE_SRV
++		if (toolstack_domid < 0) {
++			toolstack_domid = domid_start;
++		}
++#endif
+ 		domid_start++;
+ 		created_doms++;
+ 	} while (rc < CONFIG_DOMU_MAX);
+ 
+ 	LOG_INF("dom0less: attached %d domains", created_doms);
+ 
++#ifdef CONFIG_XEN_STORE_SRV
++	if (toolstack_domid >= 0) {
++		LOG_INF("dom0less: toolstack domid = %d (first dom0less domain)",
++			toolstack_domid);
++		xss_set_toolstack_domid(toolstack_domid);
++	}
++#endif
+ 	return rc == -ESRCH ? 0 : rc;
+ }
+ #endif /* CONFIG_XEN_DOM0LESS_BOOT */
+diff --git a/xen-dom-mgmt/include/xen_dom_mgmt.h b/xen-dom-mgmt/include/xen_dom_mgmt.h
+--- a/xen-dom-mgmt/include/xen_dom_mgmt.h
++++ b/xen-dom-mgmt/include/xen_dom_mgmt.h
+@@ -30,6 +30,31 @@
+ int domain_create(struct xen_domain_cfg *domcfg, uint32_t domid);
+ 
+ /**
++ * Introduce a domain created by an external privileged toolstack
++ * (DomD via `xl create`) into Zephyr Dom0's xenstore server. Allocates the
++ * shadow xen_domain, maps the store ring at @store_pfn, binds @remote_evtchn,
++ * seeds the guest xenstore tree and tracks it in domain_list. Idempotent.
++ * Called from xenstore_srv's XS_INTRODUCE (op 8) handler.
++ *
++ * @param domid         The domid to introduce (must already exist at Xen).
++ * @param store_pfn     Guest gfn of the xenstore ring page (from XS_INTRODUCE).
++ * @param remote_evtchn Guest-side xenstore event channel port (from XS_INTRODUCE).
++ * @return 0 on success, or a negative error code on failure.
++ */
++int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtchn);
++
++/**
++ * Release a toolstack-introduced domain from Zephyr Dom0's xenstore
++ * server (counterpart to xs_introduce_domain). Tears down xenstore state only;
++ * the external toolstack (DomD) owns the hypervisor destroy. Idempotent.
++ * Called from xenstore_srv's XS_RELEASE (op 9) handler.
++ *
++ * @param domid The domid to release.
++ * @return 0 on success, or a negative error code on failure.
++ */
++int xs_release_domain(uint32_t domid);
++
++/**
+  * Destroys the specified domain.
+  *
+  * @param domid The ID of the domain to destroy.
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -20,6 +20,7 @@
+ 
+ #include <mem-mgmt.h>
+ #include "domain.h"
++#include "xen_dom_mgmt.h"
+ #include "xen/public/io/xs_wire.h"
+ #include "xenstore_srv.h"
+ #include "xss.h"
+@@ -1712,14 +1713,18 @@
+ {
+ 	char buf[INT32_MAX_STR_LEN] = { 0 };
+ 
+-	if (xenstore->running_transaction) {
+-		LOG_ERR("domid#%u: transaction already started", xenstore->domain->domid);
+-		send_errno(xenstore, id, EBUSY);
+-		return;
+-	}
+-
+-	xenstore->running_transaction = ++xenstore->transaction;
+-	snprintf(buf, sizeof(buf), "%d", xenstore->running_transaction);
++	/* This server's transactions are non-isolating
++	 * stubs (writes apply directly), so do NOT enforce single-transaction
++	 * exclusion — a toolstack domain (DomD) multiplexes several clients
++	 * (xl, xenconsoled, xl devd) over one xenbus connection and legitimately
++	 * has multiple transactions open at once; the old EBUSY rejection made the
++	 * 2nd concurrent XS_TRANSACTION_START fail ("transaction already started")
++	 * and libxl's console/backend setup retried forever. Track a COUNT of open
++	 * transactions instead of a single flag so pending watch events are still
++	 * deferred while ANY transaction is open (see the worker loop). The tx id
++	 * itself is a monotonic counter, unique per start. */
++	xenstore->running_transaction++;
++	snprintf(buf, sizeof(buf), "%d", ++xenstore->transaction);
+ 	send_reply(xenstore, id, XS_TRANSACTION_START, buf);
+ }
+ 
+@@ -1727,9 +1732,12 @@
+ 				    char *payload, uint32_t len)
+ {
+ 	// TODO check contents, transaction completion, etc
+-	xenstore->stop_transaction_id = id;
+-	xenstore->pending_stop_transaction = true;
+-	xenstore->running_transaction = 0;
++	if (xenstore->running_transaction > 0) {
++		xenstore->running_transaction--;
++	}
++	/* Ack directly rather than via the single-slot pending_stop_transaction
++	 * deferral, which cannot represent multiple concurrent transaction ends. */
++	send_reply(xenstore, id, XS_TRANSACTION_END, "OK");
+ }
+ 
+ static void handle_get_domain_path(struct xenstore *xenstore, uint32_t id,
+@@ -1779,6 +1787,125 @@
+ 	k_mutex_unlock(&pfl_mutex);
+ }
+ 
++/*
++ * XS_INTRODUCE (op 8) handler. Required so an external
++ * privileged toolstack (DomD running `xl create`) can register a newly created
++ * guest with this Zephyr Dom0 xenstore server. The stock xen-troops server left
++ * this NULL because reference driver domains are non-privileged and never
++ * introduce domains; here DomD is the control/toolstack domain (capabilities
++ * 0x1) and must be able to introduce DomU/DomA. Payload is the canonical
++ * NUL-separated triple "domid\0mfn\0evtchn\0"; we hand it to xs_introduce_domain
++ * which maps the ring, binds the evtchn and seeds the guest xenstore tree.
++ */
++static void handle_introduce(struct xenstore *xenstore, uint32_t id,
++			     char *payload, uint32_t sz)
++{
++	uint32_t domid, remote_evtchn;
++	uint64_t store_pfn;
++	size_t off, l;
++	int rc;
++
++	/* Only Dom0 or the configured toolstack domain (DomD) may introduce. */
++	if (!is_privileged(xenstore->domain->domid)) {
++		LOG_ERR("XS_INTRODUCE from unprivileged dom#%u rejected",
++			xenstore->domain->domid);
++		send_errno(xenstore, id, EACCES);
++		return;
++	}
++
++	/* Payload = "domid\0mfn\0evtchn\0" */
++	l = strnlen(payload, sz) + 1;
++	if (l >= sz) {
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++	domid = atoi(payload);
++	off = l;
++
++	l = strnlen(payload + off, sz - off) + 1;
++	if (off + l >= sz) {
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++	store_pfn = strtoull(payload + off, NULL, 10);
++	off += l;
++
++	/* Third field (evtchn): the wire ring buffer is not guaranteed
++	 * NUL-terminated, so require a NUL within the remaining bytes before
++	 * parsing — otherwise atoi() would read past the buffer end. */
++	if (off >= sz || strnlen(payload + off, sz - off) == (size_t)(sz - off)) {
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++	remote_evtchn = atoi(payload + off);
++
++	LOG_INF("XS_INTRODUCE dom#%u store_pfn=0x%llx evtchn=%u (from dom#%u)",
++		domid, store_pfn, remote_evtchn, xenstore->domain->domid);
++
++	rc = xs_introduce_domain(domid, store_pfn, remote_evtchn);
++	if (rc) {
++		int e = (rc < 0) ? -rc : rc;
++
++		/* ESRCH is not in the xsd_errors table (send_errno would flatten it
++		 * to EINVAL); report the "domain does not exist" case as ENOENT. */
++		send_errno(xenstore, id, (e == ESRCH) ? ENOENT : e);
++		return;
++	}
++
++	/* Fire the special "@introduceDomain" watch so backends that
++	 * watch it (notably xenconsoled) learn about the new domain and set up its
++	 * console/tty and other backends. The stock server never fired it (it had
++	 * no XS_INTRODUCE at all), so `xl create` timed out waiting for
++	 * /local/domain/<id>/console/tty. Matches upstream xenstored do_introduce. */
++	notify_watchers("@introduceDomain", 0);
++
++	send_reply(xenstore, id, XS_INTRODUCE, "OK");
++}
++
++/*
++ * XS_RELEASE (op 9) handler. Counterpart to
++ * handle_introduce: DomD's `xl destroy` issues XS_RELEASE to remove a guest's
++ * xenstore connection. Payload is "domid\0". Was NULL in the stock server, so
++ * `xl destroy` (and the rollback path of a failed `xl create`) hung on an
++ * unknown operation. xs_release_domain tears down the xenstore-side state; the
++ * hypervisor destroy is done by DomD itself.
++ */
++static void handle_release(struct xenstore *xenstore, uint32_t id,
++			   char *payload, uint32_t sz)
++{
++	uint32_t domid;
++	int rc;
++
++	if (!is_privileged(xenstore->domain->domid)) {
++		LOG_ERR("XS_RELEASE from unprivileged dom#%u rejected",
++			xenstore->domain->domid);
++		send_errno(xenstore, id, EACCES);
++		return;
++	}
++
++	if (strnlen(payload, sz) >= sz) {
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++	domid = atoi(payload);
++
++	LOG_INF("XS_RELEASE dom#%u (from dom#%u)", domid, xenstore->domain->domid);
++
++	rc = xs_release_domain(domid);
++	if (rc) {
++		int e = (rc < 0) ? -rc : rc;
++
++		send_errno(xenstore, id, (e == ESRCH) ? ENOENT : e);
++		return;
++	}
++
++	/* Fire "@releaseDomain" so backends tear down state for the
++	 * gone domain (counterpart to @introduceDomain). Matches upstream. */
++	notify_watchers("@releaseDomain", 0);
++
++	send_reply(xenstore, id, XS_RELEASE, "OK");
++}
++
+ const struct message_handle message_handle_list[XS_TYPE_COUNT] = { [XS_CONTROL] = { handle_control },
+ 					    [XS_DIRECTORY] = { handle_directory },
+ 					    [XS_READ] = { handle_read },
+@@ -1787,8 +1914,8 @@
+ 					    [XS_UNWATCH] = { handle_unwatch },
+ 					    [XS_TRANSACTION_START] = { handle_transaction_start },
+ 					    [XS_TRANSACTION_END] = { handle_transaction_stop },
+-					    [XS_INTRODUCE] = { NULL },
+-					    [XS_RELEASE] = { NULL },
++					    [XS_INTRODUCE] = { handle_introduce },
++					    [XS_RELEASE] = { handle_release },
+ 					    [XS_GET_DOMAIN_PATH] = { handle_get_domain_path },
+ 					    [XS_WRITE] = { handle_write },
+ 					    [XS_MKDIR] = { handle_mkdir },

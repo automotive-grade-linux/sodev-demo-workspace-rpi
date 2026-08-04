@@ -1,0 +1,218 @@
+From 071eefaf606a087415759aba983fc71775226dba Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: toolstack teardown + xsring diagnostics
+
+Add toolstack-domain teardown and xenstore-ring diagnostics.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-dom-mgmt/src/mem-mgmt.c b/xen-dom-mgmt/src/mem-mgmt.c
+index efe3578..2384ddf 100644
+--- a/xen-dom-mgmt/src/mem-mgmt.c
++++ b/xen-dom-mgmt/src/mem-mgmt.c
+@@ -226,7 +226,10 @@ int xenmem_map_region(int domid, uint64_t nr_pages, uint64_t base_gfn,
+ 	return 0;
+ 
+ err_out:
+-	if (region_space_remove(mapped_addr, nr_added_pfns) != nr_added_pfns) {
++	/* was region_space_remove(mapped_addr, ...): passing
++	 * the void** itself made xen_virt_to_gfn() operate on a STACK address,
++	 * removing arbitrary Dom0 pages from the physmap on this error path. */
++	if (region_space_remove(*mapped_addr, nr_added_pfns) != nr_added_pfns) {
+ 		LOG_ERR("Failed to populate space, addr: %p", mapped_addr);
+ 	}
+ 
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index f5c324f..02d2a6b 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -668,6 +668,27 @@ struct xen_domain *get_domain(uint32_t domid)
+ 	return iter;
+ }
+ 
++/* Drop a reference taken by get_domain() WITHOUT running the
++ * refcount==0 teardown, for read-only borrowers (e.g. the `xu xsring` diag
++ * command) that must not touch dom0less domains (put_domain() asserts
++ * !f_dom0less) and never own the last reference. The decrement is done under
++ * dl_mutex so it cannot race the locked increments/decrements in get_domain()/
++ * put_domain()/xs_release_domain() — a raw `domain->refcount--` from a shell
++ * thread could otherwise lose an update against the DomD worker thread on a
++ * preemptible single-CPU build. The caller must hold a reference (so the count
++ * stays >= 1 here and teardown is never due). */
++void unref_domain(struct xen_domain *domain)
++{
++	if (!domain) {
++		return;
++	}
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	if (domain->refcount > 0) {
++		domain->refcount--;
++	}
++	k_mutex_unlock(&dl_mutex);
++}
++
+ void put_domain(struct xen_domain *domain)
+ {
+ 	int rc;
+@@ -681,34 +702,44 @@ void put_domain(struct xen_domain *domain)
+ 	k_mutex_lock(&dl_mutex, K_FOREVER);
+ 	domain->refcount--;
+ 	if (domain->refcount == 0) {
++		/* Same rule as xs_release_domain: unlink under
++		 * dl_mutex, drop the lock, then tear down. stop_domain_stored()'s
++		 * k_thread_join must not run under dl_mutex (it would stall every
++		 * other get_domain/put_domain caller). The domain is exclusively ours
++		 * once unlinked at refcount 0. */
++		domid_t domid = domain->domid;
++
++		sys_dlist_remove(&domain->node);
++		--dom_num;
++		k_mutex_unlock(&dl_mutex);
++
+ 		rc = xs_remove_xenstore_backends(domain);
+ 		if (rc) {
+ 			LOG_ERR("Failed to remove_xenstore_backends domain#%u (rc=%d)",
+-					domain->domid, rc);
++					domid, rc);
+ 		}
+ 
+ 		rc = stop_domain_stored(domain);
+ 		if (rc) {
+-			LOG_ERR("Failed to stop domain#%u store (rc=%d)", domain->domid, rc);
++			LOG_ERR("Failed to stop domain#%u store (rc=%d)", domid, rc);
+ 		}
+ 
+-		xs_deinitialize_domain_xenstore(domain->domid);
++		xs_deinitialize_domain_xenstore(domid);
+ 
+ 	#ifdef CONFIG_XEN_CONSOLE_SRV
+ 		rc = xen_stop_domain_console(domain);
+ 		if (rc) {
+-			LOG_ERR("Failed to stop domain#%u console (rc=%d)", domain->domid, rc);
++			LOG_ERR("Failed to stop domain#%u console (rc=%d)", domid, rc);
+ 		}
+ 	#endif
+ 
+-		rc = xen_domctl_destroydomain(domain->domid);
++		rc = xen_domctl_destroydomain(domid);
+ 		if (rc) {
+-			LOG_ERR("Failed to destroy domain#%u (rc=%d)", domain->domid, rc);
++			LOG_ERR("Failed to destroy domain#%u (rc=%d)", domid, rc);
+ 		}
+ 
+-		sys_dlist_remove(&domain->node);
+-		--dom_num;
+ 		k_free(domain);
++		return;
+ 	}
+ 	k_mutex_unlock(&dl_mutex);
+ }
+@@ -1350,6 +1381,19 @@ int xs_release_domain(uint32_t domid)
+ 	 * destroys it itself; doing so here would be a double-destroy. The
+ 	 * teardown helpers do not re-take dl_mutex (same as put_domain). */
+ 	if (--domain->refcount == 0) {
++		/* Unlink under dl_mutex, then RELEASE the lock
++		 * before teardown. stop_domain_stored() does k_thread_join(K_FOREVER)
++		 * on the guest's worker; this runs on DomD's OWN xenstore worker
++		 * thread (XS_RELEASE handler), so holding dl_mutex across a ~1s (or,
++		 * if that worker is wedged, forever) join would stall/deadlock every
++		 * get_domain/put_domain/introduce/release on the console-srv and shell
++		 * threads. Once unlinked at refcount 0 the domain is exclusively ours
++		 * (no new get_domain can find it, no outstanding reference exists), so
++		 * the teardown is safe outside the lock. */
++		sys_dlist_remove(&domain->node);
++		--dom_num;
++		k_mutex_unlock(&dl_mutex);
++
+ 		rc = xs_remove_xenstore_backends(domain);
+ 		if (rc) {
+ 			LOG_ERR("xs_release:domid:%u remove_backends err (%d)", domid, rc);
+@@ -1369,15 +1413,13 @@ int xs_release_domain(uint32_t domid)
+ 		}
+ #endif
+ 
+-		sys_dlist_remove(&domain->node);
+-		--dom_num;
+ 		k_free(domain);
+ 		LOG_INF("xs_release:domid:%u released by toolstack", domid);
+-	} else {
+-		LOG_WRN("xs_release:domid:%u still referenced (refcount=%d), teardown deferred",
+-			domid, domain->refcount);
++		return 0;
+ 	}
+ 
++	LOG_WRN("xs_release:domid:%u still referenced (refcount=%d), teardown deferred",
++		domid, domain->refcount);
+ 	k_mutex_unlock(&dl_mutex);
+ 	return 0;
+ }
+diff --git a/xen-shell-cmd/src/xen_cmds.c b/xen-shell-cmd/src/xen_cmds.c
+index c34f99c..7f03556 100644
+--- a/xen-shell-cmd/src/xen_cmds.c
++++ b/xen-shell-cmd/src/xen_cmds.c
+@@ -325,6 +325,51 @@ out:
+ 	return ret;
+ }
+ 
++/* Diagnostic: dump a domain's xenstore ring/server state.
++ * Added to root-cause the on-HW "DomD xenstore connection wedges" issue:
++ * shows whether requests sit unconsumed in the ring (req_cons != req_prod),
++ * whether replies are stuck (out bufs / rsp indexes) and the worker state. */
++extern struct xen_domain *get_domain(uint32_t domid);
++extern void unref_domain(struct xen_domain *domain);
++
++static int domain_xsring(const struct shell *shell, size_t argc, char **argv)
++{
++	uint32_t domid;
++	struct xen_domain *domain;
++	struct xenstore *xs;
++	struct xenstore_domain_interface *intf;
++
++	domid = atoi(argv[1]);
++	domain = get_domain(domid);
++	if (!domain) {
++		shell_error(shell, "domain %u not found", domid);
++		return -ESRCH;
++	}
++	xs = &domain->xenstore;
++	intf = xs->domint;
++	if (intf) {
++		shell_print(shell,
++			    "dom%u ring: req_cons=%u req_prod=%u (pend=%u) rsp_cons=%u rsp_prod=%u (unread=%u)",
++			    domid, intf->req_cons, intf->req_prod,
++			    intf->req_prod - intf->req_cons,
++			    intf->rsp_cons, intf->rsp_prod,
++			    intf->rsp_prod - intf->rsp_cons);
++	} else {
++		shell_print(shell, "dom%u ring: (not mapped)", domid);
++	}
++	shell_print(shell,
++		    "dom%u srv: out_bufs=%d tx_last=%d tx_open=%d thrd_stop=%ld sem=%u",
++		    domid, xs->used_out_bufs, xs->transaction,
++		    xs->running_transaction, atomic_get(&xs->thrd_stop),
++		    k_sem_count_get(&xs->xb_sem));
++	/* Drop the get_domain() reference under dl_mutex (unref_domain), NOT via a
++	 * raw refcount-- (races the DomD worker's xs_release_domain) and NOT via
++	 * put_domain() (asserts on dom0less DomD). We hold a reference throughout,
++	 * so the domain and its ring mapping cannot be torn down under us. */
++	unref_domain(domain);
++	return 0;
++}
++
+ SHELL_STATIC_SUBCMD_SET_CREATE(
+ 	subcmd_xu,
+ 	SHELL_CMD_ARG(create, NULL,
+@@ -353,6 +398,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
+ 		      " Usage: console <domid|name>\n",
+ 		      domu_console_attach, 2, 0),
+ #endif
++	SHELL_CMD_ARG(xsring, NULL,
++		      " Dump domain xenstore ring/server state\n"
++		      " Usage: xsring <domid>\n",
++		      domain_xsring, 2, 0),
+ 	SHELL_CMD_ARG(list, NULL,
+ 		      " List all Xen domains\n"
+ 			  " Usage: list\n",

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=DomD GPU bring-up (ordered i2c-brcmstb -> vc4 -> v3d load, V3D runtime-PM pin)
+Documentation=file:///usr/libexec/domd-gpu-init
+# Needs udev/devtmpfs up so the platform devices and /dev/dri nodes exist, and
+# must finish before the compositor claims DRM master.
+After=systemd-udevd.service
+Before=weston.service
+ConditionPathExists=/sys/bus/platform
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/domd-gpu-init
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# multi-user.target (not graphical.target) so the unit is ordered in the same
+# transaction as weston.service without depending on graphical.target itself.
+WantedBy=multi-user.target

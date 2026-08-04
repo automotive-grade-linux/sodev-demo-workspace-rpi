@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Fix sshd (privsep dir /run/sshd + host keys) for DomD
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mkdir -p /run/sshd
+ExecStart=/usr/bin/ssh-keygen -A
+# openssh-sshd provides only sshd.socket + sshd@.service (socket-activated);
+# there is no plain sshd.service, so restarting sshd.service / sshd logged
+# "Unit sshd.service not found". Restart only the socket that exists.
+ExecStart=-/bin/systemctl restart sshd.socket
+# Self-report into xenstore (readable from Dom0 as /local/domain/1/data/sshdfix
+# even when sshd itself is down and the DomD console is backpressured).
+ExecStartPost=-/bin/sh -c 'xenstore-write /local/domain/1/data/sshdfix "keys=$(ls /etc/ssh/ssh_host_*_key 2>/dev/null | wc -l) socket=$(systemctl is-active sshd.socket) uptime=$(cut -d. -f1 /proc/uptime)"'
+
+[Install]
+WantedBy=multi-user.target

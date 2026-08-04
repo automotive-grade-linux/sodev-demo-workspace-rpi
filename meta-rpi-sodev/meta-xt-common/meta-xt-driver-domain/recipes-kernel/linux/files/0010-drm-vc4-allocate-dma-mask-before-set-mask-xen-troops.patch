@@ -1,0 +1,130 @@
+From b0c2fed1b2a301b1ad81e33c46cafb3c0efe2e84 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 28 May 2026 16:00:00 +0900
+Subject: [PATCH] drm/vc4: reorder of_dma_configure + clear stale xen_swiotlb_dma_ops
+
+A `dma_set_mask -EIO` WARN persisted, and pinpointing the root cause to
+line 832 shows that a simple reorder is not enough:
+
+  kernel/dma/mapping.c line 828-834:
+    static int dma_supported(struct device *dev, u64 mask)
+    {
+        const struct dma_map_ops *ops = get_dma_ops(dev);
+        if (use_dma_iommu(dev)) {
+            if (WARN_ON(ops))           <- line 832
+                return false;
+            return true;
+        }
+        ...
+
+The WARN fires on the contradiction `dev->dma_iommu == true` together with
+`dev->dma_ops != NULL`.
+
+Tracing dev->dma_ops through
+arch/arm64/mm/dma-mapping.c::arch_setup_dma_ops shows that at platform
+device alloc time it calls xen_setup_dma_ops(), and under Xen Dom0
+xen_swiotlb_detect() == true so dev->dma_ops = &xen_swiotlb_dma_ops is set
+(include/xen/arm/xen-ops.h).
+
+axi:gpu (a reg-less container node) skips of_dma_configure at
+platform_device_alloc time, so the switch to IOMMU mode never runs and it
+reaches vc4_drm_bind with dev->dma_iommu = false. There the vc4 driver
+calls of_dma_configure(hvs_node, true) to set dev->dma_iommu = true, but
+xen_swiotlb_dma_ops is not cleared, so the contradiction triggers the WARN
+and -EIO.
+
+On bare-metal RPi5 xen_swiotlb_detect() == false, so dev->dma_ops stays
+NULL, there is no contradiction, and vc4-drm bind succeeds.
+
+Fix:
+1. Move of_dma_configure before dma_set_mask_and_coherent (sets
+   dev->dma_iommu = true and allocates dev->dma_mask).
+2. Also clear the xen_swiotlb direct-ops residue with
+   `if (dev->dma_iommu) dev->dma_ops = NULL` after of_dma_configure.
+
+This lets dma_supported() pass without the WARN under Xen Dom0.
+
+Side-effect assessment:
+- bare-metal: dev->dma_iommu stays false, so the if-guard skips the clear;
+  no effect.
+- Xen DomU passthrough: dev->dma_iommu = false (via xen_swiotlb); no
+  effect.
+- other drivers: change is confined to the vc4 driver.
+- IOMMU functionality: of_dma_configure still enters iommu mode correctly,
+  so functionality is preserved.
+
+Refer: include/xen/arm/xen-ops.h::xen_setup_dma_ops()
+Refer: kernel/dma/mapping.c::dma_supported() line 828-834
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/vc4/vc4_drv.c | 50 +++++++++++++++++++++++++++++++----
+ 1 file changed, 44 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/vc4/vc4_drv.c
++++ b/drivers/gpu/drm/vc4/vc4_drv.c
+@@ -332,11 +332,37 @@
+ 	else
+ 		driver = &vc4_drm_driver;
+ 
+-	if (gen >= VC4_GEN_6_C)
+-		dma_set_mask_and_coherent(dev, DMA_BIT_MASK(36));
+-	else
+-		dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+-
++	/*
++	 * Handle xen_swiotlb_dma_ops
++	 * residue + reorder of_dma_configure before dma_set_mask.
++	 *
++	 * The vc4 aggregate device (`/axi/gpu`) is a container DT node with no
++	 * `reg` property, so platform_device_alloc() does not call
++	 * of_dma_configure() for it. We must do it manually, otherwise
++	 * dev->dma_mask is NULL and dev->iommu is uninitialized, and
++	 * dma_set_mask() returns -EIO.
++	 *
++	 * Under Xen Dom0 there is an additional twist: arch_setup_dma_ops()
++	 * unconditionally calls xen_setup_dma_ops() (arch/arm64/mm/dma-mapping.c),
++	 * which sets `dev->dma_ops = &xen_swiotlb_dma_ops` whenever
++	 * xen_swiotlb_detect() is true. That happens BEFORE any device-specific
++	 * setup, so axi:gpu lands at vc4_drm_bind() with both:
++	 *   - dev->dma_ops    == &xen_swiotlb_dma_ops  (set by xen_setup_dma_ops)
++	 *   - dev->dma_iommu  == false                  (not yet configured)
++	 *
++	 * After of_dma_configure() below switches the device to IOMMU mode
++	 * (dev->dma_iommu = true), dma_supported() inside dma_set_mask()
++	 * detects both flags set and triggers WARN_ON(ops) at mapping.c:832 —
++	 * that's an assertion against the iommu/direct-ops contradiction. We
++	 * have to clear dev->dma_ops manually because xen_setup_dma_ops()
++	 * doesn't reconcile with later iommu setup.
++	 *
++	 * On bare-metal RPi5 xen_swiotlb_detect() returns false so
++	 * dev->dma_ops stays NULL and the WARN never fires.
++	 *
++	 * An earlier variant that only set the mask still hit
++	 * WARN_ON(ops) at dma_supported().
++	 */
+ 	node = of_find_matching_node_and_match(NULL, vc4_dma_range_matches,
+ 					       NULL);
+ 	if (node) {
+@@ -347,6 +373,19 @@
+ 			return ret;
+ 	}
+ 
++	/*
++	 * Reconcile with xen_setup_dma_ops(): IOMMU mode is mutually exclusive
++	 * with direct dma_ops. Without this clear, dma_supported() bails out
++	 * with WARN_ON(ops != NULL) for Xen Dom0 builds.
++	 */
++	if (dev->dma_iommu)
++		dev->dma_ops = NULL;
++
++	if (gen >= VC4_GEN_6_C)
++		dma_set_mask_and_coherent(dev, DMA_BIT_MASK(36));
++	else
++		dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++
+ 	vc4 = devm_drm_dev_alloc(dev, driver, struct vc4_dev, base);
+ 	if (IS_ERR(vc4))
+ 		return PTR_ERR(vc4);

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Weston Simple EGL Demo
+After=weston.service weston.socket
+Requires=weston.service
+Wants=weston.socket
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=XDG_RUNTIME_DIR=/run
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -S /run/wayland-0 ] && exit 0; sleep 1; done; echo "wayland-0 socket not found after 60s" >&2; exit 1'
+ExecStart=/usr/bin/weston-simple-egl
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

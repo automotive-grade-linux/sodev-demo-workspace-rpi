@@ -1,0 +1,129 @@
+From 621765d58cec21f38ffd81ed38a5d3468ab68598 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 19 Jun 2026 08:49:29 +0900
+Subject: xen/arm: dom0less: route an MSI controller's msi-ranges SPIs to the domain
+
+dom0less passthrough (handle_passthrough_prop -> map_device_irqs_to_domain)
+only routes a node's interrupts.  An MSI controller such as the BCM2712 MIP
+does not list its outputs in interrupts; it declares the GIC SPIs it raises
+via msi-ranges = <&intc <intspec> span>.  Those SPIs (MIP: GIC_SPI 128..191,
+abs IRQ 160..223) carry the RP1 PCIe-endpoint MSIs, so without routing them the
+guest MSI controller driver cannot receive MSI-X interrupts -- the root cause
+behind rp1_probe's pci_alloc_irq_vectors(PCI_IRQ_MSIX) stall under whole-block
+passthrough.
+
+arch_handle_passthrough_prop() now also routes a passthrough node's msi-ranges:
+for each GIC_SPI (intspec type 0) it sets the SPI type and calls
+map_irq_to_domain() (-> the non-hwdom route_irq_to_guest relaxation already in
+this tree).  No-op for nodes without msi-ranges, so safe for every passthrough
+node.  dom0less-only; needs no toolstack (avoids the 4.19/4.21 xl ABI mismatch).
+
+Builds clean (arm64, Xen 4.21.0).
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ xen/arch/arm/dom0less-build.c | 83 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/xen/arch/arm/dom0less-build.c b/xen/arch/arm/dom0less-build.c
+index 4181c10538..c647a83099 100644
+--- a/xen/arch/arm/dom0less-build.c
++++ b/xen/arch/arm/dom0less-build.c
+@@ -273,10 +273,91 @@ int __init init_vuart(struct domain *d, struct kernel_info *kinfo,
+     return rc;
+ }
+ 
++/*
++ * Route an MSI controller's declared GIC SPI output range to a dom0less
++ * domain.  dom0less' map_device_irqs_to_domain() only routes a node's
++ * "interrupts"; an MSI controller (e.g. the BCM2712 MIP) instead declares the
++ * GIC SPIs it raises via "msi-ranges" = <&intc <intspec> span>.  Those SPIs
++ * carry the PCIe endpoint (RP1) MSIs and must be routed to the guest so its
++ * MSI controller driver can receive them.  For a GIC_SPI (intspec type 0) the
++ * Xen IRQ is the SPI number + NR_LOCAL_IRQS.  No-op for nodes without
++ * msi-ranges, so safe to call for every passthrough node.
++ */
++static int __init route_msi_ranges_to_domain(struct domain *d,
++                                              struct dt_device_node *node)
++{
++    uint32_t r[20];
++    int n, pos = 0;
++
++    n = dt_property_read_variable_u32_array(node, "msi-ranges", r, 1,
++                                            ARRAY_SIZE(r));
++    if ( n <= 0 )
++        return 0;   /* not an MSI controller declaring an SPI range */
++
++    if ( n >= (int)ARRAY_SIZE(r) )
++        printk(XENLOG_WARNING "msi-ranges truncated (>%u cells)\n",
++               (unsigned)ARRAY_SIZE(r));
++
++    while ( pos + 2 <= n )
++    {
++        const struct dt_device_node *intc = dt_find_node_by_phandle(r[pos]);
++        uint32_t icells, type, number, flags, span;
++        unsigned int i;
++        int res;
++
++        if ( !intc || !dt_property_read_u32(intc, "#interrupt-cells", &icells) ||
++             icells < 3 || pos + 1 + icells + 1 > (unsigned int)n )
++        {
++            printk(XENLOG_ERR "%s: malformed msi-ranges\n", dt_node_name(node));
++            return -EINVAL;
++        }
++
++        type   = r[pos + 1];
++        number = r[pos + 2];
++        flags  = r[pos + 3];
++        span   = r[pos + 1 + icells];
++        pos   += 1 + icells + 1;
++
++        /* Only the primary GIC produces routable SPIs (intspec type 0). */
++        if ( intc != dt_interrupt_controller || type != 0 )
++            continue;
++
++        if ( span == 0 ||
++             number + span - 1 + NR_LOCAL_IRQS >= gic_number_lines() )
++        {
++            printk(XENLOG_WARNING
++                   "%s: msi-ranges GIC_SPI %u span %u out of range (gic lines %u), skipping\n",
++                   dt_node_name(node), number, span, gic_number_lines());
++            continue;
++        }
++
++        for ( i = 0; i < span; i++ )
++        {
++            unsigned int irq = number + i + NR_LOCAL_IRQS;
++
++            irq_set_spi_type(irq, flags ? flags : DT_IRQ_TYPE_EDGE_RISING);
++            res = map_irq_to_domain(d, irq, true, "mip-msi-range");
++            if ( res )
++                return res;
++        }
++        printk(XENLOG_INFO
++               "routed msi-ranges GIC_SPI %u..%u (abs IRQ %u..%u) to %pd via %s\n",
++               number, number + span - 1, number + NR_LOCAL_IRQS,
++               number + span - 1 + NR_LOCAL_IRQS, d, dt_node_name(node));
++    }
++
++    return 0;
++}
++
+ int __init arch_handle_passthrough_prop(struct kernel_info *kinfo,
+                                         struct dt_device_node *node)
+ {
+-    return sci_assign_dt_device(kinfo->bd.d, node);
++    int res = sci_assign_dt_device(kinfo->bd.d, node);
++
++    if ( res )
++        return res;
++
++    return route_msi_ranges_to_domain(kinfo->bd.d, node);
+ }
+ 
+ static int __init domu_dt_sci_parse(struct dt_device_node *node,
+-- 
+2.43.0
+

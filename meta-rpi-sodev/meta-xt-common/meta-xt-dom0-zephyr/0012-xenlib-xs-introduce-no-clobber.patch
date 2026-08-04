@@ -1,0 +1,47 @@
+From 6ee2a03fa9846b95b28527d64181e5c1f630bd76 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: xs-introduce: no-clobber existing domain node
+
+XS_INTRODUCE must not clobber a domain's existing xenstore node/state when the domain was created by an external toolstack.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index fa34c94..f5c324f 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -1275,11 +1275,17 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 		goto err_free;
+ 	}
+ 
+-	rc = xs_initialize_xenstore(domid, domain);
+-	if (rc) {
+-		LOG_ERR("xs_introduce:domid:%u init Xenstore err (%d)", domid, rc);
+-		goto err_free_stored;
+-	}
++	/* Do NOT call xs_initialize_xenstore() here: for a toolstack-created
++	 * guest, libxl has already built the complete per-domain xenstore tree
++	 * (name, console, device backends/frontends, memory, cpu availability).
++	 * xs_initialize_xenstore() overwrites those nodes with Zephyr defaults
++	 * (observed on hardware: `xl list` showed the shadow name "DomU-2"
++	 * instead of the cfg's name — direct evidence of the clobbering), which
++	 * corrupts the device wiring right after XS_INTRODUCE. The introduce
++	 * only needs the ring mapping + event channel + server-side thread
++	 * (start_domain_stored above) and the local registration below.
++	 * (dom0less_init_domain keeps calling it: there IS no pre-built tree
++	 * in that path.) */
+ 
+ 	notify_evtchn(domain->xenstore.remote_evtchn);
+ 
+@@ -1293,8 +1299,6 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 	LOG_INF("xs_introduce:domid:%u introduced by toolstack", domid);
+ 	return 0;
+ 
+-err_free_stored:
+-	stop_domain_stored(domain);
+ err_free:
+ 	k_free(domain);
+ 	return rc;

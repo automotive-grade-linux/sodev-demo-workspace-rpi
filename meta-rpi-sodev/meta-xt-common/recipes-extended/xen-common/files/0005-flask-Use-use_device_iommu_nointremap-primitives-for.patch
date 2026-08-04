@@ -1,0 +1,36 @@
+From 040d48fabc691c9d544c6bdebd41379bde34af0f Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 16 Mar 2017 12:30:43 +0200
+Subject: [PATCH 05/24] flask: Use use_device_iommu_nointremap primitives for
+ several devices
+
+Allow a device to be used by a domain only if an IOMMU is active,
+even if it does not support interrupt remapping.
+
+This is needed for the device pass-through use case.
+
+Note: interrupt remapping is an x86 (VT-d) concept; on ARM/RPi5 (BCM2712, no
+IOMMU intremap) use_device_iommu_nointremap is the correct/no-harm primitive
+-- re-evaluate only if this policy is reused on x86.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 040d48fabc691c9d544c6bdebd41379bde34af0f
+---
+ tools/flask/policy/modules/domU.te | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tools/flask/policy/modules/domU.te b/tools/flask/policy/modules/domU.te
+index 3f269018f9..0bea4ef8bb 100644
+--- a/tools/flask/policy/modules/domU.te
++++ b/tools/flask/policy/modules/domU.te
+@@ -29,3 +29,8 @@ delegate_devices(dom0_t, domU_t)
+ 
+ # Both of these domain types can be created using the default (system) role
+ role system_r types { domU_t dm_dom_t };
++
++use_device_iommu_nointremap(domU_t, irq_t)
++use_device_iommu_nointremap(domU_t, iomem_t)
++use_device_iommu_nointremap(domU_t, device_t)
++use_device_iommu_nointremap(domU_t, ioport_t)

@@ -1,0 +1,275 @@
+From 86a0f21a8a524fbfe73f5d6239af6964e9591131 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: optional initrd loading
+
+Add the initrd_info field + load_initrd_bytes/get_initrd_size callbacks on struct xen_domain_cfg, the linux,initrd-start/end chosen-FDT props, and the physmap initrd load. Needed by the AAOS layered ramdisk.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-dom-mgmt/include/domain.h b/xen-dom-mgmt/include/domain.h
+index ca66ed8..f93746b 100644
+--- a/xen-dom-mgmt/include/domain.h
++++ b/xen-dom-mgmt/include/domain.h
+@@ -178,6 +178,15 @@ struct xen_domain_cfg {
+ 	load_image_bytes_t load_image_bytes;
+ 	get_image_size_t get_image_size;
+ 
++	/* Optional: separate initrd for guests whose kernel doesn't have
++	 * initramfs bundled (e.g. Android/AAOS GKI kernel + Android ramdisk).
++	 * If load_initrd_bytes is NULL the guest is started without an initrd.
++	 * The callbacks take the same shape as the kernel callbacks so the
++	 * existing storage-backed loader can be reused. */
++	load_image_bytes_t load_initrd_bytes;
++	get_image_size_t get_initrd_size;
++	void *initrd_info;
++
+ 	void *image_info;
+ 
+ 	struct backend_configuration back_cfg;
+diff --git a/xen-dom-mgmt/include/xen-dom-fdt.h b/xen-dom-mgmt/include/xen-dom-fdt.h
+index a5a8947..d2739c7 100644
+--- a/xen-dom-mgmt/include/xen-dom-fdt.h
++++ b/xen-dom-mgmt/include/xen-dom-fdt.h
+@@ -23,11 +23,15 @@ extern "C" {
+  * @param pfdt Pointer to a partial FDT
+  * @param pfdt_size The size of the partial FDT
+  * @param domid The domain ID.
++ * @param initrd_addr Guest physical address where the initrd will be loaded;
++ *        0 if the guest has no initrd.
++ * @param initrd_size Size of the initrd in bytes; 0 if no initrd.
+  * @return Returns 0 on success, or a negative error code on failure.
+  */
+ int gen_domain_fdt(struct xen_domain_cfg *domcfg, void **fdtaddr,
+ 		size_t *fdtsize, int xen_major, int xen_minor, void *pfdt,
+-		size_t pfdt_size, int domid);
++		size_t pfdt_size, int domid,
++		uint64_t initrd_addr, uint64_t initrd_size);
+ 
+ /**
+  * Frees the memory allocated for a device tree blob (FDT).
+diff --git a/xen-dom-mgmt/src/xen-dom-fdt.c b/xen-dom-mgmt/src/xen-dom-fdt.c
+index df366ad..23603eb 100644
+--- a/xen-dom-mgmt/src/xen-dom-fdt.c
++++ b/xen-dom-mgmt/src/xen-dom-fdt.c
+@@ -192,11 +192,12 @@ static int fdt_property_regs(void *fdt, unsigned int addr_cells,
+ 	return fdt_property(fdt, "reg", regs, sizeof(regs));
+ }
+ 
+-static int create_chosen(void *fdt, const char *cmdline)
++static int create_chosen(void *fdt, const char *cmdline,
++			 uint64_t initrd_addr, uint64_t initrd_size)
+ {
+ 	int res;
+ 
+-	if (!cmdline)
++	if (!cmdline && !initrd_size)
+ 		return 0;
+ 
+ 	/* See linux Documentation/devicetree/... */
+@@ -204,10 +205,24 @@ static int create_chosen(void *fdt, const char *cmdline)
+ 	if (res)
+ 		return res;
+ 
+-	LOG_INF("bootargs = %s", cmdline);
+-	res = fdt_property_string(fdt, "bootargs", cmdline);
+-	if (res)
+-		return res;
++	if (cmdline) {
++		LOG_INF("bootargs = %s", cmdline);
++		res = fdt_property_string(fdt, "bootargs", cmdline);
++		if (res)
++			return res;
++	}
++
++	if (initrd_size) {
++		uint64_t end = initrd_addr + initrd_size;
++		LOG_INF("linux,initrd-start = 0x%llx end = 0x%llx",
++			initrd_addr, end);
++		res = fdt_property_u64(fdt, "linux,initrd-start", initrd_addr);
++		if (res)
++			return res;
++		res = fdt_property_u64(fdt, "linux,initrd-end", end);
++		if (res)
++			return res;
++	}
+ 
+ 	res = fdt_end_node(fdt);
+ 	if (res)
+@@ -828,7 +843,8 @@ static inline int fdt_to_errno(int rc)
+ 
+ int gen_domain_fdt(struct xen_domain_cfg *domcfg, void **fdtaddr,
+ 		  size_t *fdtsize, int xen_major, int xen_minor,
+-		  void *pfdt, size_t pfdt_size, int domid)
++		  void *pfdt, size_t pfdt_size, int domid,
++		  uint64_t initrd_addr, uint64_t initrd_size)
+ {
+ 	int rc = 0;
+ 	int fdt_size = CONFIG_PARTIAL_DEVICE_TREE_SIZE;
+@@ -866,7 +882,7 @@ int gen_domain_fdt(struct xen_domain_cfg *domcfg, void **fdtaddr,
+ 		goto err;
+ 	}
+ 
+-	rc = create_chosen(fdt, domcfg->cmdline);
++	rc = create_chosen(fdt, domcfg->cmdline, initrd_addr, initrd_size);
+ 	if (rc < 0) {
+ 		goto err;
+ 	}
+@@ -969,8 +985,11 @@ void free_domain_fdt(void *fdt)
+ #else /* CONFIG_XEN_LIBFDT */
+ int gen_domain_fdt(struct xen_domain_cfg *domcfg, void **fdtaddr,
+ 		size_t *fdtsize, int xen_major, int xen_minor,
+-		void *pfdt, size_t pfdt_size, int domid)
++		void *pfdt, size_t pfdt_size, int domid,
++		uint64_t initrd_addr, uint64_t initrd_size)
+ {
++	ARG_UNUSED(initrd_addr);
++	ARG_UNUSED(initrd_size);
+ 	LOG_WRN("Domain device tree generation is not supported");
+ 	*fdtaddr = pfdt;
+ 	*fdtsize = pfdt_size;
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index f766122..41e7867 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -33,6 +33,8 @@ LOG_MODULE_REGISTER(xen_dom_mgmt);
+ struct modules_address {
+   uint64_t ventry;
+   uint64_t dtb_addr;
++  uint64_t initrd_addr;
++  uint64_t initrd_size;
+ };
+ 
+ /* Number of active domains, used as an indicator to not exhaust allocated stack area.
+@@ -379,10 +381,51 @@ static int probe_zimage(int domid, uint64_t base_addr,
+ 		zhdr.text_offset, base_addr, nr_pages,
+ 		nr_pages * XEN_PAGE_SIZE);
+ 
++	/* Resolve optional initrd size up-front so the chosen FDT node can
++	 * carry linux,initrd-start / linux,initrd-end before we generate
++	 * the device tree. */
++	if (domcfg->load_initrd_bytes && domcfg->get_initrd_size) {
++		uint64_t isize = 0;
++		uint64_t kfoot = domain_size;
++
++		rc = domcfg->get_initrd_size(domcfg->initrd_info, &isize);
++		if (rc < 0 || isize == 0) {
++			LOG_ERR("Error calling get_initrd_size rc: %d (size=%llu)",
++				rc, isize);
++			return -EINVAL;
++		}
++		modules->initrd_size = isize;
++		/* Place the initrd just past the kernel image in the same RAM
++		 * bank, page-aligned. The DTB will land below this (handled by
++		 * get_dtb_addr) so we leave room for it via fdt_size below.
++		 * Key the initrd off the kernel's loaded foot, not
++		 * just its file size: arm64 image_size (zhdr.res1) covers the BSS
++		 * the kernel zeroes past the file image, so using domain_size (file
++		 * size) alone could drop the initrd inside the kernel BSS. nr_pages
++		 * (map/copy) stays keyed off the file size and is unchanged. */
++		if (zhdr.res1 && zhdr.res1 > kfoot) {
++			kfoot = zhdr.res1;
++		}
++		modules->initrd_addr = ROUND_UP(load_addr + kfoot,
++						XEN_PAGE_SIZE);
++
++		/* Fail cleanly if the initrd would not fit in the
++		 * guest RAM bank [base_addr, base_addr + mem_kb). Nothing has been
++		 * mapped yet, so a plain return needs no unwinding. */
++		if (modules->initrd_addr + modules->initrd_size >
++		    base_addr + KB(domcfg->mem_kb)) {
++			LOG_ERR("initrd overflows guest RAM: end=0x%llx > ram_end=0x%llx",
++				modules->initrd_addr + modules->initrd_size,
++				base_addr + KB(domcfg->mem_kb));
++			return -ENOSPC;
++		}
++	}
++
+ 	rc = gen_domain_fdt(domcfg, (void **)&fdt, &fdt_size,
+ 			   XEN_VERSION_MAJOR, XEN_VERSION_MINOR,
+ 			   (void *)domcfg->dtb_start,
+-			   domcfg->dtb_end - domcfg->dtb_start, domid);
++			   domcfg->dtb_end - domcfg->dtb_start, domid,
++			   modules->initrd_addr, modules->initrd_size);
+ 	if (rc || fdt_size == 0) {
+ 		LOG_ERR("Failed to generate domain FDT (rc=%d)", rc);
+ 		return -ENOMEM;
+@@ -395,6 +438,22 @@ static int probe_zimage(int domid, uint64_t base_addr,
+ 		goto out_dtb;
+ 	}
+ 
++	/* get_dtb_addr does not know about the initrd, which we
++	 * placed past the kernel in the same RAM bank. Reject the case where the
++	 * DTB region [dtb_addr, dtb_addr + ROUND_UP(fdt_size, MB(2))) overlaps
++	 * the initrd [initrd_addr, initrd_addr + initrd_size). fdt is allocated
++	 * by now, so unwind through out_dtb. */
++	if (modules->initrd_size &&
++	    modules->initrd_addr < dtb_addr + ROUND_UP(fdt_size, MB(2)) &&
++	    dtb_addr < modules->initrd_addr + modules->initrd_size) {
++		LOG_ERR("initrd/DTB overlap: initrd=[0x%llx,0x%llx) dtb=[0x%llx,0x%llx)",
++			modules->initrd_addr,
++			modules->initrd_addr + modules->initrd_size,
++			dtb_addr, dtb_addr + ROUND_UP(fdt_size, MB(2)));
++		rc = -ENOSPC;
++		goto out_dtb;
++	}
++
+ 	modules->dtb_addr = dtb_addr;
+ 	rc = load_dtb(domid, dtb_addr, fdt, fdt + fdt_size);
+ 	if (rc) {
+@@ -450,6 +509,53 @@ static int probe_zimage(int domid, uint64_t base_addr,
+ 
+ 	/* .text start address in domU memory */
+ 	modules->ventry = load_addr;
++
++	/* Load the initrd (if any) into the same physmap, just past the
++	 * kernel. Mirrors the kernel load path: map → copy → flush → unmap. */
++	if (modules->initrd_size) {
++		void *mapped_initrd;
++		uint64_t initrd_pages =
++			DIV_ROUND_UP(modules->initrd_size, XEN_PAGE_SIZE);
++		uint64_t initrd_gfn = XEN_PHYS_PFN(modules->initrd_addr);
++		int err_flush2 = 0;
++
++		LOG_INF("initrd will be placed at %llx, size=%llu (%llu pages)",
++			modules->initrd_addr, modules->initrd_size,
++			initrd_pages);
++
++		rc = xenmem_map_region(domid, initrd_pages, initrd_gfn,
++				       &mapped_initrd);
++		if (rc) {
++			LOG_ERR("Failed to map initrd region (rc=%d)", rc);
++			goto out_dtb;
++		}
++
++		rc = domcfg->load_initrd_bytes((uint8_t *)mapped_initrd,
++					       modules->initrd_size, 0,
++					       domcfg->initrd_info);
++		if (rc < 0) {
++			LOG_ERR("load_initrd_bytes failed (rc=%d)", rc);
++			xenmem_unmap_region(initrd_pages, mapped_initrd);
++			goto out_dtb;
++		}
++
++		err_flush2 = xenmem_cacheflush_mapped_pfns(
++			initrd_pages, xen_virt_to_gfn(mapped_initrd));
++		if (err_flush2)
++			LOG_ERR("Failed to flush initrd memory (rc=%d)",
++				err_flush2);
++
++		rc = xenmem_unmap_region(initrd_pages, mapped_initrd);
++		if (rc) {
++			LOG_ERR("Failed to unmap initrd region (rc=%d)", rc);
++			goto out_dtb;
++		}
++		if (err_flush2) {
++			rc = err_flush2;
++			goto out_dtb;
++		}
++	}
++
+ 	rc = 0;
+  out_dtb:
+ 	free_domain_fdt(fdt);

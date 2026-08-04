@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# DomU (AGL Cluster IC) network config.
+#
+# DomU eth0 is the Xen netfront device (xen-netfront kernel module);
+# the netback in DomD connects it to DomD's xenbr0 bridge.
+# DomU does NOT host the bridge itself.
+#
+# IP: 192.168.10.12/24. Flat L2 map (mirrors sodev-net.inc): DomD xenbr0/router
+# .10.10, DomD eth0 .11, DomU .12, DomA .13/.14. Gateway + DNS = DomD xenbr0
+# (.10.10), which is what DomD dnsmasq advertises. DomU is built in a separate
+# bitbake instance (build-domu) that does not include meta-xt-driver-domain, so
+# these values are set directly here and kept in sync with sodev-net.inc by hand.
+#
+# Match: xen-netfront device is usually named `eth0` (legacy) or `enX0`
+# (systemd predictable name for Xen guest virtual NICs). List both for robust
+# matching, just like Dom0/DomD.
+[Match]
+Name=eth0 enX0
+
+[Network]
+Address=192.168.10.12/24
+Gateway=192.168.10.10
+DNS=192.168.10.10
+ConfigureWithoutCarrier=yes

@@ -1,0 +1,207 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+
+	gic: gic {
+		#interrupt-cells = <0x3>;
+		interrupt-controller;
+	};
+
+	passthrough: passthrough {
+		compatible = "raspberrypi,5-model-b", "brcm,bcm2712", "simple-bus";
+		ranges;
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+
+		clk_xosc: clk_xosc {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-output-names = "xosc";
+			clock-frequency = <50000000>;
+		};
+
+		macb_pclk: macb_pclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-output-names = "pclk";
+			clock-frequency = <200000000>;
+		};
+
+		macb_hclk: macb_hclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-output-names = "hclk";
+			clock-frequency = <200000000>;
+		};
+
+		mip0: msi-controller@1000130000 {
+			compatible = "brcm,bcm2712-mip";
+			reg = <0x10 0x130000 0x00 0xc0 0xff 0xfffff000 0x00 0x1000>;
+			msi-controller;
+			msi-ranges = <&gic 0x0 0x80 0x01 0x40>;
+			brcm,msi-offset = <0x00>;
+			xen,path = "/axi/msi-controller@1000130000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x00130000 0x0 0x1000 0x10 0x00130000
+				   0xff 0xfffff000 0x00 0x1000 0xff 0xfffff000>;
+		};
+
+		pciex: pcie@1000120000 {
+			compatible = "brcm,bcm2712-pcie";
+			#address-cells = <0x3>;
+			#size-cells = <0x2>;
+			#interrupt-cells = <0x1>;
+			reg = <0x10 0x120000 0x0 0x9310>;
+			aspm-no-l0s;
+			brcm,vdm-qos-map = <0x8080809 0xa0a0b0b>;
+			num-lanes = <0x04>;
+			linux,pci-domain = <2>;
+			dma-ranges = <0x2000000 0x0 0x0 0x1f 0x0 0x0 0x400000
+				      0x43000000 0x10 0x0 0x0 0x0 0x10 0x0
+				      0x3000000 0xff 0xfffff000 0x10 0x130000 0x00 0x1000>;
+			ranges = <0x2000000 0x0 0x0 0x1f 0x0 0x0 0xfffffffc
+				  0x43000000 0x4 0x0 0x1c 0x0 0x3 0x0>;
+			interrupt-parent = <&gic>;
+			msi-parent = <&mip0>;
+			msi-controller;
+			interrupt-names = "pcie", "msi";
+			interrupts = <0x0 0xe9 0x4 0x0 0xea 0x4>;
+			interrupt-map-mask = <0x0 0x0 0x0 0x7>;
+			interrupt-map = <0x00 0x00 0x00 0x01 &gic 0x00 0xe5 0x04 
+					 0x00 0x00 0x00 0x02 &gic 0x00 0xe6 0x04
+					 0x00 0x00 0x00 0x03 &gic 0x00 0xe7 0x04
+					 0x00 0x00 0x00 0x04 &gic 0x00 0xe8 0x04>;
+			reset-names = "rescal", "bridge";
+			resets = <&reset_controller119500>,
+				 <&reset_controller1504318 0x2c>;
+			max-link-speed = <0x2>;
+			device_type = "pci";
+			xen,path = "/axi/pcie@1000120000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x120000 0x0 0xA000 0x10 0x120000
+				   0x1f 0x00 0x0 0x600000 0x1f 0x00>;
+			status = "okay";
+
+			rp1: rp1@c040000000 {
+				compatible = "simple-bus";
+				#address-cells = <0x2>;
+				#size-cells = <0x2>;
+				#interrupt-cells = <0x2>;
+				interrupt-controller;
+				interrupt-parent = <&rp1>;
+				dma-ranges = <0x10 0x0 0x43000000 0x10 0x0 0x10
+					      0x0 0xc0 0x40000000 0x2000000 0x0
+					      0x0 0x0 0x400000 0x0 0x0 0x2000000
+					      0x10 0x0 0x10 0x0>;
+				ranges = <0xc0 0x40000000 0x2000000 0x0 0x0 0x0 0x400000>;
+
+				ethernet@c040100000 {
+					compatible = "cdns,macb";
+					#address-cells = <0x1>;
+					#size-cells = <0x0>;
+					reg = <0xc0 0x40100000 0x0 0x4000>;
+					interrupts = <0x6 0x4>;
+					phy-reset-duration = <0x5>;
+					phy-reset-gpios = <&gpiod0000 0x20 0x1>;
+					phy-handle = <0x4b>;
+					local-mac-address = [00 00 00 00 00 00];
+					cdns,use-aw2b-fill;
+					cdns,ar2r-max-pipe = [08];
+					cdns,aw2w-max-pipe = [08];
+					phy-mode = "rgmii-id";
+					clock-names = "pclk", "hclk", "tsu_clk";
+					clocks = <&macb_pclk>, <&macb_hclk>, <&clocks18000 0x1d>;
+					xen,path = "/axi/pcie@1000120000/rp1/ethernet@100000";
+					xen,force-assign-without-iommu;
+					xen,reg = <0xc0 0x40100000 0x0 0x4000 0xc0 0x40100000>;
+					status = "okay";
+
+					ethernet-phy@1 {
+						reg = <0x1>;
+						brcm,powerdown-enable;
+					};
+				};
+
+				gpiod0000: gpio@c0400d0000 {
+					compatible = "raspberrypi,rp1-gpio";
+					#gpio-cells = <0x2>;
+					gpio-controller;
+					reg = <0xc0 0x400d0000 0x0 0xc000
+					       0xc0 0x400e0000 0x0 0xc000
+					       0xc0 0x400f0000 0x0 0xc000>;
+					gpio-line-names = "ID_SDA", "ID_SCL", "GPIO2", "GPIO3",
+							  "GPIO4", "GPIO5", "GPIO6", "GPIO7",
+							  "GPIO8", "GPIO9", "GPIO10", "GPIO11",
+							  "GPIO12", "GPIO13", "GPIO14", "GPIO15",
+							  "GPIO16", "GPIO17", "GPIO18", "GPIO19",
+							  "GPIO20", "GPIO21", "GPIO22", "GPIO23",
+							  "GPIO24", "GPIO25", "GPIO26", "GPIO27",
+							  "PCIE_RP1_WAKE", "FAN_TACH", "HOST_SDA",
+							  "HOST_SCL", "ETH_RST_N", "-",
+							  "CD0_IO0_MICCLK", "CD0_IO0_MICDAT0",
+							  "RP1_PCIE_CLKREQ_N", "-", "CD0_SDA",
+							  "CD0_SCL", "CD1_SDA", "CD1_SCL",
+							  "USB_VBUS_EN", "USB_OC_N", "RP1_STAT_LED",
+							  "FAN_PWM", "CD1_IO0_MICCLK", "2712_WAKE",
+							  "CD1_IO1_MICDAT1", "EN_MAX_USB_CUR",
+							  "-", "-", "-", "-";
+					xen,path = "/axi/pcie@1000120000/rp1/gpio@d0000";
+					xen,force-assign-without-iommu;
+					xen,reg = <0xc0 0x400d0000 0x0 0xc000 0xc0 0x400d0000
+						   0xc0 0x400e0000 0x0 0xc000 0xc0 0x400e0000
+						   0xc0 0x400f0000 0x0 0xc000 0xc0 0x400f0000>;
+					status = "okay";
+					interrupts = <0x00 0x04 0x01 0x04 0x02 0x04>;
+					#interrupt-cells = <0x02>;
+					gpio-ranges = <&gpiod0000 0x00 0x00 0x36>;
+					interrupt-controller;
+				};
+
+				clocks18000: clocks@c040018000 {
+					compatible = "raspberrypi,rp1-clocks";
+					#clock-cells = <0x1>;
+					reg = <0xc0 0x40018000 0x0 0x10038>;
+					clocks = <&clk_xosc>;
+					assigned-clock-rates = <0x3b9aca00 0x5b8d8000 0xbebc200
+								0x7735940 0x3a98000 0x927c000
+								0xbebc200 0x5f5e100 0x2faf080
+								0xf4240 0xbebc200 0x2faf080>;
+					assigned-clocks = <&clocks18000 0x0>, <&clocks18000 0x1>,
+							  <&clocks18000 0x3>, <&clocks18000 0x9>,
+							  <&clocks18000 0x4>, <&clocks18000 0xa>,
+							  <&clocks18000 0xc>, <&clocks18000 0x6>,
+							  <&clocks18000 0xd>, <&clocks18000 0x1f>,
+							  <&clocks18000 0x20>, <&clocks18000 0x1d>;
+					xen,path = "/axi/pcie@1000120000/rp1/clocks@18000";
+					xen,force-assign-without-iommu;
+					xen,reg = <0xc0 0x40018000 0x0 0x11000 0xc0 0x40018000>;
+				};
+			};
+		};
+
+		reset_controller1504318: reset-controller@1001504318 {
+			compatible = "brcm,brcmstb-reset";
+			#reset-cells = <0x1>;
+			reg = <0x10 0x1504318 0x0 0x30>;
+			xen,path = "/soc@107c000000/reset-controller@1504318";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x1504000 0x0 0x1000 0x10 0x1504000>;
+		};
+
+		reset_controller119500: reset-controller@1000119500 {
+			compatible = "brcm,bcm7216-pcie-sata-rescal";
+			#reset-cells = <0x0>;
+			reg = <0x10 0x119500 0x0 0x10>;
+			xen,path = "/soc@107c000000/reset-controller@119500";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x119000 0x0 0x1000 0x10 0x119000>;
+		};
+	};
+};

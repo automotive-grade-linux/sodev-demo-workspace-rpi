@@ -1,0 +1,93 @@
+From de60b0e20d5708115639285e20d161009cb153d1 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Sat, 27 May 2023 14:09:34 +0300
+Subject: [PATCH] vhost_xen: Get the guest domid from Xenstore
+
+Setup watch to specific Xenstore entry "drivers/dom0-qemu-command-monitor/..."
+which represents Qemu command line. Hopefully it contains "-xen-domid"
+property which is used to configure pass guest domid for Qemu, parse it
+to get the required info.
+
+The proper solution would be to pass guest domid from Qemu directly by
+extending some of VHOST ioctls (for example, VHOST_SET_MEM_TABLE).
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Acked-by: Volodymyr Babchuk <volodymyr_babchuk@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/linux commit 82c53344828fa26717b088c5c2cb811ad9865a51
+---
+ drivers/vhost/xen.c | 46 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
+index 0b9f1b57c73c..d4466a1c3c2c 100644
+--- a/drivers/vhost/xen.c
++++ b/drivers/vhost/xen.c
+@@ -13,11 +13,11 @@
+ #include <linux/vhost.h>
+ #include <xen/grant_table.h>
+ #include <xen/xen.h>
++#include <xen/xenbus.h>
+ 
+ #include "vhost.h"
+ 
+-/* TODO: Make it possible to get domid */
+-static domid_t guest_domid = 2;
++static domid_t guest_domid = DOMID_INVALID;
+ 
+ struct vhost_xen_grant_map {
+ 	struct list_head next;
+@@ -261,11 +261,53 @@ void vhost_xen_unmap_desc(struct vhost_virtqueue *vq, void *ptr, u32 size)
+ 	}
+ }
+ 
++static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
++		const char *path, const char *token)
++{
++	char *str, *p;
++
++	str = (char *)xenbus_read(XBT_NIL, "drivers/dom0-qemu-command-monitor",
++			"value", NULL);
++	if (XENBUS_IS_ERR_READ(str))
++		return;
++
++	p = strstr(str, "-xen-domid ");
++	if (p) {
++		guest_domid = simple_strtoul(p + strlen("-xen-domid "), NULL, 0);
++		pr_info("%s: Get new domid: %u\n", __func__, guest_domid);
++	}
++
++	kfree(str);
++}
++
++static struct xenbus_watch vhost_xen_qemu_args = {
++	.node = "drivers/dom0-qemu-command-monitor/value",
++	.callback = vhost_xen_get_guest_domid,
++};
++
++static int vhost_xen_watcher(struct notifier_block *notifier,
++		unsigned long event, void *data)
++{
++	int ret;
++
++	ret = register_xenbus_watch(&vhost_xen_qemu_args);
++	if (ret)
++		pr_err("%s: Failed to set watcher (ret=%d)\n", __func__, ret);
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block vhost_xen_notifier = {
++	.notifier_call = vhost_xen_watcher,
++};
++
+ static int __init vhost_xen_init(void)
+ {
+ 	if (!xen_domain())
+ 		return -ENODEV;
+ 
++	register_xenstore_notifier(&vhost_xen_notifier);
++
+ 	pr_info("%s: Initialize module for Xen grant mappings\n", __func__);
+ 
+ 	return 0;

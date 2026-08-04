@@ -1,0 +1,68 @@
+From 07097b482384424ba22435367198dd5852d1683f Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Tue, 17 Oct 2023 13:27:49 +0300
+Subject: [PATCH 19/24] xen/arm: Update emulation of level for legacy PCI
+ interrupts
+
+To avoid mixing with real H/W SPIs add a check for unallocated irqs.
+Update the pci_irq_level array size calculation according to
+the total possible number of irqs. This fork does not wrap the handling
+in CONFIG_VIRTIO_PCI: it stays bounded by the GUEST_VIRTIO_PCI_SPI_FIRST/LAST
+range, which arch-arm.h defines unconditionally (see patch 0011), so no
+#ifdef is needed to build.
+
+For the upstream this should be squashed with:
+"xen/arm: Emulate level for legacy PCI interrupts with current vGIC"
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: applied on top of the locally-modified 0013; the NR_PCI_IRQS redefinition and writer bound are adjusted to match the project's over-sized pci_irq_level[]
+Origin: https://github.com/xen-troops/xen commit 07097b482384424ba22435367198dd5852d1683f
+---
+ xen/arch/arm/gic-vgic.c         | 2 ++
+ xen/arch/arm/include/asm/vgic.h | 3 +--
+ xen/arch/arm/vgic.c             | 3 ++-
+ 3 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/xen/arch/arm/gic-vgic.c b/xen/arch/arm/gic-vgic.c
+index 76efebb271..0e9929d852 100644
+--- a/xen/arch/arm/gic-vgic.c
++++ b/xen/arch/arm/gic-vgic.c
+@@ -240,6 +240,8 @@ static void gic_update_one_lr(struct vcpu *v, int i)
+                  irq < GUEST_VIRTIO_PCI_SPI_LAST &&
+                  vgic_pci_irq_level(v->domain, irq) )
+             {
++                ASSERT(!test_bit(irq, v->domain->arch.vgic.allocated_irqs));
++
+                 set_bit(GIC_IRQ_GUEST_QUEUED, &p->status);
+                 if ( test_bit(GIC_IRQ_GUEST_ENABLED, &p->status) )
+                     gic_raise_guest_irq(v, irq, p->priority);
+diff --git a/xen/arch/arm/include/asm/vgic.h b/xen/arch/arm/include/asm/vgic.h
+index bfa3e0835d..ab86ad9520 100644
+--- a/xen/arch/arm/include/asm/vgic.h
++++ b/xen/arch/arm/include/asm/vgic.h
+@@ -127,8 +127,7 @@ struct vgic_irq_rank {
+     uint8_t vcpu[32];
+ };
+ 
+-/* GUEST_VIRTIO_PCI_SPI_LAST - GUEST_VIRTIO_PCI_SPI_FIRST */
+-#define NR_PCI_IRQS   4
++#define NR_PCI_IRQS   (GUEST_VIRTIO_PCI_SPI_LAST - GUEST_VIRTIO_PCI_SPI_FIRST)
+ 
+ #define vgic_pci_irq_level(d, irq)   \
+     ((d)->arch.vgic.pci_irq_level[(irq) - GUEST_VIRTIO_PCI_SPI_FIRST])
+diff --git a/xen/arch/arm/vgic.c b/xen/arch/arm/vgic.c
+index 6172789064..0bcd883596 100644
+--- a/xen/arch/arm/vgic.c
++++ b/xen/arch/arm/vgic.c
+@@ -758,7 +758,8 @@ void vgic_inject_irq(struct domain *d, struct vcpu *v, unsigned int virq,
+     unsigned long flags;
+ 
+     if ( virq >= GUEST_VIRTIO_PCI_SPI_FIRST &&
+-         virq <= GUEST_VIRTIO_PCI_SPI_LAST )
++         virq < GUEST_VIRTIO_PCI_SPI_LAST &&
++         !test_bit(virq, d->arch.vgic.allocated_irqs) )
+         vgic_pci_irq_level(d, virq) = level;
+ 
+     /*

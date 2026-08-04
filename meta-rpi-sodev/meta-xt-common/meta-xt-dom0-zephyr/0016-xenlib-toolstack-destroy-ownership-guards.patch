@@ -1,0 +1,93 @@
+From d9a07ec98b37943b5650325365c3a5d907073b20 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xenlib: toolstack destroy ownership guards
+
+Guard domain-destroy paths by toolstack ownership.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-dom-mgmt/include/domain.h b/xen-dom-mgmt/include/domain.h
+index f93746b..eb8cf07 100644
+--- a/xen-dom-mgmt/include/domain.h
++++ b/xen-dom-mgmt/include/domain.h
+@@ -235,6 +235,12 @@ struct xen_domain {
+ 	struct backends_state back_state;
+ 
+ 	bool f_dom0less:1; /**< Indicates that domain was created by Xen itself */
++	/* Set for a domain introduced by the external toolstack
++	 * (DomD's `xl create`, via XS_INTRODUCE). The hypervisor domain is owned
++	 * by DomD, which destroys it itself; Zephyr must never call
++	 * xen_domctl_destroydomain() on it, and `xu destroy` must refuse it.
++	 * Torn down on the Zephyr side only by xs_release_domain() (XS_RELEASE). */
++	bool f_toolstack:1;
+ };
+ 
+ struct xen_domain *get_domain(uint32_t domid);
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index 02d2a6b..0d788c9 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -697,7 +697,27 @@ void put_domain(struct xen_domain *domain)
+ 		LOG_ERR("Domain is NULL");
+ 		return;
+ 	}
+-	__ASSERT(!domain->f_dom0less, "dom0less domain#%u operation not supported", domain->domid);
++
++	/*
++	 * put_domain owns full teardown+destroy ONLY for a Zephyr-CREATED
++	 * domain. For a dom0less domain (DomD, owned by dom0less_init) or a
++	 * toolstack-introduced domain (owned by DomD, torn down on the Zephyr
++	 * side by xs_release_domain), put_domain is only a borrow drop and must
++	 * never free or destroy.
++	 *
++	 * This has to be a real runtime branch, not an __ASSERT: assertions are
++	 * compiled out in the shipped build (CONFIG_ASSERT=n), and what is at
++	 * the end of the unguarded path is xen_domctl_destroydomain() on the
++	 * control domain -- the owner of the GPU, HDMI and SD.
++	 */
++	if (domain->f_dom0less || domain->f_toolstack) {
++		k_mutex_lock(&dl_mutex, K_FOREVER);
++		if (domain->refcount > 0) {
++			domain->refcount--;
++		}
++		k_mutex_unlock(&dl_mutex);
++		return;
++	}
+ 
+ 	k_mutex_lock(&dl_mutex, K_FOREVER);
+ 	domain->refcount--;
+@@ -1005,6 +1021,20 @@ int domain_destroy(uint32_t domid)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Only Zephyr-CREATED domains may be destroyed here.
++	 * Refuse dom0less (DomD) and toolstack-introduced (DomD-owned) domains:
++	 * `xu destroy 1` would otherwise tear down the control domain, and
++	 * `xu destroy <toolstack DomU>` would double-destroy a domain DomD owns
++	 * (and its double put_domain could race xs_release_domain into a
++	 * use-after-free). Drop only the get_domain() borrow and return. */
++	if (domain->f_dom0less || domain->f_toolstack) {
++		LOG_ERR("Refusing to destroy dom0less/toolstack domain#%u from Zephyr "
++			"(owned by %s)", domid,
++			domain->f_dom0less ? "dom0less_init" : "the toolstack (use xl destroy on DomD)");
++		unref_domain(domain);
++		return -EPERM;
++	}
++
+ 	/* Call put domain twice to drop the original reference and trigger freeing */
+ 	put_domain(domain);
+ 	put_domain(domain);
+@@ -1296,6 +1326,10 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 	 * (not Zephyr) owns HVM_PARAM_STORE_* — start_domain_stored() re-asserts
+ 	 * HVM_PARAM_STORE_EVTCHN to the same value, which is harmless. */
+ 	domain->f_dom0less = false;
++	/* DomD owns the hypervisor domain; mark it so Zephyr
++	 * never destroys it via put_domain/domain_destroy (only xs_release_domain
++	 * tears down the Zephyr-side state on XS_RELEASE). */
++	domain->f_toolstack = true;
+ 	snprintf(domain->name, CONTAINER_NAME_SIZE, "DomU-%u", domid);
+ 
+ 	domain->xenstore.remote_evtchn = remote_evtchn;

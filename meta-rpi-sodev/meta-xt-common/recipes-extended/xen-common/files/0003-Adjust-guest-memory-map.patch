@@ -1,0 +1,32 @@
+From 990f0ccccd4d9d22b102337bc21c3bc6942911ba Mon Sep 17 00:00:00 2001
+From: Andrii Anisov <andrii_anisov@epam.com>
+Date: Wed, 6 Jun 2018 12:33:13 +0300
+Subject: [PATCH 03/24] Adjust guest memory map
+
+In order to get running guests with access to IO we have to adjust
+XEN guest domain memory map to one specific for an exact platform.
+In our case R-CAR Gen3 has IO mapped at 0xc0000000 with 1GB size,
+so we limit RAM0_SIZE to 2GB at 0x40000000.
+
+Signed-off-by: Andrii Anisov <andrii_anisov@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 990f0ccccd4d9d22b102337bc21c3bc6942911ba
+---
+ xen/include/public/arch-arm.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/xen/include/public/arch-arm.h b/xen/include/public/arch-arm.h
+index b31324f8d4..095b1a23e3 100644
+--- a/xen/include/public/arch-arm.h
++++ b/xen/include/public/arch-arm.h
+@@ -488,8 +488,8 @@ typedef uint64_t xen_callback_t;
+  * address space) relies on the fact that the regions reserved for the RAM
+  * below are big enough to also accommodate such regions.
+  */
+-#define GUEST_RAM0_BASE   xen_mk_ullong(0x40000000) /* 3GB of low RAM @ 1GB */
+-#define GUEST_RAM0_SIZE   xen_mk_ullong(0xc0000000)
++#define GUEST_RAM0_BASE   xen_mk_ullong(0x40000000) /* 2GB of low RAM @ 1GB */
++#define GUEST_RAM0_SIZE   xen_mk_ullong(0x80000000)
+ 
+ /* 4GB @ 4GB Prefetch Memory for VPCI */
+ #define GUEST_VPCI_ADDR_TYPE_PREFETCH_MEM   xen_mk_ullong(0x43000000)

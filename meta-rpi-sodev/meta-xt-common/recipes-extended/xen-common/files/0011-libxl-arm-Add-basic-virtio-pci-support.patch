@@ -1,0 +1,530 @@
+From 37c557abea90e9f7ba52c7cb82cbb1237cd84fd2 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Sun, 11 Sep 2022 20:03:53 +0300
+Subject: [PATCH 11/24] libxl/arm: Add basic virtio-pci support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce new transport mechanism "pci" for the Virtio device
+and update parsing and configuration logic accordingly.
+
+Also extend PCI Host bridge DT node exposed to the guest by adding
+bindings for Legacy PCI interrupts (#INTA - #INTD).
+
+Reserve a SPI range for Legacy PCI interrupts, the emulator (virtio
+backend) must be aware of that range, if passing it via
+include/public/arch-arm.h is not an option, then a range should
+be passed by other means (cmd line, Xenstore).
+
+It is not completely clear yet whether exposing a single PCI
+Host bridge would be enough to cover virtio-pci devices those backends
+are running in different domains at the same time. Consider exposing
+PCI host bridge per virtio backend domain. For now, just don't allow
+virtio-pci backends from different domains.
+
+TODO: Split into several patches. Also сheck whether it won't break
+the PCI passthrough as we might have both features enabled at
+the same time.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 37c557abea90e9f7ba52c7cb82cbb1237cd84fd2
+---
+ docs/man/xl.cfg.5.pod.in         |   9 ++-
+ tools/libs/light/libxl_arm.c     | 121 +++++++++++++++++++++++++++----
+ tools/libs/light/libxl_create.c  |  16 +++-
+ tools/libs/light/libxl_types.idl |  19 +++--
+ tools/libs/light/libxl_virtio.c  |  88 ++++++++++++++++------
+ tools/xl/xl_parse.c              |  36 +++++++++
+ xen/include/public/arch-arm.h    |   3 +
+ 7 files changed, 244 insertions(+), 48 deletions(-)
+
+diff --git a/docs/man/xl.cfg.5.pod.in b/docs/man/xl.cfg.5.pod.in
+index 8ea5f31e6c..c866b528a2 100644
+--- a/docs/man/xl.cfg.5.pod.in
++++ b/docs/man/xl.cfg.5.pod.in
+@@ -1672,8 +1672,13 @@ hexadecimal format, without the "0x" prefix and all in lower case, like
+ 
+ =item B<transport=STRING>
+ 
+-Specifies the transport mechanism for the Virtio device, only "mmio" is
+-supported for now.
++Specifies the transport mechanism for the Virtio device, both "mmio" and "pci"
++are supported. This option is mandatory.
++
++=item B<bdf=STRING>
++
++The Virtio device with transport "pci" must be identified by its B<BDF>.
++See L<xl-pci-configuration(5)> for more details about the format for B<BDF>.
+ 
+ =item B<grant_usage=BOOLEAN>
+ 
+diff --git a/tools/libs/light/libxl_arm.c b/tools/libs/light/libxl_arm.c
+index e4407d6e3f..ffd963736f 100644
+--- a/tools/libs/light/libxl_arm.c
++++ b/tools/libs/light/libxl_arm.c
+@@ -86,8 +86,9 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+ {
+     uint32_t nr_spis = 0, cfg_nr_spis = d_config->b_info.arch_arm.nr_spis;
+     unsigned int i;
+-    uint32_t vuart_irq, virtio_irq = 0;
+-    bool vuart_enabled = false, virtio_enabled = false;
++    uint32_t vuart_irq, virtio_mmio_irq_last;
++    bool vuart_enabled = false, virtio_mmio_enabled = false;
++    unsigned int num_virtio_pcidevs = 0;
+     uint64_t virtio_mmio_base = GUEST_VIRTIO_MMIO_BASE;
+     uint32_t virtio_mmio_irq = GUEST_VIRTIO_MMIO_SPI_FIRST;
+     int rc;
+@@ -118,10 +119,13 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+     for (i = 0; i < d_config->num_virtios; i++) {
+         libxl_device_virtio *virtio = &d_config->virtios[i];
+ 
+-        if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO)
++        if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO) {
++            num_virtio_pcidevs ++;
+             continue;
++        }
+ 
+-        rc = alloc_virtio_mmio_params(gc, &virtio->base, &virtio->irq,
++        rc = alloc_virtio_mmio_params(gc, &virtio->u.mmio.base,
++                                      &virtio->u.mmio.irq,
+                                       &virtio_mmio_base, &virtio_mmio_irq);
+ 
+         if (rc)
+@@ -134,16 +138,19 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+      * The resulting "nr_spis" needs to cover the highest possible SPI.
+      */
+     if (virtio_mmio_irq != GUEST_VIRTIO_MMIO_SPI_FIRST) {
+-        virtio_enabled = true;
++        virtio_mmio_enabled = true;
+ 
+         /*
+          * Assumes that "virtio_mmio_irq" is the highest allocated irq, which is
+          * updated from alloc_virtio_mmio_irq() currently.
+          */
+-        virtio_irq = virtio_mmio_irq - 1;
+-        nr_spis = max(nr_spis, virtio_irq - 32 + 1);
++        virtio_mmio_irq_last = virtio_mmio_irq - 1;
++        nr_spis = max(nr_spis, virtio_mmio_irq_last - 32 + 1);
+     }
+ 
++    if (num_virtio_pcidevs)
++        nr_spis = max(nr_spis, (uint32_t)(GUEST_VIRTIO_PCI_SPI_LAST - 32 + 1));
++
+     for (i = 0; i < d_config->b_info.num_irqs; i++) {
+         uint32_t irq = d_config->b_info.irqs[i];
+         uint32_t spi;
+@@ -164,10 +171,14 @@ int libxl__arch_domain_prepare_config(libxl__gc *gc,
+         }
+ 
+         /* The same check as for vpl011 */
+-        if (virtio_enabled &&
+-            (irq >= GUEST_VIRTIO_MMIO_SPI_FIRST && irq <= virtio_irq)) {
++        if (virtio_mmio_enabled &&
++            (irq >= GUEST_VIRTIO_MMIO_SPI_FIRST && irq <= virtio_mmio_irq_last)) {
+             LOG(ERROR, "Physical IRQ %u conflicting with Virtio MMIO IRQ range\n", irq);
+             return ERROR_FAIL;
++        } else if (num_virtio_pcidevs &&
++            (irq >= GUEST_VIRTIO_PCI_SPI_FIRST && irq <= GUEST_VIRTIO_PCI_SPI_LAST)) {
++            LOG(ERROR, "Physical IRQ %u conflicting with Virtio PCI IRQ range\n", irq);
++            return ERROR_FAIL;
+         }
+ 
+         if (irq < 32)
+@@ -888,9 +899,10 @@ static int make_vpl011_uart_node(libxl__gc *gc, void *fdt,
+     return 0;
+ }
+ 
+-static int make_vpci_node(libxl__gc *gc, void *fdt,
+-                          const struct arch_info *ainfo,
+-                          struct xc_dom_image *dom)
++/* The caller is responsible to complete / close the fdt node */
++static int make_vpci_node_common(libxl__gc *gc, void *fdt,
++                                 const struct arch_info *ainfo,
++                                 struct xc_dom_image *dom)
+ {
+     int res;
+     const uint64_t vpci_ecam_base = GUEST_VPCI_ECAM_BASE;
+@@ -929,7 +941,69 @@ static int make_vpci_node(libxl__gc *gc, void *fdt,
+         GUEST_VPCI_PREFETCH_MEM_SIZE);
+     if (res) return res;
+ 
+-    res = fdt_end_node(fdt);
++    return 0;
++}
++
++#define PCI_NUM_IRQ   4
++#define PCI_IRQ_MAP_STRIDE   8
++
++static int create_vpci_irq_map(libxl__gc *gc, void *fdt)
++{
++    uint32_t full_irq_map[PCI_NUM_IRQ * PCI_NUM_IRQ * PCI_IRQ_MAP_STRIDE] = {0};
++    uint32_t *irq_map = full_irq_map;
++    unsigned int slot, pin;
++    int res;
++
++    res = fdt_property_cell(fdt, "#interrupt-cells", 1);
++    if (res) return res;
++
++    for (slot = 0; slot < PCI_NUM_IRQ; slot++) {
++        for (pin = 0; pin < PCI_NUM_IRQ; pin++) {
++            uint32_t irq = GUEST_VIRTIO_PCI_SPI_FIRST +
++                ((pin + slot) % PCI_NUM_IRQ);
++            unsigned int i = 0;
++
++            /* PCI address (3 cells) */
++            irq_map[i++] = cpu_to_fdt32(PCI_DEVFN(slot, 0) << 8);
++            irq_map[i++] = cpu_to_fdt32(0);
++            irq_map[i++] = cpu_to_fdt32(0);
++
++            /* PCI interrupt (1 cell) */
++            irq_map[i++] = cpu_to_fdt32(pin + 1);
++
++            /* GIC phandle (1 cell) */
++            irq_map[i++] = cpu_to_fdt32(GUEST_PHANDLE_GIC);
++
++            /* GIC interrupt (3 cells) */
++            irq_map[i++] = cpu_to_fdt32(0); /* SPI */
++            irq_map[i++] = cpu_to_fdt32(irq - 32);
++            irq_map[i++] = cpu_to_fdt32(DT_IRQ_TYPE_LEVEL_HIGH);
++
++            irq_map += PCI_IRQ_MAP_STRIDE;
++        }
++    }
++
++    res = fdt_property(fdt, "interrupt-map", full_irq_map, sizeof(full_irq_map));
++    if (res) return res;
++
++    res = fdt_property_values(gc, fdt, "interrupt-map-mask", 4,
++                              PCI_DEVFN(3, 0) << 8, 0, 0, 0x7);
++    if (res) return res;
++
++    return 0;
++}
++
++static int make_vpci_node_virtio(libxl__gc *gc, void *fdt,
++                                 libxl_domain_config *d_config)
++{
++    int res;
++
++    /* The same property as for virtio-mmio device */
++    res = fdt_property(fdt, "dma-coherent", NULL, 0);
++    if (res) return res;
++
++    /* Legacy PCI interrupts (#INTA - #INTD) */
++    res = create_vpci_irq_map(gc, fdt);
+     if (res) return res;
+ 
+     return 0;
+@@ -1301,6 +1375,7 @@ static int libxl__prepare_dtb(libxl__gc *gc, libxl_domain_config *d_config,
+     libxl_domain_build_info *const info = &d_config->b_info;
+     bool iommu_needed = false;
+     unsigned int i;
++    unsigned int num_virtio_pcidevs = 0;
+ 
+     const libxl_version_info *vers;
+     const struct arch_info *ainfo;
+@@ -1429,14 +1504,28 @@ next_resize:
+             if (libxl_defbool_val(virtio->grant_usage))
+                 iommu_needed = true;
+ 
+-            FDT( make_virtio_mmio_node_device(gc, fdt, virtio->base,
+-                                              virtio->irq, virtio->type,
++            if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO) {
++                num_virtio_pcidevs ++;
++                continue;
++            }
++
++            FDT( make_virtio_mmio_node_device(gc, fdt, virtio->u.mmio.base,
++                                              virtio->u.mmio.irq, virtio->type,
+                                               virtio->backend_domid,
+                                               libxl_defbool_val(virtio->grant_usage)) );
+         }
+ 
++        if (d_config->num_pcidevs || num_virtio_pcidevs) {
++            FDT( make_vpci_node_common(gc, fdt, ainfo, dom) );
++
++            if (num_virtio_pcidevs)
++                FDT( make_vpci_node_virtio(gc, fdt, d_config) );
++
++            FDT( fdt_end_node(fdt) );
++        }
++
+         /*
+-         * The iommu node should be created only once for all virtio-mmio
++         * The iommu node should be created only once for all virtio
+          * devices.
+          */
+         if (iommu_needed)
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index 7ff7185939..2e4e208b31 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1077,6 +1077,7 @@ int libxl__domain_config_setdefault(libxl__gc *gc,
+     libxl_ctx *ctx = libxl__gc_owner(gc);
+     int ret, i;
+     bool pod_enabled = false;
++    libxl_domid virtio_pci_domid = INVALID_DOMID;
+     libxl_domain_create_info *c_info = &d_config->c_info;
+ 
+     libxl_physinfo physinfo;
+@@ -1271,12 +1272,23 @@ int libxl__domain_config_setdefault(libxl__gc *gc,
+     }
+ 
+     for (i = 0; i < d_config->num_virtios; i++) {
+-        ret = libxl__virtio_devtype.set_default(gc, domid,
+-                                                &d_config->virtios[i], false);
++        libxl_device_virtio *virtio = &d_config->virtios[i];
++
++        ret = libxl__virtio_devtype.set_default(gc, domid, virtio, false);
+         if (ret) {
+             LOGD(ERROR, domid, "Unable to set virtio defaults for device %d", i);
+             goto error_out;
+         }
++
++        if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI) {
++            if (virtio_pci_domid == INVALID_DOMID) {
++                virtio_pci_domid = virtio->backend_domid;
++            } else if (virtio_pci_domid != virtio->backend_domid) {
++                ret = ERROR_INVAL;
++                LOGD(ERROR, domid, "Cannot enable virtio-pci backends from different domains");
++                goto error_out;
++            }
++        }
+     }
+ 
+     ret = 0;
+diff --git a/tools/libs/light/libxl_types.idl b/tools/libs/light/libxl_types.idl
+index e4a1d043ea..d4dde32a33 100644
+--- a/tools/libs/light/libxl_types.idl
++++ b/tools/libs/light/libxl_types.idl
+@@ -288,6 +288,7 @@ libxl_vkb_backend = Enumeration("vkb_backend", [
+ libxl_virtio_transport = Enumeration("virtio_transport", [
+     (0, "UNKNOWN"),
+     (1, "MMIO"),
++    (2, "PCI"),
+     ])
+ 
+ libxl_passthrough = Enumeration("passthrough", [
+@@ -789,13 +790,21 @@ libxl_device_virtio = Struct("device_virtio", [
+     ("backend_domid", libxl_domid),
+     ("backend_domname", string),
+     ("type", string),
+-    ("transport", libxl_virtio_transport),
++    ("u", KeyedUnion(None, libxl_virtio_transport, "transport",
++              [("unknown", None),
++               # Note that virtio-mmio parameters (irq and base) are for internal
++               # use by libxl and can't be modified.
++               ("mmio", Struct(None, [("irq", uint32),
++                                      ("base", uint64),
++                                     ])),
++               ("pci", Struct(None,  [("func", uint8),
++                                      ("dev", uint8),
++                                      ("bus", uint8),
++                                      ("domain", uint16),
++                                     ])),
++              ])),
+     ("grant_usage", libxl_defbool),
+     ("devid", libxl_devid),
+-    # Note that virtio-mmio parameters (irq and base) are for internal
+-    # use by libxl and can't be modified.
+-    ("irq", uint32),
+-    ("base", uint64)
+     ])
+ 
+ libxl_device_disk = Struct("device_disk", [
+diff --git a/tools/libs/light/libxl_virtio.c b/tools/libs/light/libxl_virtio.c
+index e5e321adc5..b593fd45de 100644
+--- a/tools/libs/light/libxl_virtio.c
++++ b/tools/libs/light/libxl_virtio.c
+@@ -57,8 +57,20 @@ static int libxl__set_xenstore_virtio(libxl__gc *gc, uint32_t domid,
+ {
+     const char *transport = libxl_virtio_transport_to_string(virtio->transport);
+ 
+-    flexarray_append_pair(back, "irq", GCSPRINTF("%u", virtio->irq));
+-    flexarray_append_pair(back, "base", GCSPRINTF("%#"PRIx64, virtio->base));
++    if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_MMIO) {
++        flexarray_append_pair(back, "irq", GCSPRINTF("%u", virtio->u.mmio.irq));
++        flexarray_append_pair(back, "base", GCSPRINTF("%#"PRIx64, virtio->u.mmio.base));
++    } else {
++        /*
++         * TODO:
++         * Probably we will also need to store PCI Host bridge details (irq and
++         * mem ranges) this particular PCI device belongs to if emulator cannot
++         * or should not rely on what is described at include/public/arch-arm.h
++         */
++        flexarray_append_pair(back, "bdf", GCSPRINTF("%04x:%02x:%02x.%01x",
++                              virtio->u.pci.domain, virtio->u.pci.bus,
++                              virtio->u.pci.dev, virtio->u.pci.func));
++    }
+     flexarray_append_pair(back, "type", GCSPRINTF("%s", virtio->type));
+     flexarray_append_pair(back, "transport", GCSPRINTF("%s", transport));
+     flexarray_append_pair(back, "grant_usage",
+@@ -84,33 +96,63 @@ static int libxl__virtio_from_xenstore(libxl__gc *gc, const char *libxl_path,
+     rc = libxl__backendpath_parse_domid(gc, be_path, &virtio->backend_domid);
+     if (rc) goto out;
+ 
+-    rc = libxl__xs_read_checked(gc, XBT_NULL,
+-				GCSPRINTF("%s/irq", be_path), &tmp);
+-    if (rc) goto out;
+-
+-    if (tmp) {
+-        virtio->irq = strtoul(tmp, NULL, 0);
++    tmp = libxl__xs_read(gc, XBT_NULL, GCSPRINTF("%s/transport", be_path));
++    if (!tmp) {
++        LOG(ERROR, "Missing xenstore node %s/transport", be_path);
++        rc = ERROR_INVAL;
++        goto out;
+     }
+ 
+-    tmp = NULL;
+-    rc = libxl__xs_read_checked(gc, XBT_NULL,
+-				GCSPRINTF("%s/base", be_path), &tmp);
+-    if (rc) goto out;
++    rc = libxl_virtio_transport_from_string(tmp, &virtio->transport);
++    if (rc) {
++        LOG(ERROR, "Unable to parse xenstore node %s/transport", be_path);
++        goto out;
++    }
+ 
+-    if (tmp) {
+-        virtio->base = strtoul(tmp, NULL, 0);
++    if (virtio->transport != LIBXL_VIRTIO_TRANSPORT_MMIO &&
++        virtio->transport != LIBXL_VIRTIO_TRANSPORT_PCI) {
++        LOG(ERROR, "Unexpected transport for virtio");
++        rc = ERROR_INVAL;
++        goto out;
+     }
+ 
+-    tmp = NULL;
+-    rc = libxl__xs_read_checked(gc, XBT_NULL,
+-				GCSPRINTF("%s/transport", be_path), &tmp);
+-    if (rc) goto out;
++    if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_MMIO) {
++        tmp = NULL;
++        rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                    GCSPRINTF("%s/irq", be_path), &tmp);
++        if (rc) goto out;
+ 
+-    if (tmp) {
+-        if (!strcmp(tmp, "mmio")) {
+-            virtio->transport = LIBXL_VIRTIO_TRANSPORT_MMIO;
+-        } else {
+-            return ERROR_INVAL;
++        if (tmp) {
++            virtio->u.mmio.irq = strtoul(tmp, NULL, 0);
++        }
++
++        tmp = NULL;
++        rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                    GCSPRINTF("%s/base", be_path), &tmp);
++        if (rc) goto out;
++
++        if (tmp) {
++            virtio->u.mmio.base = strtoul(tmp, NULL, 0);
++        }
++    } else {
++        unsigned int domain, bus, dev, func;
++
++        tmp = NULL;
++        rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                    GCSPRINTF("%s/bdf", be_path), &tmp);
++        if (rc) goto out;
++
++        if (tmp) {
++            if (sscanf(tmp, "%04x:%02x:%02x.%01x",
++                &domain, &bus, &dev, &func) != 4) {
++                rc = ERROR_INVAL;
++                goto out;
++            }
++
++            virtio->u.pci.domain = domain;
++            virtio->u.pci.bus = bus;
++            virtio->u.pci.dev = dev;
++            virtio->u.pci.func = func;
+         }
+     }
+ 
+diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
+index 0c95111354..d5a1427fca 100644
+--- a/tools/xl/xl_parse.c
++++ b/tools/xl/xl_parse.c
+@@ -1219,6 +1219,24 @@ static int parse_virtio_config(libxl_device_virtio *virtio, char *token)
+         if (rc) return rc;
+     } else if (MATCH_OPTION("grant_usage", token, oparg)) {
+         libxl_defbool_set(&virtio->grant_usage, strtoul(oparg, NULL, 0));
++    } else if (MATCH_OPTION("bdf", token, oparg)) {
++        /*
++         * TODO:
++         * We pretend that we are ordinary PCI device to reuse BDF parsing
++         * logic. This needs to be properly reused by adjusting parse_bdf().
++         */
++        libxl_device_pci pci;
++
++        rc = xlu_pci_parse_bdf(NULL, &pci, oparg);
++        if (rc) {
++            fprintf(stderr, "Unable to parse BDF `%s' for virtio-pci\n", oparg);
++            return -1;
++        }
++
++        virtio->u.pci.domain = pci.domain;
++        virtio->u.pci.bus = pci.bus;
++        virtio->u.pci.dev = pci.dev;
++        virtio->u.pci.func = pci.func;
+     } else {
+         fprintf(stderr, "Unknown string \"%s\" in virtio spec\n", token);
+         return -1;
+@@ -1240,6 +1258,7 @@ static void parse_virtio_list(const XLU_Config *config,
+         while ((item = xlu_cfg_get_listitem(virtios, entry)) != NULL) {
+             libxl_device_virtio *virtio;
+             char *p;
++            bool bdf_present = false;
+ 
+             virtio = ARRAY_EXTEND_INIT(d_config->virtios, d_config->num_virtios,
+                                        libxl_device_virtio_init);
+@@ -1262,6 +1281,8 @@ static void parse_virtio_list(const XLU_Config *config,
+                         strcat(str, p2);
+                         p = str;
+                     }
++                } else if (MATCH_OPTION("bdf", p, oparg)) {
++                    bdf_present = true;
+                 }
+ 
+                 rc = parse_virtio_config(virtio, p);
+@@ -1272,6 +1293,21 @@ static void parse_virtio_list(const XLU_Config *config,
+                 p = strtok(NULL, ",");
+             }
+ 
++            if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_UNKNOWN) {
++                fprintf(stderr, "Unspecified transport for virtio\n");
++                rc = ERROR_FAIL; goto out;
++            }
++
++            if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_PCI &&
++                !bdf_present) {
++                fprintf(stderr, "BDF must be specified for virtio-pci\n");
++                rc = ERROR_FAIL; goto out;
++            } else if (virtio->transport == LIBXL_VIRTIO_TRANSPORT_MMIO &&
++                bdf_present) {
++                fprintf(stderr, "BDF must not be specified for virtio-mmio\n");
++                rc = ERROR_FAIL; goto out;
++            }
++
+             entry++;
+             free(buf);
+         }
+diff --git a/xen/include/public/arch-arm.h b/xen/include/public/arch-arm.h
+index 095b1a23e3..5b64aeadc5 100644
+--- a/xen/include/public/arch-arm.h
++++ b/xen/include/public/arch-arm.h
+@@ -534,6 +534,9 @@ typedef uint64_t xen_callback_t;
+ #define GUEST_FFA_NOTIF_PEND_INTR_ID      8
+ #define GUEST_FFA_SCHEDULE_RECV_INTR_ID   9
+ 
++#define GUEST_VIRTIO_PCI_SPI_FIRST   44
++#define GUEST_VIRTIO_PCI_SPI_LAST    48
++
+ /* PSCI functions */
+ #define PSCI_cpu_suspend 0
+ #define PSCI_cpu_off     1

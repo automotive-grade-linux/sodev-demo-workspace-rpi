@@ -1,0 +1,1094 @@
+/*
+ * BCM2712 RPi5 - DomD VC4 driver domain partial device tree
+ *
+ * Architecture: thin Dom0 (control; Zephyr by default, or Linux) + Linux DomD
+ * (GPU driver) + DomU (AGL cluster) + DomA (AAOS).
+ *
+ * This DTS is shared by both Dom0 flavours. domd-vc4.bb strips the SD/GPIO block
+ * between the SODEV-LINUX-DOM0-SD-STRIP markers when DOM0_OS=linux, because there
+ * Dom0 owns the SD; with DOM0_OS=zephyr (the default) the block stays and DomD
+ * owns it.
+ *
+ * Source DT references:
+ *   arch/arm64/boot/dts/broadcom/bcm2712.dtsi
+ *   arch/arm64/boot/dts/broadcom/bcm2712-ds.dtsi
+ *   arch/arm64/boot/dts/broadcom/bcm2712-rpi.dtsi
+ *
+ * Bus translation:
+ *   soc@107c000000 ranges = <0x0 0x10 0x00000000 0x80000000>
+ *     -> soc-internal 0x7c...... -> axi level 0x10_7c......
+ *   axi: ranges identity, so axi addresses are absolute physical.
+ *
+ * Address mode (xl iomem + xen,reg):
+ *   Identity mapping: guest IPA = host PA.
+ *   xen,reg semantics: <host PA size guest IPA size> per Xen partial DT spec.
+ *
+ * Mailbox ownership: DomD accesses the mailbox directly, so the mailbox node is
+ *   kept here and "0x107c013,1" is listed in the domain config's iomem. The
+ *   alternative -- proxying mailbox calls through Dom0 -- is not used.
+ *
+ * Details that are easy to get wrong and are load-bearing here:
+ *   - HDMI and HVS interrupts are routed via their L2 controllers (aon_intr and
+ *     disp_intr), not directly from the GIC
+ *   - the V3D and HVS iomem ranges are the exact register sizes, not rounded up
+ *   - all 9 HDMI reg blocks are present (metadata, csc, cec, hd, ...); a missing
+ *     block leaves the driver bound but unable to drive that sub-function
+ *   - the firmware node carries dma-ranges
+ *   - disp_intr is SPI 97 (a plausible-looking 44 is wrong)
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+
+	gic: gic {
+		#interrupt-cells = <0x3>;
+		interrupt-controller;
+		/*
+		 * Hard-code phandle to GUEST_PHANDLE_GIC (= 65000 = 0xfde8) from
+		 * xen/include/public/device_tree_defs.h. libxl prepare_dtb() does
+		 * NOT copy this root-level dummy gic node (only /passthrough +
+		 * /aliases get copied). However, all `interrupt-parent = <&gic>`
+		 * references inside /passthrough are emitted as phandle values that
+		 * must match the libxl-generated GIC node (make_gicv2_node sets
+		 * phandle=65000). Without this hard-code, dtc auto-assigns a small
+		 * phandle (e.g. 1) and partial-DT &gic refs point to a non-existent
+		 * node -> DomD kernel IRQ resolution fails -> vc4-drm bind fails.
+		 */
+		phandle = <0xfde8>;
+		linux,phandle = <0xfde8>;
+	};
+
+	/*
+	 * Explicitly add a root-level /hypervisor node. libxl
+	 * make_hypervisor_node should auto-generate it, but it may be skipped
+	 * on the partial DT path, so inject it explicitly. Linux arm64
+	 * xen_early_init() runs of_scan_flat_dt(fdt_find_hyper_node), which
+	 * walks the root for the "xen,xen" compatible; finding it here makes
+	 * Xen detection succeed -> xen_swiotlb_dma_ops works -> p2m translation
+	 * for V3D DMA.
+	 *
+	 * reg uses the placeholder value libxl defines in dom_xen_4_19.h:
+	 * GUEST_GNTTAB_BASE = 0x38000000 (within DomD memory, grant table area)
+	 * size = 0x1000000 (16 MB).
+	 * Note: the actual grant table location is assigned by libxl, so this
+	 * reg is only for Linux Xen detection (node-existence check).
+	 */
+	hypervisor: hypervisor {
+		compatible = "xen,xen-4.19", "xen,xen";
+		reg = <0x0 0x38000000 0x0 0x1000000>;
+		interrupts = <0x1 0xf 0xf04>;
+		interrupt-parent = <&gic>;
+	};
+
+	/*
+	 * Linux of_platform_default_populate() walks the DT root with
+	 * strict=true, requiring each bus to have `compatible` matching
+	 * of_default_bus_match_table (simple-bus, simple-mfd, isa, amba-bus)
+	 * to enumerate its children as platform_devices. Without this, the
+	 * /passthrough subtree (HVS/V3D/HDMI/PV) is never registered, the
+	 * corresponding drivers' probe() is never called, and vc4-drm bind
+	 * completes with an empty component list -> /dev/dri/card0 not created
+	 * -> weston fails to start.
+	 *
+	 * The dtc warning is build-time only (non-fatal), and libxl
+	 * copy_partial_fdt() does NOT inspect bus compatible. The Xen
+	 * partial-device-tree spec (xen/docs/misc/arm/passthrough.txt:48)
+	 * explicitly mandates `compatible = "simple-bus"` on /passthrough.
+	 */
+	passthrough: passthrough {
+		compatible = "simple-bus";
+		ranges;
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+
+		/* Fixed clocks */
+		/*
+		 * Add the fixed-clock nodes that HDMI audio/cec clocks need.
+		 * Upstream BCM2712 defines them at the bcm2712.dtsi root level, but
+		 * the partial DT spec allows them under /passthrough (SW-only
+		 * fixed-clock, no hardware register needed).
+		 *   clk_27MHz  -> HDMI cec clock source
+		 *   clk_108MHz -> dvp parent clock (to HDMI audio via dvp)
+		 */
+		clk_27MHz: clk-27M {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <27000000>;
+			clock-output-names = "27MHz-clock";
+		};
+
+		clk_108MHz: clk-108M {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <108000000>;
+			clock-output-names = "108MHz-clock";
+		};
+
+		/*
+		 * The BCM2712 VPU returns a GET_CLOCKS (tag 0x00010007) data format
+		 * that mismatches the raspberrypi-clk driver's sanity check, so its
+		 * probe fails with -22 (EINVAL) and the firmware_clocks provider is
+		 * never registered, leaving every <&firmware_clocks N> reference
+		 * from HVS/V3D/HDMI unresolved.
+		 *
+		 * Pragmatic workaround: turn the primary clocks vc4-drm needs into
+		 * fixed-clocks to remove the firmware_clocks dependency entirely.
+		 * The driver's devm_clk_get / clk_prepare_enable succeed at probe;
+		 * clk_set_rate() returns EINVAL on the fixed-clock side but the
+		 * driver only warns and continues. The VPU does the real clock
+		 * control at KMS init, so the Linux driver does not need to set a
+		 * rate (the display mode keeps the VPU default).
+		 */
+		clk_hvs_core: clk-hvs-core {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <600000000>;   /* HVS core 600 MHz */
+		};
+		clk_hvs_disp: clk-hvs-disp {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <600000000>;   /* HVS disp 600 MHz */
+		};
+		clk_v3d_core: clk-v3d-core {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <600000000>;   /* V3D core 600 MHz */
+		};
+		clk_hdmi_pixel: clk-hdmi-pixel {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <297000000>;   /* HDMI pixel clock 297 MHz (~4K@60) */
+		};
+		clk_bvb: clk-bvb {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <162000000>;   /* HDMI BVB 162 MHz */
+		};
+
+		clk_xosc: clk_xosc {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-output-names = "xosc";
+			clock-frequency = <50000000>;
+		};
+
+		/* RP1 GbE fixed clocks (macb pclk/hclk). clk_xosc (50 MHz) is above. */
+		macb_pclk: macb_pclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-output-names = "pclk";
+			clock-frequency = <200000000>;
+		};
+
+		macb_hclk: macb_hclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-output-names = "hclk";
+			clock-frequency = <200000000>;
+		};
+
+		/* =====================================================================
+		 * Native-style FAN control (kernel thermal-zone managed; daemon removed)
+		 *
+		 * The RPi5 active-cooler FAN sits under RP1 (cooling_fan/pwm-fan -> rp1_pwm1
+		 * ch3 = GPIO45 FAN_PWM). Native Linux lets the kernel auto-control it via the
+		 * SoC AVS temperature sensor (brcm,bcm2711-thermal) -> cpu_thermal thermal-zone
+		 * -> cooling-map -> cooling_fan. To reproduce the same scheme in DomD, pass
+		 * through the SoC AVS sensor (under avs_monitor) and place the thermal-zone +
+		 * cooling_fan in the guest DT.
+		 *
+		 * Placement: dom0less copies only the partial DT's /passthrough subtree into
+		 * the guest DT (dom0less-build.c:407-410 "Only scan .../passthrough, ignore the
+		 * rest"), so all nodes, including thermal-zones, are placed under /passthrough.
+		 * 6.18 thermal_of does a whole-tree name search via
+		 * of_find_node_by_name(NULL,"thermal-zones") (thermal_of.c:130), so it can find
+		 * them even under /passthrough.
+		 * ===================================================================== */
+
+		/* SoC AVS thermal sensor. brcm,bcm2711-thermal binds using only the parent's
+		 * (avs_monitor=syscon) regmap, with zero clocks/power-domain/reset dependency
+		 * and no IRQ (polling). host PA = axi 0x10_7d542000 (soc@107c000000 ranges
+		 * translation). The thin Dom0 does not use thermal and cooling_fan (RP1) is
+		 * already passed through, so taking this sensor for DomD does not affect Dom0 boot. */
+		avs_monitor: avs-monitor@107d542000 {
+			compatible = "brcm,bcm2711-avs-monitor", "syscon", "simple-mfd";
+			reg = <0x10 0x7d542000 0x0 0xf00>;
+			status = "okay";
+			xen,path = "/soc@107c000000/avs-monitor@7d542000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x7d542000 0x0 0x1000 0x10 0x7d542000>;
+
+			avs_thermal: thermal {
+				compatible = "brcm,bcm2711-thermal";
+				#thermal-sensor-cells = <0x0>;
+			};
+		};
+
+		/* cpu_thermal thermal-zone (same values as native bcm2712-ds.dtsi +
+		 * bcm2712-rpi-5-b.dts). coefficients are written as the same-byte hex as the
+		 * host DTB. The thermal governor (step_wise) controls the FAN duty via the
+		 * cooling-map according to temperature. */
+		thermal-zones {
+			cpu_thermal: cpu-thermal {
+				polling-delay-passive = <1000>;
+				polling-delay = <1000>;
+				coefficients = <0xfffffdda 0x6ddd0>;   /* = <(-550) 450000> */
+				thermal-sensors = <&avs_thermal>;
+
+				trips {
+					cpu_tepid: cpu-tepid {
+						temperature = <50000>;
+						hysteresis = <5000>;
+						type = "active";
+					};
+					cpu_warm: cpu-warm {
+						temperature = <60000>;
+						hysteresis = <5000>;
+						type = "active";
+					};
+					cpu_hot: cpu-hot {
+						temperature = <67500>;
+						hysteresis = <5000>;
+						type = "active";
+					};
+					cpu_vhot: cpu-vhot {
+						temperature = <75000>;
+						hysteresis = <5000>;
+						type = "active";
+					};
+					cpu_crit: cpu-crit {
+						temperature = <110000>;
+						hysteresis = <0>;
+						type = "critical";
+					};
+				};
+
+				cooling-maps {
+					tepid {
+						trip = <&cpu_tepid>;
+						cooling-device = <&fan 1 1>;
+					};
+					warm {
+						trip = <&cpu_warm>;
+						cooling-device = <&fan 2 2>;
+					};
+					hot {
+						trip = <&cpu_hot>;
+						cooling-device = <&fan 3 3>;
+					};
+					vhot {
+						trip = <&cpu_vhot>;
+						cooling-device = <&fan 4 4>;
+					};
+					melt {
+						trip = <&cpu_crit>;
+						cooling-device = <&fan 4 4>;
+					};
+				};
+			};
+		};
+
+		/* Active-cooler FAN (pwm-fan). Referenced as a cooling-device from the
+		 * cooling-map; the kernel thermal governor controls the duty of rp1_pwm1
+		 * ch3 (GPIO45) according to temperature. pwms = <&rp1_pwm1 ch period polarity>.
+		 * The partial DT does not include the dt-bindings macros, so values are written
+		 * numerically (period 41566ns ~24kHz, polarity 1 = PWM_POLARITY_INVERTED).
+		 * pwm-fan has no MMIO and uses the already-passed-through RP1 PWM via pwms, so
+		 * xen,reg is not needed. tacho (rpm-regmap/rpm-offset) is omitted (RPM telemetry
+		 * only, not needed for FAN control). */
+		fan: cooling_fan {
+			compatible = "pwm-fan";
+			#cooling-cells = <0x2>;
+			cooling-min-state = <0x0>;
+			cooling-max-state = <0x3>;
+			cooling-levels = <0 75 125 175 250>;
+			pwms = <&rp1_pwm1 3 41566 1>;
+			status = "okay";
+		};
+
+		/* PCIe reset controllers: real host PA -> correct literal xen,reg (unlike the
+		 * RP1 sub-device 0xc0_40.. addresses). pcie2 resets= references these. */
+		reset_controller1504318: reset-controller@1001504318 {
+			compatible = "brcm,brcmstb-reset";
+			#reset-cells = <0x1>;
+			reg = <0x10 0x1504318 0x0 0x30>;
+			xen,path = "/soc@107c000000/reset-controller@1504318";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x1504000 0x0 0x1000 0x10 0x1504000>;
+		};
+
+		reset_controller119500: reset-controller@1000119500 {
+			compatible = "brcm,bcm7216-pcie-sata-rescal";
+			#reset-cells = <0x0>;
+			reg = <0x10 0x119500 0x0 0x10>;
+			xen,path = "/soc@107c000000/reset-controller@119500";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x119000 0x0 0x1000 0x10 0x119000>;
+		};
+
+		/* ===== Mailbox + firmware (Option II) =====
+		 * raspberrypi-clk probe -22 / vc4 "Couldn't stop firmware display: -22"
+		 * ROOT CAUSE (confirmed): the firmware property buffer is allocated from the
+		 * MAILBOX platform device (raspberrypi.c:103 dma_alloc_coherent(fw->chan->
+		 * mbox->dev)). The VideoCore (VPU) can only DMA the low <1GB of machine RAM,
+		 * but DomD's xen,static-mem banks place coherent allocs in a high bank the VPU
+		 * cannot write -> the response status word buf[1] never becomes
+		 * RPI_FIRMWARE_STATUS_SUCCESS(0x80000000), so rpi_firmware_property_list returns
+		 * -EINVAL for EVERY property request (GET_CLOCKS, display-stop, ...).
+		 * FIX: wrap mailbox+firmware in an intermediate simple-bus carrying a BOUNDED
+		 * dma-ranges that caps this device's dma_alloc_coherent to the only VPU-reachable
+		 * machine bank (0x20000000-0x27ffffff). `ranges;` keeps MMIO identity-mapped; only
+		 * DMA is constrained, and only for mailbox+firmware (other passthrough devices keep
+		 * their own dma-ranges). of_dma_configure picks this up -> dev->bus_dma_limit =
+		 * 0x28000000 -> dma_direct_alloc forces the buffer into the low bank the VPU sees.
+		 * (The previous empty `dma-ranges;` on the firmware node was a no-op: the kernel
+		 * ignores empty dma-ranges, and the alloc device is the mailbox, not firmware.)
+		 * NOTE: V3D/HVS/HDMI deliberately KEEP their fixed-clock refs below (safe display
+		 * path); once HW confirms raspberrypi-clk now probes, a later step can switch them
+		 * to <&firmware_clocks N> for native busy/idle DVFS.
+		 */
+		mbox_bus: mbox-bus {
+			compatible = "simple-bus";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			dma-ranges = <0x0 0x20000000 0x0 0x20000000 0x0 0x08000000>;
+
+			mailbox: mailbox@107c013880 {
+				compatible = "brcm,bcm2835-mbox";
+				reg = <0x10 0x7c013880 0x0 0x40>;
+				interrupts = <0x0 0x21 0x4>;  /* GIC SPI 33 LEVEL_HIGH */
+				interrupt-parent = <&gic>;
+				#mbox-cells = <0>;
+				xen,path = "/soc@107c000000/mailbox@7c013880";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x7c013000 0x0 0x1000 0x10 0x7c013000>;
+			};
+
+			firmware: firmware {
+				compatible = "raspberrypi,bcm2835-firmware", "simple-mfd";
+				#address-cells = <0x1>;
+				#size-cells = <0x1>;
+				mboxes = <&mailbox>;
+
+				firmware_clocks: clocks {
+					compatible = "raspberrypi,firmware-clocks";
+					#clock-cells = <0x1>;
+				};
+
+				reset: reset {
+					compatible = "raspberrypi,firmware-reset";
+					#reset-cells = <0x1>;
+				};
+			};
+		};
+
+		/* ===== IOMMU (HVS DMA mapping) ===== */
+		iommuc: iommuc@1000005b00 {
+			compatible = "brcm,bcm2712-iommuc";
+			reg = <0x10 0x5b00 0x0 0x80>;
+			/* dom0less requires xen,reg on a node that has xen,path
+			 * (dom0less-build.c:481 `xen_path && !xen_reg` -> -EINVAL -22).
+			 * iommuc (0x5b00) is in the same page (0x5000) as iommu4, whose
+			 * xen,reg already maps the entire 0x5000 page. So strip all
+			 * passthrough properties from iommuc to make it a plain node: it
+			 * is copied to the guest DT (so the &iommuc phandle in iommu4's
+			 * cache= resolves), its iomem is covered by iommu4's page, and a
+			 * double map (overlap -22) is avoided. */
+		};
+
+		iommu4: iommu@1000005200 {
+			compatible = "brcm,bcm2712-iommu";
+			reg = <0x10 0x5200 0x0 0x80>;
+			cache = <&iommuc>;
+			#iommu-cells = <0x0>;
+			#interconnect-cells = <0x0>;
+			xen,path = "/axi/iommu@5200";
+			xen,force-assign-without-iommu;
+			/* page-align 0x5200->0x5000 (dom0less requires a page-aligned
+			 * xen,reg base). This 0x5000 page contains both iommu4 (0x5200)
+			 * and iommuc (0x5b00). */
+			xen,reg = <0x10 0x5000 0x0 0x1000 0x10 0x5000>;
+		};
+
+		/* ===== Display interrupt controller (L2 intc) =====
+		 * source: bcm2712.dtsi disp_intr: interrupt-controller@7c502000
+		 * GIC SPI 97 LEVEL_HIGH, #interrupt-cells = <1>
+		 */
+		disp_intr: interrupt-controller@107c502000 {
+			compatible = "brcm,bcm2711-l2-intc", "brcm,l2-intc";
+			reg = <0x10 0x7c502000 0x0 0x30>;
+			interrupts = <0x0 0x61 0x4>;   /* GIC SPI 97 LEVEL_HIGH */
+			interrupt-parent = <&gic>;
+			interrupt-controller;
+			#interrupt-cells = <0x1>;
+			xen,path = "/soc@107c000000/interrupt-controller@7c502000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x7c502000 0x0 0x1000 0x10 0x7c502000>;
+		};
+
+		/* ===== Always-on interrupt controller (HDMI parent) =====
+		 * source: bcm2712.dtsi aon_intr: interrupt-controller@7d510600
+		 * GIC SPI 239 LEVEL_HIGH, #interrupt-cells = <1>
+		 */
+		aon_intr: interrupt-controller@107d510600 {
+			compatible = "brcm,bcm2711-l2-intc", "brcm,l2-intc";
+			reg = <0x10 0x7d510600 0x0 0x30>;
+			interrupts = <0x0 0xef 0x4>;   /* GIC SPI 239 LEVEL_HIGH */
+			interrupt-parent = <&gic>;
+			interrupt-controller;
+			#interrupt-cells = <0x1>;
+			xen,path = "/soc@107c000000/interrupt-controller@7d510600";
+			xen,force-assign-without-iommu;
+			/* page-align 0x7d510600->0x7d510000 (dom0less page boundary).
+			 * The 0x7d510000 page contains aon_intr (0x7d510600). */
+			xen,reg = <0x10 0x7d510000 0x0 0x1000 0x10 0x7d510000>;
+		};
+
+		/* ===== ddc0 / ddc1 i2c (HDMI EDID readback) =====
+		 * The `ddc` property name resolves correctly, but with
+		 * status="disabled" the brcmstb-i2c driver does not bind and
+		 * of_find_i2c_adapter_by_node() returns NULL -> a silent
+		 * -EPROBE_DEFER loop, so HDMI cannot bind. Use status="okay" with
+		 * full passthrough (clocks + interrupts + xen,reg). Sub-IRQs 14/15
+		 * are chosen (no conflict with HVS 2/9/16).
+		 */
+		ddc0: i2c@107d508200 {
+			compatible = "brcm,brcmstb-i2c";
+			reg = <0x10 0x7d508200 0x0 0x58>;
+			clock-frequency = <97500>;
+			clocks = <&clk_27MHz>;
+			interrupt-parent = <&disp_intr>;
+			interrupts = <14>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+			xen,path = "/soc@107c000000/i2c@7d508200";
+			xen,force-assign-without-iommu;
+			/* page-align 0x7d508200->0x7d508000 (dom0less page boundary).
+			 * The 0x7d508000 page contains both ddc0 (0x7d508200) and ddc1
+			 * (0x7d508280). */
+			xen,reg = <0x10 0x7d508000 0x0 0x1000 0x10 0x7d508000>;
+		};
+
+		ddc1: i2c@107d508280 {
+			compatible = "brcm,brcmstb-i2c";
+			reg = <0x10 0x7d508280 0x0 0x58>;
+			clock-frequency = <97500>;
+			clocks = <&clk_27MHz>;
+			interrupt-parent = <&disp_intr>;
+			interrupts = <15>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+			/* dom0less requires xen,reg on a node that has xen,path
+			 * (dom0less-build.c:481 `xen_path && !xen_reg` -> -EINVAL -22).
+			 * ddc1 (0x7d508280) is in the same page (0x7d508000) as ddc0,
+			 * whose xen,reg already maps the page. So strip all passthrough
+			 * properties from ddc1 to make it a plain node: it is copied to
+			 * the guest DT (so the &ddc1 phandle in hdmi1's ddc= resolves),
+			 * its iomem is covered by ddc0's page, and a double map is
+			 * avoided. */
+		};
+
+		/* ===== dvp (Display VPU): HDMI audio clock + reset provider =====
+		 * vc4_hdmi (the BCM2712 path = vc5_hdmi_init_resources) requires
+		 * audio / cec / reset:
+		 *   devm_clk_get(dev, "audio") <- &dvp 0
+		 *   devm_clk_get(dev, "cec")   <- &clk_27MHz
+		 *   devm_reset_control_get(dev, NULL) <- &dvp 1|2
+		 * dvp is an MMIO-based clock + reset controller (brcm,brcm2711-dvp).
+		 * reg = 0x107c700000 (16 bytes; already within the HDMI shared csc
+		 * iomem "0x107c700,1" page, so no extra iomem is needed).
+		 */
+		dvp: clock@107c700000 {
+			compatible = "brcm,brcm2711-dvp";
+			reg = <0x10 0x7c700000 0x0 0x10>;
+			clocks = <&clk_108MHz>;
+			#clock-cells = <1>;
+			#reset-cells = <1>;
+			xen,path = "/soc@107c000000/clock@7c700000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x7c700000 0x0 0x1000 0x10 0x7c700000>;
+		};
+
+		/* ===== vc4 aggregate =====
+		 * The Linux drm/vc4 `bcm2712-vc6` driver walks HVS/V3D/HDMI with
+		 * for_each_child_of_node() to probe them, so they must sit directly
+		 * under the vc4 (gpu) node. With them as siblings the probe fails
+		 * (weston dependency error). The gpu node is a proper aggregate
+		 * (#address-cells=2 / #size-cells=2 / ranges identity) with
+		 * HVS / V3D / HDMI0 / HDMI1 as children.
+		 *
+		 * empty `ranges` = identity mapping (child reg is absolute address),
+		 * consistent with the xl iomem grant (iomem= on the passthrough parent).
+		 */
+		vc4: gpu {
+			/*
+			 * Also list `simple-bus` on the vc4 aggregate.
+			 * compatible="brcm,bcm2712-vc6" binds the vc4_drv aggregate
+			 * driver, but of_platform does not enumerate children. Adding
+			 * `simple-bus` as a fallback compatible makes
+			 * of_platform_bus_create() register the children (HVS/V3D/HDMI/PV)
+			 * as platform_devices -> component_match_add completes vc4-drm.
+			 */
+			compatible = "brcm,bcm2712-vc6", "simple-bus";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+			status = "okay";
+
+			/* ===== HVS (Display compositor) ===== */
+			hvs: hvs@107c580000 {
+				compatible = "brcm,bcm2712-hvs";
+				reg = <0x10 0x7c580000 0x0 0x1a000>;
+				/*
+				 * firmware_clocks fails to register, so reference
+				 * fixed-clocks instead. vc4_hvs.c:2049 devm_clk_get(dev,
+				 * "core"/"disp") then gets a fixed-clock and probe succeeds;
+				 * the VPU does the real clock control at boot, so the Linux
+				 * driver does not need to set a rate.
+				 */
+				clocks = <&clk_hvs_core>, <&clk_hvs_disp>;
+				clock-names = "core", "disp";
+				interrupt-parent = <&disp_intr>;
+				interrupts = <2>, <9>, <16>;
+				interrupt-names = "ch0-eof", "ch1-eof", "ch2-eof";
+				iommus = <&iommu4>;
+				/* In the host DT hvs is at ROOT level /hvs@107c580000
+				 * (iommu/v3d are under /axi but hvs is not). dom0less
+				 * resolves xen,path strictly against the host DT, so an
+				 * /axi/ prefix gives "Couldn't find node in host_dt!" -> -22.
+				 * The host bcm2712-rpi-5-b.dtb __symbols__ confirms
+				 * hvs = "/hvs@107c580000". */
+				xen,path = "/hvs@107c580000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x7c580000 0x0 0x1a000 0x10 0x7c580000>;
+			};
+
+			/* ===== V3D (3D acceleration) =====
+			 * Three separate reg blocks (hub + core0 + sms), each at its exact
+			 * size rather than one rounded-up range.
+			 */
+			v3d: v3d@1002000000 {
+				compatible = "brcm,2712-v3d";
+				reg = <0x10 0x02000000 0x0 0x4000>,
+				      <0x10 0x02008000 0x0 0x6000>,
+				      <0x10 0x02030800 0x0 0x0700>;
+				reg-names = "hub", "core0", "sms";
+				/* Stage 2 (native dynamic V3D clock): now that raspberrypi-clk
+				 * probes (mbox-bus dma-ranges fix, confirmed on HW: fw-clk-v3d
+				 * registered + driver bound), reference the firmware V3D clock
+				 * (RPI_FIRMWARE_V3D_CLK_ID=5) instead of the fixed-clock. clk-
+				 * raspberrypi marks the V3D variant .maximize=true, so on v3d
+				 * runtime-PM resume (clk_prepare) the firmware is asked for
+				 * v3d_freq(=960MHz max) and on idle (clk_unprepare) it drops to
+				 * v3d_freq_min -> native busy-960/idle-min DVFS (lower idle
+				 * heat/power than constant 960, also eases the USB power budget).
+				 * HVS/HDMI keep their fixed-clocks (display clocks, no DVFS gain,
+				 * and the audio dvp clock is not wired here). To revert to the
+				 * safe constant path, restore <&clk_v3d_core>. */
+				clocks = <&firmware_clocks 5>;
+				clock-names = "v3d";
+				/*
+				 * v3d_drv.c tries devm_reset_control_get_exclusive() and on
+				 * failure falls back to requesting bridge regs. Referencing
+				 * the firmware reset controller via the resets property makes
+				 * the reset get succeed, so probe succeeds without bridge
+				 * regs. The firmware reset child (compatible =
+				 * "raspberrypi,firmware-reset") exists in the partial DT;
+				 * BCM2835_RESET_V3D = 0.
+				 */
+				resets = <&reset 0>;   /* BCM2835_RESET_V3D */
+				interrupts = <0x0 0xfa 0x4>,   /* GIC SPI 250 */
+					     <0x0 0xf9 0x4>;   /* GIC SPI 249 */
+				interrupt-parent = <&gic>;
+				xen,path = "/axi/v3d@2000000";
+				xen,force-assign-without-iommu;
+				/* 3 reg blocks, separate xen,reg entries.
+				 * page-align the sms base (0x2030800->0x2030000): dom0less
+				 * requires a page-aligned xen,reg base (the real sms reg
+				 * 0x2030800/0x700 fits within the 0x2030000 page, so cover it
+				 * with 0x2030000/0x1000). Matches domd.cfg iomem
+				 * "0x1002030,1". */
+				xen,reg = <0x10 0x02000000 0x0 0x4000 0x10 0x02000000>,
+					  <0x10 0x02008000 0x0 0x6000 0x10 0x02008000>,
+					  <0x10 0x02030000 0x0 0x1000 0x10 0x02030000>;
+				status = "okay";
+			};
+
+			/* ===== HDMI0 =====
+			 * 9 reg blocks: hdmi + dvp + phy + rm + packet + metadata + csc + cec + hd
+			 * interrupts via aon_intr (L2 controller), cell values 1,2,3,7,8
+			 */
+			hdmi0: hdmi@107c701400 {
+				compatible = "brcm,bcm2712-hdmi0";
+				reg = <0x10 0x7c701400 0x0 0x300>,
+				      <0x10 0x7c701000 0x0 0x200>,
+				      <0x10 0x7c701d00 0x0 0x300>,
+				      <0x10 0x7c702000 0x0 0x80>,
+				      <0x10 0x7c703800 0x0 0x200>,
+				      <0x10 0x7c704000 0x0 0x800>,
+				      <0x10 0x7c700100 0x0 0x80>,
+				      <0x10 0x7d510800 0x0 0x100>,
+				      <0x10 0x7c720000 0x0 0x100>;
+				reg-names = "hdmi", "dvp", "phy", "rm", "packet",
+					    "metadata", "csc", "cec", "hd";
+				/*
+				 * Required clocks: audio (&dvp 0) + cec (&clk_27MHz) +
+				 * resets (&dvp 1). The primary hdmi/bvb clocks are also
+				 * fixed-clocks (firmware_clocks is absent due to the
+				 * raspberrypi-clk probe -22).
+				 */
+				clocks = <&clk_hdmi_pixel>, <&clk_bvb>,
+					 <&dvp 0>, <&clk_27MHz>;
+				clock-names = "hdmi", "bvb", "audio", "cec";
+				resets = <&dvp 1>;
+				/*
+				 * The Yocto-built vc4_hdmi.c uses the downstream RPi pattern
+				 * of_parse_phandle(dev->of_node, "ddc", 0); the upstream
+				 * mainline "ddc-i2c-bus" name does not match and gives
+				 * -ENODEV. List both properties for downstream + upstream
+				 * compatibility.
+				 */
+				ddc = <&ddc0>;           /* downstream RPi kernel (actual Yocto build) */
+				ddc-i2c-bus = <&ddc0>;   /* upstream Linux mainline compatibility */
+				interrupt-parent = <&aon_intr>;
+				interrupts = <1>, <2>, <3>, <7>, <8>;
+				interrupt-names = "cec-tx", "cec-rx", "cec-low",
+						  "hpd-connected", "hpd-removed";
+				xen,path = "/soc@107c000000/hdmi@7c701400";
+				xen,force-assign-without-iommu;
+				/* HDMI0 main reg block (5 contiguous + 1 metadata) and
+				 * shared csc/cec/hd (shared with HDMI1 at a different
+				 * offset). Pass each through as a separate xen,reg pair.
+				 * Add the shared hd page 0x7c720000 (the vc4_hdmi "hd"
+				 * reg-name = HDMITX top, must be ioremap'd). csc (0x7c700100)
+				 * is in the clock node's 0x7c700000 page; cec (0x7d510800) is
+				 * already mapped by aon_intr's 0x7d510000 page. hd is shared
+				 * by both HDMI, so map it only once in hdmi0 (re-mapping in
+				 * hdmi1 would double-map the same MFN->GPA, overlap -22).
+				 * Matches domd.cfg iomem
+				 * "0x107c701,3"+"0x107c704,1"+"0x107c720,1".
+				 */
+				xen,reg = <0x10 0x7c701000 0x0 0x3000 0x10 0x7c701000>,
+					  <0x10 0x7c704000 0x0 0x1000 0x10 0x7c704000>,
+					  <0x10 0x7c720000 0x0 0x1000 0x10 0x7c720000>;
+				status = "okay";
+			};
+
+			/* ===== HDMI1 ===== */
+			hdmi1: hdmi@107c706400 {
+				compatible = "brcm,bcm2712-hdmi1";
+				reg = <0x10 0x7c706400 0x0 0x300>,
+				      <0x10 0x7c706000 0x0 0x200>,
+				      <0x10 0x7c706d00 0x0 0x300>,
+				      <0x10 0x7c707000 0x0 0x80>,
+				      <0x10 0x7c708800 0x0 0x200>,
+				      <0x10 0x7c709000 0x0 0x800>,
+				      <0x10 0x7c700180 0x0 0x80>,
+				      <0x10 0x7d511000 0x0 0x100>,
+				      <0x10 0x7c720000 0x0 0x100>;
+				reg-names = "hdmi", "dvp", "phy", "rm", "packet",
+					    "metadata", "csc", "cec", "hd";
+				/*
+				 * audio (&dvp 1) + cec + reset (&dvp 2).
+				 * primary hdmi/bvb also reference fixed-clocks.
+				 */
+				clocks = <&clk_hdmi_pixel>, <&clk_bvb>,
+					 <&dvp 1>, <&clk_27MHz>;
+				clock-names = "hdmi", "bvb", "audio", "cec";
+				resets = <&dvp 2>;
+				/* list both downstream + upstream property names */
+				ddc = <&ddc1>;
+				ddc-i2c-bus = <&ddc1>;
+				interrupt-parent = <&aon_intr>;
+				interrupts = <11>, <12>, <13>, <14>, <15>;
+				interrupt-names = "cec-tx", "cec-rx", "cec-low",
+						  "hpd-connected", "hpd-removed";
+				xen,path = "/soc@107c000000/hdmi@7c706400";
+				xen,force-assign-without-iommu;
+				/* Add the cec1 page 0x7d511000 (HDMI1 "cec" reg-name).
+				 * hd (0x7c720000) is already mapped by hdmi0, so do not
+				 * re-map it (avoid overlap -22). csc (0x7c700180) is in the
+				 * clock's 0x7c700000 page. Matches domd.cfg iomem
+				 * "0x107c706,3"+"0x107c709,1"+"0x107d511,1". */
+				xen,reg = <0x10 0x7c706000 0x0 0x3000 0x10 0x7c706000>,
+					  <0x10 0x7c709000 0x0 0x1000 0x10 0x7c709000>,
+					  <0x10 0x7d511000 0x0 0x1000 0x10 0x7d511000>;
+				status = "okay";
+			};
+
+			/* ===== MOP / MOPlet (Display Transposer / TXP for writeback) =====
+			 * vc4_plane.c::vc4_plane_create_additional_planes() does:
+			 *   drm_for_each_crtc(crtc, drm) {
+			 *       if (vc4_crtc->feeds_txp) { txp_crtc = crtc; break; }
+			 *   }
+			 *   non_txp_crtc_mask = GENMASK(...) - drm_crtc_mask(txp_crtc);
+			 *                                                    ^^^^^^^^^^
+			 * If no TXP CRTC is found, txp_crtc is uninitialized (~= NULL) and
+			 * drm_crtc_mask(NULL) dereferences NULL -> kernel OOPS. On BCM2712
+			 * MOP/MOPlet take the TXP role, so adding both nodes fixes it.
+			 *
+			 * MOP/MOPlet are disp_intr child IRQs (sub-IRQ 1/0); their regs
+			 * are on separate pages (0x107c500, 0x107c501) so iomem grants
+			 * are needed.
+			 */
+			mop: mop@107c500000 {
+				compatible = "brcm,bcm2712-mop";
+				reg = <0x10 0x7c500000 0x0 0x28>;
+				interrupt-parent = <&disp_intr>;
+				interrupts = <1>;
+				xen,path = "/soc@107c000000/mop@7c500000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x7c500000 0x0 0x1000 0x10 0x7c500000>;
+				status = "okay";
+			};
+
+			moplet: moplet@107c501000 {
+				compatible = "brcm,bcm2712-moplet";
+				reg = <0x10 0x7c501000 0x0 0x20>;
+				interrupt-parent = <&disp_intr>;
+				interrupts = <0>;
+				xen,path = "/soc@107c000000/moplet@7c501000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x7c501000 0x0 0x1000 0x10 0x7c501000>;
+				status = "okay";
+			};
+
+			/* ===== PixelValve0 (HDMI output pixel stream) =====
+			 * As a vc4-drm CRTC it receives the pixel stream from HVS and
+			 * passes it to the HDMI encoder. If unplaced, Dom0 claims it and
+			 * DomD vc4-drm cannot bind the PV and cannot take HDMI output
+			 * control (a Dom0 framebuffer stays on HDMI). SPI 101 -> abs IRQ 133.
+			 */
+			pixelvalve0: pixelvalve@107c410000 {
+				compatible = "brcm,bcm2712-pixelvalve0";
+				reg = <0x10 0x7c410000 0x0 0x100>;
+				interrupts = <0x0 0x65 0x4>;   /* GIC SPI 101 LEVEL_HIGH */
+				interrupt-parent = <&gic>;
+				xen,path = "/soc@107c000000/pixelvalve@7c410000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x7c410000 0x0 0x1000 0x10 0x7c410000>;
+				status = "okay";
+			};
+
+			/* ===== PixelValve1 (HDMI output pixel stream, SPI 110 -> abs IRQ 142) ===== */
+			pixelvalve1: pixelvalve@107c411000 {
+				compatible = "brcm,bcm2712-pixelvalve1";
+				reg = <0x10 0x7c411000 0x0 0x100>;
+				interrupts = <0x0 0x6e 0x4>;   /* GIC SPI 110 LEVEL_HIGH */
+				interrupt-parent = <&gic>;
+				xen,path = "/soc@107c000000/pixelvalve@7c411000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x7c411000 0x0 0x1000 0x10 0x7c411000>;
+				status = "okay";
+			};
+
+			/* =====================================================================
+			 * RP1 / PCIe RC passthrough — ITERATION 1 (RC link-up scaffold)
+			 *
+			 * Goal: move USB (the touch panel) + Ethernet — which live inside RP1, a
+			 * PCIe endpoint behind pcie2 — from Dom0 to DomD, toward the Zephyr-Dom0
+			 * architecture where DomD owns the peripherals. USB+Eth share RP1's single
+			 * PCIe RID / IOMMU stream and cannot be split, so the whole RC is passed.
+			 *
+			 * THIS ITERATION passes only the PCIe RC (pcie2) + its MSI controller
+			 * (mip0). Validate on HW first: in DomD `lspci` should list the RP1
+			 * endpoint and `dmesg | grep -i brcm-pcie` should show link-up. Only then
+			 * add the RP1 sub-peripheral subtree (rp1_eth / rp1_usb0 / rp1_usb1 + the
+			 * RP1 interrupt-controller + clocks) in iteration 2.
+			 *
+			 * KNOWN GAPS to resolve during HW iteration (NOT handled yet):
+			 *   - resets: host pcie2 needs <&pcie_rescal>,<&bcm_reset 44>; omitted
+			 *     here (the reset controllers are SoC-level, not in this partial DT),
+			 *     so brcm-pcie may fail to bring the link up until they are added.
+			 *   - clocks: pcie2 / RP1 clock providers are not in the partial DT.
+			 *   - MSI: guest MSI via the BCM2712 MIP on Xen/ARM is UNPROVEN; the MIP
+			 *     doorbell (0xff_fffff000) + the GIC SPI 128..191 lines must reach DomD
+			 *     (the SPIs are intentionally not yet in domd.cfg irqs).
+			 *   - Dom0 must release pcie2/rp1 (status=disabled in the Dom0 DT) and its
+			 *     network must move onto a DomD netback vif (Stage 2).
+			 * ===================================================================== */
+
+			/* MSI controller for pcie2 (BCM2712 MIP0): maps 64 MSIs to GIC SPI
+			 * 128..191 (EDGE_RISING). reg = control regs + the 4 KiB MSI doorbell. */
+			mip0: msi-controller@1000130000 {
+				compatible = "brcm,bcm2712-mip";
+				reg = <0x10 0x00130000 0x00 0xc0>,
+				      <0xff 0xfffff000 0x00 0x1000>;
+				msi-controller;
+				msi-ranges = <&gic 0x0 128 0x1 64>;   /* GIC_SPI 128, EDGE_RISING, x64 */
+				brcm,msi-offset = <0>;
+				xen,path = "/axi/msi-controller@1000130000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x10 0x00130000 0x0 0x1000 0x10 0x00130000>,
+				          <0xff 0xfffff000 0x0 0x1000 0xff 0xfffff000>;
+				status = "okay";
+			};
+
+			/* PCIe RC (pcie2): RP1 is its endpoint. reg/ranges/dma-ranges/
+			 * interrupt-map are literal copies of bcm2712.dtsi pcie@1000120000.
+			 * GIC_SPI 233(pcie)/234(msi); INTA-D = GIC_SPI 229..232. */
+			pcie2: pcie@1000120000 {
+				compatible = "brcm,bcm2712-pcie";
+				reg = <0x10 0x00120000 0x00 0x9310>;
+				device_type = "pci";
+				linux,pci-domain = <2>;
+				max-link-speed = <2>;
+				num-lanes = <4>;
+				#address-cells = <3>;
+				#interrupt-cells = <1>;
+				#size-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <0x0 233 0x4>, <0x0 234 0x4>;   /* pcie, msi (LEVEL_HIGH) */
+				interrupt-names = "pcie", "msi";
+				interrupt-map-mask = <0x0 0x0 0x0 0x7>;
+				interrupt-map = <0 0 0 1 &gic 0x0 229 0x4>,
+						<0 0 0 2 &gic 0x0 230 0x4>,
+						<0 0 0 3 &gic 0x0 231 0x4>,
+						<0 0 0 4 &gic 0x0 232 0x4>;
+				msi-controller;
+				msi-parent = <&mip0>;
+				/* RC bring-up needs the rescal + bridge resets. They are passed through as
+				 * real-host-PA reset-controller nodes (defined at /passthrough level below);
+				 * their xen,reg IS a correct literal host PA, so DomD brcm-pcie can reset the
+				 * link. (0x2c = 44 = the bcm_reset "bridge" index, matching host DT.) */
+				reset-names = "rescal", "bridge";
+				resets = <&reset_controller119500>, <&reset_controller1504318 0x2c>;
+
+				ranges =
+					<0x02000000 0x00 0x00000000 0x1f 0x00000000 0x00 0x01000000>,
+					<0x43000000 0x04 0x00000000 0x1c 0x00000000 0x03 0x00000000>;
+				dma-ranges =
+					<0x02000000 0x00 0x00000000 0x1f 0x00000000 0x00 0x00400000>,
+					<0x43000000 0x10 0x00000000 0x00 0x00000000 0x10 0x00000000>,
+					<0x03000000 0xff 0xfffff000 0x10 0x00130000 0x00 0x00001000>;
+
+				xen,path = "/axi/pcie@1000120000";
+				xen,force-assign-without-iommu;
+				/* RC registers + a 16 MiB RP1 outbound MMIO window at host
+				 * 0x1f_00000000. The pcie2 `ranges` 32-bit window above is trimmed to
+				 * the SAME 16 MiB so the guest PCI core can only place RP1's BARs
+				 * inside the mapped region: BAR1 (4 MiB peripheral window: eth@100000,
+				 * usb0@200000, usb1@300000=touch) is the largest BAR so it lands at
+				 * bus 0x0 -> host 0x1f_00000000, and BAR0 (the MSI-X table) lands just
+				 * above it. Without this trim the guest assigns the MSI-X-table BAR
+				 * somewhere in the full 4 GiB window that is NOT p2m-mapped, and
+				 * rp1_probe's pci_alloc_irq_vectors(PCI_IRQ_MSIX) faults (DABT FSC=0,
+				 * address-size) reading the table. (Xen ARM has no vPCI/MSI-X
+				 * emulation -- has_vpci()==false -- so the guest reads the real table
+				 * and programs the real BCM2712 MIP directly.) */
+				xen,reg = <0x10 0x00120000 0x0 0xa000 0x10 0x00120000>,
+				          <0x1f 0x00000000 0x0 0x01000000 0x1f 0x00000000>;
+				status = "okay";
+
+				/* ===== RP1 subtree (DESCRIPTIVE only) ==================================
+				 * Xen dom0less-build.c handle_passthrough_prop() maps xen,reg pbase as a
+				 * LITERAL host PA with NO ranges translation, so a per-device xen,reg using
+				 * the RP1-internal 0xc0_40.. address would map a bogus host PA. The real RP1
+				 * MMIO is mapped ONCE via the pcie2 xen,reg aperture (host 0x1f_00000000)
+				 * above. These nodes carry NO xen,path/xen,reg; they exist only so DomD's
+				 * kernel binds rp1/macb/dwc3 drivers, with reg in RP1-internal space that
+				 * the ranges below translate. RP1 device IRQs are internal to RP1's own
+				 * irqchip (this node); only the upstream MSIs reach the GIC (SPI 160..223,
+				 * granted via domd.cfg irqs). ===================================== */
+				rp1: rp1@c040000000 {
+					compatible = "simple-bus";
+					#address-cells = <0x2>;
+					#size-cells = <0x2>;
+					#interrupt-cells = <0x2>;
+					interrupt-controller;
+					interrupt-parent = <&rp1>;
+					ranges = <0xc0 0x40000000 0x02000000 0x0 0x0 0x0 0x00410000>;
+					dma-ranges = <0x10 0x00000000 0x43000000 0x10 0x00000000 0x10 0x00000000>,
+					             <0xc0 0x40000000 0x02000000 0x0 0x00000000 0x0 0x00410000>,
+					             <0x00 0x00000000 0x02000000 0x10 0x00000000 0x10 0x00000000>;
+
+					/* RP1 Gigabit Ethernet (Eth -> DomD, toward Zephyr-Dom0). */
+					ethernet@c040100000 {
+						compatible = "cdns,macb";
+						#address-cells = <0x1>;
+						#size-cells = <0x0>;
+						reg = <0xc0 0x40100000 0x0 0x4000>;
+						interrupts = <0x6 0x4>;
+						phy-mode = "rgmii-id";
+						phy-handle = <&eth_phy>;
+						phy-reset-gpios = <&gpiod0000 0x20 0x1>;
+						phy-reset-duration = <0x5>;
+						local-mac-address = [00 00 00 00 00 00];
+						clock-names = "pclk", "hclk", "tsu_clk";
+						clocks = <&macb_pclk>, <&macb_hclk>, <&clocks18000 0x1d>;
+						status = "okay";
+
+						eth_phy: ethernet-phy@1 {
+							reg = <0x1>;
+							brcm,powerdown-enable;
+						};
+					};
+
+					/* RP1 USB0 (dwc3 host). */
+					usb@c040200000 {
+						compatible = "snps,dwc3";
+						reg = <0xc0 0x40200000 0x0 0x100000>;
+						interrupts = <0x1f 0x1>;
+						dr_mode = "host";
+						usb3-lpm-capable;
+						status = "okay";
+					};
+
+					/* RP1 USB1 (dwc3 host) = HDMI-A-2 USB touch panel. */
+					usb@c040300000 {
+						compatible = "snps,dwc3";
+						reg = <0xc0 0x40300000 0x0 0x100000>;
+						interrupts = <0x24 0x1>;
+						dr_mode = "host";
+						usb3-lpm-capable;
+						status = "okay";
+					};
+
+					/* RP1 GPIO (eth phy-reset-gpios references this). */
+					gpiod0000: gpio@c0400d0000 {
+						compatible = "raspberrypi,rp1-gpio";
+						#gpio-cells = <0x2>;
+						gpio-controller;
+						#interrupt-cells = <0x2>;
+						interrupt-controller;
+						reg = <0xc0 0x400d0000 0x0 0xc000 0xc0 0x400e0000 0x0 0xc000 0xc0 0x400f0000 0x0 0xc000>;
+						interrupts = <0x0 0x4 0x1 0x4 0x2 0x4>;
+						gpio-ranges = <&gpiod0000 0x0 0x0 0x36>;
+						status = "okay";
+						/* GPIO45 -> pwm1 (FAN). Copy of rp1.dtsi:918 rp1_pwm1_gpio45. */
+						rp1_pwm1_gpio45: rp1_pwm1_gpio45 {
+							function = "pwm1";
+							pins = "gpio45";
+							bias-pull-down;
+						};
+					};
+
+					/* RP1 clock controller (macb tsu_clk = index 0x1d). */
+					clocks18000: clocks@c040018000 {
+						compatible = "raspberrypi,rp1-clocks";
+						#clock-cells = <0x1>;
+						reg = <0xc0 0x40018000 0x0 0x10038>;
+						clocks = <&clk_xosc>;
+						status = "okay";
+					};
+
+					/* RP1 PWM1 = FAN driver. rp1.dtsi:407 pwm@9c000. pwm-rp1 exposes a
+					 * 4-channel pwmchip. The GPIO45->pwm1 mux references rp1_pwm1_gpio45
+					 * inside gpiod0000. The FAN (pwm1 ch3) is auto-controlled the native way
+					 * by the kernel thermal-zone (cpu_thermal) + cooling_fan (pwm-fan) (see the
+					 * thermal block directly under /passthrough; daemon removed). */
+					rp1_pwm1: pwm@c04009c000 {
+						compatible = "raspberrypi,rp1-pwm";
+						reg = <0xc0 0x4009c000 0x0 0x100>;
+						#pwm-cells = <0x3>;
+						clocks = <&clocks18000 0x12>;
+						assigned-clocks = <&clocks18000 0x12>;
+						assigned-clock-rates = <50000000>;
+						pinctrl-names = "default";
+						pinctrl-0 = <&rp1_pwm1_gpio45>;
+						status = "okay";
+					};
+				};
+			};
+		};
+
+		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb strips this whole SD/GPIO
+		 * block for DOM0_OS=linux. In the linux flavour the thin Linux Dom0 is the
+		 * hardware domain and KEEPS the SoC SDHCI (mmc@fff000) + AON GPIO, mounting
+		 * /dev/mmcblk0p1 and block-attaching p3/p4 to DomD (xvdb/xvdc). Only the
+		 * zephyr flavour hands the SD to DomD, so only there does DomD need this
+		 * block (which claims mmc IRQ SPI273 -> route_irq_to_guest). Comments are
+		 * dropped by dtc, so the zephyr DTB is byte-identical with these markers. */
+		/* ------------------------------------------------------------------
+		 * SoC-internal SDHCI (SD card slot) passthrough
+		 * to DomD. In the disaggregated topology the Dom0 is Zephyr (no blkback), so DomD owns the SD
+		 * directly and its qemu serves /dev/mmcblk0p3 (DomU rootfs) /
+		 * /dev/mmcblk0p4 (DomA super) as virtio-blk. Content ported verbatim
+		 * from bcm2712-raspberrypi5-mmc.dtso (EPAM, same xen,reg/xen,path/
+		 * force-assign conventions as the GPU nodes above). Includes the AON
+		 * GPIO controller (gpio@7d517c00) that the SD card-detect and the two
+		 * regulators depend on; boot.cmd no longer strips its xen,passthrough
+		 * marker in the host DT (AON GPIO moves Dom0->DomD; the Zephyr Dom0
+		 * does not use GPIO).
+		 * ------------------------------------------------------------------ */
+		mmc@1000fff000 {
+			compatible = "brcm,bcm2712-sdhci";
+			interrupt-parent = <&gic>;
+			interrupts = <0x0 0x111 0x4>;
+			reg-names = "host", "cfg", "busisol", "lcpll";
+			reg = <0x10 0xfff000 0x0 0x260 0x10 0xfff400 0x0 0x200
+			       0x10 0x15040b0 0x0 0x4 0x10 0x15200f0 0x0 0x24>;
+			clocks = <&clk_emmc2>;
+			clock-names = "sw_sdio";
+			cd-gpios = <&gpio7d517c00 0x5 0x1>;
+			sd-uhs-sdr104;
+			sd-uhs-ddr50;
+			sd-uhs-sdr50;
+			bus-width = <0x4>;
+			vmmc-supply = <&sd_vcc_reg>;
+			vqmmc-supply = <&sd_io_1v8_reg>;
+			mmc-ddr-3_3v;
+			sdhci-caps = <0x0 0x0>;
+			sdhci-caps-mask = <0xc000 0x0>;
+			xen,path = "/soc@107c000000/mmc@fff000";
+			xen,force-assign-without-iommu;
+			/* busisol lives in host page 0x1504000, which is already mapped by
+			 * reset-controller@1504318 above; drop the duplicate xen,reg entry so
+			 * each host page is passed through exactly once (direct-map: the mmc
+			 * driver still reaches busisol via that single mapping). */
+			xen,reg = <0x10 0xfff000 0x0 0x1000 0x10 0xfff000
+				   0x10 0x1520000 0x0 0x1000 0x10 0x1520000>;
+			status = "okay";
+		};
+
+		clk_emmc2: clk_emmc2 {
+			compatible = "fixed-clock";
+			#clock-cells = <0x0>;
+			clock-output-names = "emmc2-clock";
+			clock-frequency = <0xbebc200>;
+		};
+
+		sd_io_1v8_reg: sd_io_1v8_reg {
+			compatible = "regulator-gpio";
+			states = <0x1b7740 0x1 0x325aa0 0x0>;
+			gpios = <&gpio7d517c00 0x3 0x0>;
+			regulator-settling-time-us = <0x1388>;
+			regulator-always-on;
+			regulator-boot-on;
+			regulator-max-microvolt = <0x325aa0>;
+			regulator-min-microvolt = <0x1b7740>;
+			regulator-name = "vdd-sd-io";
+			status = "okay";
+		};
+
+		gpio7d517c00: gpio@107d517c00 {
+			compatible = "brcm,brcmstb-gpio";
+			#gpio-cells = <0x2>;
+			gpio-controller;
+			reg = <0x10 0x7d517c00 0x00 0x40>;
+			brcm,gpio-direct;
+			brcm,gpio-bank-widths = <0x11 0x6>;
+			xen,path = "/soc@107c000000/gpio@7d517c00";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x7d517000 0x0 0x1000 0x10 0x7d517000>;
+		};
+
+		sd_vcc_reg: sd_vcc_reg {
+			compatible = "regulator-fixed";
+			gpios = <&gpio7d517c00 0x4 0x0>;
+			enable-active-high;
+			regulator-boot-on;
+			regulator-max-microvolt = <0x325aa0>;
+			regulator-min-microvolt = <0x325aa0>;
+			regulator-name = "vcc-sd";
+			status = "okay";
+		};
+		/* SODEV-LINUX-DOM0-SD-STRIP-END */
+	};
+};

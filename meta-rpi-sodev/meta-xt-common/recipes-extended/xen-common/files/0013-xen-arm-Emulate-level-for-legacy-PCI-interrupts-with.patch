@@ -1,0 +1,88 @@
+From f24fff155f1d9e4b2ca1c935d7a1245d82896d65 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Sun, 18 Sep 2022 17:38:39 +0300
+Subject: [PATCH 13/24] xen/arm: Emulate level for legacy PCI interrupts with
+ current vGIC
+
+This is needed for supporting virtio-pci.
+
+The legacy PCI interrupts (#INTA - #INTD) are level interrupts (not edge).
+
+So we need either to enable NEW_VGIC for the proper emulation of level
+interrupts (GIC v2 only) or to create fake level interrupts if NEW_VGIC
+cannot be enabled (GIC v3).
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Dmytro Firsov <dmytro_firsov@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: pci_irq_level[] over-sized to NR_PCI_IRQS+1 and the writer kept SPI_LAST-inclusive so the array access stays in-bounds at this interim stage; 0019 later tightens the writer; the gic-vgic.c reader bound is exclusive (irq < GUEST_VIRTIO_PCI_SPI_LAST) so reader and writer disagree by one entry at this interim stage, which the over-sized array absorbs; explanatory comment added
+Origin: https://github.com/xen-troops/xen commit f24fff155f1d9e4b2ca1c935d7a1245d82896d65
+---
+ xen/arch/arm/gic-vgic.c         | 10 ++++++++++
+ xen/arch/arm/include/asm/vgic.h |  8 ++++++++
+ xen/arch/arm/vgic.c             |  4 ++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/xen/arch/arm/gic-vgic.c b/xen/arch/arm/gic-vgic.c
+index ea48c5375a..76efebb271 100644
+--- a/xen/arch/arm/gic-vgic.c
++++ b/xen/arch/arm/gic-vgic.c
+@@ -235,6 +235,16 @@ static void gic_update_one_lr(struct vcpu *v, int i)
+                 irq_set_affinity(p->desc, cpumask_of(v_target->processor));
+                 clear_bit(GIC_IRQ_GUEST_MIGRATING, &p->status);
+             }
++
++            if ( irq >= GUEST_VIRTIO_PCI_SPI_FIRST &&
++                 irq < GUEST_VIRTIO_PCI_SPI_LAST &&
++                 vgic_pci_irq_level(v->domain, irq) )
++            {
++                set_bit(GIC_IRQ_GUEST_QUEUED, &p->status);
++                if ( test_bit(GIC_IRQ_GUEST_ENABLED, &p->status) )
++                    gic_raise_guest_irq(v, irq, p->priority);
++                list_add_tail(&p->inflight, &v->arch.vgic.inflight_irqs);
++            }
+         }
+     }
+ }
+diff --git a/xen/arch/arm/include/asm/vgic.h b/xen/arch/arm/include/asm/vgic.h
+index 31b3d3e5ec..bfa3e0835d 100644
+--- a/xen/arch/arm/include/asm/vgic.h
++++ b/xen/arch/arm/include/asm/vgic.h
+@@ -127,6 +127,12 @@ struct vgic_irq_rank {
+     uint8_t vcpu[32];
+ };
+ 
++/* GUEST_VIRTIO_PCI_SPI_LAST - GUEST_VIRTIO_PCI_SPI_FIRST */
++#define NR_PCI_IRQS   4
++
++#define vgic_pci_irq_level(d, irq)   \
++    ((d)->arch.vgic.pci_irq_level[(irq) - GUEST_VIRTIO_PCI_SPI_FIRST])
++
+ struct vgic_dist {
+     /* Version of the vGIC */
+     enum gic_version version;
+@@ -165,6 +171,8 @@ struct vgic_dist {
+      * eSPIs [nr_spis..nr_spis + nr_espis - 1]
+      */
+     struct pending_irq *pending_irqs;
++    /* Current legacy PCI IRQ levels (sized incl. LAST; 0019 tightens writer) */
++    bool pci_irq_level[NR_PCI_IRQS + 1];
+     /* Base address for guest GIC */
+     paddr_t dbase; /* Distributor base address */
+     paddr_t cbase; /* CPU interface base address */
+diff --git a/xen/arch/arm/vgic.c b/xen/arch/arm/vgic.c
+index 3ebdf9953f..6172789064 100644
+--- a/xen/arch/arm/vgic.c
++++ b/xen/arch/arm/vgic.c
+@@ -757,6 +757,10 @@ void vgic_inject_irq(struct domain *d, struct vcpu *v, unsigned int virq,
+     struct pending_irq *iter, *n;
+     unsigned long flags;
+ 
++    if ( virq >= GUEST_VIRTIO_PCI_SPI_FIRST &&
++         virq <= GUEST_VIRTIO_PCI_SPI_LAST )
++        vgic_pci_irq_level(d, virq) = level;
++
+     /*
+      * For edge triggered interrupts we always ignore a "falling edge".
+      * For level triggered interrupts we shouldn't, but do anyways.

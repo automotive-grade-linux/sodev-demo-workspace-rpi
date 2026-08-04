@@ -1,0 +1,28 @@
+From 8207d09d8f115f4719a80266d29a02d4fb6db2f0 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 08 Jul 2026 00:00:00 +0900
+Subject: [PATCH] xen/public: bump sysctl interface version to 0x16
+
+Match the Xen 4.21 sysctl ABI (interface version 0x16) used by the Zephyr Dom0 domain manager.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/arch/arm64/core/xen/Kconfig b/arch/arm64/core/xen/Kconfig
+index 645e857a5a..2abcc29d75 100644
+--- a/arch/arm64/core/xen/Kconfig
++++ b/arch/arm64/core/xen/Kconfig
+@@ -48,7 +48,10 @@ config XEN_DOMCTL_INTERFACE_VERSION
+ config XEN_SYSCTL_INTERFACE_VERSION
+ 	hex "Xen Sysctl interface version"
+-	default 0x15
++	default 0x16
+-	range 0x15 0x15
++	# allow 0x16 = Xen 4.21 (same treatment as the domctl
++	# range above; without it every sysctl call fails the version check and
++	# e.g. `xu list` / `xstat physinfo` silently print nothing).
++	range 0x15 0x16
+ 	depends on XEN
+ 	help
+ 	  Xen Sysctl interface version to use. This is the version of the

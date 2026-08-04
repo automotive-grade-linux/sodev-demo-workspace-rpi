@@ -1,0 +1,58 @@
+xt-cluster-shm
+==============
+
+Tiny AGL Cluster IC stand-in that renders a speedometer + tripmeter
+into a wl_shm buffer with cairo. No EGL, no V3D — runs on whatever
+weston backend is up.
+
+Why this exists
+---------------
+
+This renders through wl_shm only, with no GPU involvement, which makes it
+useful for bringing a display path up before the V3D stack is known good and
+for telling a compositor problem apart from a GPU problem.
+
+It was written for a configuration in which every EGL/GLES client
+(weston-simple-egl, kmscube, SurfaceFlinger via virglrenderer) showed a
+transparent black window: vc4_hvs could not take the HVS core clock while the
+firmware display driver still held it. The shipping configuration no longer
+has that problem -- weston runs gl-renderer through Mesa V3D -- so treat this
+as a diagnostic tool. Note also that cluster-service from
+packagegroup-agl-ic-core is a backend-only service and renders nothing itself.
+
+xt-cluster-shm proves the wayland surface chain is alive end-to-end
+and gives the demo a recognisable Cluster IC face on HDMI without
+touching V3D.
+
+Boot path
+---------
+
+  weston.socket (/run/wayland-0)
+    -> weston.service, whose weston.socket publishes /run/wayland-0
+       -> xt-cluster-shm.service
+          -> wayland xdg_shell + wl_shm
+             -> desktop-shell.so places it at the centre / fullscreens it
+                -> HDMI scanout via the firmware display driver
+
+Diagnostics
+-----------
+
+  systemctl status xt-cluster-shm
+  journalctl -u xt-cluster-shm -b
+  pidof xt-cluster-shm                   # client alive
+  ls -la /run/wayland-0                  # socket present
+  ssh root@192.168.10.10 \
+    'XDG_RUNTIME_DIR=/run WAYLAND_DISPLAY=wayland-0 xt-cluster-shm'  # foreground
+
+If you would rather use a GPU-backed cluster
+--------------------------------------------
+
+This recipe is a fallback. The real Cluster IC (packagegroup-agl-ic-core
++ cluster_service + the GUI binary that pulls in
+qtquickcontrols2-agl / agl-image-flutter) needs working EGL, which
+needs the firmware-mailbox passthrough fix in meta-xt-rpi5's domd DT.
+
+License
+-------
+
+Apache-2.0 (SPDX-License-Identifier: Apache-2.0), same as the rest of this layer.

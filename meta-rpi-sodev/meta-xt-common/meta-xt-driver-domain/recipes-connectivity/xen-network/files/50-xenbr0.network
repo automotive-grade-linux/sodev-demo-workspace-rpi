@@ -1,0 +1,15 @@
+# xenbr0: bring the bridge up with NO address. The late flat-bridge unit
+# (domd-flatbridge.service) assigns 192.168.10.10 once the guest vifs exist.
+#
+# Do NOT put 192.168.0.1 here (it is a tempting NAT default): 192.168.0.1 is Dom0's
+# end of the Dom0<->DomD point-to-point vif (dom0-domd-vif-up), and a local
+# 192.168.0.1 on DomD's xenbr0 shadows it — every PC/DomD packet to Dom0 is
+# then delivered to DomD itself and PC->Dom0 SSH breaks. Verified live on the
+# board: `ip addr del 192.168.0.1/24 dev xenbr0` on DomD
+# immediately made `ssh root@192.168.0.1` reach Dom0 (route via DomD .10.10).
+[Match]
+Name=xenbr0
+
+[Network]
+ConfigureWithoutCarrier=yes
+LinkLocalAddressing=no

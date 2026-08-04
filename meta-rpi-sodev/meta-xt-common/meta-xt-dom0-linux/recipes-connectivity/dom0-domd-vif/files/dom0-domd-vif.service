@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Attach the Dom0<->DomD point-to-point vif (Dom0 = 192.168.0.1) for dom0less DomD
+# DomD is dom0less, so the toolstack must be up before we can attach a vif.
+After=xencommons.service xen-init-dom0.service
+Wants=xencommons.service
+ConditionPathExists=/proc/xen
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/dom0-domd-vif-up
+
+[Install]
+WantedBy=multi-user.target

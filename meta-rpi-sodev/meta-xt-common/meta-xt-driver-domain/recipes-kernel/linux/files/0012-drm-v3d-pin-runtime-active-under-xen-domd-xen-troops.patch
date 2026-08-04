@@ -1,0 +1,63 @@
+From 69578a8c60aaf07cc7ec9e96ed027c0e01d84ef7 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 25 Jun 2026 13:00:00 +0900
+Subject: [PATCH] drm/v3d: pin V3D runtime-active under Xen DomD passthrough
+
+Linux 6.18 introduced Runtime PM + autosuspend for V3D ("drm/v3d:
+Introduce Runtime Power Management"). On a V3D_GEN_71 (Pi5) the
+autosuspend path runs v3d_power_suspend(), which POWER_OFFs the V3D SMS
+power state machine and clk_disable_unprepare()s the core clock. Both
+the SMS power island and the V3D clock are serviced through the
+VideoCore firmware mailbox / power domains, which in the Xen
+disaggregated setup live in Dom0, not in the DomD GPU driver-domain that
+owns V3D via direct-map passthrough. DomD therefore cannot complete the
+power-off / power-on handshake, and the first GPU idle->resume cycle
+(e.g. when a virtio-gpu-gl guest starts rendering) wedges the whole
+board, including the Xen hypervisor console.
+
+Linux 6.12 had no runtime-PM path: the clock was enabled once at probe
+and stayed on for the life of the driver, which is why the two-screen
+DomU/DomA demo worked there. The upstream hang fixes (cache-clean / MMU
+flush across PM cycles) address non-Xen stale-state hangs, not the
+fundamental "DomD cannot reach the Dom0/firmware power domain" problem,
+so they do not help here.
+
+Restore the 6.12 behaviour by keeping the runtime-PM reference taken at
+probe (pm_runtime_resume_and_get) held for the life of the driver and
+dropping autosuspend, so v3d_power_suspend() is only ever reached at
+driver remove. The device stays powered; no firmware/Dom0 cooperation is
+needed at runtime. CONFIG_PM stays =y (the suspend/resume callbacks are
+still installed but are never reached at runtime because the usage count
+never drops to zero).
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/v3d/v3d_drv.c | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/v3d/v3d_drv.c b/drivers/gpu/drm/v3d/v3d_drv.c
+--- a/drivers/gpu/drm/v3d/v3d_drv.c
++++ b/drivers/gpu/drm/v3d/v3d_drv.c
+@@ -431,9 +431,6 @@ static int v3d_platform_drm_probe(struct platform_device *pdev)
+ 
+ 	v3d_init_hw_state(v3d);
+ 
+-	pm_runtime_set_autosuspend_delay(dev, 100);
+-	pm_runtime_use_autosuspend(dev);
+-
+ 	ret = drm_dev_register(drm, 0);
+ 	if (ret)
+ 		goto runtime_pm_put;
+@@ -442,10 +439,7 @@ static int v3d_platform_drm_probe(struct platform_device *pdev)
+ 	ret = v3d_sysfs_init(dev);
+ 	if (ret)
+ 		goto drm_unregister;
+ 
+-	pm_runtime_mark_last_busy(dev);
+-	pm_runtime_put_autosuspend(dev);
+-
+ 	return 0;
+ 
+ drm_unregister:

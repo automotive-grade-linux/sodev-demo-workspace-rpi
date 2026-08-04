@@ -1,0 +1,334 @@
+From 4a4d6c7b8aa81a013746046eaf7c09d464784ee9 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 3 Aug 2023 15:25:09 +0300
+Subject: [PATCH 15/24] libxl: Update xl devd to also spawn Qemu for Virtio
+ devices
+
+Currently xl devd only supports Qdisk backend in that regard.
+Extend support for Virtio devices those backends are running
+inside Qemu.
+
+In order to run Qemu for providing Virtio devices we need to pass
+an extra parameters (dm_args, guest memory size and the number
+of vCPUs) to it. For that purpose store required parameters
+in local "device-model" directory in Xenstore.
+
+Also introduce new backend_kind LIBXL__DEVICE_KIND_QVIRTIO to
+distinguish between Qemu based and standalone Virtio devices in
+add_device(). If adding an extra backend_kind is not welcome,
+then add_device() could be reworked to read an additional info
+from the Xenstore about backend_type to make sure that Qemu would
+only be spawned for LIBXL_VIRTIO_BACKEND_QEMU.
+
+TODO: With reusing Qdisk backend functionality for Virtio backends
+we likely need to rename involved functions, entries in Xenstore,
+log files that contain qdisk in the name.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Dmytro Firsov <dmytro_firsov@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/xen commit 4a4d6c7b8aa81a013746046eaf7c09d464784ee9
+---
+ tools/libs/light/libxl_create.c           |  22 +++-
+ tools/libs/light/libxl_device.c           |  20 +++-
+ tools/libs/light/libxl_dm.c               | 118 +++++++++++++++++++++-
+ tools/libs/light/libxl_internal.h         |   9 +-
+ tools/libs/light/libxl_types_internal.idl |   1 +
+ tools/libs/light/libxl_virtio.c           |   3 +-
+ 6 files changed, 164 insertions(+), 9 deletions(-)
+
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index 2e4e208b31..de20549bd4 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1685,6 +1685,7 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+     libxl__domain_create_state *dcs = CONTAINER_OF(multidev, *dcs, multidev);
+     STATE_AO_GC(dcs->ao);
+     int i;
++    bool dmargs_saved = false;
+ 
+     /* convenience aliases */
+     const uint32_t domid = dcs->guest_domid;
+@@ -1774,9 +1775,24 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
+         libxl__device_add(gc, domid, &libxl__pvcallsif_devtype,
+                           &d_config->pvcallsifs[i]);
+ 
+-    for (i = 0; i < d_config->num_virtios; i++)
+-        libxl__device_add(gc, domid, &libxl__virtio_devtype,
+-                          &d_config->virtios[i]);
++    for (i = 0; i < d_config->num_virtios; i++) {
++        libxl_device_virtio *virtio = &d_config->virtios[i];
++
++        if (virtio->backend_type == LIBXL_VIRTIO_BACKEND_QEMU &&
++            virtio->backend_domid != LIBXL_TOOLSTACK_DOMID && !dmargs_saved) {
++
++            ret = libxl__save_qdisk_backend_dm_args(gc, domid,
++                                                    virtio->backend_domid,
++                                                    &d_config->b_info);
++            if (ret) {
++                LOGD(ERROR, domid, "Unable to save dm_args for Qdisk backend");
++                goto error_out;
++            }
++            dmargs_saved = true;
++        }
++
++        libxl__device_add(gc, domid, &libxl__virtio_devtype, virtio);
++    }
+ 
+     if (d_config->num_vkbs) {
+         for (i = 0; i < d_config->num_vkbs; i++) {
+diff --git a/tools/libs/light/libxl_device.c b/tools/libs/light/libxl_device.c
+index 42d71c17bc..2a343a501d 100644
+--- a/tools/libs/light/libxl_device.c
++++ b/tools/libs/light/libxl_device.c
+@@ -1552,6 +1552,7 @@ typedef struct libxl__ddomain_device {
+ typedef struct libxl__ddomain_guest {
+     uint32_t domid;
+     int pvqemu_refcnt;
++    int num_qvirtios;
+     XEN_SLIST_HEAD(, struct libxl__ddomain_device) devices;
+     XEN_SLIST_ENTRY(struct libxl__ddomain_guest) next;
+ } libxl__ddomain_guest;
+@@ -1646,15 +1647,21 @@ static int add_device(libxl__egc *egc, libxl__ao *ao,
+     switch(dev->backend_kind) {
+     case LIBXL__DEVICE_KIND_QDISK:
+     case LIBXL__DEVICE_KIND_9PFS:
+-        if (dguest->pvqemu_refcnt == 0) {
++    case LIBXL__DEVICE_KIND_QVIRTIO:
++        if (dguest->pvqemu_refcnt == 0 && dguest->num_qvirtios == 0) {
+             GCNEW(dmss);
+             dmss->guest_domid = dev->domid;
++            dmss->backend_domid = dev->backend_domid;
+             dmss->spawn.ao = ao;
+             dmss->callback = qemu_xenpv_spawn_outcome;
+ 
+             libxl__spawn_qemu_xenpv_backend(egc, dmss);
+         }
+-        dguest->pvqemu_refcnt++;
++        if (dev->backend_kind == LIBXL__DEVICE_KIND_QDISK ||
++            dev->backend_kind == LIBXL__DEVICE_KIND_9PFS)
++            dguest->pvqemu_refcnt++;
++        else
++            dguest->num_qvirtios++;
+         break;
+     default:
+         GCNEW(aodev);
+@@ -1686,7 +1693,14 @@ static int remove_device(libxl__egc *egc, libxl__ao *ao,
+     switch(ddev->dev->backend_kind) {
+     case LIBXL__DEVICE_KIND_QDISK:
+     case LIBXL__DEVICE_KIND_9PFS:
+-        if (--dguest->pvqemu_refcnt == 0) {
++    case LIBXL__DEVICE_KIND_QVIRTIO:
++        if (dev->backend_kind == LIBXL__DEVICE_KIND_QDISK ||
++            dev->backend_kind == LIBXL__DEVICE_KIND_9PFS)
++            dguest->pvqemu_refcnt--;
++        else
++            dguest->num_qvirtios--;
++
++        if (dguest->pvqemu_refcnt == 0 && dguest->num_qvirtios == 0) {
+             rc = libxl__destroy_qemu_xenpv_backend(gc, dev->domid);
+             if (rc)
+                 goto out;
+diff --git a/tools/libs/light/libxl_dm.c b/tools/libs/light/libxl_dm.c
+index 268e9c9fa0..eb6193201e 100644
+--- a/tools/libs/light/libxl_dm.c
++++ b/tools/libs/light/libxl_dm.c
+@@ -3340,6 +3340,117 @@ static void device_model_postconfig_done(libxl__egc *egc,
+     dmss->callback(egc, dmss, rc);
+ }
+ 
++static int libxl__get_qdisk_backend_dm_args(libxl__gc *gc,
++                                            uint32_t domid,
++                                            uint32_t backend_domid,
++                                            flexarray_t *dm_args)
++{
++    const char *dm_path, *tmp = NULL;
++    char **dir;
++    unsigned int n;
++    int rc, i = 0;
++
++    dm_path = GCSPRINTF("/local/domain/%d/device-model", backend_domid);
++
++    dir = libxl__xs_directory(gc, XBT_NULL, dm_path, &n);
++    if (!dir)
++        return 0;
++
++    dm_path = DEVICE_MODEL_XS_PATH(gc, backend_domid, domid, "");
++
++    tmp = NULL;
++    rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                GCSPRINTF("%s/ram_size", dm_path), &tmp);
++    if (rc) return rc;
++
++    if (tmp) {
++        uint64_t ram_size = strtoul(tmp, NULL, 0);
++
++        flexarray_vappend(dm_args, "-m", GCSPRINTF("%"PRId64, ram_size), NULL);
++    }
++
++    tmp = NULL;
++    rc = libxl__xs_read_checked(gc, XBT_NULL,
++                                GCSPRINTF("%s/max_vcpus", dm_path), &tmp);
++    if (rc) return rc;
++
++    if (tmp) {
++        uint32_t max_vcpus = strtoul(tmp, NULL, 0);
++
++        flexarray_vappend(dm_args, "-smp", GCSPRINTF("%d", max_vcpus), NULL);
++    }
++
++    do {
++        const char *path = GCSPRINTF("%s/dm_args/%d", dm_path, i);
++
++        tmp = NULL;
++        rc = libxl__xs_read_checked(gc, XBT_NULL, path, &tmp);
++        if (rc) return rc;
++
++        if (tmp) {
++            flexarray_append(dm_args, (void *)tmp);
++        }
++        i++;
++    } while (tmp);
++
++    return 0;
++}
++
++int libxl__save_qdisk_backend_dm_args(libxl__gc *gc,
++                                      uint32_t domid,
++                                      uint32_t backend_domid,
++                                      const libxl_domain_build_info *guest_info)
++{
++    const char *dm_path;
++    char **dir;
++    xs_transaction_t t = XBT_NULL;
++    unsigned int n;
++    int rc;
++
++    dm_path = GCSPRINTF("/local/domain/%d/device-model", backend_domid);
++
++    dir = libxl__xs_directory(gc, XBT_NULL, dm_path, &n);
++    if (!dir)
++        return ERROR_INVAL;
++
++    dm_path = DEVICE_MODEL_XS_PATH(gc, backend_domid, domid, "");
++
++    for (;;) {
++        uint64_t ram_size;
++        int i;
++
++        rc = libxl__xs_transaction_start(gc, &t);
++        if (rc) goto out;
++
++        ram_size = libxl__sizekb_to_mb(guest_info->max_memkb -
++                                       guest_info->video_memkb);
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/ram_size", dm_path),
++                                     GCSPRINTF("%"PRId64, ram_size));
++        if (rc) goto out;
++
++        rc = libxl__xs_write_checked(gc, t, GCSPRINTF("%s/max_vcpus", dm_path),
++                                     GCSPRINTF("%d", guest_info->max_vcpus));
++        if (rc) goto out;
++
++        for (i = 0; guest_info->extra && guest_info->extra[i] != NULL; i++) {
++            rc = libxl__xs_write_checked(gc, t,
++                                         GCSPRINTF("%s/dm_args/%d", dm_path, i),
++                                         GCSPRINTF("%s", guest_info->extra[i]));
++            if (rc) goto out;
++        }
++
++        rc = libxl__xs_transaction_commit(gc, &t);
++        if (!rc) break;
++        if (rc < 0) goto out;
++    }
++
++    return 0;
++
++out:
++    libxl__xs_transaction_abort(gc, &t);
++    return rc;
++}
++
+ void libxl__spawn_qemu_xenpv_backend(libxl__egc *egc,
+                                      libxl__dm_spawn_state *dmss)
+ {
+@@ -3347,7 +3458,7 @@ void libxl__spawn_qemu_xenpv_backend(libxl__egc *egc,
+     flexarray_t *dm_args, *dm_envs;
+     char **args, **envs;
+     const char *dm;
+-    int logfile_w, null = -1, rc;
++    int logfile_w = -1, null = -1, rc;
+     uint32_t domid = dmss->guest_domid;
+ 
+     dmss_init(dmss);
+@@ -3368,6 +3479,11 @@ void libxl__spawn_qemu_xenpv_backend(libxl__egc *egc,
+     flexarray_vappend(dm_args, "-monitor", "/dev/null", NULL);
+     flexarray_vappend(dm_args, "-serial", "/dev/null", NULL);
+     flexarray_vappend(dm_args, "-parallel", "/dev/null", NULL);
++
++    rc = libxl__get_qdisk_backend_dm_args(gc, domid, dmss->backend_domid,
++                                          dm_args);
++    if (rc) goto out;
++
+     flexarray_append(dm_args, NULL);
+     args = (char **) flexarray_contents(dm_args);
+ 
+diff --git a/tools/libs/light/libxl_internal.h b/tools/libs/light/libxl_internal.h
+index 7bbdbb3e61..dccb7b822b 100644
+--- a/tools/libs/light/libxl_internal.h
++++ b/tools/libs/light/libxl_internal.h
+@@ -755,7 +755,8 @@ typedef struct {
+     (dev)->backend_kind == LIBXL__DEVICE_KIND_VFB || \
+     (dev)->backend_kind == LIBXL__DEVICE_KIND_QUSB || \
+     (dev)->backend_kind == LIBXL__DEVICE_KIND_9PFS || \
+-    (dev)->backend_kind == LIBXL__DEVICE_KIND_VKBD)
++    (dev)->backend_kind == LIBXL__DEVICE_KIND_VKBD || \
++    (dev)->backend_kind == LIBXL__DEVICE_KIND_QVIRTIO)
+ 
+ #define XC_PCI_BDF             "0x%x, 0x%x, 0x%x, 0x%x"
+ #define PCI_DEVFN(slot, func)   ((((slot) & 0x1f) << 3) | ((func) & 0x07))
+@@ -4112,6 +4113,7 @@ struct libxl__dm_spawn_state {
+     const char *dm;
+     /* filled in by user, must remain valid: */
+     uint32_t guest_domid; /* domain being served */
++    uint32_t backend_domid;
+     libxl_domain_config *guest_config;
+     libxl__domain_build_state *build_state; /* relates to guest_domid */
+     libxl__dm_spawn_cb *callback;
+@@ -4152,6 +4154,11 @@ _hidden void libxl__spawn_qemu_xenpv_backend(libxl__egc *egc,
+                                         libxl__dm_spawn_state *dmss);
+ _hidden int libxl__destroy_qemu_xenpv_backend(libxl__gc *gc, uint32_t domid);
+ 
++_hidden int libxl__save_qdisk_backend_dm_args(libxl__gc *gc,
++                                              uint32_t domid,
++                                              uint32_t backend_domid,
++                                              const libxl_domain_build_info *guest_info);
++
+ /*----- Domain creation -----*/
+ 
+ 
+diff --git a/tools/libs/light/libxl_types_internal.idl b/tools/libs/light/libxl_types_internal.idl
+index 2458045f24..7edac763bf 100644
+--- a/tools/libs/light/libxl_types_internal.idl
++++ b/tools/libs/light/libxl_types_internal.idl
+@@ -38,6 +38,7 @@ libxl__device_kind = Enumeration("device_kind", [
+     (19, "VBD3"),
+     (20, "XEN_9PFS"),
+     (21, "VGSX"),
++    (22, "QVIRTIO"),
+     ])
+ 
+ libxl__console_backend = Enumeration("console_backend", [
+diff --git a/tools/libs/light/libxl_virtio.c b/tools/libs/light/libxl_virtio.c
+index 6593152423..cf8744473c 100644
+--- a/tools/libs/light/libxl_virtio.c
++++ b/tools/libs/light/libxl_virtio.c
+@@ -55,7 +55,8 @@ static int libxl__device_from_virtio(libxl__gc *gc, uint32_t domid,
+     device->devid           = virtio->devid;
+     device->domid           = domid;
+ 
+-    device->backend_kind    = LIBXL__DEVICE_KIND_VIRTIO;
++    device->backend_kind    = virtio->backend_type == LIBXL_VIRTIO_BACKEND_QEMU ?
++        LIBXL__DEVICE_KIND_QVIRTIO : LIBXL__DEVICE_KIND_VIRTIO;
+     device->kind            = LIBXL__DEVICE_KIND_VIRTIO;
+ 
+     return 0;
