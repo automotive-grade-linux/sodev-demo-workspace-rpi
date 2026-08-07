@@ -16,16 +16,19 @@
 # Python bytecode (from importing/compiling the committed .py helpers)
 __pycache__/
 *.pyc
+# Throw-away shims build.sh creates so a bare '*-project-objects' mirror can serve as a
+# repo --reference (--aaos-ref / --aaos-kernel-ref). They hold nothing but a symlink.
+.aaos-ref-shim/
 # local scratch / per-site overrides (not part of the PR)
 *.bak-*
 /rpi5-sodev.build.yaml
-/docs/
 # SSH host keys — generated on first boot by ssh-keygen -A, never committed
 **/recipes-core/images/files/ssh_host_*
-# AAOS prebuilt binaries — staged by hand per README "Staging the AAOS prebuilts", never committed.
+# DomA boot artifacts. Normally DERIVED from the AAOS build outputs, so nothing is
+# staged and nothing is ignored. The exception is --aaos=prebuilt, which has no AOSP
+# checkout to derive from: there build.sh copies these two out of the bundle's files/
+# (see docs/BUILD.md). Build inputs, never committed.
 # The AOSP NOTICE that accompanies them is NOT listed here: the recipe fetches it with
 # file://NOTICE, so it has to be committed or a fresh clone fails at do_fetch.
-meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files/aaos-android-kernel-xenbuilt-6.1.118
-meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files/aaos-vendor-boot-ramdisk-xenbuilt-padded
-meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-extended/xt-aaos-host-services/files/vehicle_hal_grpc_server
-meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-extended/xt-aaos-host-services/files/dumpstate_grpc_server
+**/recipes-bsp/aaos-guest-binaries/files/aaos-android-kernel-xenbuilt-*
+**/recipes-bsp/aaos-guest-binaries/files/aaos-vendor-boot-ramdisk-xenbuilt-*

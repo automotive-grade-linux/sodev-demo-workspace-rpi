@@ -30,6 +30,8 @@ AAOS_REQUIRED=""                                    # set by -a/--android: DomA 
 XT_SSTATE_DIR="${XT_SSTATE_DIR:-}"                  # --sstate=<dir>
 XT_DL_DIR="${XT_DL_DIR:-}"                          # --dl=<dir>
 XT_WEST_CACHE_DIR="${XT_WEST_CACHE_DIR:-}"          # --west-cache=<dir> (west reference workspace: Zephyr Dom0 manifest+projects; DL_DIR analogue)
+XT_AAOS_REF="${XT_AAOS_REF:-}"                      # --aaos-ref=<dir>        (repo object mirror for the AOSP tree; the AAOS analogue of --west-cache)
+XT_AAOS_KERNEL_REF="${XT_AAOS_KERNEL_REF:-}"        # --aaos-kernel-ref=<dir> (repo object mirror for the AAOS guest-kernel tree)
 REBUILD_IMAGES="${REBUILD_IMAGES:-0}"              # --rebuild-images
 XT_DOCKER_NETWORK="${XT_DOCKER_NETWORK:-}"         # --network for the build containers, e.g. "host"
 XT_DOCKER_RUN_OPTS="${XT_DOCKER_RUN_OPTS:-}"       # extra `docker run` opts for the build containers, e.g. "--memory=48g --cpus=12" (recommended on shared hosts to bound the heavy AOSP/Yocto steps; empty = no limit)
@@ -73,11 +75,17 @@ DomA (AAOS) options:
       --aaos-prebuilt=<dir>  Prebuilt AAOS bundle (layout: files/ + images/). Used by
                              prebuilt/auto. Default probe: <workspace>/aaos-prebuilt
       --aaos-src=<dir>       Reuse an existing AOSP checkout for source mode (skip repo sync)
+      --aaos-ref=<dir>       Repo OBJECT MIRROR for the AOSP tree: seed the checkout with
+                             'repo init --reference=<dir>' so the sync is local. Accepts a
+                             repo client, or a bare '*-project-objects' tree (a shim is
+                             made for it). The AAOS analogue of --west-cache
+      --aaos-kernel-ref=<dir>  Same, for the AAOS guest-kernel tree (android_kernel)
 
 Build environment:
       --sstate=<dir>     Reuse an external Yocto sstate cache
       --dl=<dir>         Reuse an external Yocto downloads dir
       --west-cache=<dir> Reuse a west reference workspace (Zephyr Dom0 manifest+projects)
+                         (the AAOS equivalents are --aaos-ref / --aaos-kernel-ref above)
       --proxy=<url>      HTTP(S) proxy for docker builds + fetches
       --rebuild-images   Force-rebuild the docker/ build image (REQUIRED after changing
                          --proxy: the value is baked into the image)
@@ -98,6 +106,8 @@ Examples:
   ./build.sh -u                                     # + DomU (AGL cluster)
   ./build.sh -u --aaos=prebuilt --aaos-prebuilt=$HOME/aaos-bundle   # + DomU + DomA from prebuilt (no AOSP build)
   ./build.sh -u --aaos=source   --aaos-src=$HOME/aosp    # + DomU + DomA built from AOSP source
+  ./build.sh -u --aaos=source --aaos-ref=/mirror/aosp --aaos-kernel-ref=/mirror/aosp-kernel
+                                                    # DomA from source off a local repo mirror
   ./build.sh --dom0=linux -u -a                     # Linux Dom0, DomA auto (prebuilt if bundle, else source)
 EOF
 }
@@ -128,6 +138,10 @@ while [ $# -gt 0 ]; do
     --dl=*)             XT_DL_DIR="${1#*=}" ;;
     --west-cache)       needval $# "$1"; XT_WEST_CACHE_DIR="$2"; shift ;;
     --west-cache=*)     XT_WEST_CACHE_DIR="${1#*=}" ;;
+    --aaos-ref)         needval $# "$1"; XT_AAOS_REF="$2"; shift ;;
+    --aaos-ref=*)       XT_AAOS_REF="${1#*=}" ;;
+    --aaos-kernel-ref)  needval $# "$1"; XT_AAOS_KERNEL_REF="$2"; shift ;;
+    --aaos-kernel-ref=*) XT_AAOS_KERNEL_REF="${1#*=}" ;;
     --proxy)            needval $# "$1"; PROXY="$2"; shift ;;
     --proxy=*)          PROXY="${1#*=}" ;;
     --rebuild-images)   REBUILD_IMAGES=1 ;;
@@ -182,6 +196,11 @@ fi
 aaos_have_source=no
 { [ -n "$AAOS_SRC_DIR" ] && [ -f "$AAOS_SRC_DIR/build/envsetup.sh" ]; } && aaos_have_source=yes
 [ -f "$workdir/android/build/envsetup.sh" ] && aaos_have_source=yes
+# A repo object mirror is a way to OBTAIN the source, so it counts as source being available
+# even though no checkout exists yet -- build.sh seeds one from it below. Without this,
+# `-a --aaos-ref=<mirror>` resolved auto to a hard error ("found neither a prebuilt bundle
+# nor an AOSP source checkout") while holding exactly what it needed.
+{ [ -n "$XT_AAOS_REF" ] || [ -n "$XT_AAOS_KERNEL_REF" ]; } && aaos_have_source=yes
 if [ "$AAOS_MODE" = auto ]; then
   if   [ "$aaos_have_bundle" = yes ]; then AAOS_MODE=prebuilt
   elif [ "$aaos_have_source" = yes ]; then AAOS_MODE=source
@@ -190,7 +209,8 @@ if [ "$AAOS_MODE" = auto ]; then
     # NOT silently ship a DomA-less image and exit 0 — a CI/user asked for DomA).
     echo "ERROR: -a/--android requested DomA, but found neither a prebuilt bundle" >&2
     echo "       (6 images at '$AAOS_PREBUILT_DIR/images/') nor an AOSP source checkout." >&2
-    echo "       Pass --aaos-prebuilt=<dir> (files/ + images/) or --aaos=source --aaos-src=<dir>," >&2
+    echo "       Pass --aaos-prebuilt=<dir> (files/ + images/), --aaos=source --aaos-src=<dir>," >&2
+    echo "       or --aaos-ref=<repo object mirror> (build.sh seeds a checkout from it)," >&2
     echo "       or drop -a for a DomA-less image (use --aaos=auto to allow the silent fall-back)." >&2
     exit 1
   else
@@ -237,9 +257,11 @@ if [ -z "$NINJA_TARGET" ] && [ "$AAOS_MODE" != "off" ]; then
     echo "       Drop --domains-only (build a full.img) or drop -a." >&2
     exit 1
   fi
-  echo ">> WARNING: DomA (--aaos=$AAOS_MODE) with --domains-only: DomA is built/staged +" >&2
-  echo ">>   assembled into p4 only during SD-image assembly (which --domains-only skips)," >&2
-  echo ">>   so this build produces NO DomA. Drop --domains-only to include DomA." >&2
+  echo ">> WARNING: DomA (--aaos=$AAOS_MODE) with --domains-only: the p4 nested GPT is" >&2
+  echo ">>   assembled only during SD-image assembly (which --domains-only skips), so this" >&2
+  echo ">>   build produces NO bootable DomA. Drop --domains-only to include DomA." >&2
+  echo ">>   NOTE: in source mode the AOSP components still run -- the DomD bitbake derives" >&2
+  echo ">>   the DomA kernel/ramdisk from their outputs -- so this is not a short build." >&2
 fi
 
 # C2 guard: DomA (p4) requires DomU (p3). The SD partition order is fixed by
@@ -297,12 +319,95 @@ DOCKER_RUN_OPTS+=( ${XT_DOCKER_RUN_OPTS:-} )
 # the containers and let bitbake pick it up via XT_SSTATE_DIR/XT_DL_DIR (rpi5-sodev.yaml
 # reads them with os.getenv; passed through below). A dir already under $workdir is
 # reachable via the workspace mount, so only external paths get an extra -v.
-add_cache_mount() { local d="$1"; [ -n "$d" ] || return 0; mkdir -p "$d"; case "$d/" in "$workdir"/*) return 0;; esac; CACHE_MOUNTS+=( -v "$d":"$d" ); }
+# docker rejects two -v with the same container path ("Duplicate mount point"), and the
+# flags legitimately overlap: --aaos-ref and --aaos-kernel-ref can name one mirror, and the
+# android_kernel sibling mount derived from --aaos-src below can land on the same path a
+# --aaos-kernel-ref already claimed. So record every container path that has been mounted
+# and skip repeats instead of letting `docker run` fail after the build has already started.
+MOUNTED_AT=()
+mount_at() {  # $1=host path  $2=container path
+  local h="$1" c="$2" m
+  for m in ${MOUNTED_AT[@]+"${MOUNTED_AT[@]}"}; do [ "$m" = "$c" ] && return 0; done
+  MOUNTED_AT+=( "$c" ); CACHE_MOUNTS+=( -v "$h":"$c" )
+}
+add_cache_mount() { local d="$1"; [ -n "$d" ] || return 0; mkdir -p "$d"; case "$d/" in "$workdir"/*) return 0;; esac; mount_at "$d" "$d"; }
+# A cache path that does not exist is, in practice, a typo. add_cache_mount's `mkdir -p`
+# used to create it silently, and nothing later in the run said so: the build simply
+# rebuilt everything from scratch against an empty cache, turning a 20-minute build into a
+# multi-hour one with a log that looks entirely normal. So require the directory to exist,
+# and name the remedy for the case where a fresh cache really was intended. An existing but
+# EMPTY directory is legitimate (first use, and the build populates it) -- that only gets a
+# note, so a cold cache is at least visible in the log.
+check_cache_dir() {  # $1=dir  $2=flag name  $3=what it holds
+  local d="$1" flag="$2" what="$3"
+  [ -n "$d" ] || return 0
+  if [ ! -d "$d" ]; then
+    echo "ERROR: $flag: no such directory: $d" >&2
+    echo "       This is almost always a typo -- a mistyped cache silently rebuilds" >&2
+    echo "       everything. If a fresh $what really was intended, create it first:" >&2
+    echo "         mkdir -p '$d'" >&2
+    exit 1
+  fi
+  [ -n "$(ls -A "$d" 2>/dev/null)" ] || \
+    echo ">> NOTE: $flag: '$d' is empty -- cold $what, expect a long first build."
+}
+check_cache_dir "$XT_SSTATE_DIR"     --sstate     "sstate cache"
+check_cache_dir "$XT_DL_DIR"         --dl         "downloads dir"
+check_cache_dir "$XT_WEST_CACHE_DIR" --west-cache "west reference workspace"
 add_cache_mount "$XT_SSTATE_DIR"
 if [ -n "$XT_DL_DIR" ] && [ "$XT_DL_DIR" != "$XT_SSTATE_DIR" ]; then add_cache_mount "$XT_DL_DIR"; fi
 # Zephyr Dom0 west source cache (DL_DIR analogue): a pre-populated west reference
 # workspace the fetch-dom0 step pulls from offline (see the zephyr branch below).
 add_cache_mount "$XT_WEST_CACHE_DIR"
+# AAOS repo object mirrors (the --west-cache analogue for the AOSP side). Validate BEFORE
+# add_cache_mount: that helper does `mkdir -p`, which would turn a typo into a silently
+# created empty directory -- repo would then quietly fall back to full network fetches,
+# i.e. exactly the failure these flags exist to avoid. A mirror must exist and must hold
+# at least one bare repo, either directly or under .repo/project-objects.
+check_repo_mirror() {  # $1=dir $2=flag name
+  local d="$1" flag="$2" root="$1"
+  [ -n "$d" ] || return 0
+  [ -d "$d" ] || { echo "ERROR: $flag: no such directory: $d" >&2; exit 1; }
+  [ -d "$d/.repo/project-objects" ] && root="$d/.repo/project-objects"
+  # No -maxdepth: repo nests project-objects by manifest path, and AOSP's is deep
+  # (platform/frameworks/opt/telephony.git is already 4 levels down, and a mirror exported
+  # under an extra prefix is deeper still). A bounded search rejected valid mirrors. The
+  # walk is cheap when a mirror IS valid (-quit stops at the first hit); only the error
+  # path pays for a full traversal, and it exits immediately after.
+  if [ -z "$(find "$root" -type d -name '*.git' -print -quit 2>/dev/null)" ]; then
+    echo "ERROR: $flag: '$d' holds no bare '*.git' repositories, so it cannot serve as a" >&2
+    echo "       repo --reference. Expected either a repo client (with .repo/project-objects/)" >&2
+    echo "       or an exported '*-project-objects' tree." >&2
+    exit 1
+  fi
+  # A mirror that was ITSELF seeded with --reference carries an objects/info/alternates
+  # chain pointing outside itself. Only the named mirror gets bind-mounted, so inside the
+  # container git resolves that chain to a path that is not there and prints
+  # "object directory ... does not exist; check .git/objects/info/alternates" -- for every
+  # project, from a step that has already started. Catch it here and name the root instead.
+  local alt chain
+  alt="$(find "$d" -path '*/objects/info/alternates' -print -quit 2>/dev/null)"
+  if [ -n "$alt" ]; then
+    chain="$(head -1 "$alt" 2>/dev/null)"
+    case "${chain%/}/" in
+      "$d"/*|"$workdir"/*) ;;   # self-contained, or reachable via the workspace mount
+      *)
+        echo "ERROR: $flag: '$d' is itself referenced against another mirror:" >&2
+        echo "         $alt" >&2
+        echo "         -> $chain" >&2
+        echo "       Only '$d' is mounted into the build container, so that chain would not" >&2
+        echo "       resolve there. Point $flag at the ROOT mirror instead (the one with no" >&2
+        echo "       objects/info/alternates), or detach the chain first:" >&2
+        echo "         git -C <each repo> repack -a -d && rm <its objects/info/alternates>" >&2
+        exit 1 ;;
+    esac
+  fi
+}
+check_repo_mirror "$XT_AAOS_REF"        --aaos-ref
+check_repo_mirror "$XT_AAOS_KERNEL_REF" --aaos-kernel-ref
+# Mounted so the seeding step below, which runs inside the builder, can read them.
+add_cache_mount "$XT_AAOS_REF"
+add_cache_mount "$XT_AAOS_KERNEL_REF"
 
 # When --aaos-src points OUTSIDE the workspace, the ninja doma/doma_kernel
 # components (run in the sodev-builder container) reach the AOSP tree via the
@@ -323,7 +428,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "$AAOS
   # before moulin populates it.
   ak_sib="$(dirname "$AAOS_SRC_DIR")/android_kernel"
   mkdir -p "$workdir/android_kernel"
-  case "$ak_sib/" in "$workdir"/*) ;; *) CACHE_MOUNTS+=( -v "$workdir/android_kernel":"$ak_sib" ) ;; esac
+  case "$ak_sib/" in "$workdir"/*) ;; *) mount_at "$workdir/android_kernel" "$ak_sib" ;; esac
 fi
 
 # moulin.conf resolves DL_DIR/SSTATE_DIR via os.getenv('XT_DL_DIR'/'XT_SSTATE_DIR');
@@ -368,7 +473,14 @@ fi
 # Include the optional AAOS guest-kernel/ramdisk md5 pins so a value set in the
 # environment (as the README documents, alongside local.conf) actually reaches
 # bitbake inside the container (aaos-guest-binaries_1.0.bb reads them as bb vars).
-export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE_DIR XT_DL_DIR AAOS_KERNEL_MD5 AAOS_RAMDISK_MD5"
+# CONNECTIVITY_CHECK_URIS is in the list because the README tells proxied sites to set
+# it empty to skip bitbake's connectivity probe; without it in BOTH the docker -e list
+# (below) and here, exporting it on the host had no effect at all inside the container.
+# It is forwarded with the bare `-e CONNECTIVITY_CHECK_URIS` form on purpose: that
+# passes the variable only when it is actually set, so "unset" (keep bitbake's default
+# probe) stays distinct from "set to empty" (disable the probe). `-e VAR="${VAR-}"`
+# would define it unconditionally and silently disable the probe for everyone.
+export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE_DIR XT_DL_DIR AAOS_KERNEL_MD5 AAOS_RAMDISK_MD5 CONNECTIVITY_CHECK_URIS"
 
 # Run a command inside a Docker image, mounting the workspace at the same path.
 in_docker() {  # $1=image, rest=command
@@ -381,6 +493,7 @@ in_docker() {  # $1=image, rest=command
     -e NO_PROXY="${NO_PROXY:-}" -e no_proxy="${NO_PROXY:-}" \
     -e REPO_SKIP_SELF_UPDATE="${REPO_SKIP_SELF_UPDATE:-}" \
     -e XT_DISABLE_SPDX="${XT_DISABLE_SPDX:-}" \
+    -e CONNECTIVITY_CHECK_URIS \
     -e AAOS_KERNEL_MD5="${AAOS_KERNEL_MD5:-}" -e AAOS_RAMDISK_MD5="${AAOS_RAMDISK_MD5:-}" \
     -e XT_SSTATE_DIR="$XT_SSTATE_DIR" -e XT_DL_DIR="$XT_DL_DIR" \
     -e XT_WEST_CACHE_DIR="$XT_WEST_CACHE_DIR" \
@@ -407,55 +520,19 @@ else
   echo ">> submodules already initialized; skipping update"
 fi
 
-# 0-stage) AAOS artifacts. A DomA build needs TWO independent artifact sets:
-#   (Type-1) the five boundary files in meta-xt-doma (the .gitignore'd,
-#     aaos-guest-binaries / xt-aaos-host-services SRC_URI files) -> consumed by the DomD
-#     Yocto build (p1 guest kernel/ramdisk + DomD host gRPC backends). This is the two
-#     guest binaries (kernel, ramdisk) + the two host gRPC backends + the AOSP NOTICE
-#     that, per Apache-2.0 section 4(d), must be redistributed with the Apache-2.0
-#     host-service binaries (file://NOTICE in xt-aaos-host-services, .gitignore'd like
-#     the binaries; without it that recipe fails do_fetch). REQUIRED for ANY DomA build
-#     (source OR prebuilt); the aaos-guest-binaries recipe md5 check is opt-in
-#     (off by default; set AAOS_KERNEL_MD5/AAOS_RAMDISK_MD5 to assert a validated build).
-#   (Type-2) the six AOSP output images (android/out/.../*.img) -> assembled into p4.
-#     Built by the AOSP 'doma' component (source mode) or supplied by the bundle (prebuilt).
-#   With a bundle (--aaos-prebuilt=<dir> containing files/ + images/) both sets are staged
-#   automatically; otherwise the five Type-1 files must be staged by hand (README).
+# 0-stage) AAOS artifacts. A DomA build needs the six AOSP output images
+#   (android/out/.../*.img) assembled into p4. They come from the AOSP build in
+#   `source` mode, or from a bundle in `prebuilt` mode.
+#
+#   The guest kernel and vendor-boot ramdisk that DomA boots from are DERIVED from
+#   those outputs by the aaos-guest-binaries recipe (see
+#   meta-xt-doma/recipes-bsp/aaos-guest-binaries/aaos-guest-binaries-derive.inc), and
+#   the two DomD-side gRPC backends are BUILT from public sources by
+#   google-trout-agl-services. Nothing has to be staged by hand any more, so the
+#   boundary-file check that used to gate this step is gone. `prebuilt` mode is the one
+#   exception: it has no AOSP checkout to derive the two boot artifacts from, so they
+#   come out of the bundle -- copied in below, not by hand.
 if [ "${ENABLE_ANDROID}" = "yes" ]; then
-  aaos_base="meta-rpi-sodev/meta-xt-common/meta-xt-doma"
-  gb_dir="$aaos_base/recipes-bsp/aaos-guest-binaries/files"
-  hs_dir="$aaos_base/recipes-extended/xt-aaos-host-services/files"
-  # Auto-stage a Type-1 boundary file from the bundle when present but not yet in-tree.
-  stage_boundary() {  # $1=filename $2=dest_dir
-    if [ ! -f "$2/$1" ] && [ -f "$AAOS_PREBUILT_DIR/files/$1" ]; then
-      install -D "$AAOS_PREBUILT_DIR/files/$1" "$2/$1" && echo ">> staged boundary file from bundle: $1"
-    fi
-  }
-  stage_boundary aaos-android-kernel-xenbuilt-6.1.118     "$gb_dir"
-  stage_boundary aaos-vendor-boot-ramdisk-xenbuilt-padded "$gb_dir"
-  stage_boundary vehicle_hal_grpc_server                  "$hs_dir"
-  stage_boundary dumpstate_grpc_server                    "$hs_dir"
-  # AOSP NOTICE (Apache-2.0 sec 4d): a SRC_URI file of xt-aaos-host-services, .gitignore'd
-  # like the binaries, so do_fetch fails without it. Stage it alongside the host binaries.
-  stage_boundary NOTICE                                   "$hs_dir"
-  # Verify all five are present (pre-staged by hand or just staged from the bundle).
-  aaos_missing=0
-  for f in \
-    "$gb_dir/aaos-android-kernel-xenbuilt-6.1.118" \
-    "$gb_dir/aaos-vendor-boot-ramdisk-xenbuilt-padded" \
-    "$hs_dir/vehicle_hal_grpc_server" \
-    "$hs_dir/dumpstate_grpc_server" \
-    "$hs_dir/NOTICE" ; do
-    [ -f "$f" ] || { echo "   missing: $f" >&2; aaos_missing=1; }
-  done
-  if [ "$aaos_missing" = "0" ]; then
-    echo ">> AAOS boundary prebuilts present (5/5); continuing."
-  else
-    echo "ERROR: DomA requested but the five AAOS boundary prebuilts are not staged (see above)." >&2
-    echo "       Provide them via --aaos-prebuilt=<dir> (a bundle with files/), stage by hand" >&2
-    echo "       (README: 'Staging the AAOS prebuilts'), or drop -a/--aaos for a DomA-less image." >&2
-    exit 1
-  fi
   # prebuilt mode: place the six AOSP output images (Type-2) where rouge expects them,
   # so 'ninja dom0 domd domu' + rouge assemble p4 WITHOUT running the AOSP build (m)/bazel.
   if [ "$AAOS_MODE" = prebuilt ]; then
@@ -468,9 +545,14 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
         || { echo "ERROR: prebuilt bundle failed MANIFEST.md5 (corrupt/wrong bundle)" >&2; exit 1; }
       # Coverage: a partial MANIFEST (md5sum -c only checks listed lines) must NOT read
       # as "verified" — require every expected artifact to be listed.
+      # The list is exactly what this mode consumes: the six p4 images and the two boot
+      # artifacts. It used to also demand files/vehicle_hal_grpc_server,
+      # files/dumpstate_grpc_server and files/NOTICE -- the gRPC servers are built from
+      # source now (nothing stages or reads them) and the NOTICE is committed, so
+      # requiring them would reject a correctly formed bundle for carrying only what is
+      # still used.
       for req in \
         files/aaos-android-kernel-xenbuilt-6.1.118 files/aaos-vendor-boot-ramdisk-xenbuilt-padded \
-        files/vehicle_hal_grpc_server files/dumpstate_grpc_server files/NOTICE \
         images/boot.img images/init_boot.img images/vendor_boot.img images/vbmeta.img \
         images/super.img images/userdata.img ; do
         grep -q " ${req}\$" "$AAOS_PREBUILT_DIR/MANIFEST.md5" \
@@ -488,6 +570,46 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
       cp -f "$src" "$img_dst/$im.img"   # unconditional: never keep a stale/corrupt same-size image
     done
     echo ">> AAOS prebuilt images staged into android/out (AOSP build will be skipped)."
+    # The DomA kernel/ramdisk are normally DERIVED from the AOSP outputs, but that needs
+    # the AOSP checkout itself (system/tools/mkbootimg/unpack_bootimg.py) and the bazel
+    # kernel Image -- neither of which exists in prebuilt mode, which is the whole point
+    # of the mode. So stage the bundle's two boot artifacts and let the recipe use them
+    # verbatim instead of deriving (see aaos-guest-binaries-derive.inc). Staged, not
+    # required: without them prebuilt mode fails in the recipe with an actionable message.
+    fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
+    staged=0
+    for f in aaos-android-kernel-xenbuilt-6.1.118 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
+      if [ -f "$AAOS_PREBUILT_DIR/files/$f" ]; then
+        mkdir -p "$fdir"
+        cp -f "$AAOS_PREBUILT_DIR/files/$f" "$fdir/$f"   # unconditional: never keep a stale copy
+        staged=$((staged + 1))
+      fi
+    done
+    if [ "$staged" = 2 ]; then
+      echo ">> AAOS prebuilt guest kernel + ramdisk staged into meta-xt-doma (derivation will be skipped)."
+    else
+      echo ">> ERROR: --aaos=prebuilt needs both boot artifacts in '$AAOS_PREBUILT_DIR/files/':" >&2
+      echo ">>   aaos-android-kernel-xenbuilt-6.1.118 and aaos-vendor-boot-ramdisk-xenbuilt-padded." >&2
+      echo ">>   They cannot be derived here: deriving them needs the AOSP checkout" >&2
+      echo ">>   (system/tools/mkbootimg) and the bazel guest kernel, which prebuilt mode" >&2
+      echo ">>   deliberately does not have. Use --aaos=source --aaos-src=<AOSP checkout>," >&2
+      echo ">>   which produces them from the build." >&2
+      exit 1
+    fi
+  else
+    # Any non-prebuilt mode DERIVES the two artifacts, so a copy left behind by an
+    # earlier --aaos=prebuilt run has to go. The recipe prefers a staged file over
+    # deriving (it has to: prebuilt mode cannot derive), so leaving them would make
+    # `--aaos=source` silently keep shipping the old bundle's kernel and ramdisk while
+    # building a fresh p4 from source -- the exact kernel/vendor_dlkm ABI mismatch that
+    # boots to a black panel with sys.boot_completed=1.
+    fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
+    for f in aaos-android-kernel-xenbuilt-6.1.118 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
+      if [ -e "$fdir/$f" ]; then
+        rm -f "$fdir/$f"
+        echo ">> removed a stale prebuilt-staged artifact ($f); --aaos=$AAOS_MODE derives it"
+      fi
+    done
   fi
 fi
 
@@ -507,9 +629,10 @@ fi
 #     into the SD image p4 as a nested GPT (V4H android_only style; see rpi5-sodev.yaml
 #     ENABLE_ANDROID). There is no prebuilt combined-disk and no separate warm step: the
 #     moulin `android` builder runs the full repo sync + lunch + build itself in step 2
-#     (the AOSP toolchain is baked into Dockerfile.builder). Budget ~250 GiB free + 1-3 h
-#     on first run. --aaos-src reuses an existing checkout (skip the ~100 GiB sync);
-#     omit -a for a DomA-less SD.
+#     (the AOSP toolchain is baked into Dockerfile.builder). Budget ~300 GiB free; one
+#     measured from-scratch run took 5 h 11 min. --aaos-src reuses an existing checkout
+#     (skips the sync); --aaos-ref seeds it from a repo object mirror; omit -a for a
+#     DomA-less SD.
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "${AAOS_SRC_DIR}" ] && [ "${AAOS_SRC_DIR}" != "$workdir/android" ]; then
   # rouge + the doma component read the AOSP tree at <repo>/android (the component
   # build-dir). When --aaos-src points at an external tree, symlink it in so ninja reuses it.
@@ -519,6 +642,93 @@ if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "${AAO
     exit 1
   fi
   ln -sfn "$AAOS_SRC_DIR" "$workdir/android"   # (re)point the symlink at the external AOSP tree
+fi
+
+# 0b) AAOS repo object mirrors (--aaos-ref / --aaos-kernel-ref) — the AOSP analogue of
+#     --west-cache. moulin's generated `repo init` carries no --reference (and a
+#     `reference:` key in the yaml would be silently ignored, like every key moulin does
+#     not know), so seed the checkout HERE with the reference applied. moulin's later
+#     `repo init` preserves the recorded repo.reference, so every sync it runs stays
+#     local. Nothing is pinned twice: the manifest URL/rev/depth are read out of
+#     rpi5-sodev.yaml, which remains the single source of truth.
+if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] &&
+   { [ -n "$XT_AAOS_REF" ] || [ -n "$XT_AAOS_KERNEL_REF" ]; }; then
+  # `repo --reference` wants a repo client: <ref>/.repo/project-objects/<name>.git.
+  # An exported mirror is usually a bare '*-project-objects' tree, so wrap that shape in
+  # a shim instead of making every caller do it by hand. The shim lives in the workspace
+  # (so it is visible in-container) and only contains a symlink to the real mirror, which
+  # in_docker mounts at the same path.
+  ref_root() {  # $1=user dir  $2=component -> reference root (validated by check_repo_mirror)
+    local d="$1"
+    [ -d "$d/.repo/project-objects" ] && { echo "$d"; return 0; }
+    # Name the shim after the COMPONENT, not basename "$d": --aaos-ref and
+    # --aaos-kernel-ref routinely point at two mirrors with the same basename (both are
+    # exported as '<something>-project-objects'), and a shared shim name would make the
+    # second `ln -sfn` retarget the first one -- seeding both trees from one mirror.
+    local shim="$workdir/.aaos-ref-shim/$2"
+    mkdir -p "$shim/.repo"; ln -sfn "$d" "$shim/.repo/project-objects"
+    echo "$shim"
+  }
+  # Sync concurrency. Deliberately NOT $(nproc): even with every object available locally,
+  # repo still runs one `git fetch` per project against the real remote to resolve refs and
+  # tags, and android.googlesource.com rate-limits that. Measured on a 32-core host:
+  # -j16 => 12 of 1379 projects failed with 'remote: RESOURCE_EXHAUSTED', -j8 => 1 failed,
+  # and a plain retry fixed it in both cases. So: a modest default, then serial retries.
+  # XT_AAOS_SYNC_JOBS overrides it for sites with their own (unthrottled) mirror server.
+  AAOS_SYNC_JOBS="${XT_AAOS_SYNC_JOBS:-4}"
+  seed_repo() {  # $1=component name in the yaml  $2=checkout dir  $3=mirror dir
+    local comp="$1" dir="$2" mirror="$3" ref
+    [ -n "$mirror" ] || return 0
+    ref="$(ref_root "$mirror" "$comp")"
+    if [ -d "$dir/.repo" ]; then
+      # Do not rewrite an existing client's config (its reference, if any, is kept), but DO
+      # run the sync: an interrupted or rate-limited seed leaves a partial tree, and repo
+      # sync is incremental -- a complete tree costs a couple of seconds. The `repo init`
+      # below is skipped in-container for exactly that reason.
+      echo ">> $comp: '$dir' already has a .repo; keeping its config and completing the sync."
+    else
+      echo ">> $comp: seeding '$dir' from mirror '$mirror' (reference root '$ref')"
+    fi
+    mkdir -p "$dir"
+    in_docker "$XT_DOCKER" "
+      set -e
+      # single source of truth: take url/rev/manifest/depth from the yaml's repo source
+      eval \"\$(python3 - '${MOULIN_YAML}' '${comp}' <<'PYEOF'
+import sys, yaml, shlex
+d = yaml.safe_load(open(sys.argv[1]))
+s = [x for x in d['components'][sys.argv[2]]['sources'] if x.get('type') == 'repo'][0]
+for k, v in (('R_URL', s['url']), ('R_REV', s['rev']),
+             ('R_MANIFEST', s.get('manifest', 'default.xml')),
+             ('R_DEPTH', str(s.get('depth', '')))):
+    print('%s=%s' % (k, shlex.quote(v)))
+PYEOF
+)\"
+      cd '$dir'
+      if [ ! -d .repo ]; then
+        repo init --reference='$ref' --no-clone-bundle -u \"\$R_URL\" -m \"\$R_MANIFEST\" -b \"\$R_REV\" \${R_DEPTH:+--depth=\$R_DEPTH}
+      fi
+      jobs=${AAOS_SYNC_JOBS}
+      tries=0
+      until repo sync -j\$jobs --no-clone-bundle --retry-fetches=20 --optimized-fetch; do
+        tries=\$((tries+1))
+        if [ \$tries -ge 3 ]; then
+          echo \"ERROR: $comp: repo sync did not complete after \$tries attempts.\" >&2
+          echo \"       If the errors say RESOURCE_EXHAUSTED the remote is rate-limiting the\" >&2
+          echo \"       per-project ref fetch; lower XT_AAOS_SYNC_JOBS and re-run (the sync is\" >&2
+          echo \"       incremental, so nothing already fetched is lost).\" >&2
+          exit 1
+        fi
+        jobs=1   # de-parallelise: a rate-limited remote recovers when asked serially
+        echo \">>   $comp: repo sync incomplete (attempt \$tries); retrying serially in 30s\" >&2
+        sleep 30
+      done
+      echo \">>   reference recorded: \$(git -C .repo/manifests.git config --get repo.reference)\"
+    "
+  }
+  # doma lives at <ws>/android (a symlink to --aaos-src when that points outside);
+  # doma_kernel always lives at <ws>/android_kernel.
+  seed_repo doma        "$workdir/android"        "$XT_AAOS_REF"
+  seed_repo doma_kernel "$workdir/android_kernel" "$XT_AAOS_KERNEL_REF"
 fi
 
 # 1) DomU (AGL Flutter) — same procedure as upstream sodev-demo-workspace/build.sh.
@@ -584,6 +794,30 @@ if [ "$AAOS_MODE" = prebuilt ]; then
   fi
 else
   NINJA_CMD="ninja ${NINJA_TARGET}"; ROUGE_CMD=":"
+  # source mode: the AOSP components MUST finish before the DomD bitbake, because
+  # aaos-guest-binaries derives the DomA kernel/ramdisk from their outputs
+  # (android/out/.../vendor_boot.img and the bazel Image). ninja does not know that --
+  # the dependency lives inside a bitbake recipe, not in the moulin graph -- and with a
+  # single goal it picks DomD first (observed: "[8/13] Yocto Build: domd" ahead of
+  # "[11/13] Invoke Android build system"), so a clean tree fails do_compile.
+  #
+  # Ordering here costs nothing: every moulin builder rule (yocto/android/bazel/zephyr)
+  # declares ninja's `console` pool, whose depth is 1, so the components are already
+  # serialised -- this only fixes WHICH order.
+  #
+  # `ninja doma_kernel doma` is not a substitute for the graph edge if someone runs
+  # `ninja image-full` by hand; that case is covered by the recipe's do_compile bb.fatal,
+  # which names the build.sh invocation to use.
+  #
+  # Not gated on NINJA_TARGET: --domains-only (NINJA_TARGET="") still builds DomD, and
+  # moulin's default ninja target does NOT include doma/doma_kernel, so without this the
+  # AOSP outputs would be missing there too. See the NG-2 guard above.
+  if [ "$ENABLE_ANDROID" = yes ]; then
+    # NINJA_TARGET may be empty (--domains-only); `ninja` with no goal builds the
+    # default target, which is what the un-prefixed command did, so keep it unquoted
+    # and unguarded rather than dropping the second invocation.
+    NINJA_CMD="ninja doma_kernel doma && ninja ${NINJA_TARGET}"
+  fi
 fi
 echo ">> moulin (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
 in_docker "$XT_DOCKER" "
@@ -618,8 +852,39 @@ in_docker "$XT_DOCKER" "
   # failed step. Wrap the ninja in a small bounded retry loop (a deterministic build
   # error just re-runs the same failing edge and exits after the cap; not masked). The
   # rouge assembly (prebuilt mode) runs ONCE after a successful ninja, never retried.
+  # An OOM kill is NOT transient: the AOSP step dies, and every retry re-dies within
+  # seconds, so the loop would burn all its attempts and blame the network. soong_ui
+  # sizes ninja -j from nproc+2 and ignores the cgroup limit, so on a many-core host a
+  # cold AOSP build overruns any --memory. Detect it and stop with the real remedy.
+  # The kill surfaces in soong's output rather than as a 137 exit status (moulin's ninja
+  # turns it into a plain rc=1), so the output is what we check; rc 137 is checked too,
+  # for a ninja killed directly. Match soong_ui's own wording -- 'ninja failed with:
+  # signal: killed' -- and not a bare 'signal: killed', which any build log is free to
+  # contain for reasons that have nothing to do with an OOM. The capture file is
+  # truncated per attempt (tee, not tee -a) so one attempt's output can never condemn a
+  # later one; the complete log is on stdout regardless.
+  ninja_out=\$(mktemp)
+  # The brace group is load-bearing. NINJA_CMD is substituted into this script as TEXT and
+  # can be a compound command ('ninja doma_kernel doma && ninja image-full'), and
+  # 'A && B 2>&1 | tee f' parses as 'A && (B 2>&1 | tee f)' -- so without the braces the
+  # FIRST ninja's output bypasses the capture entirely. That is the AOSP build, i.e. the one
+  # step where the OOM actually happens, so the detector below would never fire for it and
+  # the loop would spend all five attempts blaming the network. Verified over the three
+  # failure positions (first fails / second fails / both succeed).
+  run_ninja() { { ${NINJA_CMD}; } 2>&1 | tee \"\$ninja_out\"; return \${PIPESTATUS[0]}; }
   tries=0
-  until ${NINJA_CMD}; do
+  until run_ninja; do
+    rc=\$?
+    if [ \$rc -eq 137 ] || grep -q 'ninja failed with: signal: killed' \"\$ninja_out\"; then
+      echo \">> ninja was KILLED (rc=\$rc). This is the container OOM killer, not a transient\" >&2
+      echo \">>   fetch: retrying cannot help. Confirm on the host with\" >&2
+      echo \">>   'dmesg -T | grep -i oom-kill' (constraint=CONSTRAINT_MEMCG => the container).\" >&2
+      echo \">>   Cap build parallelism and re-run; the build resumes incrementally:\" >&2
+      echo \">>     XT_DOCKER_RUN_OPTS=\\\"--cpuset-cpus=0-15\\\" ./build.sh ...\" >&2
+      echo \">>   (--cpus does NOT help: it leaves nproc, and therefore ninja -j, unchanged.)\" >&2
+      echo \">>   See 'Bounding a cold AOSP build' in docs/BUILD.md.\" >&2
+      exit 1
+    fi
     tries=\$((tries+1))
     if [ \$tries -ge 5 ]; then echo \">> ninja failed after \$tries attempts (deterministic error, or too many transient aborts)\" >&2; exit 1; fi
     echo \">> ninja attempt \$tries failed; retrying in 15s (incremental resume; transient fetch/repo-sync abort?)\" >&2
