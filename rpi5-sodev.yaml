@@ -402,18 +402,20 @@ parameters:
   # meta-xt-rpi5/recipes-kernel/linux/files/bcm2712-raspberrypi5-xen.dtso):
   #   16g: Dom0  512 + DomD 4096 + DomU 1024 + DomA 4096 =  9728 MiB (+ Xen ~64)
   # DomD's static-mem banks reach 0x1c0000000 (7 GiB), so on an 8 GB board every
-  # ADDRESS in the map still exists -- it is the TOTAL that does not fit. 8g therefore
-  # shrinks DomD only and leaves the other three domains at their verified sizes:
-  #    8g: Dom0  512 + DomD 2048 + DomU 1024 + DomA 4096 =  7680 MiB
-  #        WARNING: DomD 2048 is the size the overlay records as having OOM-killed `xl devd`
-  #        with both guests' qemu device-models + weston + the VHAL backend running,
-  #        which is why 16g uses 4096. 8g reintroduces it deliberately (DomD is the
-  #        only domain that can give the space back); a DomU-only or DomA-only 8 GB
-  #        build is the safe configuration.
-  #        (static-mem: bank4 at 0x180000000 dropped, bank3 at 0x100000000 2G -> 1G;
+  # ADDRESS in the map still exists -- it is the TOTAL that does not fit. 8g takes the
+  # reduction out of DomD and DomA and leaves Dom0/DomU at their verified sizes:
+  #    8g: Dom0  512 + DomD 3072 + DomU 1024 + DomA 3072 =  7680 MiB
+  #        The reduction is SPLIT rather than taken from DomD alone: DomD 2048 is the
+  #        size the overlay records as having OOM-killed `xl devd` with both guests'
+  #        qemu device-models + weston + the VHAL backend running, which is why 16g
+  #        uses 4096. 3072/3072 keeps DomD clear of that figure and still fits.
+  #        (static-mem: bank4 at 0x180000000 dropped, bank3 at 0x100000000 2G -> 1G,
+  #         and the boot script sets /chosen/domD memory = <0x0 0x300000> = 3072 MiB;
   #         the three low banks are kept because bank[0]=0x50000000 is where
   #         place_modules() puts the DomD kernel/DTB and 0x20000000/0x80000000 are
-  #         inside the VPU 32-bit DMA window that carries vc4's CMA)
+  #         inside the VPU 32-bit DMA window that carries vc4's CMA.
+  #         DomA's 3072 comes from doma.cfg, which xt-xen-cfg-doma substitutes per
+  #         BOARD_RAM: 16g -> 4096, 8g -> 3072.)
   #
   # 7680 + Xen ~64 = 7744 MiB against roughly 8180 MiB usable (extrapolated from
   # total_memory=16372 = 16384 - 12), i.e. ~436 MiB of headroom. build.sh prints this
@@ -436,7 +438,7 @@ parameters:
   # tools/check-memory-map.py validates BOTH values against Xen's
   # allocate_memory_11() placement and the boot scripts' load addresses.
   BOARD_RAM:
-    desc: "Target Raspberry Pi 5 SKU: 16g (default; full 4-domain cockpit) or 8g (DomD 2048 MiB; the four domains then total 7680 MiB and fit an 8 GB board -- see the comment above)"
+    desc: "Target Raspberry Pi 5 SKU: 16g (default; full 4-domain cockpit) or 8g (DomD and DomA 3072 MiB each; the four domains then total 7680 MiB and fit an 8 GB board -- see the comment above)"
     "16g":
       default: true
       overrides:

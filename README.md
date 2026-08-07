@@ -67,11 +67,14 @@ Before you build:
   instrument cluster / Android** on the displays. The full dual-display demo
   needs `-u -a`.
 - **`-a` (Android) = `--aaos=auto`**: how DomA is produced is chosen by `--aaos`
-  (`off` | `auto` | `source` | `prebuilt`). DomA needs five staged files (four AAOS
-  binaries plus the AOSP `NOTICE`) **not shipped in this repo** plus the p4 images
-  — supply a **prebuilt bundle**
-  (`--aaos=prebuilt --aaos-prebuilt=<dir>`, no AOSP build, minutes) or build from
-  **source** (`--aaos=source`, ~250 GiB / 1-3 h). See *Staging the AAOS prebuilts* (`docs/BUILD.md`).
+  (`off` | `auto` | `source` | `prebuilt`). **Nothing has to be staged by hand.**
+  `--aaos=source` builds AAOS from public sources (measured: 5 h 11 min and 272 GiB of
+  workspace on a 32-core host — see *Starting with no AOSP checkout* in `docs/BUILD.md`)
+  and the DomA
+  guest kernel, its vendor-boot ramdisk and the DomD-side gRPC backends are all
+  derived or built from that; `--aaos=prebuilt --aaos-prebuilt=<dir>` consumes a
+  bundle instead and skips the AOSP build (minutes). See *How the DomA artifacts are
+  produced* (`docs/BUILD.md`).
 - **Behind an HTTP(S) proxy / restricted network?** Set `HTTPS_PROXY` (that is the
   variable `build.sh` reads; `--proxy=<url>` does the same) and you will usually also
   need `CONNECTIVITY_CHECK_URIS=""` and `REPO_SKIP_SELF_UPDATE=1` (see *Docker
@@ -88,7 +91,8 @@ Before you build:
 - **git** and **bash** on the host — `build.sh` checks for git, initialises the
   `external/` submodules, and runs `meta-rpi-sodev/scripts/sync-guest-pins.sh`
   before entering any container.
-- **Disk**: ~250 GiB free for a full `-a` (AAOS) build (AOSP dominates); the
+- **Disk**: ~300 GiB free for a full `-a` (AAOS) build — one measured run used 272 GiB
+  of workspace and AOSP dominates it; the
   guest-less default build (no AOSP) needs far less. Do not build on a
   filesystem with filename-length limits (e.g. ecryptfs).
 - **RAM**: an AOSP/Yocto build is memory-hungry — 16 GiB is marginal, ≥32 GiB is
@@ -112,12 +116,13 @@ disables the heavy Android/Flatcar guests by default).
 | `--aaos=<mode>` (`AAOS_MODE`) | off (`-a`⇒auto) | `off` \| `auto` \| `source` \| `prebuilt`. **auto** = prebuilt if a bundle is found (default probe `<workspace>/aaos-prebuilt`), else source if an AOSP checkout is found, else off (or a hard error when DomA was required via `-a`) |
 | `--aaos-prebuilt=<dir>` (`AAOS_PREBUILT_DIR`) | `<ws>/aaos-prebuilt` | Prebuilt AAOS bundle (`files/` + `images/` + `MANIFEST.md5`); consumed by `prebuilt`/`auto`. **Skips the AOSP source build entirely.** See *AAOS build modes* |
 | `--aaos-src=<dir>` (`AAOS_SRC_DIR`) | — | Reuse an existing AOSP checkout for `source` mode (skip the repo sync; still builds AOSP from it) |
+| `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from `rpi5-sodev.yaml`, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
 | `--memory=<size>` (`XT_DOCKER_MEMORY`) | — (unlimited) | Cap each build container's RAM via docker `--memory` **and** `--memory-swap` (equal ⇒ no host-swap spill, so an unbounded moulin/AOSP/Yocto build cannot OOM the host), e.g. `24g` |
 | (`XT_DOCKER_NETWORK`) | — (Docker bridge) | `--network` value for the build containers, e.g. `host`. Needed when the build has to reach a proxy or package mirror bound to the **host's** loopback: a bridged container's `127.0.0.1` is its own, not the host's. Applies to `docker run` and `docker build` |
 | (`XT_DOCKER_RUN_OPTS`) | — | Extra `docker run` options applied verbatim to every builder, for anything `--memory` does not cover (e.g. `--cpus 8`) |
-| `--sstate=<dir>` (`XT_SSTATE_DIR`) | — | Reuse an external Yocto sstate cache; bind-mounted into the builders |
-| `--dl=<dir>` (`XT_DL_DIR`) | — | Reuse an external Yocto downloads dir; bind-mounted into the builders |
+| `--sstate=<dir>` (`XT_SSTATE_DIR`) | — | Reuse an external Yocto sstate cache; bind-mounted into the builders Must name an **existing** directory (a typo would otherwise rebuild everything against an empty cache); an existing but empty one is accepted with a note. |
+| `--dl=<dir>` (`XT_DL_DIR`) | — | Reuse an external Yocto downloads dir; bind-mounted into the builders Must name an existing directory, as `--sstate`. |
 | (`XT_DISABLE_SPDX`) | — (SBOM on) | Set to any non-empty value to drop `create-spdx` from `INHERIT` for the Yocto components. SBOM generation is **on by default** — the images ship SPDX documents — so this is only an escape hatch for a faster iteration cycle or for working around an SPDX-tool problem, never for a release build |
 
 DomU / DomA gating follows the V4H `prod-devel-rcar4_new.yaml` idiom: the
@@ -137,7 +142,7 @@ See also:
 
 - [Docker usage](docs/BUILD.md) — the container the build runs in, proxies, offline mirrors and shared caches.
 - [Manual build (moulin + ninja, upstream style)](docs/BUILD.md) — driving moulin and ninja directly instead of through build.sh.
-- [Staging the AAOS prebuilts](docs/BUILD.md) — what the Android guest's prebuilt images and host binaries are, their md5s, and the three --aaos modes.
+- [How the DomA artifacts are produced](docs/BUILD.md) — where the Android guest kernel, ramdisk, p4 images and the DomD-side gRPC backends come from, and the three --aaos modes.
 ## Flashing the SD card
 ```sh
 sudo dd if=full.img of=/dev/<sd-dev> bs=4M conv=fsync status=progress
@@ -264,7 +269,7 @@ On **hardware**, the default **Zephyr-Dom0** disaggregated stack is verified
 the AGL cluster renders on HDMI-A-1 and the shipping **`--aaos=prebuilt` AAOS**
 renders on HDMI-A-2 (all guest modules load, SurfaceFlinger up) — the guest
 kernel and the `super.img` vendor_dlkm modules must come from one coherent build
-(same `module_layout` ABI; see *Staging the AAOS prebuilts* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
+(same `module_layout` ABI; see *How the DomA artifacts are produced* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
 is build- and wiring-complete, but its end-to-end boot has not been re-validated
 on the current tree (see the *Verification status* note under *Boot process* (`docs/DESIGN.md`)).
 The Zephyr full-image HW checklist:

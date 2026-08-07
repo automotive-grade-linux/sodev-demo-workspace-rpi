@@ -135,6 +135,68 @@ such a run — that was the missing tty, not a missing console.
 Quick sanity: all four domains in `xl list`, both panels lit, touch works on
 the IVI panel, `kmscube`-class GL content renders via virtio-gpu-gl.
 
+## `ninja failed with: signal: killed` during a `--aaos=source` build
+
+**Symptom.** The AOSP step dies part-way (often 40-60 %) with
+`ninja failed with: signal: killed`, then `#### failed to build some targets ####`,
+then `FAILED: android/out/target/product/<device>/boot.img …`. Older `build.sh`
+revisions reported it as a possible transient fetch/repo-sync abort and burned all
+five retries on it; it now stops on the first one with the remedy below.
+
+**Cause.** The build container was OOM-killed. Confirm on the host:
+
+```sh
+dmesg -T | grep -iE 'oom-kill|Memory cgroup out of memory'
+# oom-kill:constraint=CONSTRAINT_MEMCG … task=ninja
+```
+
+`CONSTRAINT_MEMCG` means the *container's* limit was hit, not the host's — the host
+can still have tens of GiB free. AOSP's `soong_ui` sizes `ninja -j` from
+`runtime.NumCPU()+2` and never consults the cgroup limit, so a many-core host
+overruns any `--memory` you set.
+
+**Fix.** Cap the CPUs the container can see. This is what lowers `-j`; docker
+`--cpus` does not, because it leaves `nproc` unchanged:
+
+```sh
+XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh --aaos=source … --memory=44g
+```
+
+Re-run — the AOSP build resumes incrementally, so nothing is lost. For scale: on a
+32-core host with a 44 GiB cap, a cold AOSP build was killed at `nproc`=32 and peaked
+at ~19 GiB at `nproc`=16. Neither a warm `--aaos-src` tree (its `m` finishes in
+minutes) nor a resumed build reaches that peak, so verify the fix on a cold one. See
+*Bounding a cold AOSP build* (`docs/BUILD.md`).
+
+## A mistyped `--sstate` / `--dl` / `--west-cache` path
+
+**Symptom.** `build.sh` stops in a second or two with:
+
+```
+ERROR: --sstate: no such directory: /mnt/disk3/yocto/sstat
+       This is almost always a typo -- a mistyped cache silently rebuilds
+       everything. If a fresh sstate cache really was intended, create it first:
+         mkdir -p '/mnt/disk3/yocto/sstat'
+```
+
+**Cause.** The path does not exist. It used to be created for you, which meant a
+mistyped cache produced a *working* build that reused nothing: every task rebuilt from
+source, the log looked entirely ordinary, and the only symptom was a 20-minute build
+taking hours. The check exists so that failure is loud and immediate instead.
+
+**Fix.** Correct the path. If you really did mean to start a fresh cache in a new
+location, create the directory first — an existing but empty cache is accepted and only
+noted:
+
+```
+>> NOTE: --sstate: '/data/sstate' is empty -- cold sstate cache, expect a long first build.
+```
+
+Nothing is auto-created any more, for any of the three cache flags. `--aaos-ref` and
+`--aaos-kernel-ref` are checked more strictly still: the directory must exist *and*
+hold at least one bare `*.git`, because an empty one would make `repo` fall back to
+full network fetches — the very thing those flags exist to avoid.
+
 ## Health checks (xenstore / teardown regression sanity)
 Run from the toolstack domain after boot:
 

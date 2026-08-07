@@ -131,11 +131,13 @@ the root. (The override lives in the `.conf`, not as a `-D` in `rpi5-sodev.yaml`
 because moulin mishandles an empty-string `-D` argument.) Without a matching file
 `xu create` fails at `xrun_get_file_size`.
 
-**Build-graph resolution:** `aaos-android-kernel` / `aaos-vendor-boot-ramdisk`
-are **md5-pinned prebuilts** staged into the AAOS layer before the build (see the
-top-level README §"Staging the AAOS prebuilts") — they are deliberately not
-produced inside the Zephyr Dom0 graph (the Zephyr west build has no
-`tmp/deploy/images/…`). With them staged, `DOM0_OS=zephyr` produces the complete
+**Build-graph resolution:** `aaos-android-kernel` / `aaos-vendor-boot-ramdisk` are
+produced by the **DomD** bitbake (`aaos-guest-binaries`, which derives them from the
+`doma_kernel` / `doma` component outputs — see `docs/BUILD.md` §"How the DomA artifacts
+are produced") — they are deliberately not produced inside the Zephyr Dom0 graph (the
+Zephyr west build has no `tmp/deploy/images/…`). Sourcing them from DomD makes the
+`DOM0_OS=zephyr` and `DOM0_OS=linux` graphs identical in this respect, and
+`DOM0_OS=zephyr` produces the complete
 4-domain `full.img` (p1 carries `zephyr.bin` + `xen` + the DomD `Image`/initramfs/DT
 + `aaos-android-kernel` / `aaos-vendor-boot-ramdisk` + `linux-domu`; p4 the AAOS
 nested GPT). Verified end-to-end from a clean checkout for **both** `--dom0=zephyr`
