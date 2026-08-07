@@ -2,6 +2,12 @@
 /agl/
 /android
 /android_kernel/
+# The Raspberry Pi 4 build checks the same two trees out under board-suffixed names
+# (DOMA_DIR / ANDROID_KERNEL_DIR in rpi4-sodev.yaml), so that switching --board cannot
+# make one board inherit the other's checkout -- and a mis-specified --aaos-ref fails
+# on the spot instead of silently on some later clean build.
+/android-rpi4
+/android_kernel-rpi4/
 /yocto/
 /zephyr/
 /artifacts/
