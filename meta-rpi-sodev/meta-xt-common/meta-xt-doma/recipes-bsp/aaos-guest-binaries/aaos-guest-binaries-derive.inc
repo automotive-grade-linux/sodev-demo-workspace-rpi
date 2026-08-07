@@ -47,7 +47,11 @@
 AAOS_SRC_TREE ??= "${TOPDIR}/../../android"
 AAOS_KERNEL_TREE ??= "${TOPDIR}/../../android_kernel"
 
-AAOS_PRODUCT_OUT ??= "${AAOS_SRC_TREE}/out/target/product/xenvm_trout_arm64"
+# PRODUCT_DEVICE of the AAOS product being built. A board that adds its own AOSP
+# product variant (see meta-xt-doma/aosp-device/) has a different one and the product
+# yaml passes it in; the default is the upstream xenvm-trout arm64 device.
+AAOS_DEVICE ??= "xenvm_trout_arm64"
+AAOS_PRODUCT_OUT ??= "${AAOS_SRC_TREE}/out/target/product/${AAOS_DEVICE}"
 AAOS_KERNEL_IMAGE ??= "${AAOS_KERNEL_TREE}/out/deploy/common-modules/xen-virtual-device/xen_virtual_device_aarch64/Image"
 AAOS_UNPACK_BOOTIMG ??= "${AAOS_SRC_TREE}/system/tools/mkbootimg/unpack_bootimg.py"
 

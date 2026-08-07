@@ -36,6 +36,10 @@ RDEPENDS:${PN} = "xen-tools-xl xen-tools-xenstore"
 # The default matches moulin's own default so a standalone bitbake still works.
 BOARD_RAM ??= "16g"
 
+# Board layers whose SKUs are not the Pi 5's 16g/8g set this to DomA's size in MiB
+# and the BOARD_RAM map in do_install is not consulted. Empty means "use the map".
+DOMA_MEM_MiB ??= ""
+
 do_compile() {
     dtc -I dts -O dtb -o ${WORKDIR}/doma.dtb ${UNPACKDIR}/doma.dts
 }
@@ -51,11 +55,21 @@ do_install() {
     # crash-looped in binder while DomD itself still had 1.3 GiB free and was never
     # OOM-killed). 3072/3072 keeps the same total and boots all four domains. The
     # measurement and its history are in doma.cfg next to this value.
-    case "${BOARD_RAM}" in
-        16g) doma_mem=4096 ;;
-        8g)  doma_mem=3072 ;;
-        *)   bbfatal "BOARD_RAM must be 8g or 16g (got '${BOARD_RAM}')" ;;
-    esac
+    # A board whose SKUs are not 16g/8g sets DOMA_MEM_MiB and bypasses the map
+    # entirely. meta-xt-rpi4 does: the Raspberry Pi 4 SKUs are 8g and 4g, and its
+    # 8 GiB budget puts DomA at a different size than the Pi 5's, so neither the
+    # sizes nor the SKU names carry over. The map below stays literal because
+    # tools/check-memory-map.py cross-checks these numbers against its own budget
+    # table for the Pi 5.
+    if [ -n "${DOMA_MEM_MiB}" ]; then
+        doma_mem="${DOMA_MEM_MiB}"
+    else
+        case "${BOARD_RAM}" in
+            16g) doma_mem=4096 ;;
+            8g)  doma_mem=3072 ;;
+            *)   bbfatal "BOARD_RAM must be 8g or 16g (got '${BOARD_RAM}'), or the board layer must set DOMA_MEM_MiB" ;;
+        esac
+    fi
     # Fail loudly rather than ship the placeholder: `xl create` rejects a
     # non-numeric `memory`, so DomA would simply never start -- and the same
     # applies if a future edit renames the token.
@@ -86,6 +100,8 @@ do_install() {
 # from sstate that still carries the other board's `memory` value. The same reason
 # BOARD_RAM is in xt-rpi-u-boot-scr's do_compile[vardeps].
 do_install[vardeps] += "BOARD_RAM"
+# Same reason, for the board-layer override that bypasses the BOARD_RAM map.
+do_install[vardeps] += "DOMA_MEM_MiB"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \

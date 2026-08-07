@@ -55,7 +55,22 @@ SRC_URI:append = " \
     file://optee.cfg \
 "
 
-RPI_KERNEL_DEVICETREE:append = " \
+# SCOPED TO raspberrypi5, and it has to be. All five names below are templated from
+# ${RPI_SOC_FAMILY}-${MACHINE} (or, for SCMI_XEN_DT_NAME, from the yaml's
+# XEN_DT_SCMI which is built the same way), and the files that satisfy them exist
+# only as bcm2712-raspberrypi5-* in this layer's files/. Left unscoped, another
+# board asks do_fetch for e.g. bcm2711-raspberrypi4-64-domd-scmi.dtso and the parse
+# dies with "Unable to get checksum ... file could not be found".
+#
+# Neither list is order-sensitive — they are device trees copied into the kernel
+# source tree and names added to the deploy list, not patches — so scoping them
+# leaves the expanded values for raspberrypi5 unchanged.
+#
+# What a board without these needs to be true instead: no SCMI (BCM2711 has no SCMI
+# firmware interface at all; clocks and power come from the VideoCore mailbox) and no
+# WiFi passthrough (on Raspberry Pi 4 the SDIO WiFi shares GIC SPI 126 with the SD
+# controller, so it cannot be handed to a different domain than the SD card).
+RPI_KERNEL_DEVICETREE:append:raspberrypi5 = " \
     broadcom/${SCMI_XEN_DT_NAME}.dtbo \
     broadcom/${SCMI_DOMD_DT_NAME}.dtbo \
     broadcom/${SCMI_DOMD_PCIE1_DT_NAME}.dtbo \
@@ -63,7 +78,7 @@ RPI_KERNEL_DEVICETREE:append = " \
     broadcom/${XEN_WIFI_PASSTHROUGH_DT_NAME}.dtbo \
 "
 
-SRC_URI:append = " \
+SRC_URI:append:raspberrypi5 = " \
     file://${SCMI_XEN_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
     file://${SCMI_DOMD_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
     file://${SCMI_DOMD_PCIE1_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
