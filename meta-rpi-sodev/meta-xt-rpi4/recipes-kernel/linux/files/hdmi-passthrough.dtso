@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) 2025 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Host-DT overlay: hand the whole display/GPU complex to DomD.
+ *
+ * Every label below exists in the shipped bcm2711-rpi-4-b.dtb __symbols__ — a
+ * missing one makes the entire `fdt apply` fail and silently drops the other
+ * markers, so this list must not be extended speculatively.
+ *
+ * Dropped versus the BCM2712 version, because these blocks do not exist on
+ * BCM2711:
+ *   &cpu_l2_irq  &disp_intr  &bsc_irq  &mop  &moplet  &dma32  &dma40
+ * On BCM2711 there is a single display L2 interrupt controller — labelled
+ * `aon_intr` here as well (/soc/interrupt-controller@7ef00100, GIC SPI 96,
+ * EDGE_RISING) — HVS is wired straight to GIC SPI 97, and the transposer role
+ * that BCM2712 splits into mop/moplet is the plain `txp`.
+ *
+ * Pixelvalves: vc4_crtc.c binds HDMI0 to bcm2711_pv2_data and HDMI1 to
+ * bcm2711_pv4_data, so pixelvalve2 and pixelvalve4 are the CRTCs to move —
+ * not pixelvalve0/1 as on BCM2712. pixelvalve1 also shares GIC SPI 110 with
+ * pixelvalve4, so leaving it in the hardware domain avoids a double route.
+ *
+ * `pm` (/soc/watchdog@7e100000) is included because it provides V3D's power
+ * domain and reset on BCM2711; `firmware` because HVS/V3D/HDMI take their
+ * clocks from <&firmware_clocks N> over the mailbox; `firmwarekms` and `fb`
+ * because they are the two paths by which the VideoCore keeps HDMI after boot.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&mailbox       { xen,passthrough; };
+&firmware      { xen,passthrough; };
+&pm            { xen,passthrough; };
+
+&hvs           { xen,passthrough; };
+&v3d           { xen,passthrough; };
+&vc4           { xen,passthrough; };
+&txp           { xen,passthrough; };
+
+&aon_intr      { xen,passthrough; };
+&dvp           { xen,passthrough; };
+&hdmi0         { xen,passthrough; };
+&hdmi1         { xen,passthrough; };
+&ddc0          { xen,passthrough; };
+&ddc1          { xen,passthrough; };
+&pixelvalve2   { xen,passthrough; };
+&pixelvalve4   { xen,passthrough; };
+/* pixelvalve1 shares GIC SPI 110 with pixelvalve4 and must be withheld from the
+ * hardware domain or DomD's claim fails with -EBUSY. Mirrors the base
+ * bcm2711-raspberrypi4-64-xen.dtso; see the SPI-110 note there. */
+&pixelvalve1   { xen,passthrough; };
+
+&firmwarekms   { xen,passthrough; };
+/* The DomD-side companion overlay bcm2711-raspberrypi4-64-hdmi.dtso declares
+ * avs-monitor@fd5d2000, so release it here too (the base xen.dtso already does —
+ * these overlays are applied IN ADDITION to it, not instead of it, so this is
+ * belt-and-braces against the base changing). */
+&avs_monitor   { xen,passthrough; };
+&fb            { xen,passthrough; };

@@ -1,0 +1,25 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Host-DT overlay: hand the PCIe root complex (= the VL805 USB3 controller) to
+ * DomD.
+ *
+ * BCM2712 had two root complexes and this marked &pcie1 (the NVMe/M.2 one).
+ * BCM2711 has exactly one, label `pcie0` in the shipped bcm2711-rpi-4-b.dtb
+ * (/scb/pcie@7d500000), and its only endpoint is the on-board VL805 xHCI. The
+ * MSI controller is inside the RC, so no separate MSI-controller node needs
+ * marking here — unlike BCM2712, where &mip0 had to be handed over as well.
+ *
+ * Applied only when MACHINE_FEATURES contains "domd_nvme" (variable name kept
+ * for yaml/recipe compatibility). See bcm2711-raspberrypi4-64-pcie1.dtso for the
+ * matching DomD-side node and the hardware caveats.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&pcie0         { xen,passthrough; };

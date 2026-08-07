@@ -1,0 +1,62 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * BCM2711 USB2 (dwc2) passthrough for the base DomD partial DT.
+ *
+ * The BCM2712 original added the two RP1 `snps,dwc3` controllers
+ * (usb@200000 / usb@300000) inside the RP1 PCIe endpoint, together with a pile
+ * of snps,* quirk properties. RPi4 has no RP1: its USB2 root hub is the on-SoC
+ * Synopsys OTG core that the Raspberry Pi kernel binds as `brcm,bcm2708-usb`
+ * (dwc_otg), at 0xfe980000 with a second 0x200 register block at 0xfe00b200
+ * and two GIC SPIs — 73 ("usb") and 40 ("soft", the software-triggered
+ * interrupt dwc_otg uses for its deferred work).
+ *
+ * SCOPE WARNING: on a Pi 4 Model B this controller drives ONLY the USB-C
+ * connector, which is also the power input and comes up in peripheral mode. The
+ * four USB-A ports are all behind the VL805 xHCI on /scb/pcie@7d500000, handled by
+ * bcm2711-raspberrypi4-64-pcie1.dtso. So enabling domd_usb on its own does not give
+ * DomD any usable port: it additionally needs a config.txt change to put the USB-C
+ * port in host mode (otg_mode / a dwc2 dr_mode=host overlay — confirm the exact
+ * knob against the Raspberry Pi config.txt documentation) and the board powered
+ * from the GPIO 5 V pins. On a CM4 carrier with the USB2 lines broken out
+ * separately this caveat does not apply.
+ *
+ * The 0xfe00b200 block shares its 4 KiB page with the VideoCore mailbox
+ * (0xfe00b880), which already maps that page in the base DT, so this node must
+ * NOT carry an xen,reg entry for it -- and the xen,reg below covers only the
+ * 0xfe980000 block for exactly that reason.
+ *
+ * Xen does NOT reject a duplicate: handle_passthrough_prop() ->
+ * map_regions_p2mt() -> p2m_insert_mapping() -> p2m_set_entry(), which
+ * OVERWRITES an existing entry. The rule is this design's own discipline, not a
+ * Xen check: a page mapped twice means two nodes each think they own it. The
+ * DomD passthrough cross-check enforces it.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&soc_bus {
+	usb: usb@fe980000 {
+		compatible = "brcm,bcm2708-usb";
+		reg = <0x0 0xfe980000 0x0 0x10000>,
+		      <0x0 0xfe00b200 0x0 0x200>;
+		interrupts = <0x0 73 0x4>,		/* GIC SPI 73  "usb"  */
+			     <0x0 40 0x4>;		/* GIC SPI 40  "soft" */
+		interrupt-names = "usb", "soft";
+		interrupt-parent = <&gic>;
+		#address-cells = <0x1>;
+		#size-cells = <0x0>;
+		clocks = <&clk_usb>;
+		clock-names = "otg";
+		power-domains = <&power 6>;		/* RPI_POWER_DOMAIN_USB */
+		xen,path = "/soc/usb@7e980000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe980000 0x0 0x10000 0x0 0xfe980000>;
+		status = "okay";
+	};
+};

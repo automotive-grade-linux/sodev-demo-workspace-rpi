@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 25 Jul 2026 00:00:00 +0900
+Subject: [PATCH] bcm283x: map DRAM above 4 GiB on BCM2711
+
+bcm2711_mem_map only describes DRAM up to 0xfc000000 (the MMIO window base), so on
+the 8 GiB Raspberry Pi 4 SKU U-Boot cannot touch the 0x1_00000000 - 0x2_00000000
+half of memory at all: a fatload with a destination up there dies with
+"Synchronous Abort ... Translation fault, level 1" even though
+fdtdec_setup_memory_banksize() correctly reports the bank.
+
+That matters for a Xen dom0less boot, where U-Boot has to place the hypervisor plus
+one kernel/DTB/initramfs triple per domain before handing over. The RPi4 SoDeV
+cockpit currently keeps every module below 0xfc000000 on purpose, but the low 4 GiB
+is also where all of Dom0's and DomD's static memory lives, so the headroom is thin
+and any additional dom0less guest has nowhere to go. This is the BCM2711
+counterpart of the BCM2712 "expand MMU to 16 GB" change the RPi5 port carried for
+exactly the same reason.
+
+Add a fourth entry covering the upper 4 GiB as normal cacheable memory.
+MEM_MAP_MAX_ENTRIES is 5 and bcm2711_mem_map used three entries plus the
+terminator, so the table still fits without touching the bound.
+
+On boards with less than 8 GiB the extra entry maps address space that has no DRAM
+behind it. That is harmless: U-Boot only ever accesses memory it learned about from
+the firmware device tree via bi_dram, and the LMB allocator is built from those
+banks, so nothing dereferences the unbacked range.
+
+Generated against xen-troops/u-boot branch rpi5-2024.04-xt
+(arch/arm/mach-bcm283x/init.c), which is what recipes-bsp/u-boot/u-boot-src.inc
+pins, so the hunk offsets match the tree bitbake unpacks.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [configuration]
+---
+ arch/arm/mach-bcm283x/init.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/arch/arm/mach-bcm283x/init.c b/arch/arm/mach-bcm283x/init.c
+--- a/arch/arm/mach-bcm283x/init.c
++++ b/arch/arm/mach-bcm283x/init.c
+@@ -63,6 +63,16 @@
+ 			 PTE_BLOCK_NON_SHARE |
+ 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+ 	}, {
++		/*
++		 * DRAM above the 4 GiB MMIO hole (8 GiB SKU). Needed so Xen
++		 * dom0less boot modules can be fatload'ed there.
++		 */
++		.virt = 0x100000000UL,
++		.phys = 0x100000000UL,
++		.size = 0x100000000UL,
++		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
++			 PTE_BLOCK_INNER_SHARE
++	}, {
+ 		/* List terminator */
+ 		0,
+ 	}
+--
+2.43.0

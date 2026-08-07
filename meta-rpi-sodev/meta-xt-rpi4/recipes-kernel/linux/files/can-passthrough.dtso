@@ -1,0 +1,60 @@
+/*
+ * Copyright (c) 2026 Yuichi Kusakabe
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Host-DT overlay: hand the SPI-attached CAN plumbing to DomD.
+ *
+ * This file has no BCM2712 ancestor. It exists because the RPi4 CAN overlays
+ * claim on-SoC controllers with real GIC SPIs, and a DomD DT that claims an SPI
+ * the hardware domain still owns cannot be built at all: Xen keeps the node,
+ * routes the SPI to the hardware domain, and route_irq_to_guest() then returns
+ * -EBUSY when DomD asks for it — aborting DomD construction with no other
+ * diagnostic. On BCM2712 the same devices lived inside RP1, which was handed over
+ * as a single PCIe endpoint, so no per-device host marker was needed.
+ *
+ * Marked here, with the GIC SPIs they carry:
+ *   gpio  /soc/gpio@7e200000   SPI 113 + 114   pin mux + the CAN INT lines
+ *   spi0  /soc/spi@7e204000    SPI 118         both CAN flavours
+ *   i2c1  /soc/i2c@7e804000    SPI 117         only the seeed-fd flavour's RTC
+ *
+ * i2c1 is marked unconditionally even for the mcp2515 flavour, which does not use
+ * it. That is harmless — it is `status = "disabled"` in the stock DTB and nothing
+ * in Dom0 touches it — and keeps this file independent of DOMD_CAN_TYPE.
+ *
+ * Applied only when MACHINE_FEATURES contains "domd_can", the same gate as
+ * bcm2711-raspberrypi4-64-can-*.dtso, so the claim and the marker always appear
+ * together or not at all.
+ *
+ * NOT VERIFIED ON HARDWARE — the cockpit build leaves domd_can off.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&gpio          { xen,passthrough; };
+&spi0          { xen,passthrough; };
+&i2c1          { xen,passthrough; };
+
+/*
+ * spi0 is GIC SPI 118 and i2c1 is GIC SPI 117 — and on BCM2711 those SPIs are
+ * SHARED with the other instances of each block:
+ *   SPI 118: spi3 (0x7e204600), spi4 (0x7e204800), spi5 (0x7e204a00), spi6 (0x7e204c00)
+ *   SPI 117: i2c0if (0x7e205000), i2c3 (0x7e205600), i2c4 (0x7e205800),
+ *            i2c5 (0x7e205a00), i2c6 (0x7e205c00)
+ * All are status="disabled" in the stock DTB, but that is irrelevant: Xen's
+ * handle_node() has no status check, so an unmarked node still gets its IRQ routed
+ * to the hardware domain, and DomD's claim then fails with -EBUSY. Release them
+ * all. Every label below exists in the stock bcm2711-rpi-4-b.dtb __symbols__.
+ */
+&spi3      { xen,passthrough; };
+&spi4      { xen,passthrough; };
+&spi5      { xen,passthrough; };
+&spi6      { xen,passthrough; };
+&i2c0if    { xen,passthrough; };
+&i2c3      { xen,passthrough; };
+&i2c4      { xen,passthrough; };
+&i2c5      { xen,passthrough; };
+&i2c6      { xen,passthrough; };

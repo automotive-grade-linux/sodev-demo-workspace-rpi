@@ -1,0 +1,184 @@
+From b93dd29dbb2cfc4e0c064f5180612fee47f27f40 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 8 Jul 2026 00:00:00 +0900
+Subject: [PATCH] dom0less/arm: take direct-mapped xenstore page from domain
+ static memory
+
+For a direct-mapped dom0less domain, alloc_xenstore_page() sets the store
+gfn to the store page's machine address, but allocates that page from the
+GENERAL heap (alloc_domheap_page). Its PA therefore lies OUTSIDE the domain's
+static /memory banks, i.e. in an iomem hole that the guest Linux
+unpopulated-alloc pool claims as foreign-map "scratch". A subsequent foreign
+map (e.g. a disaggregated toolstack domain's qemu mapping a freshly-created
+guest's RAM via XENMEM_add_to_physmap_range / gmfn_foreign) is then
+P2M-remapped over the live store page -- guest_physmap_add_entry() overwrites
+the store P2M entry unconditionally for a non-xenheap RAM page -- and the
+xenstore ring is silently clobbered. On this project's Zephyr-Dom0 topology
+(a direct-mapped Linux "DomD" running the toolstack) this reproduces on
+hardware as a permanent "xenbus: error -5 while reading/writing message"
+wedge ~50s into boot, exactly when DomD's xl create foreign-maps the new
+guests' RAM.
+
+Fix: for a direct-mapped static-memory domain, reserve one page off the top
+of a static bank in assign_static_memory_11() (removed from guest RAM, parked
+on d->resv_page_list) and take the store page from that reserve via
+acquire_reserved_page(). The store PA then lives just below a bank top, inside
+the domain's own footprint: the guest never reports it as usable RAM, and
+Xen's unpopulated-alloc (which only carves PAGES_PER_SECTION-aligned ranges)
+can never select a page below the next section boundary. Falls back to the
+heap when no reserve was set aside, so non-static / non-direct-mapped domains
+keep their existing behaviour.
+
+Assisted-by: Claude Code:claude-opus-4-8
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ xen/common/device-tree/dom0less-build.c |  37 +++++++++++++++++++++++++++++++++++--
+ xen/common/device-tree/static-memory.c  |  63 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/xen/common/device-tree/dom0less-build.c b/xen/common/device-tree/dom0less-build.c
+index 9fd004c..4ccbed5 100644
+--- a/xen/common/device-tree/dom0less-build.c
++++ b/xen/common/device-tree/dom0less-build.c
+@@ -568,6 +568,9 @@ static int __init alloc_xenstore_page(struct domain *d)
+     mfn_t mfn;
+     gfn_t gfn;
+     int rc;
++#ifdef CONFIG_STATIC_MEMORY
++    bool from_reserved = false;
++#endif
+ 
+     if ( (UINT_MAX - d->max_pages) < 1 )
+     {
+@@ -577,7 +578,32 @@ static int __init alloc_xenstore_page(struct domain *d)
+     }
+ 
+     d->max_pages += 1;
+-    xenstore_pg = alloc_domheap_page(d, MEMF_bits(32));
++    xenstore_pg = NULL;
++#ifdef CONFIG_STATIC_MEMORY
++    /*
++     * For a direct-mapped domain the store gfn == the
++     * page's machine PA. A general-heap page would land OUTSIDE the domain's
++     * static /memory, in an iomem hole the guest's unpopulated-alloc pool
++     * claims as foreign-map scratch -- a later foreign map can then be
++     * P2M-remapped over the live store page (HW-observed "xenbus: error -5"
++     * wedge). Prefer a page reserved from the domain's own static memory (see
++     * assign_static_memory_11) so the store PA is inside /memory and can never
++     * be a scratch/foreign-map target. Fall back to the heap if no reserve was
++     * set aside (behaviour then matches upstream).
++     */
++    if ( is_domain_direct_mapped(d) )
++    {
++        mfn_t rmfn = acquire_reserved_page(d, MEMF_bits(32));
++
++        if ( !mfn_eq(rmfn, INVALID_MFN) )
++        {
++            xenstore_pg = mfn_to_page(rmfn);
++            from_reserved = true;
++        }
++    }
++#endif
++    if ( xenstore_pg == NULL )
++        xenstore_pg = alloc_domheap_page(d, MEMF_bits(32));
+     if ( xenstore_pg == NULL && is_64bit_domain(d) )
+         xenstore_pg = alloc_domheap_page(d, 0);
+     if ( xenstore_pg == NULL )
+@@ -596,7 +620,12 @@ static int __init alloc_xenstore_page(struct domain *d)
+     rc = guest_physmap_add_page(d, gfn, mfn, 0);
+     if ( rc )
+     {
+-        free_domheap_page(xenstore_pg);
++#ifdef CONFIG_STATIC_MEMORY
++        if ( from_reserved )
++            free_domstatic_page(xenstore_pg);
++        else
++#endif
++            free_domheap_page(xenstore_pg);
+         return rc;
+     }
+ 
+diff --git a/xen/common/device-tree/static-memory.c b/xen/common/device-tree/static-memory.c
+index 0774d06806..95f1fc0202 100644
+--- a/xen/common/device-tree/static-memory.c
++++ b/xen/common/device-tree/static-memory.c
+@@ -1,8 +1,10 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ 
+ #include <xen/sched.h>
++#include <xen/mm.h>
+ #include <xen/static-memory.h>
+ 
++#include <asm/p2m.h>
+ #include <asm/setup.h>
+ 
+ static bool __init append_static_memory_to_bank(struct domain *d,
+@@ -250,6 +252,67 @@ void __init assign_static_memory_11(struct domain *d, struct kernel_info *kinfo,
+         goto fail;
+     }
+ 
++    /*
++     * Reserve one page for the xenstore ring.
++     *
++     * For a direct-mapped domain alloc_xenstore_page() sets the store gfn to
++     * the store page's machine address. If that page comes from the general
++     * heap (alloc_domheap_page), its PA is OUTSIDE this domain's static
++     * /memory, i.e. in an iomem hole that the guest's Xen unpopulated-alloc
++     * pool hands out as foreign-map "scratch". A later foreign map (e.g. a
++     * disaggregated toolstack's qemu mapping a freshly-created guest's RAM) is
++     * then P2M-remapped over the live store page and the ring is silently
++     * clobbered -- HW-observed as a permanent "xenbus: error -5 while
++     * reading/writing message" wedge on this project's Zephyr-Dom0 topology.
++     *
++     * Carve the top page off a static bank instead and park it on
++     * d->resv_page_list so alloc_xenstore_page() can take it via
++     * acquire_reserved_page(). The store PA then lives just below a bank top,
++     * inside this domain's own footprint: the guest never reports it as usable
++     * RAM (the bank is one page shorter) and Xen's unpopulated-alloc, which
++     * only carves PAGES_PER_SECTION-aligned ranges, can never select a page
++     * that sits below the next section boundary. Prefer a <4GB bank so the
++     * store page stays 32-bit addressable (matches the old MEMF_bits(32)).
++     */
++    {
++        unsigned int i, pick = mem->nr_banks;
++
++        for ( i = 0; i < mem->nr_banks; i++ )
++            if ( mem->bank[i].size > PAGE_SIZE &&
++                 (mem->bank[i].start + mem->bank[i].size) <= (1ULL << 32) )
++            {
++                pick = i;
++                break;
++            }
++        if ( pick == mem->nr_banks )
++            for ( i = 0; i < mem->nr_banks; i++ )
++                if ( mem->bank[i].size > PAGE_SIZE )
++                {
++                    pick = i;
++                    break;
++                }
++        if ( pick < mem->nr_banks )
++        {
++            struct membank *b = &mem->bank[pick];
++            mfn_t rmfn = maddr_to_mfn(b->start + b->size - PAGE_SIZE);
++            int rrc = guest_physmap_remove_page(d,
++                          gaddr_to_gfn(mfn_to_maddr(rmfn)), rmfn, 0);
++
++            if ( rrc )
++                printk(XENLOG_WARNING
++                       "%pd: could not reserve xenstore store page (rc=%d); "
++                       "falling back to heap allocation\n", d, rrc);
++            else
++            {
++                b->size -= PAGE_SIZE;
++                free_domstatic_page(mfn_to_page(rmfn));
++                printk(XENLOG_INFO
++                       "%pd: reserved xenstore store page %#"PRIpaddr" from static bank %u\n",
++                       d, mfn_to_maddr(rmfn), pick);
++            }
++        }
++    }
++
+     return;
+ 
+  fail:

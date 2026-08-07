@@ -1,0 +1,238 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * ============================================================================
+ * BCM2711 / Raspberry Pi 4 — base DomD partial device tree (upstream layout)
+ * ============================================================================
+ * This is the xen-troops-style *base* DomD partial DT that the optional
+ * feature overlays extend at build time:
+ *
+ *   bcm2711-raspberrypi4-64-mmc.dtso    (MACHINE_FEATURES domd_mmc)   -> &emmc2_bus
+ *   bcm2711-raspberrypi4-64-usb.dtso    (MACHINE_FEATURES domd_usb)   -> &soc_bus
+ *   bcm2711-raspberrypi4-64-pcie1.dtso  (MACHINE_FEATURES domd_nvme)  -> &scb_bus
+ *   bcm2711-raspberrypi4-64-hdmi.dtso   (MACHINE_FEATURES domd_hdmi)  -> &soc_bus
+ *   bcm2711-raspberrypi4-64-can-*.dtso  (MACHINE_FEATURES domd_can)   -> &soc_bus
+ *
+ * The SoDeV cockpit does NOT use this file at run time: boot.cmd loads the
+ * self-contained bcm2711-raspberrypi4-64-domd-vc4.dtb (recipes-guest/domd-vc4/)
+ * instead. It is kept building and coherent so the upstream single-overlay
+ * flow stays available, and because the deploy list still ships
+ * ${SOC_FAMILY}-${MACHINE}-domd.dtb to the boot partition.
+ *
+ * What changed versus the BCM2712 original:
+ *   - RP1 is gone. The BCM2712 `pciex`/`rp1` subtree, the `mip0` MSI-in-the-
+ *     middle controller, the 16 MiB RP1 aperture and the two brcmstb reset
+ *     controllers (rescal/bridge, which BCM2711's RC does not need) are all
+ *     removed. Ethernet, USB2, GPIO and SD are on-SoC here, and USB3 is a
+ *     VL805 behind the BCM2711 root complex.
+ *   - `cdns,macb` becomes `brcm,bcm2711-genet-v5`.
+ *   - the three bus wrappers below replace BCM2712's flat /axi: BCM2711's
+ *     legacy peripherals DMA through the 0xc0000000 VideoCore alias and are
+ *     limited to the low 1 GiB, while /scb and /v3dbus devices are identity
+ *     mapped. See ../../../BCM2711-DT-TRUTH.md §1.
+ *
+ * Addresses/SPIs: read from the shipped bcm2711-rpi-4-b.dtb, never translated
+ * from the RPi5 values. Validate with
+ *   The DomD passthrough cross-check <this file> --host <that dtb>
+ * ============================================================================
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+
+	gic: gic {
+		#interrupt-cells = <0x3>;
+		interrupt-controller;
+		phandle = <0xfde8>;		/* GUEST_PHANDLE_GIC */
+		linux,phandle = <0xfde8>;
+	};
+
+	passthrough: passthrough {
+		compatible = "raspberrypi,4-model-b", "brcm,bcm2711", "simple-bus";
+		ranges;
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+		interrupt-parent = <&gic>;
+
+		clk_27MHz: clk-27M {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <27000000>;
+			clock-output-names = "27MHz-clock";
+		};
+
+		clk_108MHz: clk-108M {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <108000000>;
+			clock-output-names = "108MHz-clock";
+		};
+
+		clk_usb: clk-usb {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <480000000>;
+			clock-output-names = "otg";
+		};
+
+		/*
+		 * Legacy-peripheral bus: dma_addr = phys + 0xc0000000, bounded to
+		 * the DomD low static-mem bank (0x08000000 + 384 MiB) declared in
+		 * bcm2711-raspberrypi4-64-xen.dtso. Mirrors the host /soc
+		 * dma-ranges = <0xc0000000 0x0 0x0 0x40000000>.
+		 */
+		soc_bus: soc-bus {
+			compatible = "simple-bus";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			dma-ranges = <0x0 0xc8000000 0x0 0x08000000 0x0 0x18000000>;
+
+			mailbox: mailbox@fe00b880 {
+				compatible = "brcm,bcm2835-mbox";
+				reg = <0x0 0xfe00b880 0x0 0x40>;
+				interrupts = <0x0 33 0x4>;
+				interrupt-parent = <&gic>;
+				#mbox-cells = <0>;
+				xen,path = "/soc/mailbox@7e00b880";
+				xen,force-assign-without-iommu;
+				/* covers vchiq@fe00b840 and dwc2's 0xfe00b200 block too */
+				xen,reg = <0x0 0xfe00b000 0x0 0x1000 0x0 0xfe00b000>;
+				status = "okay";
+			};
+
+			firmware: firmware {
+				compatible = "raspberrypi,bcm2835-firmware", "simple-mfd";
+				#address-cells = <0x1>;
+				#size-cells = <0x1>;
+				mboxes = <&mailbox>;
+
+				firmware_clocks: clocks {
+					compatible = "raspberrypi,firmware-clocks";
+					#clock-cells = <0x1>;
+				};
+
+				reset: reset {
+					compatible = "raspberrypi,firmware-reset";
+					#reset-cells = <0x1>;
+				};
+
+				expgpio: gpio {
+					compatible = "raspberrypi,firmware-gpio";
+					gpio-controller;
+					#gpio-cells = <0x2>;
+					gpio-line-names = "BT_ON", "WL_ON",
+							  "PWR_LED_OFF",
+							  "GLOBAL_RESET",
+							  "VDD_SD_IO_SEL",
+							  "CAM_GPIO",
+							  "SD_PWR_ON",
+							  "SD_OC_N";
+					status = "okay";
+				};
+			};
+
+			power: power {
+				compatible = "raspberrypi,bcm2835-power";
+				firmware = <&firmware>;
+				#power-domain-cells = <0x1>;
+			};
+
+			/*
+			 * NO GPIO NODE HERE, on purpose.
+			 *
+			 * /soc/gpio@7e200000 carries GIC SPI 113 and 114. Claiming it with
+			 * xen,path unconditionally would make this DT unbuildable as a DomD:
+			 * nothing marks &gpio xen,passthrough in the host DT for the base
+			 * flow, so Xen keeps the node with the hardware domain, routes both
+			 * SPIs there, and route_irq_to_guest() then returns -EBUSY when DomD
+			 * asks for them -- aborting DomD construction.
+			 *
+			 * The only consumer is the optional SPI-attached CAN feature, so the
+			 * node now lives in bcm2711-raspberrypi4-64-can-*.dtso together with
+			 * its pin groups, and can-passthrough.dtso supplies the matching host
+			 * marker. Both are gated on MACHINE_FEATURES "domd_can", so the claim
+			 * and the marker always appear together or not at all.
+			 */
+		};
+
+		/*
+		 * /scb-equivalent bus: identity DMA over the low 3 GiB. Hosts
+		 * GENET and (via bcm2711-raspberrypi4-64-pcie1.dtso) the PCIe RC.
+		 */
+		scb_bus: scb-bus {
+			compatible = "simple-bus";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			dma-ranges = <0x0 0x0 0x0 0x0 0x0 0xc0000000>;
+
+			/*
+			 * Gigabit Ethernet. This is the RPi4 replacement for the
+			 * RP1 `cdns,macb` NIC: on-SoC GENET v5 at 0xfd580000 with
+			 * GIC SPI 157 (irq0) and 158 (irq1), phy-mode
+			 * "rgmii-rxid" and an internal MDIO bus at offset 0xe14.
+			 * xen-network's NIC name pin matches on the bcmgenet
+			 * driver instead of macb (see 00-genet-eth0.link).
+			 */
+			genet: ethernet@fd580000 {
+				compatible = "brcm,bcm2711-genet-v5";
+				reg = <0x0 0xfd580000 0x0 0x10000>;
+				#address-cells = <0x1>;
+				#size-cells = <0x1>;
+				interrupts = <0x0 157 0x4>,
+					     <0x0 158 0x4>;
+				interrupt-parent = <&gic>;
+				phy-mode = "rgmii-rxid";
+				phy-handle = <&phy1>;
+				local-mac-address = [00 00 00 00 00 00];
+				xen,path = "/scb/ethernet@7d580000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x0 0xfd580000 0x0 0x10000 0x0 0xfd580000>;
+				status = "okay";
+
+				genet_mdio: mdio@e14 {
+					compatible = "brcm,genet-mdio-v5";
+					reg = <0xe14 0x8>;
+					reg-names = "mdio";
+					#address-cells = <0x1>;
+					#size-cells = <0x0>;
+
+					phy1: ethernet-phy@1 {
+						reg = <0x1>;
+						brcm,powerdown-enable;
+						led-modes = <0x0 0x8>;
+					};
+				};
+			};
+		};
+
+		/* V3D bus: identity DMA (own MMU, /v3dbus dma-ranges spans 16 GiB). */
+		v3d_bus: v3d-bus {
+			compatible = "simple-bus";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			dma-ranges = <0x0 0x0 0x0 0x0 0x4 0x0>;
+		};
+
+		/*
+		 * SD bus: same 0xc0000000 alias as soc_bus, mirroring the host
+		 * /emmc2bus wrapper. bcm2711-raspberrypi4-64-mmc.dtso fills it in.
+		 */
+		emmc2_bus: emmc2-bus {
+			compatible = "simple-bus";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			dma-ranges = <0x0 0xc8000000 0x0 0x08000000 0x0 0x18000000>;
+		};
+	};
+};

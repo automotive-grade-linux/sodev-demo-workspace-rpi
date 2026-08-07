@@ -1,0 +1,89 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * BCM2711 PCIe root complex passthrough for the base DomD partial DT.
+ *
+ * NAMING: the file is still called "-pcie1" (and the recipe variable is still
+ * PCIE1_DT_NAME / MACHINE_FEATURES "domd_nvme") so the yaml, bbappend and
+ * deploy lists do not have to be renamed. On BCM2711 there is only ONE root
+ * complex and it is not an NVMe slot: /scb/pcie@7d500000 hosts the on-board
+ * VL805 xHCI, i.e. all four USB3 ports. Enabling this feature therefore means
+ * "give USB3 to DomD".
+ *
+ * Compared with the BCM2712 pcie1 this is much simpler:
+ *   - the MSI controller is INSIDE the RC (msi-controller + msi-parent =
+ *     <&pcie0>, GIC SPI 148). There is no BCM2712 MIP, so the RPi5 hack of
+ *     pointing msi-parent back at the RC to dodge brcm,msi-base-spi is not
+ *     needed — that IS the hardware description here — and the RPi5 Xen patch
+ *     4.21-0002-route-msi-ranges has no RPi4 counterpart.
+ *   - no `resets` (BCM2711's RC needs neither rescal nor a bridge reset) and no
+ *     brcm,clkreq-mode / vdm-qos / fifo-qos properties.
+ *   - legacy INTA-D are GIC SPI 143..146, the RC's own interrupt is SPI 147.
+ *
+ * The 32-bit outbound window is trimmed from the host's 1 GiB (PCI 0xc0000000
+ * -> host 0x6_00000000) down to 4 MiB so the guest PCI core can only place
+ * VL805's BARs inside the region actually covered by xen,reg. Xen/ARM has no
+ * vPCI emulation, so the guest programs the real BARs and any placement outside
+ * the mapped aperture faults on first access.
+ *
+ * STATUS: unproven on hardware — see README.md "Known limitations". The safe fallback is
+ * USB2 only (bcm2711-raspberrypi4-64-usb.dtso), which needs no MSI at all.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&scb_bus {
+	pcie0: pcie@fd500000 {
+		compatible = "brcm,bcm2711-pcie";
+		reg = <0x0 0xfd500000 0x0 0x9310>;
+		device_type = "pci";
+		#address-cells = <0x3>;
+		#size-cells = <0x2>;
+		#interrupt-cells = <0x1>;
+		linux,pci-domain = <0>;
+		interrupt-parent = <&gic>;
+		interrupts = <0x0 147 0x4>,		/* pcie */
+			     <0x0 148 0x4>;		/* msi  */
+		interrupt-names = "pcie", "msi";
+		interrupt-map-mask = <0x0 0x0 0x0 0x7>;
+		interrupt-map = <0x0 0x0 0x0 0x1 &gic 0x0 143 0x4>,
+				<0x0 0x0 0x0 0x2 &gic 0x0 144 0x4>,
+				<0x0 0x0 0x0 0x3 &gic 0x0 145 0x4>,
+				<0x0 0x0 0x0 0x4 &gic 0x0 146 0x4>;
+		msi-controller;
+		msi-parent = <&pcie0>;
+		brcm,enable-ssc;
+		ranges = <0x02000000 0x0 0xc0000000
+			  0x6 0x00000000 0x0 0x00400000>;
+		dma-ranges = <0x02000000 0x0 0x00000000
+			      0x0 0x00000000 0x0 0xc0000000>;
+		xen,path = "/scb/pcie@7d500000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfd500000 0x0 0xa000 0x0 0xfd500000>,
+			  <0x6 0x00000000 0x0 0x00400000 0x6 0x00000000>;
+		status = "okay";
+
+		pci@0,0 {
+			device_type = "pci";
+			#address-cells = <0x3>;
+			#size-cells = <0x2>;
+			ranges;
+			reg = <0x0 0x0 0x0 0x0 0x0>;
+
+			/*
+			 * VL805. `resets` makes xhci_pci ask the VideoCore to
+			 * reload the VL805 SPI firmware before enumeration,
+			 * which RPi4 boards with an unflashed EEPROM require.
+			 */
+			usb@0,0 {
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				resets = <&reset 0>;	/* RASPBERRYPI_FIRMWARE_RESET_ID_USB */
+			};
+		};
+	};
+};

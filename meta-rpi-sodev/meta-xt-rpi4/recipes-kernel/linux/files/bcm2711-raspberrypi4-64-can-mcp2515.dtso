@@ -1,0 +1,155 @@
+/*
+ * Copyright (c) 2025 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Dual MCP2515 CAN controllers on SPI0 for the base DomD partial DT.
+ * Optional: MACHINE_FEATURES "domd_can" + DOMD_CAN_TYPE = "mcp2515".
+ *
+ * The BCM2712 version hung these off RP1's Synopsys DW-APB SSI
+ * (rp1_spi0 @ 0xc0_40050000) with an RP1 AXI DMA engine and RP1 pinctrl
+ * ("function"/"pins" string properties). RPi4 has none of that: SPI0 is the
+ * on-SoC BCM2835 controller at 0xfe204000 (GIC SPI 118), and pin muxing uses
+ * the legacy `brcm,pins` / `brcm,function` bindings on the bcm2711 GPIO bank.
+ *
+ * Wiring matches the stock Raspberry Pi mcp2515-can0/can1 overlays:
+ *   CE0 (GPIO8)  -> can0, INT on GPIO25
+ *   CE1 (GPIO7)  -> can1, INT on GPIO23
+ *   SPI0: SCLK GPIO11, MOSI GPIO10, MISO GPIO9 (ALT0 = brcm,function 4)
+ *
+ * CLOCK CAVEAT: the host takes SPI0's clock from cprman
+ * (<&clocks BCM2835_CLOCK_VPU>), which cannot be handed to a driver domain
+ * without dragging in clk-osc and the DSI PHY clock providers. bcm2835-spi only
+ * reads the rate to compute its CDIV, so a fixed-clock stands in — but the value
+ * MUST match the board's actual core clock or SCK is off by that ratio. RPi4
+ * defaults to core_freq=500 and scales down when idle, so pin it in config.txt
+ * (`core_freq=250` + `core_freq_min=250`, or `force_turbo=1`) and set the value
+ * below to match. 250 MHz is used here because that is the value the Raspberry
+ * Pi CAN documentation tells users to force.
+ *
+ * NOT VERIFIED ON HARDWARE — the cockpit build leaves domd_can off.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&passthrough {
+	can0_osc: can0-osc {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <16000000>;
+	};
+
+	can1_osc: can1-osc {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <16000000>;
+	};
+
+	/* Stand-in for cprman BCM2835_CLOCK_VPU — see the CLOCK CAVEAT above. */
+	clk_spi0: clk-spi0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <250000000>;
+		clock-output-names = "spi0-core";
+	};
+};
+
+/*
+ * Pin groups on the passed-through bcm2711 GPIO bank. bcm2835/bcm2711 pinctrl
+ * uses brcm,pins + brcm,function, not RP1's "pins"/"function" strings.
+ *   brcm,function 0 = GPIO input, 1 = GPIO output, 4 = ALT0
+ */
+&soc_bus {
+	/*
+	 * On-SoC pinctrl/GPIO. Defined here rather than in the base DomD partial DT
+	 * because the SPI-attached CAN controllers are its only consumer, and its two
+	 * GIC SPIs (113/114) must not be claimed unless can-passthrough.dtso is also
+	 * applied to the host DT -- otherwise Xen keeps the node with the hardware
+	 * domain and DomD's request for those SPIs fails with -EBUSY.
+	 */
+	gpio: gpio@fe200000 {
+		compatible = "brcm,bcm2711-gpio";
+		reg = <0x0 0xfe200000 0x0 0xb4>;
+		interrupts = <0x0 113 0x4>,
+			     <0x0 114 0x4>;
+		interrupt-parent = <&gic>;
+		gpio-controller;
+		#gpio-cells = <0x2>;
+		interrupt-controller;
+		#interrupt-cells = <0x2>;
+		xen,path = "/soc/gpio@7e200000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe200000 0x0 0x1000 0x0 0xfe200000>;
+		status = "okay";
+
+		spi0_pins: spi0-pins {
+			brcm,pins = <9 10 11>;
+			brcm,function = <4>;		/* ALT0 = SPI0 */
+		};
+
+		spi0_cs_pins: spi0-cs-pins {
+			brcm,pins = <8 7>;
+			brcm,function = <1>;		/* output */
+		};
+
+		can0_pins: can0-pins {
+			brcm,pins = <25>;
+			brcm,function = <0>;		/* input (INT) */
+		};
+
+		can1_pins: can1-pins {
+			brcm,pins = <23>;
+			brcm,function = <0>;		/* input (INT) */
+		};
+	};
+};
+
+&soc_bus {
+	spi0: spi@fe204000 {
+		compatible = "brcm,bcm2835-spi";
+		reg = <0x0 0xfe204000 0x0 0x200>;
+		interrupts = <0x0 118 0x4>;	/* GIC SPI 118 */
+		interrupt-parent = <&gic>;
+		clocks = <&clk_spi0>;
+		#address-cells = <0x1>;
+		#size-cells = <0x0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spi0_pins>, <&spi0_cs_pins>;
+		cs-gpios = <&gpio 8 1>, <&gpio 7 1>;
+		/*
+		 * `dmas` deliberately omitted: it would require passing
+		 * /soc/dma-controller@7e007000 (and its 9 GIC SPIs) to DomD.
+		 * bcm2835-spi falls back to interrupt/PIO mode, which is ample
+		 * for a 10 MHz MCP2515 link.
+		 */
+		xen,path = "/soc/spi@7e204000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe204000 0x0 0x1000 0x0 0xfe204000>;
+		status = "okay";
+
+		can0: mcp2515@0 {
+			compatible = "microchip,mcp2515";
+			reg = <0x00>;
+			clocks = <&can0_osc>;
+			spi-max-frequency = <10000000>;
+			interrupt-parent = <&gpio>;
+			interrupts = <25 0x8>;		/* GPIO25, IRQ_TYPE_LEVEL_LOW */
+			pinctrl-names = "default";
+			pinctrl-0 = <&can0_pins>;
+		};
+
+		can1: mcp2515@1 {
+			compatible = "microchip,mcp2515";
+			reg = <0x01>;
+			clocks = <&can1_osc>;
+			spi-max-frequency = <10000000>;
+			interrupt-parent = <&gpio>;
+			interrupts = <23 0x8>;		/* GPIO23, IRQ_TYPE_LEVEL_LOW */
+			pinctrl-names = "default";
+			pinctrl-0 = <&can1_pins>;
+		};
+	};
+};

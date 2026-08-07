@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Pin Dom0 + dom0less DomD to the boot-time CPU map (DomU/DomA pin via xl cfg)
+After=xencommons.service
+Wants=xencommons.service
+ConditionPathExists=/proc/xen
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/xen/bin/domain-cpu-pin
+
+[Install]
+WantedBy=multi-user.target

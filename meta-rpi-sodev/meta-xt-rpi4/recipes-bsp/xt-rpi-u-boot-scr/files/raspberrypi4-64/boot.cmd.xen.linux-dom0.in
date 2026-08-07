@@ -1,0 +1,649 @@
+# =============================================================================
+# Raspberry Pi 4 / BCM2711 — U-Boot boot script, DOM0_OS=linux
+#
+# Boots: Xen 4.21 + thin Linux Dom0 (control plane) + dom0less direct-mapped
+# DomD (vc4 display driver domain). DomU/DomA are created later by Dom0's xl.
+#
+# Board differences that shape this file (see ../../../../BCM2711-DT-TRUTH.md
+# and PORT-DELTA-rpi5-to-rpi4.md):
+#   * console is the pl011 at /soc/serial@7e201000, not BCM2712's uart10, and
+#     there is no bcm2712d0 stepping overlay to correct its SPI;
+#   * no RP1, no MIP MSI controller, no IOMMU — so none of the RPi5
+#     /axi/pcie@1000120000 + /axi/msi-controller@1000130000 + /axi/iommuc@5b00
+#     blocks exist and the corresponding `fdt set` lines are gone;
+#   * the restricted-DMA problem is back: legacy peripherals reach only the low
+#     1 GiB through the 0xc0000000 VideoCore bus alias.
+#
+# ---------------------------------------------------------------------------
+# PHYSICAL MEMORY MAP — keep in sync with bcm2711-raspberrypi4-64-xen.dtso
+# ---------------------------------------------------------------------------
+#   0x00000000-0x00080000  TF-A BL31 / armstub          (firmware, atf@0)
+#   0x00080000-0x02000000  U-Boot (loaded at 0x200000, relocates itself high)
+#   0x02000000-0x02200000  module: xen                        2 MiB
+#   0x02200000-0x02300000  module: bcm2711-raspberrypi4-64-xen.dtbo
+#   0x02300000-0x02400000  module: xenpolicy (removed below)
+#   0x02400000-0x08000000  module: Dom0 kernel Image         92 MiB budget
+#   0x08000000-0x20000000  DomD static-mem bank1  LOW/VideoCore-visible
+#   0x20000000-0x30000000  *** left free: becomes Dom0's bank[0] ***
+#   0x30000000-0x3b400000  free (Xen heap / extra Dom0 banks)
+#   0x3b400000-0x40000000  gpu_mem carve-out (default gpu_mem=76M)
+#   0x40000000-0x80000000  DomD static-mem bank0  (kernel + DTB + initrd)
+#   0x80000000-0xa0000000  DomD static-mem bank2
+#   0xa0000000-0xa2000000  module: DomD DTB
+#   0xa4000000-0xa8000000  module: DomD kernel Image         64 MiB
+#   0xb0000000-0xc0000000  module: Dom0 initramfs           256 MiB
+#   (0xc0000000-0xe0000000  FREE since v93: was the DomD initramfs slot. DomD now
+#                           boots root=/dev/xvda from the ext4 on SD p2 over PV
+#                           block, so nothing is loaded here.)
+#   0xe0000000-0xfc000000  module: DomU image (dom0less path, off by default)
+#   0x100000000+           8 GiB SKU only: Xen heap / xl-created DomU + DomA
+#
+# Why Dom0's bank[0] lands at 0x20000000 by itself. Xen's rpi4 platform sets
+# .dma_bitsize = 30 (xen/arch/arm/platforms/brcm-raspberry-pi.c), and
+# allocate_memory_11() (xen/arch/arm/domain_build.c) then does, in this order:
+#   lowmem_bitsize = min(32, arch_get_dma_bitsize()) = 30, i.e. below 1 GiB
+#   order          = get_allocation_size(dom0_mem)      -- a POWER OF TWO
+#   min_low_order  = order_of(min(dom0_mem, 128 MiB))
+#   while (order >= min_low_order)
+#       for (bits = order; bits <= lowmem_bitsize; bits++)
+#           alloc_domheap_pages(d, order, MEMF_bits(bits))   -> bank[0]
+#       order--
+# Raising `bits` from `order` upward means the FIRST success is in the lowest
+# address window that can hold a naturally-aligned 2^order block; shrinking
+# `order` afterwards means the block is halved rather than moved. So bank[0] is
+# "largest power-of-two block that fits, in the lowest window that can hold it",
+# not simply "the lowest block that fits dom0_mem".
+#
+# Applied to this map, with the low DRAM bank ending at 0x3b400000 (gpu_mem=76)
+# and DomD's static-mem taking 0x08000000-0x20000000 and 0x40000000-0x80000000:
+#   dom0_mem=1024M -> order = 1 GiB: no 1 GiB-aligned 1 GiB block below 1 GiB
+#                     -> 512 MiB: 0x20000000 has only 436 MiB free above it
+#                     -> 256 MiB: 0x20000000 fits exactly.  bank[0] = 256 MiB.
+# The rest of the 1024 MiB is NOT in bank[0]: the second loop fills further banks
+# below 1 GiB (0x30000000-0x3b400000) and then, once it drops below
+# min_low_order, sets lowmem = false and continues above 1 GiB. So the START of
+# bank[0] is deterministic at 0x20000000 while its SIZE is not — which is exactly
+# why the Zephyr flavour uses dom0_mem=256M, where the first allocation lands at
+# 0x20000000 with the full 256 MiB and the relink target is unambiguous.
+# The memory-map cross-check re-derives all of this and prints both numbers.
+#
+# bank[0] below 1 GiB also guarantees Dom0 a ZONE_DMA, which it needs because it
+# keeps the SD card in this flavour. Do not fill that hole with module loads.
+#
+# Nothing above 0xfc000000 is fatload-able: U-Boot's bcm2711_mem_map only maps
+# 0x0-0xfc000000 as normal memory unless the 8 GiB MMU patch in
+# recipes-bsp/u-boot/files/ is applied.
+# =============================================================================
+
+
+# =============================================================================
+# BOARD RAM SIZE — 8 GiB (default) or 4 GiB SKU
+# =============================================================================
+# `setenv board_ram` below is SUBSTITUTED AT BUILD TIME by the xt-rpi-u-boot-scr
+# bbappend from ${BOARD_RAM} (moulin --BOARD_RAM 8g|4g, build.sh --ram=8g|4g). It is
+# a plain env var, so it can also be overridden at the U-Boot prompt for a one-off
+# test:  setenv board_ram 4g ; source ${scriptaddr}
+#
+# WHY A SWITCH IS NEEDED AT ALL. The RPi4 firmware reports (gpu_mem=76):
+#     4 GiB SKU:  0x00000000-0x3b400000 (948 MiB) + 0x40000000-0xfc000000 (3008 MiB)
+#                 = 3956 MiB   (there is NO bank above 4 GiB)
+#     8 GiB SKU:  the same two + 0x100000000-0x200000000 = 8052 MiB
+# The default map is sized for the 8 GiB board. Current values (Dom0 differs by
+# flavour: the Zephyr Dom0 is a placement lever at 128 MiB, the Linux Dom0 needs 256
+# because it owns emmc2 and every bank must be VideoCore-reachable):
+#     8g:  DomD 1920 + Dom0 128..256 + DomU 1024 + DomA 2560 + Xen 80
+#          = 5712 MiB (zephyr) / 5840 MiB (linux) of 8052 MiB
+# which does not fit 3956 MiB. Dom0+DomD alone DOES fit a 4 GiB board, so
+# `board_ram=4g` is not about making the base boot work — it is about leaving room
+# for a guest and about not silently over-committing:
+#     4g:  DomD 1024 + Dom0 128..256 + Xen 80 = 1232 MiB (zephyr) / 1360 (linux),
+#          leaving 2724 / 2596 MiB for ONE xl-created guest.
+#          DomU (1024) fits.  DomA (2560) fits ALONE.  The two TOGETHER (3584) do
+#          not — that needs the 8 GiB SKU. build.sh says so and does not refuse the
+#          build, because DomA's p4 requires DomU's p3 on the SD either way; the
+#          choice is which one is started.
+# Xen's 80 MiB is measured, not assumed: `xl info` across three DomD sizes on the
+# 4 GiB board gave 78/79/80 MiB of overhead (frametable + xenheap + image).
+# The memory-map cross-check re-derives both configurations from THIS file and the
+# host overlay, including Xen's allocate_memory_11() placement, so the two cannot
+# drift apart.
+setenv board_ram BOARD_RAM_PLACEHOLDER
+
+fdt addr ${fdt_addr}
+# The overlay adds /chosen/{xenpolicy,dom0,domD} with three static-mem banks, and
+# the fdt set/mknode calls below add module entries plus several long bootargs
+# strings. 8192 bytes overflows into FDT_ERR_NOSPACE, which the Hush parser
+# reports only as "syntax error"; 32768 leaves ample headroom.
+# NOTE: `fdt resize`'s argument is parsed with hextoul() (u-boot cmd/fdt.c:778),
+# so this asks for 0x32768 = 206,184 extra bytes, not 32,768. That is deliberate
+# headroom now that it is known: this script performs ~60 `fdt set`/`fdt mknode`
+# additions and the DomD/Dom0 module subtrees are created from nothing. Write it as
+# 0x8000 if 32 KiB is ever actually wanted.
+fdt resize 32768
+
+# -----------------------------------------------------------------------------
+# Apply the Xen host-DT overlay.
+# -----------------------------------------------------------------------------
+# Unlike the RPi5 script, every device this overlay touches is marked with a
+# real &label. That is safe here because all of those labels were verified to
+# exist in the shipped bcm2711-rpi-4-b.dtb __symbols__ — check that by applying
+# the compiled .dtbo onto the stock DTB with fdtoverlay before changing any label
+# here. So the RPi5 workaround of re-marking everything with path-based
+# `fdt set ... xen,passthrough` at runtime is unnecessary, and only the two
+# genuinely flavour-specific decisions are made below.
+fatload mmc 0 0x2200000 bcm2711-raspberrypi4-64-xen.dtbo
+fdt apply 0x2200000
+
+# -----------------------------------------------------------------------------
+# 4 GiB SKU: shrink DomD so the map fits 3956 MiB of DRAM.
+# -----------------------------------------------------------------------------
+# DomD = 1024 MiB in two banks. bank1 (0x08000000+384 MiB) is UNCHANGED and that is
+# load-bearing: it is the low, VideoCore-visible window that carries vc4's CMA and
+# sets DomD's ZONE_DMA (of_dma_get_max_cpu_address() takes the MINIMUM dma-ranges
+# limit, and the partial DT's mbox-bus/emmc2-bus cap it at 0x20000000). Moving it
+# would push CMA out of the 0xc0000000 bus-alias range. bank2 is dropped and bank0
+# shrinks 1024 -> 640 MiB.
+#
+# WHY 1024 AND NOT 1408. On a 4 GiB board every guest an xl toolstack creates comes
+# out of the SAME 3956 MiB, so DomD's static allocation is the direct budget
+# competitor of DomU/DomA. The value is MEASURED, not guessed: DomD was booted at
+# three sizes on this board with an identical workload (weston + one qemu
+# compositing the AGL cluster on HDMI-A-1) [2026-08-04].
+#
+#   DomD assigned | Xen free_memory | DomD MemFree/Avail | in use | fps (commit/paint)
+#   --------------+-----------------+--------------------+--------+-------------------
+#      1408 MiB   |     1188 MiB    |     613 / 751 MiB  | 678 MiB|      21 / 18
+#      1024 MiB   |     1573 MiB    |     244 / 351 MiB  | 671 MiB|      22 / 16
+#       896 MiB   |     1702 MiB    |     161 / 241 MiB  | 628 MiB|      29 / 22
+#
+# Every row was healthy: no allocation failures, no OOM, no CMA failure (dmesg
+# clean), weston kept DRM master on VT7 and the guest surface kept being
+# composited. "in use" barely moves because most of the difference is reclaimable
+# page cache; the hard floor is ~630 MiB, of which CMA 128 + V3D GEM BOs ~207
+# (Shmem) + qemu ~101 + weston ~34.
+#
+# Those same runs pin Xen's own overhead, which the older comments guessed at
+# "~64 MiB":  3956 - (Dom0 + DomD + DomU) - free_memory = 80 / 79 / 78 MiB across
+# the three rows. Use 80.
+#
+# 1024 is chosen over the 896 the measurement also allows, deliberately: the
+# workload above is DomU's device model, and DomA's is BIGGER (doma.cfg adds vsock,
+# virtio-serial with SIX virtconsoles and a second NIC on top of the same
+# virtio-gpu-gl 1920x720). That delta has never been measured on this board, and
+# the consequences are asymmetric -- if DomD runs out, weston loses DRM master and
+# BOTH guests' device models die with it, whereas 128 MiB less guest RAM is
+# imperceptible. So DomD keeps the 244 MiB of headroom that was measured with a
+# guest actually running, and DomA takes the 128 MiB out of its own allocation
+# (2560 MiB, still 25% above the 2048 MiB upstream sizes AAOS at).
+#
+# The 384 MiB this frees is what makes a 3-domain 4 GiB cockpit arithmetically
+# possible at all:  80 (Xen) + 128 (Zephyr Dom0) + 1024 (DomD) = 1232, leaving
+# 2724 MiB for ONE xl-created guest. DomU (1024) and DomA still cannot coexist
+# here -- that needs the 8 GiB SKU.
+#
+# Do NOT shrink bank1 to buy more: it is the only VideoCore-reachable window, and
+# CMA 128 MiB plus the V3D scanout buffers live in it.
+#
+# bank0 at 640 MiB is still far more than place_modules() needs for DomD's
+# kernel + DTB (27 MiB + 14 KiB), and the module LOAD addresses (0xa0000000 DTB,
+# 0xa4000000 kernel) stay outside every bank, so the copy sources are not clobbered.
+#
+# Dom0's bank[0] placement is NOT affected: shrinking bank0 only frees memory at
+# 0x68000000-0x80000000, which is above the 1 GiB lowmem_bitsize window
+# allocate_memory_11() searches. The low map (modules below 0x08000000, DomD bank1
+# 0x08000000-0x20000000, the free hole at 0x20000000) is untouched -- verified by
+# The memory-map cross-check, which still derives bank[0] at 0x20000000.
+#
+# The `if test` below is safe to rely on: cmd/Makefile:180 is
+# `obj-$(CONFIG_HUSH_PARSER) += test.o`, and this u-boot has CONFIG_HUSH_PARSER=y
+# (+ HUSH_OLD_PARSER=y), so the `test` command is always present — there is no
+# CONFIG_CMD_TEST to forget. That matters because a missing `test` would make the
+# condition fail and silently select the 8 GiB map on a 4 GiB board.
+#
+# The memory-map cross-check re-derives this override for BOTH flavours and requires
+# them to agree, so keep the two boot.cmd files byte-identical in this block.
+if test "${board_ram}" = "4g" ; then
+    echo "board_ram=4g: DomD 1024 MiB (bank2 dropped, bank0 640 MiB)"
+    fdt set /chosen/domD memory <0x0 0x100000>
+    fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x28000000 0x0 0x08000000 0x0 0x18000000>
+fi
+
+# Dom0 size. An unsatisfiable dom0_mem is a Xen PANIC (domain_build.c:390-393),
+# so it must be sized for the board actually booted -- but on THIS flavour there is
+# a second, tighter constraint that has nothing to do with how much RAM the board
+# has, and it is the reason both SKUs get the same number.
+#
+# IN THE linux FLAVOUR DOM0 OWNS emmc2, SO ALL OF DOM0'S RAM MUST BE
+# VIDEOCORE-REACHABLE.
+# /emmc2bus carries
+#     dma-ranges = <0x0 0xc0000000 0x0 0x0 0x40000000>
+# i.e. the SD controller reaches physical memory only through the 0xc0000000
+# VideoCore alias, which covers 0x0-0x3fffffff and nothing else. Any Dom0 page
+# above 0x40000000 is unreachable by emmc2 and can only be used via a swiotlb
+# bounce.
+#
+# Xen's allocate_memory_11() takes naturally-aligned power-of-two blocks and never
+# looks at dma-ranges, so dom0_mem alone decides whether Dom0 stays inside that
+# window. What is actually free below 0x40000000 on this map:
+#
+#   0x00000000-0x0007ffff   Xen RESVD
+#   0x02000000-0x0214bfff   Xen image           (module)
+#   0x02400000-0x03dbe9ff   Dom0 Image          (module)
+#   0x08000000-0x1fffffff   DomD static-mem bank1
+#   0x2eff1f00-0x2f000fff   host Device Tree    (module -- see below)
+#   0x3b400000-0x3fffffff   gpu_mem carve-out (gpu_mem=76M), not RAM at all
+#
+# so the usable low windows are 0x20000000-0x2eff1f00 and 0x2f001000-0x3b400000.
+# The largest naturally-aligned blocks that fit are 128 MiB at 0x20000000 and
+# 128 MiB at 0x30000000 -- 256 MiB in total. Note this is LESS than the 256 MiB
+# single block the map comment at the top of this file predicts: the firmware
+# leaves the host DTB at ${fdt_addr} = 0x2eff1f00, in the middle of the window
+# that was meant to stay clear, and `setenv fdt_high 0xffff...` (below) keeps it
+# there. 256 MiB is still reachable in two banks, so the DTB is left alone rather
+# than moved with `fdt move`, which would add a silent-failure mode (a failed move
+# leaves the working FDT at the old address while ${fdt_addr} already points at the
+# new one, and Xen is then handed garbage).
+#
+# HW-observed with dom0_mem=512M [2026-08-04]: allocate_memory_11() satisfied the
+# first 256 MiB from those two low banks and put the REMAINING 256 MiB at
+# 0xe0000000, i.e. outside the alias:
+#     /proc/iomem  20000000-27ffffff / 30000000-37ffffff / e0000000-efffffff
+#     Zone ranges  DMA [0-0x3fffffff] / DMA32 [0x40000000-0xefffffff]
+#     Policy zone  DMA32          <- ordinary allocations PREFER the unreachable bank
+#
+# 256M makes the request exactly equal to what the low windows can supply, so no
+# high bank is created and ZONE_DMA32 stays empty. Both SKUs use it: the 8 GiB
+# board has the same low map (its extra RAM is at 0x100000000+, even further out of
+# reach), and a thin Dom0 -- systemd, xenstored, xenconsoled, xl -- does not need
+# more. Confirmed on hardware [2026-08-04]:
+#     /proc/iomem  20000000-27ffffff / 30000000-37ffffff   (no high bank)
+#     Zone ranges  DMA [0-0x37ffffff] / DMA32 empty / Policy zone: DMA
+#     software IO TLB shrank from 64 MiB to 4 MiB
+#
+# NOTE ON WHY THIS IS HERE: this was found while chasing "mmc0: error -110 whilst
+# initialising SD card", and it is NOT that bug's cause -- the -110 reproduced
+# unchanged after every Dom0 page moved below the limit, which is what killed the
+# DMA-reach hypothesis (the real cause was the removed vqmmc-supply; see below).
+# It is kept because a hardware domain that owns a DMA-limited controller and holds
+# memory the controller cannot reach is wrong on its own terms: every SD transfer
+# would otherwise bounce through swiotlb, and `Policy zone: DMA32` meant ordinary
+# allocations landed in the unreachable bank by preference.
+# The memory-map cross-check check 6b now enforces it.
+#
+# The Zephyr flavour is unaffected: there DomD owns emmc2 together with expgpio,
+# and its Dom0 already uses 256M for the relink target (see the map comment above).
+setenv dom0mem 256M
+echo "board_ram=${board_ram} dom0_mem=${dom0mem} (all banks < 0x40000000 for emmc2 DMA)"
+
+# XSM Flask is disabled (xsm=dummy in the bootargs above), so no policy module is
+# wanted. NOTE: with the compatible typo fixed in the overlay ("multiboot,module",
+# not "multiboot-module"), Xen WOULD now recognise this node as a boot module, so
+# this removal is what keeps it out — it is no longer a no-op the way it was.
+# Leaving the node would make Xen look for a module boot.cmd never loads.
+fdt rm /chosen/xenpolicy
+
+# -----------------------------------------------------------------------------
+# Dom0 device-ownership fix-ups (thin Linux Dom0 = hardware domain)
+# -----------------------------------------------------------------------------
+# 1. Legacy VideoCore framebuffer. /soc/fb is already marked xen,passthrough by
+#    the overlay, but removing it as well stops the Dom0 kernel from probing a
+#    node it can no longer map, and drops the VideoCore-injected simple-framebuffer
+#    that would otherwise keep fbcon on HDMI until DomD's vc4-drm takes over.
+fdt rm /soc/fb
+
+# 2. uart2..uart5 (/soc/serial@7e2014{00,600,800,a00}) are `status=disabled` in
+#    the stock DTB, but Xen ignores status and would still assign them to Dom0 —
+#    and they share the 4 KiB page 0xfe201000 with the pl011 that Xen uses as its
+#    own console. Xen's rpi4 blacklist covers the aux UART's page neighbours
+#    (brcm,bcm2835-aux / -aux-spi) but not these, so remove them here. This is
+#    the same hazard, handled the same way.
+fdt rm /soc/serial@7e201400
+fdt rm /soc/serial@7e201600
+fdt rm /soc/serial@7e201800
+fdt rm /soc/serial@7e201a00
+
+# 3. Bluetooth. config.txt carries `dtoverlay=disable-bt` so the pl011 reaches
+#    the GPIO14/15 header for the Xen console; the BT node under it goes to Xen
+#    with the UART. Disable it explicitly in case the overlay is ever dropped.
+fdt set /soc/serial@7e201000/bluetooth status "disabled"
+
+# 4. SD card stays with Dom0 in this flavour (it owns /dev/mmcblk0), so emmc2 is
+#    NOT marked xen,passthrough. But the mailbox and /soc/firmware DO go to DomD
+#    — the display cannot work otherwise — and that takes `expgpio`
+#    (/soc/firmware/gpio) with them. emmc2's vmmc-supply / vqmmc-supply are the
+#    two expgpio-driven regulators, so leaving those phandles in place would make
+#    Dom0's SD probe wait forever on a regulator that can never appear:
+#
+#      /regulator-sd-vcc     regulator-fixed 3.3 V, gpio  = <&expgpio 6 ...>  SD_PWR_ON
+#      /regulator-sd-io-1v8  regulator-gpio 1.8/3.3 V, gpios = <&expgpio 4 ...> VDD_SD_IO_SEL
+#
+#    DO NOT SOLVE THIS BY REMOVING THE SUPPLIES. That is what this script did until
+#    2026-08-04 and it is what caused
+#        mmc0: error -110 whilst initialising SD card
+#    on every boot, with the card then unreachable until a power cycle. The reason is
+#    the exact opposite of what the removal was assumed to do (the old comment here
+#    claimed the only cost was "no 1.8 V signalling, hence no UHS-I"):
+#
+#      drivers/mmc/host/sdhci.c:4583, inside `if (!IS_ERR(mmc->supply.vqmmc))`
+#          /* If vqmmc provides no 1.8V signalling, then there's no UHS */
+#          if (!regulator_is_supported_voltage(mmc->supply.vqmmc, 1700000, 1950000))
+#                  host->caps1 &= ~(SDHCI_SUPPORT_SDR104 | SDHCI_SUPPORT_SDR50 |
+#                                   SDHCI_SUPPORT_DDR50);
+#
+#    With NO vqmmc that whole block is skipped, so the UHS caps SURVIVE. Then
+#
+#      drivers/mmc/core/sd.c:871   if (retries && mmc_host_can_uhs(host))
+#                                          ocr |= SD_OCR_S18R;
+#      drivers/mmc/core/sd.c:895   if (... (ocr & SD_OCR_S18R) && (*rocr & SD_ROCR_S18A))
+#                                          err = mmc_set_uhs_voltage(host, pocr);
+#
+#    so the core asks the card to move to 1.8 V, sends CMD11, and the card DOES move
+#    — while the host pads stay at 3.3 V, because the only thing that can drive
+#    VDD_SD_IO_SEL is expgpio, which is in DomD. sdhci sets SDHCI_CTRL_VDD_180 in
+#    HOST_CONTROL2 and reports success (there is no regulator left to fail), so
+#    sd.c's "Skipping voltage switch" retry path never triggers. Every command after
+#    the switch is answered by a card at the wrong signalling level.
+#
+#    Matches the hardware exactly: ACMD41 succeeds (it precedes the switch, which is
+#    why sd.c:1896 is reached at all and why the error is -110 rather than an earlier
+#    return), everything after it fails, later rescans fail even earlier, and only a
+#    power cycle — which lets the firmware reset the card — restores it.
+#
+#    THE FIX: keep both supplies and make the regulators reachable WITHOUT expgpio,
+#    by turning them into GPIO-free fixed 3.3 V regulators. A constant is the honest
+#    model here, not a fudge: the firmware asserted SD_PWR_ON and selected 3.3 V on
+#    VDD_SD_IO_SEL before U-Boot ran, and with expgpio in DomD nothing in Dom0 can
+#    ever change either. This is the same substitution the DomD partial DT makes for
+#    clocks it cannot reach — used only where the value really is constant.
+#
+#    A vqmmc that exists and offers only 3.3 V is what re-arms sdhci.c:4583: 1.8 V is
+#    unsupported so the UHS caps are stripped, mmc_host_can_uhs() is false, S18R is
+#    never requested and CMD11 is never sent. 2.7-3.6 V IS supported so
+#    SDHCI_SIGNALING_330 survives (sdhci.c:4591). The slot then runs at 3.3 V
+#    high-speed — which is what the old comment wanted and did not get. The Zephyr
+#    flavour, where DomD owns the SD together with expgpio, still gets real UHS.
+fdt set /regulator-sd-vcc compatible "regulator-fixed"
+fdt rm /regulator-sd-vcc gpio
+fdt rm /regulator-sd-vcc enable-active-high
+fdt set /regulator-sd-vcc regulator-always-on
+#    regulator-gpio -> regulator-fixed, and min must EQUAL max or reg-fixed-voltage
+#    leaves desc.fixed_uV at 0 and get_voltage() returns 0. 0x325aa0 = 3300000.
+fdt set /regulator-sd-io-1v8 compatible "regulator-fixed"
+fdt rm /regulator-sd-io-1v8 gpios
+fdt rm /regulator-sd-io-1v8 states
+fdt rm /regulator-sd-io-1v8 regulator-settling-time-us
+fdt set /regulator-sd-io-1v8 regulator-min-microvolt <0x325aa0>
+fdt set /regulator-sd-io-1v8 regulator-max-microvolt <0x325aa0>
+fdt set /regulator-sd-io-1v8 regulator-always-on
+#    ... and the same reasoning applies one level further up the chain, which the
+#    paragraph above missed. emmc2's clock comes from cprman:
+#
+#      mmc@7e340000  clocks = <&cprman BCM2711_CLOCK_EMMC2>
+#      cprman@7e101000  firmware = <&firmware>        <-- /soc/firmware, given to DomD
+#
+#    drivers/clk/bcm/clk-bcm2835.c:2370
+#        fw_node = of_parse_phandle(dev->of_node, "firmware", 0);
+#        if (fw_node) {
+#                struct rpi_firmware *fw = rpi_firmware_get(fw_node);
+#                if (!fw)
+#                        return -EPROBE_DEFER;      <-- Dom0 sticks here forever
+#
+#    so Dom0's cprman never probes, emmc2 never probes, /dev/mmcblk0 never appears
+#    and xl-attach-disks dies with "FATAL: no /dev/mmcblk0p2 - DomD root cannot be
+#    attached, DomD will stay blocked in rootwait". [HW-observed 2026-08-04]
+#
+#    Removing the phandle skips that block entirely; cprman->fw is then NULL, which
+#    is used in exactly one place -- bcm2835_clock_get_rate_vpu() -- and that has a
+#    register-read fallback:
+#        if (cprman->fw) { ...RPI_FIRMWARE_GET_MAX_CLOCK_RATE... }
+#        return bcm2835_clock_get_rate(hw, parent_rate);
+#    emmc2's clock is REGISTER_PER_CLK(CM_EMMC2CTL/CM_EMMC2DIV), i.e. read straight
+#    from cprman registers, so the SD is unaffected. Only the VPU core clock's
+#    *reported maximum* changes, and Dom0 does not drive the VPU.
+#
+#    Why not instead keep /soc/firmware in Dom0 (as the rpi5 xen.dtso does, where
+#    only `mailbox` is passed through)? Because the firmware driver needs the
+#    mailbox, and the mailbox MUST go to DomD for the display. On BCM2712 that costs
+#    nothing -- its SD has no firmware dependency -- which is why the rpi5 flavour
+#    needs no equivalent line. This is a genuine BCM2711-only link in the chain.
+fdt rm /soc/cprman@7e101000 firmware
+
+# 5. Drop the CMA reservation from the host DT. /reserved-memory/linux,cma has
+#    alloc-ranges = <0x0 0x0 0x30000000> (low 768 MiB) and is inherited by Dom0;
+#    Dom0 does not touch the GPU here (vc4/v3d are blacklisted on its cmdline),
+#    and if its RAM does not overlap that window the reservation just fails with
+#    a scary "unable to setup CMA region". DomD gets its CMA from `cma=` on its
+#    own cmdline instead. NOTE: only the child node is removed — never rewrite
+#    /reserved-memory itself, because the BCM2711 root is #size-cells=<1> and a
+#    cells mismatch there makes Linux discard the whole node, including the
+#    atf@0 no-map entry that protects TF-A.
+fdt rm /reserved-memory/linux,cma
+
+# 6. VideoCore-injected framebuffer nodes. Each `fdt rm` is best effort; the Hush
+#    parser skips a line whose path is absent without aborting the script.
+fdt rm /chosen/framebuffer
+fdt rm /chosen/framebuffer@3f800000
+fdt rm /reserved-memory/framebuffer
+fdt rm /framebuffer@3f800000
+
+# -----------------------------------------------------------------------------
+# Xen hypervisor bootargs
+# -----------------------------------------------------------------------------
+#   console=dtuart dtuart=/soc/serial@7e201000
+#       BCM2711's pl011 (phys 0xfe201000, GIC SPI 121). config.txt must carry
+#       `dtoverlay=disable-bt` so this UART is the one on GPIO14/15; without it
+#       pl011 is wired to the Bluetooth module and the header carries the mini
+#       UART (/soc/serial@7e215040) instead. To use the mini UART instead — the
+#       path meta-virtualization's stock RPi4 boot script takes — set
+#       dtuart=/soc/serial@7e215040 and keep enable_uart=1.
+#   dom0_mem=1024M
+#       Thin Dom0, but its xl/xenstored footprint grows with each guest (the RPi5
+#       bring-up OOM-killed xl at 512M with three domains). On a 4 GiB board
+#       lower this to 512M: the free sub-4 GiB space left by the map above is
+#       ~600 MiB there.
+#       This value is NOT best-effort — an unsatisfiable dom0_mem is FATAL:
+#           xen/arch/arm/domain_build.c:390-393
+#           if ( kinfo->unassigned_mem )
+#               panic("Failed to allocate requested dom0 memory. %ldMB unallocated\n", ...)
+#       So dom0_mem must be sized for the SMALLEST SKU the image is written to,
+#       not for the 8 GiB board this map was measured on. Getting it wrong does
+#       not degrade gracefully; Xen stops before Dom0 exists, with only that one
+#       line on the console.
+#   NO dma_bits= : Xen's rpi4 platform already sets dma_bitsize = 30, which is
+#       what pushes Dom0's bank[0] below 1 GiB. Passing dma_bits would create a
+#       separate Xen-heap DMA zone, which is not what is wanted here.
+#   xsm=dummy
+#       A dom0less domain cannot be given a Flask label through the device tree
+#       (there is no seclabel binding in dom0less-build.c), so it is always
+#       unlabeled_t and even permissive Flask can refuse to create it. Disabling
+#       XSM entirely keeps DomD construction deterministic.
+#   gnttab_max_frames=512   many virtio backends in DomD
+#   bootscrub=off           cuts several seconds off boot
+#   sync_console            serialises Xen console output while bringing up
+fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=/soc/serial@7e201000 dom0_mem=${dom0mem} dom0_max_vcpus=1 xsm=dummy gnttab_max_frames=512 bootscrub=off loglvl=all guest_loglvl=all sync_console"
+
+# -----------------------------------------------------------------------------
+# Load Xen
+# -----------------------------------------------------------------------------
+fatload mmc 0 0x2000000 xen
+echo "Xen loaded at 0x2000000, size 0x${filesize}"
+
+# -----------------------------------------------------------------------------
+# Dom0 kernel
+# -----------------------------------------------------------------------------
+fatload mmc 0 0x2400000 Image
+fdt set /chosen/dom0 reg <0x0 0x2400000 0x0 0x${filesize}>
+
+# -----------------------------------------------------------------------------
+# dom0less DomD (direct-map + static-mem)
+# -----------------------------------------------------------------------------
+# DomD must be dom0less: `xl create` cannot produce a direct-mapped domain
+# (libxl has no such option), and without GPA==PA the V3D MMU and every
+# VideoCore DMA address would be wrong.
+#
+# First-boot graceful path: if the DomD payload is not on the boot partition yet,
+# fatload returns non-zero, the else branch removes /chosen/domD and the board
+# boots Dom0-only instead of panicking in Xen. The DomD binaries are deployed on
+# the following boot by install-domd-binaries-to-boot.sh.
+# [v93] DomD no longer boots from a RAM initramfs. Its root is the ext4 on SD p2,
+# reached over PV block as /dev/xvda (Dom0 runs blkback), so nothing is fatloaded for
+# it beyond the kernel and its partial DT, and there is no module@2 ramdisk. The gate
+# for "is DomD deployed" is therefore the KERNEL load, not the initramfs load.
+if fatload mmc 0 0xa4000000 Image ; then
+    setenv domd_kernel_size ${filesize}
+    fatload mmc 0 0xa0000000 bcm2711-raspberrypi4-64-domd-vc4.dtb
+    setenv domd_dtb_size ${filesize}
+
+    # NOTE: no `xen,domain-id`. It is not a Xen 4.21 dom0less binding -- nothing in
+    # common/device-tree/dom0less-build.c reads it, ids come from
+    # domid_alloc(DOMID_INVALID). DomD still gets domid 1 because it is the first
+    # /chosen domain child, which is what the RPi5 script was really relying on.
+    # Anything that needs DomD's id must look it up at runtime, not assume 1.
+    # capabilities = DOMAIN_CAPS_CONTROL (0x1). Xen 4.21 moved the dom0less
+    # privilege spec here from the older xen,privileged bool; without it DomD is
+    # unprivileged, its qemu device-model's IOCTL_PRIVCMD_DM_OP returns EPERM,
+    # xen_register_ioreq fails and the DomU/DomA screens stay black.
+    fdt set /chosen/domD capabilities <0x1>
+
+    fdt mknode /chosen/domD module@0
+    fdt set /chosen/domD/module@0 compatible "multiboot,kernel" "multiboot,module"
+    fdt set /chosen/domD/module@0 reg <0x0 0xa4000000 0x0 0x${domd_kernel_size}>
+    # DomD cmdline notes:
+    #   console=ttyAMA0        the emulated vpl011 (vpl011=<1> in the overlay).
+    #                          No earlycon and no ignore_loglevel: on RPi5 a
+    #                          synchronous earlycon spun forever in pl011_putc
+    #                          once the vpl011 FIFO filled, and the PV console
+    #                          ring overflowed the same way. `quiet loglevel=3`
+    #                          keeps the early flood below both limits.
+    #   cma=128M               vc4's display buffers. DomD's ZONE_DMA is static-mem
+    #                          bank1 (0x08000000+384 MiB) because the partial DT's
+    #                          soc_bus/emmc2_bus dma-ranges cap
+    #                          of_dma_get_max_cpu_address() at 0x20000000, so
+    #                          dma_contiguous_reserve() lands CMA inside the
+    #                          VideoCore-visible window with no `@addr` pinning.
+    #                          [v93] 192M -> 128M: the 192 figure was sized so that CMA
+    #                          plus the 64 MiB swiotlb plus the RAM initramfs all fit in
+    #                          the 384 MiB low bank. With DomD booting from xvda the
+    #                          initramfs is gone, and upstream reduced CMA to match.
+    #                          128 + 64 = 192 MiB of 384 MiB, so the headroom grew.
+    #   xen_privcmd.unrestricted=1
+    #                          Linux 6.18 restricts privcmd by default when
+    #                          !xen_initial_domain(); a dom0less DomD has no
+    #                          xenstore target node and would get EPERM on
+    #                          IOCTL_PRIVCMD_DM_OP -> `Bus 'pcie.0' not found`.
+    #   vhost_xen.nogrant=1    DomD is direct-mapped, so the virtio backends can
+    #                          address guest memory without grant mapping.
+    # `xen_privcmd.unrestricted=1` is what lets DomD run `xl`: the carried privcmd
+    # patch blocks every hypercall in a non-initial domain otherwise. It is silently
+    # IGNORED if the kernel is locked down (security_locked_down(
+    # LOCKDOWN_XEN_USER_ACTIONS) in restrict_driver()), so bcm2711-domd-hw.cfg
+    # asserts `# CONFIG_SECURITY_LOCKDOWN_LSM is not set`. Change one, change both.
+    #   root=/dev/xvda rootwait rw
+    #                          [v93] DomD root is the ext4 on SD p2, block-attached
+    #                          by Dom0 (blkback) as xvda. This REPLACES the old
+    #                          rdinit=/init-vc4.sh RAM-initramfs boot: init-vc4.sh
+    #                          was deleted upstream and weston now runs from the
+    #                          stock poky weston.service, with GPU bring-up in
+    #                          domd-gpu-init.service. NOTE this makes DomD depend on
+    #                          a working PV block frontend, i.e. on xenbus coming up
+    #                          in DomD -- see README.md "Known limitations" for the RPi4 blocker.
+    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/xvda rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=128M net.ifnames=0 quiet loglevel=3"
+
+    fdt mknode /chosen/domD module@1
+    fdt set /chosen/domD/module@1 compatible "multiboot,device-tree" "multiboot,module"
+    fdt set /chosen/domD/module@1 reg <0x0 0xa0000000 0x0 0x${domd_dtb_size}>
+
+    echo "DomD dom0less + direct-map + GPU passthrough configured (kernel@0xa4000000 / dtb@0xa0000000, root=/dev/xvda via Dom0 blkback)"
+else
+    fdt rm /chosen/domD
+    echo "DomD kernel not on SD; Dom0-only boot (dom0less DomD disabled)"
+fi
+
+# -----------------------------------------------------------------------------
+# dom0less DomU — disabled; DomU and DomA are created by Dom0's xl.
+# -----------------------------------------------------------------------------
+# The dom0less + qemu xenpvh attach path is blocked by the Xen event-channel
+# routing gap and by xenconsoled having no pty for a dom0less guest console, so
+# the cockpit creates DomU/DomA with `xl create` (proven on V4H). The load slot
+# 0xe0000000-0xfc000000 in the memory map above is reserved for restoring the
+# dom0less path later; nothing writes it today.
+setenv domu_loaded 0
+if test "${domu_loaded}" = "1" ; then
+    echo "dom0less DomU is not implemented on rpi4 yet"
+else
+    fdt rm /chosen/domU
+fi
+
+# -----------------------------------------------------------------------------
+# Dom0 Linux bootargs
+# -----------------------------------------------------------------------------
+#   console=hvc0 earlycon=xen   Dom0 has no UART: Xen owns the pl011.
+#   root=/dev/ram0 via rdinit   thin Dom0 runs entirely from its initramfs.
+#   modprobe.blacklist=vc4,v3d,simplefb
+#       Dom0 must not bind the GPU or a firmware framebuffer; DomD owns HDMI.
+#       simplefb is a separate module and is not covered by the vc4 blacklist.
+#   fbcon=map:99                map the console to a framebuffer that does not
+#       exist, so fbcon cannot hold HDMI before DomD's modeset.
+#   No ip=...: Dom0 has no NIC (GENET went to DomD), it gets connectivity from
+#       the Dom0<->DomD vif once DomD's bridge is up.
+fdt set /chosen/dom0 bootargs "console=hvc0 earlycon=xen earlyprintk=xen rdinit=/sbin/init ignore_loglevel modprobe.blacklist=vc4,v3d,simplefb fbcon=map:99"
+
+# -----------------------------------------------------------------------------
+# Dom0 initramfs
+# -----------------------------------------------------------------------------
+fatload mmc 0 0xb0000000 initramfs-xt-dom0-thin.cpio.gz
+setenv dom0_initramfs_size ${filesize}
+echo "Dom0 initramfs loaded at 0xb0000000, size 0x${dom0_initramfs_size}"
+
+# Xen hands the initrd to Dom0 ONLY through a multiboot module entry. The module
+# node below is therefore the whole mechanism.
+#
+# REMOVED: `fdt set /chosen/dom0 linux,initrd-start/-end`. Those two writes were
+# inert, and the comment that justified them ("a direct hint for the kernel") was
+# wrong on both halves:
+#   * Xen reads linux,initrd-start/-end only from /chosen. The scan that does it,
+#     xen/common/device-tree/bootinfo-fdt.c:388, is
+#         else if ( depth == 1 && device_tree_node_matches(fdt, node, "chosen") )
+#             rc = process_chosen_node(...)
+#     and process_chosen_node() (bootinfo-fdt.c:299-320) is the only reader.
+#     /chosen/dom0 is at depth 2, so nothing ever looked at these properties.
+#   * The Dom0 kernel never sees this blob. Xen builds Dom0 a fresh device tree
+#     and creates the pair itself as placeholders it fills in later
+#     (xen/arch/arm/domain_build.c:594-601, "If the bootloader provides an initrd,
+#     we must create a placeholder for the initrd properties").
+# Writing them to /chosen (depth 1) instead would ALSO be wrong here: that is the
+# path for handing an initrd to a classic dom0 built from a bootloader-provided
+# module, and it would collide with the module list this script builds.
+fdt mknode /chosen/dom0 module@1
+fdt set /chosen/dom0/module@1 compatible "multiboot,ramdisk" "multiboot,module"
+fdt set /chosen/dom0/module@1 reg <0x0 0xb0000000 0x0 0x${dom0_initramfs_size}>
+
+# -----------------------------------------------------------------------------
+# Hand off to Xen
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Do not let U-Boot fix up the DT after we finished editing it.
+# -----------------------------------------------------------------------------
+# `booti` calls image_setup_libfdt() -> ft_board_setup()
+# (board/raspberrypi/rpi/rpi.c:577), which runs AFTER every `fdt rm` above and
+# unconditionally adds a root-level `/framebuffer` node via
+# fdt_simplefb_add_node(). The node is added with status = "disabled"
+# (boot/fdt_simplefb.c:63; fdt_setup_simplefb_node() never writes status), so no
+# simplefb driver binds it — but it does carry a `reg` in the VideoCore carve-out
+# that Xen's handle_node() would then map into Dom0's p2m, and it silently
+# reintroduces a node this script just deleted.
+#
+# boot/image-fdt.c:631-634 honours `skip_board_fixup=1` and skips ft_board_setup()
+# entirely. What that also skips is update_fdt_from_fw(), which copies
+# /chosen/kaslr-seed and the ethernet PHY `reg` from the firmware DT into this
+# blob. Neither matters here: Xen rebuilds /chosen for Dom0 from scratch
+# (domain_build.c), and DomD does not inherit this tree at all — it gets its own
+# partial DT, which declares genet with its own mdio/phy nodes.
+#
+# The u-boot cfg fragment additionally drops CONFIG_VIDEO/VIDEO_BCM2835, so
+# U-Boot never asks the VideoCore for a framebuffer either. This line is the
+# belt to that suspenders: it holds even if a future defconfig re-enables video.
+setenv skip_board_fixup 1
+
+setenv fdt_high 0xffffffffffffffff
+booti 0x2000000 - ${fdt_addr}

@@ -1,0 +1,22 @@
+# Deterministically name the on-SoC gigabit-ethernet NIC "eth0" on DomD (Raspberry Pi 4).
+#
+# The RPi5 counterpart, 00-rp1-eth0.link in meta-xt-driver-domain, matches Driver=macb
+# because RP1's NIC is a Cadence GEM reached over PCIe. BCM2711 has no RP1: its NIC is
+# the on-SoC GENET v5 at ethernet@fd580000, driven by bcmgenet and passed through to
+# DomD in bcm2711-raspberrypi4-64-domd-vc4.dts. That file's Driver=macb therefore never
+# matches here, and without this one systemd's 99-default.link would name the interface
+# end0 or similar non-deterministically.
+#
+# That matters because the whole DomD network design keys on eth0: 10-eth0.network
+# carries the static 192.168.10.11, domd-flatbridge-up enslaves eth0 into xenbr0, and
+# dnsmasq and the SSH route follow from there. A drift to end0 leaves the static
+# configuration unapplied and takes out L2, Dom0 routing and SSH together.
+#
+# Sorted before 99-default.link, so this match wins; it is also independent of the
+# kernel cmdline net.ifnames setting.
+[Match]
+Driver=bcmgenet
+Type=ether
+
+[Link]
+Name=eth0

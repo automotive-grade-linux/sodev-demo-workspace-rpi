@@ -1,0 +1,40 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Host-DT overlay: hand the SD controller to DomD.
+ *
+ * BCM2712's label was &sdio1; on BCM2711 the SD slot is /emmc2bus/mmc@7e340000,
+ * whose label in the shipped bcm2711-rpi-4-b.dtb __symbols__ is `emmc2`. Its two
+ * supply regulators live at root level (`sd_vcc_reg`, `sd_io_1v8_reg`) and are
+ * driven by the firmware GPIO (`expgpio`), so the firmware node has to move with
+ * the controller — otherwise the regulators never come up in DomD.
+ *
+ * Applied only when MACHINE_FEATURES contains "domd_mmc". For the SoDeV cockpit
+ * the equivalent markers are set at runtime by boot.cmd, per Dom0 flavour: the
+ * Zephyr flavour gives the SD to DomD, the thin-Linux flavour keeps it in Dom0
+ * (which is the hardware domain there).
+ */
+
+/dts-v1/;
+/plugin/;
+
+&emmc2     { xen,passthrough; };
+
+/*
+ * emmc2 is GIC SPI 126, and TWO other host nodes carry the same SPI:
+ *   /soc/mmcnr@7e300000  (label mmcnr,  the on-board SDIO WiFi, status="okay")
+ *   /soc/mmc@7e300000    (label sdhci,  status="disabled")
+ * Xen builds the hardware domain first and does not look at `status`
+ * (handle_node()/map_device_irqs_to_domain() have no status check), so leaving
+ * either with Dom0 makes DomD's emmc2 claim fail with -EBUSY and aborts domain
+ * construction. The zephyr boot script removes both with `fdt rm`; this overlay is
+ * the MACHINE_FEATURE path (domd_mmc), which has no such script step, so it must
+ * release them itself. Both labels exist in the stock bcm2711-rpi-4-b.dtb.
+ * The DomD passthrough cross-check --xen-overlay/--boot-cmd enforces this class.
+ */
+&mmcnr     { xen,passthrough; };
+&sdhci     { xen,passthrough; };

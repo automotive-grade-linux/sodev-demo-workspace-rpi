@@ -1,0 +1,22 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Host-DT overlay: hand USB2 to DomD.
+ *
+ * BCM2712 had two RP1 dwc3 controllers (&rp1_usb0 / &rp1_usb1). RPi4 has a
+ * single on-SoC USB2 OTG core, label `usb` in the shipped bcm2711-rpi-4-b.dtb
+ * (/soc/usb@7e980000). USB3 is a separate PCIe device and is handled by
+ * pcie1-passthrough.dtso.
+ *
+ * Applied only when MACHINE_FEATURES contains "domd_usb"; the SoDeV cockpit
+ * marks the same node from bcm2711-raspberrypi4-64-xen.dtso instead.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&usb           { xen,passthrough; };

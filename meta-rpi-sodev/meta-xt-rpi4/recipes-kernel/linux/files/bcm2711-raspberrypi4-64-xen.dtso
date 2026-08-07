@@ -1,0 +1,308 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * ============================================================================
+ * BCM2711 / Raspberry Pi 4 — Xen host device-tree overlay
+ * ============================================================================
+ * Applied by boot.cmd (`fdt apply`) on top of the firmware-supplied
+ * bcm2711-rpi-4-b.dtb. It
+ *   1. creates /chosen/{xenpolicy,dom0,domD} (dom0less topology), and
+ *   2. marks the GPU / display / I-O devices `xen,passthrough` so Xen withholds
+ *      their MMIO+IRQ from the hardware domain and DomD can claim them.
+ *
+ * Every address/SPI here comes from the real bcm2711-rpi-4-b.dtb — see
+ * ../../../BCM2711-DT-TRUTH.md. RPi5-isms that DO NOT EXIST on BCM2711 and are
+ * therefore absent from this file:
+ *   - `&uart10`  (BCM2712 D0 debug UART)     -> RPi4 console is pl011 `&uart0`
+ *   - `&mip0`    (BCM2712 MSI-in-the-middle) -> RPi4 PCIe MSI lives *inside* the
+ *                                               root complex (msi-parent=&pcie0)
+ *   - RP1 / pcie2 / the 16 MiB RP1 aperture / the BCM2712 IOMMU
+ *   - the OP-TEE reserved-memory carve-out — OP-TEE is disabled on rpi4 for now
+ *     (TF-A rpi4 ships no SPD; README.md "Known limitations"). Re-add it together with
+ *     `xen,tee = "optee"` on /chosen/domD only after OP-TEE/rpi4 is up.
+ *
+ * CELLS WARNING: the BCM2711 root is `#address-cells=<2> #size-cells=<1>`
+ * (BCM2712 is 2/2) and /reserved-memory inherits 2/1. This overlay therefore
+ * NEVER touches /reserved-memory: writing 2/2 there would make Linux's
+ * __reserved_mem_check_root reject the entire node — the exact regression the
+ * RPi5 boot.cmd hit on 2026-06-24. /chosen gets an explicit 2/2 because Xen
+ * parses the module `reg` and `xen,static-mem` with the *node's own* cells.
+ * ============================================================================
+ */
+
+/dts-v1/;
+/plugin/;
+
+&chosen {
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+
+	xenpolicy {
+		/*
+		 * "multiboot,module" with a COMMA. It used to say "multiboot-module"
+		 * with a hyphen, which is not a compatible string Xen looks for:
+		 * bootinfo-fdt.c matches "xen,multiboot-module" or "multiboot,module"
+		 * (device_tree_node_compatible checks in the depth<=3 branch), so a
+		 * hyphenated "multiboot-module" is silently ignored and the policy
+		 * would never be registered as a boot module.
+		 * Inert today — XSM is off (xsm=dummy) and both boot scripts do
+		 * `fdt rm /chosen/xenpolicy` — but a typo that only bites when someone
+		 * turns XSM on is exactly the kind that survives for years.
+		 */
+		compatible = "xen,xsm-policy", "multiboot,module";
+	};
+
+	dom0 {
+		compatible = "multiboot,kernel", "multiboot,module";
+	};
+
+	domD {
+		compatible = "xen,domain";
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+
+		/*
+		 * =====================================================================
+		 * DomD memory = 1920 MiB (0x1E0000 KiB) in three static-mem banks.
+		 * =====================================================================
+		 * BCM2711 has the OPPOSITE DMA problem to BCM2712: no IOMMU, and the
+		 * legacy peripherals are hard-wired to the low 1 GiB through the
+		 * 0xc0000000 VideoCore bus alias
+		 *     /soc      dma-ranges = <0xc0000000 0x0 0x0        0x40000000>
+		 *     /emmc2bus dma-ranges = <0x0 0xc0000000 0x0 0x0    0x40000000>
+		 * so the VideoCore mailbox, the HVS display fetch, vc4's CMA and the SD
+		 * controller can only reach physical memory below 1 GiB. GENET
+		 * (/scb, 16 GiB) and V3D (/v3dbus, own MMU) are unrestricted.
+		 *
+		 * BANK ORDER IS LOAD-BEARING. Xen's place_modules() (xen/arch/arm/
+		 * kernel.c) puts the guest kernel, DTB and initrd in **bank[0]**, and
+		 * assign_static_memory_11() (xen/common/device-tree/static-memory.c)
+		 * copies the banks in DT order with no sorting. So:
+		 *
+		 *   bank0  0x40000000 + 0x40000000  1024 MiB  <- kernel + DTB + initrd
+		 *   bank1  0x08000000 + 0x18000000   384 MiB  <- LOW: mailbox / CMA / SD
+		 *   bank2  0x80000000 + 0x20000000   512 MiB
+		 *
+		 * The big DomD initramfs therefore lands in the 1 GiB high bank instead
+		 * of competing with CMA for the scarce low RAM, while bank1 keeps the
+		 * VideoCore-reachable window. Linux then sees memstart_addr =
+		 * 0x08000000 with the Image at 0x40080000, which arm64 has supported
+		 * since v4.6 (memory below the Image is usable).
+		 *
+		 * bank1 also sets DomD's ZONE_DMA: of_dma_get_max_cpu_address() takes
+		 * the MINIMUM dma-ranges limit in the tree, and the partial DT's
+		 * `mbox-bus`/`emmc2-bus` cap it at 0x20000000, so arm64_dma_phys_limit
+		 * = 0x20000000 and dma_contiguous_reserve() puts CMA inside bank1
+		 * automatically — no `cma=...@addr` pinning needed.
+		 *
+		 * 0x08000000-0x20000000 is entirely below the RPi4 gpu_mem carve-out
+		 * (0x3b400000 with the default gpu_mem=76M) and below the 0x40000000
+		 * VideoCore DMA limit.
+		 *
+		 * The layout deliberately leaves 0x20000000-0x30000000 (256 MiB,
+		 * 256 MiB-aligned) free and LOW. allocate_memory_11() allocates a
+		 * naturally-aligned POWER-OF-TWO block, trying `bits` upward from the
+		 * order so the first success is in the lowest window that can hold it,
+		 * and halving the order (down to 128 MiB) if none can — see the full
+		 * derivation in boot.cmd.xen.linux-dom0.in. On this map that lands
+		 * Dom0's bank[0] at 0x20000000 with 256 MiB whatever dom0_mem asks for:
+		 * the thin Dom0 kernel + initramfs fit, and Dom0 keeps
+		 * a ZONE_DMA for the SD controller in the DOM0_OS=linux flavour (where
+		 * Dom0, not DomD, owns emmc2). It is also the relink target for the
+		 * Zephyr Dom0
+		 *
+		 * boot.cmd's module load addresses are chosen to miss every bank above
+		 * — the two files MUST be kept in sync (see the memory map comment at
+		 * the top of boot.cmd.xen.*-dom0.in).
+		 *
+		 * 4 GiB board: every bank and every module load stays below
+		 * 0xfc000000, so Dom0+DomD boots there as well. The full 4-domain
+		 * cockpit needs the 8 GiB SKU (as RPi5 needed the 16 GiB SKU) because
+		 * the xl-created DomU/DomA come out of the >4 GiB region.
+		 */
+		memory = <0x0 0x1e0000>;
+		cpus = <0x2>;
+		vpl011 = <0x1>;
+		direct-map;
+		xen,static-mem = <0x0 0x40000000 0x0 0x40000000
+				  0x0 0x08000000 0x0 0x18000000
+				  0x0 0x80000000 0x0 0x20000000>;
+		xen,enhanced = "enabled";
+	};
+};
+
+/*
+ * ---------------------------------------------------------------------------
+ * Console UART: pl011 serial@7e201000 (phys 0xfe201000, GIC SPI 121).
+ * ---------------------------------------------------------------------------
+ * Round the reg size up from 0x200 to a full 4 KiB page. Xen maps MMIO per page
+ * and the RPi5 port needed exactly this on uart10 before vpl011 would come up
+ * for a dom0less guest; 0xfe201000 is already page-aligned here, so only the
+ * size changes.
+ *
+ * What else is on that page, precisely: serial@7e201400/600/800/a00
+ * (uart2..uart5). They are `status = "disabled"` in the stock DTB, but that is
+ * NOT what makes the wider mapping safe — Xen's handle_node() does not look at
+ * `status`, so a disabled node still has its IRQ routed and its MMIO mapped to
+ * the hardware domain. Two other things make it safe:
+ *   1. this page belongs to XEN, not to a domain: boot.cmd passes
+ *      `console=dtuart dtuart=/soc/serial@7e201000`, so Xen keeps the pl011 for
+ *      its own console and never hands it to Dom0; and
+ *   2. both boot scripts `fdt rm` all four of uart2..uart5 before booting Xen,
+ *      precisely so no domain can claim a device inside this page.
+ * (An earlier version of this comment said they were "owned by the same domain",
+ * which was neither true nor the reason.)
+ */
+&uart0 {
+	reg = <0x7e201000 0x1000>;
+};
+
+/*
+ * ===========================================================================
+ * DomD-owned devices
+ * ===========================================================================
+ * Xen reads the host DT and strips the IRQ/iomem of `xen,passthrough` nodes
+ * from the hardware domain; that is what lets the dom0less DomD claim them.
+ *
+ * Only labels that really exist in the stock bcm2711-rpi-4-b.dtb __symbols__
+ * may appear here — one missing label makes the whole `fdt apply` fail and
+ * would silently drop every other marker. All of the following were verified
+ * present in the shipped DTB (BCM2711-DT-TRUTH.md §2).
+ *
+ * `aon_intr` is BCM2711's single display/HDMI L2 interrupt controller
+ * (/soc/interrupt-controller@7ef00100, GIC SPI 96, EDGE_RISING). BCM2712's
+ * separate disp_intr / bsc_irq / mop / moplet do not exist here, and HVS is
+ * wired straight to GIC SPI 97 instead of through an L2 controller.
+ *
+ * Display CRTCs: on BCM2711 vc4_crtc.c binds HDMI0 to **pixelvalve2** and
+ * HDMI1 to **pixelvalve4** (bcm2711_pv2_data / bcm2711_pv4_data,
+ * encoder_types[0] = VC4_ENCODER_TYPE_HDMI0 / _HDMI1). Only those two are
+ * driven by DomD: pixelvalve0/1/3 drive DSI/DPI/SMI/VEC, which this cockpit
+ * does not use.
+ *
+ * pixelvalve1 is nevertheless marked below, and it MUST be. It shares GIC
+ * SPI 110 with pixelvalve4 (both /soc/pixelvalve@7e207000 and
+ * /soc/pixelvalve@7e216000 carry `interrupts = <0 0x6e 4>` in the shipped
+ * bcm2711-rpi-4-b.dtb), and leaving a shared SPI with the hardware domain is
+ * exactly what makes DomD's claim FAIL — the opposite of what an earlier
+ * version of this comment asserted:
+ *
+ *   - Xen enumerates the host DT for the hardware domain in handle_node()
+ *     (xen/arch/arm/domain_build.c). Its only skip conditions are
+ *     skip_matches, platform_device_is_blacklisted(), used_by == DOMID_XEN,
+ *     an IOMMU node, a node using PPIs, and a reserved path. **There is no
+ *     `status` check anywhere on that path**, and
+ *     map_device_irqs_to_domain() (xen/arch/arm/device.c) likewise does not
+ *     look at `status` — so `status = "disabled"` does NOT protect a node.
+ *   - For an unmarked node handle_device() computes
+ *     own_device = !dt_device_for_passthrough(dev) = true, so
+ *     map_device_irqs_to_domain(d, dev, need_mapping=true, ...) actually
+ *     ROUTES SPI 110 to Dom0. For a marked node need_mapping is false and Xen
+ *     only grants permission, without routing.
+ *   - Dom0 is built before the dom0less domains, so by the time DomD's
+ *     pixelvalve4 asks for SPI 110 the vIRQ is taken and route_irq_to_guest()
+ *     returns -EBUSY, aborting DomD construction.
+ *
+ * Marking pixelvalve1 costs nothing: no domain claims it, DomD does not
+ * declare it, and its MMIO stays unmapped in every guest. It only stops Xen
+ * from handing SPI 110 to Dom0 first. This is the same hazard the boot scripts
+ * handle with `fdt rm` for uart2..uart5 (shared SPI 121) and for
+ * /soc/mmcnr@7e300000 + /soc/mmc@7e300000 (shared SPI 126); it is expressed as
+ * a marker here because a mistyped path in `fdt rm` is silently ignored by the
+ * U-Boot Hush parser, whereas a mistyped &label makes `fdt apply` fail loudly.
+ * The DomD passthrough cross-check enforces the whole class mechanically.
+ */
+&mailbox     { xen,passthrough; };
+&firmware    { xen,passthrough; };
+&hvs         { xen,passthrough; };
+&v3d         { xen,passthrough; };
+&vc4         { xen,passthrough; };
+&txp         { xen,passthrough; };
+&aon_intr    { xen,passthrough; };
+&dvp         { xen,passthrough; };
+&hdmi0       { xen,passthrough; };
+&hdmi1       { xen,passthrough; };
+&ddc0        { xen,passthrough; };
+&ddc1        { xen,passthrough; };
+&pixelvalve2 { xen,passthrough; };
+&pixelvalve4 { xen,passthrough; };
+/* Not driven by any domain — withheld from Dom0 only because it shares GIC
+ * SPI 110 with pixelvalve4. See the SPI-110 note above. */
+&pixelvalve1 { xen,passthrough; };
+&avs_monitor { xen,passthrough; };
+
+/*
+ * bcm2835-pm (/soc/watchdog@7e100000): V3D's power domain (<&pm 1> =
+ * BCM2835_POWER_DOMAIN_GRAFX_V3D) and reset (<&pm 0> = BCM2835_RESET_V3D), which
+ * the DomD partial DT claims with xen,path. Without this marker BOTH domains own
+ * the block: handle_device() computes own_device = !dt_device_for_passthrough(dev)
+ * and maps all three reg pages (0xfe100000 / 0xfe00a000 / 0xfec11000) into Dom0's
+ * p2m, and Xen only writes status="disabled" into the hwdom DT for passthrough
+ * nodes — so Dom0 keeps the node enabled, binds bcm2835-pm, and registers
+ * /dev/watchdog (CONFIG_BCM2835_WDT=y in bcm2711_defconfig, no clocks required)
+ * on the very PM_RSTC/PM_WDOG registers DomD uses to power and reset the 3D core.
+ *
+ * Xen's own rpi4 blacklist does NOT cover it: the entry is
+ * DT_MATCH_COMPATIBLE("brcm,bcm2835-pm") while the shipped DTB says
+ * compatible = "brcm,bcm2711-pm", "brcm,bcm2835-pm-wdt" — no exact match, so
+ * neither the blacklist nor rpi4_reset()'s dt_find_compatible_node() finds it.
+ * A `xen,passthrough` marker here is the only withhold mechanism that works on
+ * this DTB.
+ */
+&pm          { xen,passthrough; };
+
+/*
+ * firmwarekms and the legacy bcm2708_fb are the two ways the VideoCore keeps
+ * ownership of HDMI after boot (the "a Dom0 framebuffer stays on screen"
+ * failure mode). Marking them passthrough keeps them away from the hardware
+ * domain; boot.cmd additionally sets status="disabled" and drops
+ * /chosen/framebuffer, and config.txt carries disable_fw_kms_setup=1.
+ */
+&firmwarekms { xen,passthrough; };
+&fb          { xen,passthrough; };
+
+/*
+ * ---------------------------------------------------------------------------
+ * I/O that replaces RP1 on this SoC.
+ * ---------------------------------------------------------------------------
+ * USB2: on-SoC dwc2 (/soc/usb@7e980000, GIC SPI 73 "usb" + SPI 40 "soft").
+ *       Needs no MSI at all -- but on a Pi 4 Model B it drives ONLY the USB-C
+ *       connector, which is also the power input and comes up in peripheral
+ *       mode. The four USB-A ports are NOT on it. So this is not the "safe
+ *       fallback for the touch panel" it first appears to be; see the SCOPE
+ *       WARNING in bcm2711-raspberrypi4-64-usb.dtso.
+ * USB3: VL805 xHCI behind /scb/pcie@7d500000 -- this is what carries the four
+ *       USB-A ports, so on a Model B it is effectively MANDATORY for the touch
+ *       panel rather than optional. Unlike BCM2712's MIP, the BCM2711 root
+ *       complex contains its OWN MSI controller (msi-parent = <&pcie0>,
+ *       msi-controller, GIC SPI 148), and the MSI doorbell is a PCI bus address
+ *       captured by the RC's internal MSI BAR, so it never reaches DRAM and
+ *       needs no p2m mapping. With the stock 3 GiB dma-ranges pcie-brcmstb
+ *       selects BRCM_MSI_TARGET_ADDR_GT_4GB (0xf_fffffffc). A guest that gets
+ *       the RC MMIO 1:1 plus SPI 148 can therefore program MSI directly, which
+ *       is a much shorter path than the RPi5 MIP route.
+ *
+ * Ethernet: GENET is on-SoC here (/scb/ethernet@7d580000) and goes to DomD in
+ * BOTH Dom0 flavours, exactly as RP1's NIC did on RPi5. DomD owns the flat L2
+ * bridge (xenbr0, 192.168.10.10) and Dom0 reaches the network through the
+ * Dom0<->DomD vif (xen-netfront), so the Zephyr Dom0 needs no network stack at
+ * all. Consequence, same as on RPi5: Dom0 has no direct NIC — manage it over
+ * the Xen PV console until the DomD bridge is up.
+ *
+ * `power` is the firmware-backed power-domain provider
+ * (/soc/power, raspberrypi,bcm2835-power). It has no MMIO, but it follows the
+ * mailbox to DomD: dwc2 references <&power 6>, and leaving the node with the
+ * hardware domain would just make its probe fail there anyway, since `firmware`
+ * is handed over.
+ *
+ * SD (emmc2) is deliberately NOT marked here: ownership is flavour-specific and
+ * is decided at runtime by the per-flavour boot.cmd, exactly as on RPi5.
+ */
+&usb         { xen,passthrough; };
+&pcie0       { xen,passthrough; };
+&genet       { xen,passthrough; };
+&power       { xen,passthrough; };

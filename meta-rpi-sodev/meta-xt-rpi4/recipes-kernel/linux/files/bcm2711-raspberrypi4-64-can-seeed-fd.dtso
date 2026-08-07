@@ -1,0 +1,172 @@
+/*
+ * Copyright (c) 2025 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Seeed 2-channel CAN-FD HAT (dual MCP251xFD + PCF85063 RTC) on SPI0/I2C1 for
+ * the base DomD partial DT.
+ * Optional: MACHINE_FEATURES "domd_can" + DOMD_CAN_TYPE = "seeed-fd".
+ *
+ * Ported from the BCM2712/RP1 version: RP1's Synopsys DW-APB SSI + AXI DMA and
+ * Synopsys DesignWare I2C become the on-SoC BCM2835 SPI0 (0xfe204000, GIC SPI
+ * 118) and BCM2711 I2C1 (0xfe804000, GIC SPI 117), and RP1's string-based
+ * pinctrl becomes brcm,pins / brcm,function on the bcm2711 GPIO bank.
+ *
+ * Wiring follows the Seeed 2-CH CAN-FD HAT documentation:
+ *   CE0 (GPIO8) -> can0, INT on GPIO25
+ *   CE1 (GPIO7) -> can1, INT on GPIO24
+ *   RTC on I2C1 (GPIO2/GPIO3) at address 0x51
+ *
+ * See bcm2711-raspberrypi4-64-can-mcp2515.dtso for the SPI0 CLOCK CAVEAT — the
+ * same fixed-clock stand-in and core_freq pinning applies here.
+ *
+ * NOT VERIFIED ON HARDWARE — the cockpit build leaves domd_can off.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&passthrough {
+	can0_osc: mcp251xfd-spi0-0-osc {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <40000000>;
+	};
+
+	can1_osc: mcp251xfd-spi0-1-osc {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <40000000>;
+	};
+
+	/* Stand-in for cprman BCM2835_CLOCK_VPU — see the mcp2515 overlay. */
+	clk_spi0: clk-spi0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <250000000>;
+		clock-output-names = "spi0-core";
+	};
+
+	/* I2C1's host clock is cprman BCM2835_CLOCK_VPU as well. */
+	clk_i2c1: clk-i2c1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <250000000>;
+		clock-output-names = "i2c1-core";
+	};
+};
+
+&soc_bus {
+	/*
+	 * On-SoC pinctrl/GPIO. Defined here rather than in the base DomD partial DT
+	 * because the SPI-attached CAN controllers are its only consumer, and its two
+	 * GIC SPIs (113/114) must not be claimed unless can-passthrough.dtso is also
+	 * applied to the host DT -- otherwise Xen keeps the node with the hardware
+	 * domain and DomD's request for those SPIs fails with -EBUSY.
+	 */
+	gpio: gpio@fe200000 {
+		compatible = "brcm,bcm2711-gpio";
+		reg = <0x0 0xfe200000 0x0 0xb4>;
+		interrupts = <0x0 113 0x4>,
+			     <0x0 114 0x4>;
+		interrupt-parent = <&gic>;
+		gpio-controller;
+		#gpio-cells = <0x2>;
+		interrupt-controller;
+		#interrupt-cells = <0x2>;
+		xen,path = "/soc/gpio@7e200000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe200000 0x0 0x1000 0x0 0xfe200000>;
+		status = "okay";
+
+		spi0_pins: spi0-pins {
+			brcm,pins = <9 10 11>;
+			brcm,function = <4>;		/* ALT0 = SPI0 */
+		};
+
+		spi0_cs_pins: spi0-cs-pins {
+			brcm,pins = <8 7>;
+			brcm,function = <1>;		/* output */
+		};
+
+		i2c1_pins: i2c1-pins {
+			brcm,pins = <2 3>;
+			brcm,function = <4>;		/* ALT0 = I2C1 */
+		};
+
+		can0_pins: mcp251xfd-spi0-0-pins {
+			brcm,pins = <25>;
+			brcm,function = <0>;		/* input (INT) */
+		};
+
+		can1_pins: mcp251xfd-spi0-1-pins {
+			brcm,pins = <24>;
+			brcm,function = <0>;		/* input (INT) */
+		};
+	};
+};
+
+&soc_bus {
+	spi0: spi@fe204000 {
+		compatible = "brcm,bcm2835-spi";
+		reg = <0x0 0xfe204000 0x0 0x200>;
+		interrupts = <0x0 118 0x4>;	/* GIC SPI 118 */
+		interrupt-parent = <&gic>;
+		clocks = <&clk_spi0>;
+		#address-cells = <0x1>;
+		#size-cells = <0x0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spi0_pins>, <&spi0_cs_pins>;
+		cs-gpios = <&gpio 8 1>, <&gpio 7 1>;
+		xen,path = "/soc/spi@7e204000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe204000 0x0 0x1000 0x0 0xfe204000>;
+		status = "okay";
+
+		can0: mcp251xfd@0 {
+			compatible = "microchip,mcp251xfd";
+			reg = <0x00>;
+			clocks = <&can0_osc>;
+			spi-max-frequency = <20000000>;
+			interrupt-parent = <&gpio>;
+			interrupts = <25 0x8>;		/* GPIO25, IRQ_TYPE_LEVEL_LOW */
+			pinctrl-names = "default";
+			pinctrl-0 = <&can0_pins>;
+		};
+
+		can1: mcp251xfd@1 {
+			compatible = "microchip,mcp251xfd";
+			reg = <0x01>;
+			clocks = <&can1_osc>;
+			spi-max-frequency = <20000000>;
+			interrupt-parent = <&gpio>;
+			interrupts = <24 0x8>;		/* GPIO24, IRQ_TYPE_LEVEL_LOW */
+			pinctrl-names = "default";
+			pinctrl-0 = <&can1_pins>;
+		};
+	};
+
+	i2c1: i2c@fe804000 {
+		compatible = "brcm,bcm2711-i2c", "brcm,bcm2835-i2c";
+		reg = <0x0 0xfe804000 0x0 0x1000>;
+		interrupts = <0x0 117 0x4>;	/* GIC SPI 117 */
+		interrupt-parent = <&gic>;
+		clocks = <&clk_i2c1>;
+		clock-frequency = <100000>;
+		#address-cells = <0x1>;
+		#size-cells = <0x0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c1_pins>;
+		xen,path = "/soc/i2c@7e804000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe804000 0x0 0x1000 0x0 0xfe804000>;
+		status = "okay";
+
+		pcf85063@51 {
+			compatible = "nxp,pcf85063";
+			reg = <0x51>;
+		};
+	};
+};

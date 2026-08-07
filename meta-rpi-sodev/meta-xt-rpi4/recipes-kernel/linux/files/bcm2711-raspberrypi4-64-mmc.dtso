@@ -1,0 +1,82 @@
+/*
+ * Copyright (c) 2024 EPAM systems
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * BCM2711 SD-card (emmc2) passthrough for the base DomD partial DT.
+ *
+ * BCM2712's `brcm,bcm2712-sdhci` at 0x10_00fff000 with four reg blocks
+ * (host/cfg/busisol/lcpll), a brcmstb AON GPIO card-detect and GIC SPI 273 is
+ * BCM2712-only. RPi4 has a single-block `brcm,bcm2711-emmc2` at 0xfe340000 on
+ * GIC SPI 126, with `broken-cd` (the RPi4 slot has no card-detect line) and the
+ * two supply regulators driven by the firmware GPIO (expgpio) instead of a
+ * brcmstb GPIO bank.
+ *
+ * The controller goes under &emmc2_bus, whose dma-ranges carry the 0xc0000000
+ * VideoCore bus alias bounded to DomD's low static-mem bank: on BCM2711 the SD
+ * controller has the same low-1 GiB DMA limit as the mailbox and the display
+ * fetch, which is why all three have to live in the same domain.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&emmc2_bus {
+	emmc2: mmc@fe340000 {
+		compatible = "brcm,bcm2711-emmc2";
+		reg = <0x0 0xfe340000 0x0 0x100>;
+		interrupts = <0x0 126 0x4>;		/* GIC SPI 126 */
+		interrupt-parent = <&gic>;
+		clocks = <&clk_emmc2>;
+		vqmmc-supply = <&sd_io_1v8_reg>;
+		vmmc-supply = <&sd_vcc_reg>;
+		broken-cd;
+		mmc-ddr-3_3v;
+		bus-width = <0x4>;
+		xen,path = "/emmc2bus/mmc@7e340000";
+		xen,force-assign-without-iommu;
+		xen,reg = <0x0 0xfe340000 0x0 0x1000 0x0 0xfe340000>;
+		status = "okay";
+	};
+};
+
+&passthrough {
+	/*
+	 * The host clock is <&clocks BCM2711_CLOCK_EMMC2> (cprman index 0x33).
+	 * sdhci-iproc only reads the rate to derive its divider, so a fixed
+	 * 100 MHz — the BCM2711 emmc2 base rate — avoids dragging cprman (and
+	 * its clk-osc / dsi PHY clock providers) into the driver domain.
+	 */
+	clk_emmc2: clk-emmc2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0x0>;
+		clock-output-names = "emmc2-clock";
+		clock-frequency = <100000000>;
+	};
+
+	sd_io_1v8_reg: sd-io-1v8-reg {
+		compatible = "regulator-gpio";
+		regulator-name = "vdd-sd-io";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-boot-on;
+		regulator-always-on;
+		regulator-settling-time-us = <5000>;
+		gpios = <&expgpio 4 0>;			/* VDD_SD_IO_SEL */
+		states = <1800000 0x1>, <3300000 0x0>;
+		status = "okay";
+	};
+
+	sd_vcc_reg: sd-vcc-reg {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-sd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-boot-on;
+		enable-active-high;
+		gpios = <&expgpio 6 0>;			/* SD_PWR_ON */
+		status = "okay";
+	};
+};
