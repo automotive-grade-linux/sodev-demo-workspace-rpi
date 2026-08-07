@@ -1,0 +1,74 @@
+# Recorded functional differences between the per-board product yamls,
+# after tools/check-yaml-drift.py normalises the board-specific tokens.
+# '-' is present only in rpi5-sodev.yaml, '+' only in rpi4-sodev.yaml.
+# Regenerate with: tools/check-yaml-drift.py --update
++                - ["IMAGE_CLASSES:remove", "sdcard_image-rpi"]
++                - ["IMAGE_FSTYPES:remove", "rpi-sdimg"]
++                - ["PREFERRED_PROVIDER_virtual/kernel", "linux-raspberrypi"]
++                - [PREFERRED_PROVIDER_u-boot-default-script, "xt-rpi-u-boot-scr"]
++          "bcm2712-rpi-4-b.dtb": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712-rpi-4-b.dtb"
++          "bl31.bin":       "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bl31.bin"
++          "overlays/disable-bt.dtbo": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/disable-bt.dtbo"
++          BOARD_RAM: "4g"
++          BOARD_RAM: "8g"
++          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/ meta-xt-rpi5/recipes-extended/xt-xen-cfg-doma/ meta-xt-rpi5/recipes-extended/xt-aaos-host-services/"
++        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-mmc.dtbo"
++        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-pcie1.dtbo"
++        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-usb.dtbo"
++        - "tmp/deploy/images/%{MACHINE}/%{XT_DOMD_DTB_NAME}"
++        - "tmp/deploy/images/%{MACHINE}/bcm2712-rpi-4-b.dtb"
++        - "tmp/deploy/images/%{MACHINE}/bl31.bin"
++        - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup_x.dat"
++        - "tmp/deploy/images/%{MACHINE}/bootfiles/start_x.elf"
++        - "tmp/deploy/images/%{MACHINE}/disable-bt.dtbo"
++        - "tmp/deploy/images/%{MACHINE}/mmc-passthrough.dtbo"
++        - "tmp/deploy/images/%{MACHINE}/pcie1-passthrough.dtbo"
++        - "tmp/deploy/images/%{MACHINE}/rpi5-image-xt-domd-vc4-initramfs-%{MACHINE}.rootfs.cpio.gz"
++        - "tmp/deploy/images/%{MACHINE}/usb-passthrough.dtbo"
++        - ["IMAGE_CLASSES:remove", "sdcard_image-rpi"]
++        - ["IMAGE_FSTYPES:remove", "rpi-sdimg"]
++        - ["PREFERRED_PROVIDER_virtual/kernel", "linux-raspberrypi"]
++        - [AAOS_DEVICE, "%{ANDROID_DEVICE}"]
++        - [AAOS_KERNEL_TREE, "${TOPDIR}/../../%{ANDROID_KERNEL_DIR}"]
++        - [AAOS_SRC_TREE, "${TOPDIR}/../../%{DOMA_DIR}"]
++        variables:
++      default: true
++      overrides:
++    "4g":
++    "8g":
++    desc: "DomD rootfs only (RPi5)"
++    desc: "Full RPi5(BCM2711)+Xen SD image (thin Linux or Zephyr Dom0 + dom0less DomD + DomU AGL + DomA AAOS)"
++    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1024 MiB; DomU or DomA, one at a time)"
++  ANDROID_KERNEL_DIR: "android_kernel-rpi5"
++  BOARD_RAM:
++  DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}. On a new board bring the thin-Linux Dom0 up first: it is a relocatable arm64 Image, so it does not depend on the Zephyr SRAM relink being right.
++  DOMA_DIR: "android-rpi5"
++  MACHINE: "raspberrypi5"   # meta-raspberrypi machine (SOC_FAMILY=rpi, MACHINEOVERRIDES raspberrypi5, DEFAULTTUNE cortexa76-nocrypto)
+-                - [BOARD_RAM, "%{BOARD_RAM}"]
+-                - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
+-          "armstub8-2712.bin": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/armstub8-2712.bin"
+-          "bcm2712-rpi-5-b.dtb": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712-rpi-5-b.dtb"
+-          "overlays/bcm2712d0.dtbo": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712d0.dtbo"
+-          BOARD_RAM: "16g"
+-          BOARD_RAM: "8g"
+-          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/"
+-        - "../../meta-rpi-sodev/xt-prod-devel-rpi5-domd"
+-        - "tmp/deploy/images/%{MACHINE}/armstub8-2712.bin"
+-        - "tmp/deploy/images/%{MACHINE}/bcm2712-rpi-5-b.dtb"
+-        - "tmp/deploy/images/%{MACHINE}/bcm2712d0.dtbo"
+-        - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
+-        variables:
+-      default: true
+-      overrides:
+-    "16g":
+-    "8g":
+-    desc: "Full RPI image"
+-    desc: "Full RPi5+Xen SD image (Dom0 + DomD, optional DomU AGL / DomA AAOS)"
+-    desc: "Target Raspberry Pi 5 SKU: 16g (default; full 4-domain cockpit) or 8g (DomD and DomA 3072 MiB each; the four domains then total 7680 MiB and fit an 8 GB board -- see the comment above)"
+-  ANDROID_KERNEL_DIR: "android_kernel"
+-  BOARD_RAM:
+-  BOARD_RAM: "16g"           # default 16g (16 GB board); overridable: --BOARD_RAM {16g|8g}
+-  DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}
+-  DOMA_DIR: "android"
+-  MACHINE: "raspberrypi5"
+-  XEN_DT_SCMI_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen-scmi"

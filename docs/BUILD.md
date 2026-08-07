@@ -73,6 +73,13 @@ Dom0 (`--dom0=zephyr` is the default, so it needs no flag). `-a` is a synonym fo
 `auto` has nothing to choose between. If you already have an AOSP checkout or a repo object
 mirror, see *Which starting point do you have?* -- it saves the sync, not the build.
 
+Every command above builds for a **Raspberry Pi 5**, which is the default. Add
+`--board=rpi4` to build for a Raspberry Pi 4 Model B instead; that switches the whole
+configuration (`rpi4-sodev.yaml` instead of `rpi5-sodev.yaml`, `meta-xt-rpi4` instead of
+`meta-xt-rpi5`, BCM2711 device trees and memory map) and changes what `--ram` accepts --
+`8g`/`4g` there, `16g`/`8g` on the Pi 5. Nothing else in this walkthrough differs. What
+is verified on that board is listed in `meta-rpi-sodev/meta-xt-rpi4/README.md`.
+
 ### 4. Build the container image
 
 Nothing to do -- `build.sh` builds `sodev-builder` from `docker/Dockerfile.builder` on
@@ -331,7 +338,9 @@ the same known-good revision the Docker image uses (`docker/Dockerfile.builder`)
 pip install git+https://github.com/xen-troops/moulin.git@83e80587c4b1348714237d3ff53129857288a420
 ```
 
-This project provides additional parameters; check them with `--help-config`:
+This project provides additional parameters; check them with `--help-config`. There is one
+yaml per board -- `rpi5-sodev.yaml` and `rpi4-sodev.yaml` -- and they take the same four
+parameters, differing only in the SKUs `--BOARD_RAM` accepts:
 
 ```
 $ moulin rpi5-sodev.yaml --help-config
@@ -367,6 +376,7 @@ assemble the image:
 ```sh
 moulin rpi5-sodev.yaml                                        # defaults: DOM0_OS=zephyr, ENABLE_DOMU=no, ENABLE_ANDROID=no
 # moulin rpi5-sodev.yaml --DOM0_OS linux --ENABLE_ANDROID no  # other flavours
+# moulin rpi4-sodev.yaml --BOARD_RAM 8g                       # Raspberry Pi 4 (BOARD_RAM is 8g|4g there)
 ninja                # builds the configured domains (takes time and disk)
 ninja image-full     # assembles full.img (the GPT SD image)
 ```
@@ -533,6 +543,39 @@ AOSP checkout to derive from and so takes those two artifacts out of the bundle.
 checkout **or** a mirror is found, else it fails (or, for an explicit `--aaos=auto`, falls
 back to a DomA-less image). The first row is the one case `-a` cannot reach — with nothing
 to go on it has nothing to choose — so name `--aaos=source` explicitly there.
+
+### Prebuilt bundles are board-specific
+
+A prebuilt AAOS bundle is not portable between boards. The AAOS guest is compiled for the
+ISA of the host cores it runs on — a virtio guest still executes on the host's CPUs — and
+`xenvm_trout_rpi4_arm64` builds with `TARGET_CPU_VARIANT := cortex-a72` where the upstream
+product uses `cortex-a53`, whose LLVM feature set implies the ARMv8 crypto extensions that
+a Cortex-A72 does not have.
+
+Nothing about the images makes that visible. `MANIFEST.md5` answers *is this bundle
+intact*, not *is this bundle for this board*: a correctly formed bundle for the other
+board verifies perfectly, stages, gets assembled into p4, and the build exits 0 — and then
+the guest dies in `/init` with SIGILL on the first boot. Yocto has no equivalent hazard
+because `PACKAGE_ARCH` is part of every sstate key and `DEPLOY_DIR_IMAGE` is per MACHINE;
+a bundle of images has neither.
+
+So a bundle declares what it is, in a `BUNDLE-INFO` file beside `MANIFEST.md5`:
+
+```
+board=rpi4
+device=xenvm_trout_rpi4_arm64
+cpu_variant=cortex-a72          # optional, informational
+```
+
+`build.sh` refuses a bundle whose `board=` (or `device=`) disagrees with `--board`. The
+default probe prefers `<workspace>/aaos-prebuilt-<board>/` over the untagged
+`<workspace>/aaos-prebuilt/`, so the two can coexist.
+
+Bundles produced before this check exist and have no `BUNDLE-INFO`. Every one of them
+predates a second board, i.e. was built for rpi5, so an untagged bundle is accepted for
+`--board=rpi5` with a note and refused for anything else. If you know an untagged bundle
+was built for the board you are building, `AAOS_PREBUILT_ASSUME_BOARD=<board>` proceeds
+without the check.
 
 ### AAOS build modes (`--aaos`)
 

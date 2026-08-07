@@ -53,14 +53,29 @@ git clone <this repository> && cd sodev-demo-workspace-rpi
 git submodule update --init --recursive
 
 # 2. Build the SD image  ->  full.img   (build.sh applies the Zephyr Dom0 patches for you)
-./build.sh                       # DEFAULT: Dom0(Zephyr) + DomD   (guest-less, fast)
+./build.sh                       # DEFAULT: Raspberry Pi 5, Dom0(Zephyr) + DomD   (guest-less, fast)
 # ./build.sh -u                  # + DomU (AGL instrument cluster)
 # ./build.sh -u -a               # + DomU + DomA (AAOS) = full 4-domain cockpit
 # ./build.sh --dom0=linux -u -a  # thin Linux control Dom0 instead of Zephyr
+# ./build.sh --board=rpi4 -u -a  # Raspberry Pi 4 (BCM2711) instead of Pi 5
 
 # 3. Flash it to an SD card (double-check <sd-dev>!)
 sudo dd if=full.img of=/dev/<sd-dev> bs=4M conv=fsync status=progress
 ```
+
+The image is named after the configuration it contains, so building a second one
+does not replace the first and a card you flashed months ago can still be
+identified:
+
+```
+rpi5-16GB-Dom0Zephyr-DomU-DomA-20260809-1750.img
+^^^^ ^^^^ ^^^^^^^^^^ ^^^^^^^^^ ^^^^^^^^^^^^^
+board SKU  Dom0       guests    build date and time (local)
+                      present
+```
+
+`full.img` is a symlink to the newest one, so the `dd` line above — and anything
+else that refers to `full.img` — keeps working.
 
 Before you build:
 - The **default** image is guest-less (Dom0 + DomD): it boots but shows **no
@@ -108,8 +123,9 @@ disables the heavy Android/Flatcar guests by default).
 
 | Flag (env var) | Default | Effect |
 |---|---|---|
+| `--board=<board>` (`BOARD`) | **rpi5** | Which board to build: `rpi5` or `rpi4`. Selects `<board>-sodev.yaml`, and with it the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical memory map and board layer (`meta-xt-rpi5` or `meta-xt-rpi4` — never both). Raspberry Pi 5 is the reference platform; see *meta-xt-rpi4/README.md* for what the Raspberry Pi 4 configuration is verified against |
 | `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). Both flavours are HW-verified on a real RPi5, at both `--ram` values; the Zephyr flavour is the shipping default. See the verification note in *Boot process* (`docs/DESIGN.md`). |
-| `--ram=16g\|8g` (`BOARD_RAM`) | **16g** | Target Raspberry Pi 5 SKU. `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`) |
+| `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 256 + DomD 1920 + DomU 1024 + DomA 2560; `4g` takes DomD to 1024 MiB (bank2 dropped, bank0 to 640 MiB) and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
@@ -160,11 +176,16 @@ payloads), rootfs partitions for the Linux domains, and — when
 assembled the V4H way from the `doma`/`doma_kernel` moulin components).
 
 ## Hardware & displays
-- Raspberry Pi 5 (BCM2712 + RP1). Both the **16 GB** and the **8 GB** SKU are
-  supported; `--ram=16g|8g` selects which (16g is the default). The full 4-domain
-  build comes to 9728 MiB on 16g and 7680 MiB on 8g — see *Board RAM size* (`docs/DESIGN.md`).
-  Official 27 W (5 A) PSU required — 3 A supplies negotiate low current and
-  corrupt the HDMI scanout.
+- Raspberry Pi 5 (BCM2712 + RP1) — the reference platform. Both the **16 GB** and the
+  **8 GB** SKU are supported; `--ram=16g|8g` selects which (16g is the default). The
+  full 4-domain build comes to 9728 MiB on 16g and 7680 MiB on 8g — see *Board RAM size*
+  (`docs/DESIGN.md`). Official 27 W (5 A) PSU required — 3 A supplies negotiate low
+  current and corrupt the HDMI scanout.
+- Raspberry Pi 4 Model B (BCM2711), via `--board=rpi4`. **8 GB** and **4 GB** SKUs;
+  four domains need the 8 GB board. Every USB-A port is behind the VL805 xHCI, so the
+  touch panel depends on passing that controller through. What is and is not verified on
+  this board, and the open items, are listed in
+  `meta-rpi-sodev/meta-xt-rpi4/README.md`.
 - HDMI-A-1: 1920x720 cluster panel (forced CVT modeline — its EDID does not come through).
 - HDMI-A-2: 1920x720 IVI panel (forced modeline transcribed from its EDID). This panel
   answers the EDID read **3.7 s late**, which used to leave it dark for the whole
@@ -201,7 +222,8 @@ See also:
 ```
 .
 ├── build.sh                 # orchestrator (Docker; mirror of AGL sodev-demo-workspace/build.sh)
-├── rpi5-sodev.yaml          # moulin entry: Dom0/DomD/DomU/DomA build + SD-image wiring
+├── rpi5-sodev.yaml          # moulin entry (Raspberry Pi 5): Dom0/DomD/DomU/DomA build + SD-image wiring
+├── rpi4-sodev.yaml          # moulin entry (Raspberry Pi 4 / BCM2711); ./build.sh --board=rpi4
 ├── docker/                  # unified sodev-builder build image (built on demand)
 ├── docs/                    # BUILD.md (build detail) / DESIGN.md (why) / TROUBLESHOOTING.md
 ├── external/
@@ -219,6 +241,7 @@ See also:
 │   │   ├── meta-xt-{qemu,security}/ # vendored upstream
 │   │   └── recipes-extended/xen-common/   # shared Xen 4.21 hypervisor patch series (both Dom0 flavours)
 │   ├── meta-xt-rpi5/                # RPi5 BSP: u-boot/TFA/boot.scr, Xen 4.21 patch series, xen dtso, kernel DT/cfg
+│   ├── meta-xt-rpi4/                # RPi4 BSP, the sibling of the above (BCM2711). Mutually exclusive with it
 │   ├── xt-prod-devel-rpi5-domd/     # vendored upstream DomD product layer
 │   ├── meta-rpi-sodev-devel/        # opt-in diagnostic/debug/prototype layer (NOT in the shipping build; p4-tool etc.)
 │   └── scripts/                     # helpers: guest-pin sync (sync-guest-pins)
@@ -227,7 +250,13 @@ See also:
     │                            more than one layer, so they are NOT under
     │                            meta-rpi-sodev/scripts/ (which is layer-scoped). No
     │                            recipe references them; they are developer/CI tools.
-    └── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
+    ├── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
+    ├── check-yaml-drift.py         # the two product yamls share ~750 lines by copy; fails on
+    │                                   unrecorded divergence (yaml-drift-baseline.txt records the
+    │                                   64+ differences that are there by design)
+    └── compare-sd-image.py         # compare a fresh SD image against one that booted, judging
+                                        deterministic / timestamp-contaminated / deliberately-
+                                        different artifacts by different criteria
 ```
 
 ## Zephyr Dom0 (DOM0_OS=zephyr, the default)

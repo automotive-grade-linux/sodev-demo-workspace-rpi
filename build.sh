@@ -18,8 +18,9 @@ workdir="$(cd "$(dirname "$0")" && pwd)"
 cd "$workdir"
 
 # --- knobs (flag defaults; each is overridable by env or by the flags below) ---
+BOARD="${BOARD:-rpi5}"                             # --board=rpi5|rpi4 : which product yaml to build (selects <board>-sodev.yaml)
 DOM0_OS="${DOM0_OS:-zephyr}"                       # --dom0=zephyr|linux
-BOARD_RAM="${BOARD_RAM:-16g}"                      # --ram=16g|8g : target Raspberry Pi 5 SKU (16 GiB default; 8g takes DomD and DomA to 3072 MiB each)
+BOARD_RAM="${BOARD_RAM:-}"                         # --ram=<sku> : board SKU. rpi5: 16g(default)|8g. rpi4: 8g(default)|4g. Resolved after --board, below.
 ENABLE_DOMU="${ENABLE_DOMU:-no}"                   # -u/--domu    : add DomU (AGL cluster: p1 kernel + p3 rootfs)
 ENABLE_ANDROID="${ENABLE_ANDROID:-no}"             # -a/--android : add DomA (AAOS p4 nested GPT; heavy)
 NINJA_TARGET="${NINJA_TARGET-image-full}"          # --domains-only => "" (build domains, skip SD assembly)
@@ -36,7 +37,9 @@ REBUILD_IMAGES="${REBUILD_IMAGES:-0}"              # --rebuild-images
 XT_DOCKER_NETWORK="${XT_DOCKER_NETWORK:-}"         # --network for the build containers, e.g. "host"
 XT_DOCKER_RUN_OPTS="${XT_DOCKER_RUN_OPTS:-}"       # extra `docker run` opts for the build containers, e.g. "--memory=48g --cpus=12" (recommended on shared hosts to bound the heavy AOSP/Yocto steps; empty = no limit)
 PROXY="${HTTPS_PROXY:-}"                            # --proxy=<url>
-MOULIN_YAML="rpi5-sodev.yaml"
+# Set from BOARD once the flags are parsed (see "Board selection" below). Assigning it
+# here would freeze the rpi5 yaml before --board is read.
+MOULIN_YAML=""
 AGL_IMAGE="${AGL_IMAGE:-agl-cluster-demo-flutter-guest}"
 AGL_MACHINE="${AGL_MACHINE:-virtio-aarch64}"
 XT_DOCKER="${XT_DOCKER:-sodev-builder}"                # unified build image: moulin/ninja (Yocto/Xen/Zephyr) + AOSP + AGL bitbake (docker/Dockerfile.builder)
@@ -47,20 +50,33 @@ Usage() {
   cat <<'EOF'
 Usage: ./build.sh [options]
 
-  RPi5 + Xen 4.21 AGL SoDeV disaggregated cockpit builder.
-  Default build = Dom0(Zephyr) + DomD only; guests are opt-in (upstream
-  sodev-demo-workspace f3f0f8f7 "disable Android/Flatcar by default").
+  Raspberry Pi + Xen 4.21 AGL SoDeV disaggregated cockpit builder.
+  Default build = Raspberry Pi 5, Dom0(Zephyr) + DomD only; guests are opt-in
+  (upstream sodev-demo-workspace f3f0f8f7 "disable Android/Flatcar by default").
+
+Board options:
+      --board=<board>    rpi5 (default) | rpi4. Selects <board>-sodev.yaml and with it
+                         the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical
+                         memory map and board layer. Raspberry Pi 5 is the reference
+                         platform; the Raspberry Pi 4 (BCM2711) configuration is
+                         verified by build and by the sending environment's hardware
+                         run, not re-verified on hardware here.
 
 Domain options:
   -u, --domu             Build DomU (AGL instrument cluster: p1 kernel + p3 AGL rootfs)
   -a, --android          Include DomA (AAOS, p4 nested GPT). Alias for --aaos=auto
                          (how DomA is produced is chosen by --aaos).
       --dom0=<os>        Dom0 OS: zephyr (default) | linux
-      --ram=16g|8g       Target Raspberry Pi 5 SKU. 16g (default) = full 4-domain map
-                         (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB).
-                         8g = DomD 3072 MiB (static-mem bank4 dropped) and DomA
-                         3072 MiB; Dom0/DomU keep their sizes, total 7680 MiB
-                         and fit an 8 GB board with ~436 MiB headroom.
+      --ram=<sku>        Board SKU. Valid values and the default depend on --board.
+                         rpi5: 16g (default) = full 4-domain map (Dom0 512 +
+                           DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB); 8g =
+                           DomD 3072 MiB (static-mem bank4 dropped) and DomA 3072 MiB,
+                           Dom0/DomU unchanged, total 7680 MiB, ~436 MiB headroom.
+                         rpi4: 8g (default) = Dom0 256 + DomD 1920 MiB (three static-mem
+                           banks) + DomU 1024 + DomA 2560; 4g = DomD 1024 MiB (bank2
+                           dropped, bank0 640 MiB); DomA and DomU then cannot RUN at
+                           the same time (each fits alone) -- build.sh says so and both
+                           still go on the SD, so pick one at run time.
       --domains-only     Build the domains but skip SD-image assembly (no full.img;
                          with -a this also skips the DomA p4 nested GPT, which rouge
                          assembles only during SD-image assembly)
@@ -72,8 +88,18 @@ DomA (AAOS) options:
                            prebuilt : consume a prebuilt AAOS bundle; NO AOSP build (fast)
                            auto     : prebuilt if a bundle is found, else source if an
                                       AOSP checkout is found, else off
-      --aaos-prebuilt=<dir>  Prebuilt AAOS bundle (layout: files/ + images/). Used by
-                             prebuilt/auto. Default probe: <workspace>/aaos-prebuilt
+      --aaos-prebuilt=<dir>  Prebuilt AAOS bundle (layout: files/ + images/, plus an
+                             optional MANIFEST.md5 and BUNDLE-INFO). Used by
+                             prebuilt/auto. Default probe:
+                             <workspace>/aaos-prebuilt-<board>, then
+                             <workspace>/aaos-prebuilt.
+                             A bundle is BOARD-SPECIFIC (the guest is compiled for the
+                             host CPU), so it should declare itself in BUNDLE-INFO:
+                                 board=rpi4
+                                 device=xenvm_trout_rpi4_arm64
+                             A mismatch against --board is refused. An untagged bundle
+                             is accepted for rpi5 only (they all predate multi-board
+                             support); AAOS_PREBUILT_ASSUME_BOARD=<board> overrides.
       --aaos-src=<dir>       Reuse an existing AOSP checkout for source mode (skip repo sync)
       --aaos-ref=<dir>       Repo OBJECT MIRROR for the AOSP tree: seed the checkout with
                              'repo init --reference=<dir>' so the sync is local. Accepts a
@@ -121,6 +147,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -u|--domu)          ENABLE_DOMU=yes ;;
     -a|--android)       ENABLE_ANDROID=yes ;;   # "want DomA"; required-ness is derived below (only when no explicit --aaos)
+    --board)            needval $# "$1"; BOARD="$2"; shift ;;
+    --board=*)          BOARD="${1#*=}" ;;
     --dom0)             needval $# "$1"; DOM0_OS="$2"; shift ;;
     --dom0=*)           DOM0_OS="${1#*=}" ;;
     --ram)              needval $# "$1"; BOARD_RAM="$2"; shift ;;
@@ -161,16 +189,57 @@ case "$DOM0_OS" in zephyr|linux) ;; *) echo "ERROR: --dom0 must be 'zephyr' or '
 # (ENABLE_ANDROID is not validated here: it is derived from the resolved --aaos mode.)
 case "$ENABLE_DOMU" in no|yes) ;; *) echo "ERROR: ENABLE_DOMU must be 'no' or 'yes' (got '$ENABLE_DOMU'); use -u/--domu" >&2; exit 1 ;; esac
 
+# --- Board selection (which product yaml) --------------------------------------
+# One yaml per board, named <board>-sodev.yaml. They are siblings, not variants of one
+# file: the SoC, the machine, the Zephyr Dom0 board, the passthrough set and the whole
+# physical memory map differ, and each yaml lists its own board layer (meta-xt-rpi5 or
+# meta-xt-rpi4 — never both, they provide the same recipe names).
+case "$BOARD" in
+  rpi5|rpi4) ;;
+  *) echo "ERROR: --board must be rpi5 or rpi4 (got '$BOARD')" >&2; exit 1 ;;
+esac
+MOULIN_YAML="${BOARD}-sodev.yaml"
+if [ ! -f "$MOULIN_YAML" ]; then
+  echo "ERROR: --board=$BOARD selects '$MOULIN_YAML', which is not in $workdir" >&2
+  exit 1
+fi
+
+# PRODUCT_DEVICE of the AAOS product this board builds. Read from the yaml so there is ONE
+# source of truth: rpi4 uses its own product variant (see the ANDROID_DEVICE comment there)
+# and its out/target/product/ directory is named after it. Resolved HERE, next to the board,
+# because the prebuilt staging path reads it long before the ninja command is assembled.
+AAOS_PRODUCT_DEVICE=$(sed -n 's/^[[:space:]]*ANDROID_DEVICE:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$MOULIN_YAML" | head -1)
+[ -n "$AAOS_PRODUCT_DEVICE" ] || { echo "ERROR: could not read ANDROID_DEVICE from $MOULIN_YAML" >&2; exit 1; }
+
+# The AOSP checkout and the AAOS guest-kernel checkout live under names the yaml owns,
+# and they are board-specific: rpi4 uses android-rpi4 / android_kernel-rpi4 where rpi5
+# uses the historical android / android_kernel. Read them here rather than hard-coding
+# "android", so build.sh cannot disagree with the yaml about where the tree is.
+AAOS_DIR_NAME=$(sed -n 's/^[[:space:]]*DOMA_DIR:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$MOULIN_YAML" | head -1)
+AAOS_KERNEL_DIR_NAME=$(sed -n 's/^[[:space:]]*ANDROID_KERNEL_DIR:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$MOULIN_YAML" | head -1)
+[ -n "$AAOS_DIR_NAME" ] || { echo "ERROR: could not read DOMA_DIR from $MOULIN_YAML" >&2; exit 1; }
+[ -n "$AAOS_KERNEL_DIR_NAME" ] || { echo "ERROR: could not read ANDROID_KERNEL_DIR from $MOULIN_YAML" >&2; exit 1; }
+
 # --- Board RAM size (moulin parameter BOARD_RAM) -------------------------------
-# 16g (default) or 8g. See the BOARD_RAM parameter in the yaml for the full rationale;
-# in short, the default map wants 10240 MiB with all four domains, which needs the
-# 16 GB board, and 8g takes DomD from 4096 to 3072 MiB and DomA from 4096 to 3072 MiB.
-# The split is measured: DomD 2048 alone left the DomA device model unable to serve a
-# 4 GiB guest and AAOS crash-looped in binder (hardware, 2026-08-03).
-# NOTE: 4g is an RPi4 value; it is rejected here rather than silently accepted.
-case "$BOARD_RAM" in
-  16g|8g) ;;
-  *) echo "ERROR: --ram must be 16g or 8g (got '$BOARD_RAM')" >&2; exit 1 ;;
+# The SKUs are per-board and so are the domain sizes; see the BOARD_RAM parameter in
+# the corresponding yaml for the full rationale.
+#
+# rpi5: 16g (default) or 8g. The default map wants 10240 MiB with all four domains,
+#   which needs the 16 GB board; 8g takes DomD from 4096 to 3072 MiB and DomA likewise.
+#   The split is measured: DomD 2048 alone left the DomA device model unable to serve a
+#   4 GiB guest and AAOS crash-looped in binder (hardware, 2026-08-03).
+# rpi4: 8g (default) or 4g. 4g drops DomD static-mem bank2 and shrinks bank0 to 640 MiB,
+#   taking DomD to 1024 MiB. DomA still fits there (verified on hardware with 158 MiB
+#   of Xen free memory left) -- what does not fit is DomA and DomU running together.
+case "$BOARD" in
+  rpi5) BOARD_RAM_VALID="16g 8g"; BOARD_RAM_DEFAULT="16g" ;;
+  rpi4) BOARD_RAM_VALID="8g 4g";  BOARD_RAM_DEFAULT="8g"  ;;
+esac
+[ -n "$BOARD_RAM" ] || BOARD_RAM="$BOARD_RAM_DEFAULT"
+# Word-boundary match, so "8g" does not match inside some future "18g".
+case " $BOARD_RAM_VALID " in
+  *" $BOARD_RAM "*) ;;
+  *) echo "ERROR: --ram for --board=$BOARD must be one of: $BOARD_RAM_VALID (got '$BOARD_RAM')" >&2; exit 1 ;;
 esac
 
 # --- Resolve the AAOS (DomA) build mode: off | auto | source | prebuilt ---
@@ -181,8 +250,18 @@ if [ -z "$AAOS_MODE" ]; then
   if [ "$ENABLE_ANDROID" = "yes" ]; then AAOS_MODE=auto; AAOS_REQUIRED=yes; else AAOS_MODE=off; fi
 fi
 case "$AAOS_MODE" in off|auto|source|prebuilt) ;; *) echo "ERROR: --aaos must be off|auto|source|prebuilt (got '$AAOS_MODE')" >&2; exit 1 ;; esac
-# Default bundle probe: a fresh clone can drop a bundle at <workspace>/aaos-prebuilt.
-[ -n "$AAOS_PREBUILT_DIR" ] || AAOS_PREBUILT_DIR="$workdir/aaos-prebuilt"
+# Default bundle probe: prefer a board-tagged bundle, then the untagged legacy path.
+# A prebuilt AAOS bundle is board-specific -- the guest is compiled for the ISA of the
+# host cores it runs on -- but it is an opaque set of images with no arch in its name, so
+# one shared default directory invites staging the wrong board's guest. Yocto has no such
+# hazard: PACKAGE_ARCH is part of every sstate key and DEPLOY_DIR_IMAGE is per MACHINE.
+if [ -z "$AAOS_PREBUILT_DIR" ]; then
+  if [ -d "$workdir/aaos-prebuilt-$BOARD/images" ]; then
+    AAOS_PREBUILT_DIR="$workdir/aaos-prebuilt-$BOARD"
+  else
+    AAOS_PREBUILT_DIR="$workdir/aaos-prebuilt"
+  fi
+fi
 # Detect what is available for auto resolution.
 # A bundle is usable only if ALL six p4 images are present (a partial bundle must
 # not win auto and then hard-fail later; fall through to source/off instead).
@@ -195,7 +274,7 @@ if [ -d "$AAOS_PREBUILT_DIR/images" ]; then
 fi
 aaos_have_source=no
 { [ -n "$AAOS_SRC_DIR" ] && [ -f "$AAOS_SRC_DIR/build/envsetup.sh" ]; } && aaos_have_source=yes
-[ -f "$workdir/android/build/envsetup.sh" ] && aaos_have_source=yes
+[ -f "$workdir/$AAOS_DIR_NAME/build/envsetup.sh" ] && aaos_have_source=yes
 # A repo object mirror is a way to OBTAIN the source, so it counts as source being available
 # even though no checkout exists yet -- build.sh seeds one from it below. Without this,
 # `-a --aaos-ref=<mirror>` resolved auto to a hard error ("found neither a prebuilt bundle
@@ -231,7 +310,45 @@ echo ">> AAOS mode: $AAOS_MODE  (ENABLE_ANDROID=$ENABLE_ANDROID)"
 # 16 GB board's total_memory=16372 -- no 8 GB Pi 5 has been measured here -- so if
 # `xl create doma.cfg` ever fails to allocate, this is the first line to come back
 # to. See the BOARD_RAM parameter in the yaml.
-if [ "$BOARD_RAM" = "8g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
+# DomA (p4) requires DomU (p3), on both boards. The SD partition order is fixed by the
+# yaml's definition order: the ENABLE_DOMU=yes `domu` partition is defined BEFORE the
+# ENABLE_ANDROID=yes `android` one. Without -u there is no p3 DomU rootfs, so rouge
+# assembles Android as p3 -- while the DomA guest config is hard-wired to p4 (doma.cfg
+# backs qemu's disk from /dev/mmcblk0p4 directly). The image then boots to a DomA-less
+# state and the build still exits 0. Refuse loudly instead.
+#
+# Scoped to a full SD-image build (NINJA_TARGET non-empty): the mismatch can only ship
+# in an assembled image, and --domains-only is already covered by the NG-2 guard below.
+# Distinct from NG-2: NG-2 = "DomA never assembled"; this = "DomA assembled at the
+# wrong partition number".
+if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ] && [ -n "$NINJA_TARGET" ]; then
+  echo "ERROR: DomA (-a/--android or --aaos=source|prebuilt) requires DomU (-u/--domu)." >&2
+  echo "       Without -u there is no DomU rootfs at SD p3, so rouge assembles Android at" >&2
+  echo "       p3, but the DomA guest config is hard-wired to p4 (doma.cfg reads" >&2
+  echo "       /dev/mmcblk0p4) -> DomA cannot boot. Add -u/--domu, or drop DomA." >&2
+  exit 1
+fi
+
+# --- 4 GiB Raspberry Pi 4: DomA fits, but not AT THE SAME TIME as DomU ---------
+# A notice, not a refusal. On the 4 GiB SKU Dom0 (256) + DomD (1024) + DomA (2560) has
+# been booted on hardware with 158 MiB of Xen free memory left; DomU alone fits too.
+# What does not fit is DomU and DomA together. Since DomA's p4 requires DomU's p3 (the
+# guard just above), both have to be BUILT into the image regardless -- the constraint
+# is purely at run time, and refusing here would block the only 4 GiB configuration
+# that can run DomA at all.
+#
+# No arithmetic is restated here on purpose: the sizes live in
+# boot.cmd.xen.*-dom0.in (the 4 GiB DomD override and dom0_mem) and in the DomU/DomA
+# guest configs plus the meta-xt-rpi4 bbappends that override them.
+if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
+  echo ">> NOTE: on a 4 GiB Raspberry Pi 4, DomA and DomU cannot RUN at the same time." >&2
+  echo ">>   Each fits alone; together they exceed the free pool. Both are on the SD" >&2
+  echo ">>   anyway (DomA's p4 needs DomU's p3), so pick one at run time:" >&2
+  echo ">>     systemctl disable --now xl-create-domu   # then start DomA" >&2
+  echo ">>   Use --ram=8g if you need all four domains up together." >&2
+fi
+
+if [ "$BOARD" = "rpi5" ] && [ "$BOARD_RAM" = "8g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
   echo ">> --ram=8g memory budget: Dom0 512 + DomD 3072 + DomU 1024 + DomA 3072"
   echo "   = 7680 MiB (+ Xen ~64) of roughly 8180 MiB usable => ~436 MiB headroom."
   echo "   The 8180 MiB figure is extrapolated, not measured on an 8 GB board."
@@ -402,9 +519,55 @@ check_repo_mirror() {  # $1=dir $2=flag name
         exit 1 ;;
     esac
   fi
+
+  # WHICH tree is this mirror for? Everything above is satisfied by either mirror -- both
+  # are repo clients full of bare *.git repos -- so passing them the wrong way round is
+  # accepted here and then costs hours: repo falls back to the network for every project
+  # and the log looks entirely normal.
+  #
+  # Discriminate on projects that only one of the two manifests carries. Measured against
+  # both mirrors: platform/build/bazel_common_rules.git and kernel/configs.git appear in
+  # BOTH and are useless for this; the ones below appear in exactly one.
+  #
+  # One mirror may legitimately serve both flags (see the mount de-duplication below), so
+  # only a POSITIVE swap is an error: the other tree's marker present AND this tree's
+  # absent. A mirror carrying neither marker is an exported subset that cannot be
+  # classified, so it gets a note instead -- a note is enough, because the cost of being
+  # wrong there is a slow build, not a wrong image.
+  local kind="$3" has_aosp="" has_kern="" p
+  for p in platform/bionic.git platform/art.git platform/build/soong.git; do
+    [ -n "$(find "$root" -type d -path "*/$p" -print -quit 2>/dev/null)" ] && { has_aosp=yes; break; }
+  done
+  for p in kernel/common.git kernel/common-modules/virtual-device.git \
+           xen-troops/android_kernel_xen-virtual-device.git; do
+    [ -n "$(find "$root" -type d -path "*/$p" -print -quit 2>/dev/null)" ] && { has_kern=yes; break; }
+  done
+  case "$kind" in
+    aosp)
+      if [ -z "$has_aosp" ] && [ -n "$has_kern" ]; then
+        echo "ERROR: $flag names the AOSP mirror, but '$d' is the AAOS guest-kernel mirror:" >&2
+        echo "       it has kernel/common.git and none of platform/bionic.git," >&2
+        echo "       platform/art.git, platform/build/soong.git." >&2
+        echo "       --aaos-ref and --aaos-kernel-ref look swapped." >&2
+        exit 1
+      fi
+      [ -n "$has_aosp" ] || echo ">> NOTE: $flag: '$d' carries none of the projects that identify the AOSP tree; it cannot be verified as the right mirror." >&2
+      ;;
+    kernel)
+      if [ -z "$has_kern" ] && [ -n "$has_aosp" ]; then
+        echo "ERROR: $flag names the AAOS guest-kernel mirror, but '$d' is the AOSP mirror:" >&2
+        echo "       it has platform/bionic.git and none of kernel/common.git," >&2
+        echo "       kernel/common-modules/virtual-device.git," >&2
+        echo "       xen-troops/android_kernel_xen-virtual-device.git." >&2
+        echo "       --aaos-ref and --aaos-kernel-ref look swapped." >&2
+        exit 1
+      fi
+      [ -n "$has_kern" ] || echo ">> NOTE: $flag: '$d' carries none of the projects that identify the guest-kernel tree; it cannot be verified as the right mirror." >&2
+      ;;
+  esac
 }
-check_repo_mirror "$XT_AAOS_REF"        --aaos-ref
-check_repo_mirror "$XT_AAOS_KERNEL_REF" --aaos-kernel-ref
+check_repo_mirror "$XT_AAOS_REF"        --aaos-ref        aosp
+check_repo_mirror "$XT_AAOS_KERNEL_REF" --aaos-kernel-ref kernel
 # Mounted so the seeding step below, which runs inside the builder, can read them.
 add_cache_mount "$XT_AAOS_REF"
 add_cache_mount "$XT_AAOS_KERNEL_REF"
@@ -417,7 +580,7 @@ add_cache_mount "$XT_AAOS_KERNEL_REF"
 # target) so they resolve. (--aaos-src of an in-workspace dir is a no-op here.)
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "$AAOS_SRC_DIR" ]; then
   add_cache_mount "$AAOS_SRC_DIR"
-  akdir="$(readlink -f "$workdir/android_kernel" 2>/dev/null || true)"
+  akdir="$(readlink -f "$workdir/$AAOS_KERNEL_DIR_NAME" 2>/dev/null || true)"
   [ -n "$akdir" ] && [ -d "$akdir" ] && add_cache_mount "$akdir"
   # AOSP soong references ../android_kernel relative to android/ (-> AAOS_SRC_DIR),
   # i.e. AAOS_SRC_DIR's sibling. moulin builds android_kernel INSIDE the workspace
@@ -426,9 +589,9 @@ if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "$AAOS
   # fails "Image missing". Bind the workspace android_kernel onto the sibling path
   # (both container paths -> the same host dir). Pre-create it so the -v mount works
   # before moulin populates it.
-  ak_sib="$(dirname "$AAOS_SRC_DIR")/android_kernel"
-  mkdir -p "$workdir/android_kernel"
-  case "$ak_sib/" in "$workdir"/*) ;; *) mount_at "$workdir/android_kernel" "$ak_sib" ;; esac
+  ak_sib="$(dirname "$AAOS_SRC_DIR")/$AAOS_KERNEL_DIR_NAME"
+  mkdir -p "$workdir/$AAOS_KERNEL_DIR_NAME"
+  case "$ak_sib/" in "$workdir"/*) ;; *) mount_at "$workdir/$AAOS_KERNEL_DIR_NAME" "$ak_sib" ;; esac
 fi
 
 # moulin.conf resolves DL_DIR/SSTATE_DIR via os.getenv('XT_DL_DIR'/'XT_SSTATE_DIR');
@@ -536,6 +699,63 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
   # prebuilt mode: place the six AOSP output images (Type-2) where rouge expects them,
   # so 'ninja dom0 domd domu' + rouge assemble p4 WITHOUT running the AOSP build (m)/bazel.
   if [ "$AAOS_MODE" = prebuilt ]; then
+    # PROVENANCE, before integrity. MANIFEST.md5 answers "is this bundle intact"; it
+    # cannot answer "is this bundle for THIS board", because the md5s of a correctly
+    # formed bundle for the OTHER board verify perfectly. Getting that wrong is silent
+    # and expensive: the images stage, rouge assembles p4, the build exits 0, and the
+    # guest dies in /init with SIGILL on the first boot because its userspace was
+    # compiled for a CPU variant this host does not implement.
+    #
+    # A bundle therefore declares what it is, in a BUNDLE-INFO file next to MANIFEST.md5:
+    #     board=rpi4
+    #     device=xenvm_trout_rpi4_arm64
+    #     cpu_variant=cortex-a72          # optional, informational
+    # Lines starting with # and blank lines are ignored.
+    binfo="$AAOS_PREBUILT_DIR/BUNDLE-INFO"
+    if [ -f "$binfo" ]; then
+      b_board=$(sed -n 's/^board=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$binfo" | head -1)
+      b_device=$(sed -n 's/^device=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$binfo" | head -1)
+      [ -n "$b_board" ] || { echo "ERROR: $binfo has no 'board=' line." >&2; exit 1; }
+      if [ "$b_board" != "$BOARD" ]; then
+        echo "ERROR: prebuilt bundle is for board '$b_board', this build is --board=$BOARD." >&2
+        echo "       '$AAOS_PREBUILT_DIR'" >&2
+        echo "       The AAOS guest is compiled for the host CPU, so the two are not" >&2
+        echo "       interchangeable. Use the bundle built for this board, or --aaos=source." >&2
+        exit 1
+      fi
+      if [ -n "$b_device" ] && [ "$b_device" != "$AAOS_PRODUCT_DEVICE" ]; then
+        echo "ERROR: prebuilt bundle names device '$b_device'; this board builds '$AAOS_PRODUCT_DEVICE'." >&2
+        echo "       '$AAOS_PREBUILT_DIR'" >&2
+        exit 1
+      fi
+      echo ">> prebuilt bundle provenance OK (board=$b_board device=${b_device:-unset})"
+    else
+      # Legacy bundle with no provenance. Bundles predate this check, and every one of
+      # them was built before a second board existed -- i.e. for rpi5. Accept that for
+      # rpi5 so existing workflows keep working, and refuse it for any other board rather
+      # than stage a guest that cannot run. AAOS_PREBUILT_ASSUME_BOARD is the escape hatch
+      # for someone who knows their untagged bundle was built for this board.
+      if [ -n "${AAOS_PREBUILT_ASSUME_BOARD:-}" ]; then
+        if [ "$AAOS_PREBUILT_ASSUME_BOARD" != "$BOARD" ]; then
+          echo "ERROR: AAOS_PREBUILT_ASSUME_BOARD=$AAOS_PREBUILT_ASSUME_BOARD but --board=$BOARD." >&2
+          exit 1
+        fi
+        echo ">> NOTE: bundle has no BUNDLE-INFO; proceeding on AAOS_PREBUILT_ASSUME_BOARD=$BOARD (unverified)."
+      elif [ "$BOARD" = rpi5 ]; then
+        echo ">> NOTE: bundle has no BUNDLE-INFO ('$AAOS_PREBUILT_DIR'). Treating it as rpi5,"
+        echo ">>   which is what every bundle predating this check was built for. Add a"
+        echo ">>   BUNDLE-INFO with 'board=rpi5' to make that explicit."
+      else
+        echo "ERROR: prebuilt bundle has no BUNDLE-INFO and --board=$BOARD is not rpi5." >&2
+        echo "       '$AAOS_PREBUILT_DIR'" >&2
+        echo "       Untagged bundles predate multi-board support and were built for rpi5;" >&2
+        echo "       staging one here would produce a guest that dies in /init with SIGILL." >&2
+        echo "       Add a BUNDLE-INFO file with 'board=$BOARD' (and optionally" >&2
+        echo "       'device=$AAOS_PRODUCT_DEVICE'), or set AAOS_PREBUILT_ASSUME_BOARD=$BOARD" >&2
+        echo "       if you built it for this board, or use --aaos=source." >&2
+        exit 1
+      fi
+    fi
     # Integrity: if the bundle ships a MANIFEST.md5, verify files/ + images/ against it
     # (the recipe's kernel/ramdisk md5 check is opt-in/off by default; the six p4 images
     # are otherwise unverified). No MANIFEST => proceed with a NOTE.
@@ -561,8 +781,8 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     else
       echo ">> NOTE: bundle has no MANIFEST.md5; the six p4 images are NOT integrity-checked (guest kernel/ramdisk md5 is checked only if you set AAOS_KERNEL_MD5/AAOS_RAMDISK_MD5 — opt-in, off by default)."
     fi
-    img_dst="$workdir/android/out/target/product/xenvm_trout_arm64"
-    [ -L "$workdir/android" ] && rm -f "$workdir/android"   # drop a stale --aaos-src symlink
+    img_dst="$workdir/$AAOS_DIR_NAME/out/target/product/$AAOS_PRODUCT_DEVICE"
+    [ -L "$workdir/$AAOS_DIR_NAME" ] && rm -f "$workdir/$AAOS_DIR_NAME"   # drop a stale --aaos-src symlink
     mkdir -p "$img_dst"
     for im in boot init_boot vendor_boot vbmeta super userdata; do
       src="$AAOS_PREBUILT_DIR/images/$im.img"
@@ -633,15 +853,16 @@ fi
 #     measured from-scratch run took 5 h 11 min. --aaos-src reuses an existing checkout
 #     (skips the sync); --aaos-ref seeds it from a repo object mirror; omit -a for a
 #     DomA-less SD.
-if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "${AAOS_SRC_DIR}" ] && [ "${AAOS_SRC_DIR}" != "$workdir/android" ]; then
-  # rouge + the doma component read the AOSP tree at <repo>/android (the component
-  # build-dir). When --aaos-src points at an external tree, symlink it in so ninja reuses it.
-  if [ -d "$workdir/android" ] && [ ! -L "$workdir/android" ]; then
-    echo "ERROR: $workdir/android is a real directory; --aaos-src would be silently ignored." >&2
+if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "${AAOS_SRC_DIR}" ] && [ "${AAOS_SRC_DIR}" != "$workdir/$AAOS_DIR_NAME" ]; then
+  # rouge + the doma component read the AOSP tree at the component build-dir, which the
+  # yaml names per board (DOMA_DIR). When --aaos-src points at an external tree, symlink
+  # it in so ninja reuses it.
+  if [ -d "$workdir/$AAOS_DIR_NAME" ] && [ ! -L "$workdir/$AAOS_DIR_NAME" ]; then
+    echo "ERROR: $workdir/$AAOS_DIR_NAME is a real directory; --aaos-src would be silently ignored." >&2
     echo "       Remove it (or drop --aaos-src) so the external tree can be symlinked in." >&2
     exit 1
   fi
-  ln -sfn "$AAOS_SRC_DIR" "$workdir/android"   # (re)point the symlink at the external AOSP tree
+  ln -sfn "$AAOS_SRC_DIR" "$workdir/$AAOS_DIR_NAME"   # (re)point the symlink at the external AOSP tree
 fi
 
 # 0b) AAOS repo object mirrors (--aaos-ref / --aaos-kernel-ref) — the AOSP analogue of
@@ -725,10 +946,13 @@ PYEOF
       echo \">>   reference recorded: \$(git -C .repo/manifests.git config --get repo.reference)\"
     "
   }
-  # doma lives at <ws>/android (a symlink to --aaos-src when that points outside);
-  # doma_kernel always lives at <ws>/android_kernel.
-  seed_repo doma        "$workdir/android"        "$XT_AAOS_REF"
-  seed_repo doma_kernel "$workdir/android_kernel" "$XT_AAOS_KERNEL_REF"
+  # Both live under names the yaml owns and that differ per board (DOMA_DIR /
+  # ANDROID_KERNEL_DIR), so a second board starts from an empty directory instead of
+  # inheriting the first board's checkout -- which is what makes a wrong --aaos-ref
+  # fail immediately rather than silently on some later clean build.
+  # doma is a symlink to --aaos-src when that points outside the workspace.
+  seed_repo doma        "$workdir/$AAOS_DIR_NAME"        "$XT_AAOS_REF"
+  seed_repo doma_kernel "$workdir/$AAOS_KERNEL_DIR_NAME" "$XT_AAOS_KERNEL_REF"
 fi
 
 # 1) DomU (AGL Flutter) — same procedure as upstream sodev-demo-workspace/build.sh.
@@ -777,6 +1001,7 @@ fi
 #    DomA p4 nested GPT from android/out (step 0a); the AGL DomU rootfs (step 1) is the only other
 #    input not built here. --domains-only (NINJA_TARGET="") => domains only.
 APPLY_ZEPHYR="meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/apply-zephyr-patches.sh"
+STAGE_AOSP_DEVICE="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-aosp-device.sh"
 # In-container build step. prebuilt mode never invokes doma/doma_kernel: it builds the
 # domains (dom0/domd[/domu]) then assembles full.img with rouge directly from the staged
 # android/out images -> no AOSP (m) / bazel / repo sync runs. Other modes use the normal
@@ -816,10 +1041,15 @@ else
     # NINJA_TARGET may be empty (--domains-only); `ninja` with no goal builds the
     # default target, which is what the un-prefixed command did, so keep it unquoted
     # and unguarded rather than dropping the second invocation.
-    NINJA_CMD="ninja doma_kernel doma && ninja ${NINJA_TARGET}"
+    # moulin has no hook between `repo sync` and the AOSP build, so split it: the
+    # fetch-only pass populates the checkout, stage-aosp-device.sh adds this board's
+    # AAOS product variant (a no-op on rpi5), THEN the AOSP build runs. Without the
+    # staging the rpi4 lunch target does not exist and `m` fails immediately, so the
+    # order is load-bearing rather than an optimisation.
+    NINJA_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel doma && ninja ${NINJA_TARGET}"
   fi
 fi
-echo ">> moulin (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
+echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
 in_docker "$XT_DOCKER" "
   set -e
   # Regenerate the moulin build dirs' conf from scratch (V4H build.sh parity): a
