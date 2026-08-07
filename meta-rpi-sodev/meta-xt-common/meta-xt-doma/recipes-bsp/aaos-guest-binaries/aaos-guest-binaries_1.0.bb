@@ -15,17 +15,19 @@ DESCRIPTION = "\
       replaced, and a zero pad inserted before the bootconfig trailer so the \
       total size is a multiple of 4096 (bootconfig trailer alignment). \
 \
-    A layer-local copy is used (an absolute file:// path outside the workspace is \
-    not buildable because the docker builder only mounts the workspace). \
+    Both are derived at build time from the doma_kernel / doma component outputs \
+    (aaos-guest-binaries-derive.inc); --aaos=prebuilt instead uses the two artifacts \
+    build.sh stages out of the bundle, because that mode has no AOSP checkout to \
+    derive from. \
     An optional md5 assertion (AAOS_KERNEL_MD5 / AAOS_RAMDISK_MD5, empty by default) \
-    can pin a specific validated build via local.conf/env; see README."
+    can pin a specific validated build via local.conf/env; see docs/BUILD.md."
 
-# What the two staged artefacts are, for the record:
+# What the two artefacts are, for the record (measured on one build's output):
 #   - the guest kernel is a GKI 6.1.118 build, i.e. the Linux kernel, so it is
 #     GPL-2.0-only material. Corresponding source: the xen-troops
 #     android_kernel_manifest (see README, "Building the prebuilts from source").
 #   - the vendor_boot ramdisk is AOSP userspace, repacked with AVB removed and the
-#     virtio modules replaced. Measured on the staged artefact (lz4 -dc | cpio -i;
+#     virtio modules replaced. Measured on one such artefact (lz4 -dc | cpio -i;
 #     52 MiB unpacked, 334 files / 224 symlinks / 46 dirs):
 #       * lib/modules/ : 96 kernel modules. modinfo -F license gives GPL x66,
 #         "GPL v2" x15, "Dual BSD/GPL" x14, "GPL and additional rights" x1 --
@@ -62,8 +64,8 @@ DESCRIPTION = "\
 # "LICENSE: CLOSED"; that manifest is written from every installed package's LICENSE
 # without filtering.
 #
-# Note that this repository ships neither artefact: both are .gitignore'd and staged
-# by the builder (README, "Staging the AAOS prebuilts"), so nothing is redistributed
+# Note that this repository ships neither artefact: both are produced by the build (or,
+# in --aaos=prebuilt, taken from a bundle and .gitignore'd), so nothing is redistributed
 # by the repository itself. Anyone redistributing a built image is the party for whom
 # the licensing of these binaries has to be determined, and the provenance recorded
 # above is the input to that.
@@ -73,28 +75,37 @@ DESCRIPTION = "\
 # stage are Zephyr guest images rather than a Linux kernel Image; their MIT covers
 # their own glue, which is what our MIT-licensed xt-xen-cfg-* / xen-network glue
 # recipes match.
-LICENSE = "CLOSED"
+# GPL-2.0 kernel Image + Apache-2.0 AOSP ramdisk content; both are build outputs of
+# the doma_kernel / doma components, not redistributed by this repository.
+LICENSE = "GPL-2.0-only & Apache-2.0"
+# Naming real licences (instead of the previous CLOSED) makes LIC_FILES_CHKSUM
+# mandatory. Both artifacts are build outputs of the doma_kernel / doma components,
+# so there is no upstream licence file inside this recipe to point at; reference the
+# canonical texts. The AOSP NOTICE that accompanies the redistributed userspace bits
+# is shipped by xt-aaos-host-services (Apache-2.0 section 4d).
+LIC_FILES_CHKSUM = "\
+    file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d171dd6425610833a22dbe6 \
+    file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10 \
+"
 
 SRC_URI = " \
-    file://aaos-android-kernel-xenbuilt-6.1.118 \
-    file://aaos-vendor-boot-ramdisk-xenbuilt-padded \
     "
 
-# Optional prebuilt-integrity check (OFF by default). The DomA guest binaries are
-# external, .gitignore'd, and rebuilt per AOSP/kernel tree, so their md5 is a property
-# of the builder's environment, NOT of this source tree -- hardcoding a specific hash
-# here would break the build for anyone staging a different (legitimate) AAOS. Left
-# empty, do_deploy accepts whatever is staged (the --aaos-prebuilt bundle's MANIFEST.md5
-# already covers bundle integrity). To assert a specific validated build, set these via
-# local.conf / the environment; the reference values for this project's HW-verified
-# coherent bundle (guest kernel + super.img vendor_dlkm both module_layout CRC
-# 0xea759d7f) are documented in README, "Staging the AAOS prebuilts":
+# Optional integrity check (OFF by default, and it must stay off by default). The guest
+# kernel comes out of the GKI bazel build, which is NOT reproducible -- three builds of
+# the same source produced three different Image md5s -- so a hardcoded hash can never
+# match a self-built kernel and would break every clean build. Left empty, do_deploy
+# accepts whatever was derived (a --aaos-prebuilt bundle's MANIFEST.md5 covers bundle
+# integrity separately). To pin one specific validated artifact, set these via
+# local.conf / the environment; the values for this project's HW-verified bundle are:
 #   AAOS_KERNEL_MD5  = "c1700f50019c7a07baefa428abb3c41e"
 #   AAOS_RAMDISK_MD5 = "e201569f233c3cfa20cb1fc3cdc402bf"
-# (NB: the guest kernel and the super.img vendor_dlkm modules must share ONE ABI; a
-# stale-kernel / fresh-super mismatch makes ~97 guest modules fail "disagrees about
-# version of symbol module_layout" so AAOS never reaches SurfaceFlinger -- keep the
-# whole bundle from one coherent build.)
+# (NB: what actually has to agree is the ABI, not the md5. The guest kernel and the
+# super.img vendor_dlkm modules must share ONE module_layout CRC; a stale-kernel /
+# fresh-super mismatch makes ~97 guest modules fail "disagrees about version of symbol
+# module_layout" so AAOS never reaches SurfaceFlinger. That is wired up by construction
+# here -- doma consumes doma_kernel's output via TARGET_PREBUILT_KERNEL -- and is
+# checked with `modprobe --dump-modversions` / vermagic, not md5. See docs/BUILD.md.)
 AAOS_KERNEL_MD5 ?= ""
 AAOS_RAMDISK_MD5 ?= ""
 
@@ -106,25 +117,28 @@ INHIBIT_DEFAULT_DEPS = "1"
 PACKAGE_ARCH = "${MACHINE_ARCH}"
 
 do_configure[noexec] = "1"
-do_compile[noexec] = "1"
 do_install[noexec] = "1"
+
+# The kernel and ramdisk are derived from the AAOS build outputs (do_compile below);
+# they are no longer .gitignore'd blobs a developer stages by hand.
+require aaos-guest-binaries-derive.inc
 
 # Note: shell variables are referenced as $VAR (no braces) so they do not
 #       collide with bitbake variable expansion (${D} etc.), and arithmetic
 #       uses expr because bitbake pysh does not support $((...)).
 do_deploy() {
-    KSRC="${UNPACKDIR}/aaos-android-kernel-xenbuilt-6.1.118"
-    RSRC="${UNPACKDIR}/aaos-vendor-boot-ramdisk-xenbuilt-padded"
+    KSRC="${B}/aaos-android-kernel"
+    RSRC="${B}/aaos-vendor-boot-ramdisk"
 
     # Optional prebuilt-integrity check: only when AAOS_*_MD5 is set (default empty =
     # skip, so any staged AAOS builds). Set via local.conf/env to pin a validated build.
     if [ -n "${AAOS_KERNEL_MD5}" ]; then
         echo "${AAOS_KERNEL_MD5}  $KSRC" | md5sum -c - || \
-            bbfatal "aaos kernel md5 mismatch (staged binary != AAOS_KERNEL_MD5=${AAOS_KERNEL_MD5}); unset to skip"
+            bbfatal "aaos kernel md5 mismatch (derived binary != AAOS_KERNEL_MD5=${AAOS_KERNEL_MD5}); unset to skip"
     fi
     if [ -n "${AAOS_RAMDISK_MD5}" ]; then
         echo "${AAOS_RAMDISK_MD5}  $RSRC" | md5sum -c - || \
-            bbfatal "aaos ramdisk md5 mismatch (staged binary != AAOS_RAMDISK_MD5=${AAOS_RAMDISK_MD5}); unset to skip"
+            bbfatal "aaos ramdisk md5 mismatch (derived binary != AAOS_RAMDISK_MD5=${AAOS_RAMDISK_MD5}); unset to skip"
     fi
 
     install -m 0644 "$KSRC" "${DEPLOYDIR}/aaos-android-kernel"
