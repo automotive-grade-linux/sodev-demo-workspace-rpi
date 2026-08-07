@@ -661,6 +661,15 @@ components:
       - type: git
         url: "https://git.yoctoproject.org/meta-raspberrypi"
         rev: *META_RPI_REV
+      # meta-clang: required by google-trout-agl-services (TOOLCHAIN = "clang").
+      # The trout host-service sources are written against Android's toolchain and
+      # their -Wno-error list is clang diagnostic names, so gcc is not a drop-in.
+      # Pinned to the wrynose branch tip: upstream keeps one branch per Yocto series,
+      # and the scarthgap tip the V4H SoDeV pins would be rejected by the
+      # LAYERSERIES_COMPAT check in this build.
+      - type: git
+        url: "https://github.com/kraj/meta-clang"
+        rev: "ef0d22f21910a0c30c967eeb17d8f209806e2d81"
     builder:
       type: yocto
       work_dir: "%{DOMD_BUILD_DIR}"
@@ -779,6 +788,20 @@ components:
         # layers (V4H style); under ENABLE_ANDROID=no all its recipes are BBMASK'd
         # via %{XT_DOMA_BBMASK} so a DomA-less DomD build does not parse the
         # AAOS-prebuilt SRC_URI.
+        # meta-clang: provides the clang TOOLCHAIN that google-trout-agl-services
+        # (in meta-xt-doma) selects. Inert when ENABLE_ANDROID=no -- nothing else in
+        # this build sets TOOLCHAIN = "clang", and that recipe is BBMASK'd anyway.
+        #
+        # DomD only, deliberately. The dom0(linux) builder also carries meta-xt-doma
+        # (see its layers above) and therefore PARSES google-trout-agl-services, but it
+        # never BUILDS it -- only the DomD image installs xt-aaos-host-services, which
+        # is what RDEPENDS on it. Parsing alone is harmless: without meta-clang,
+        # TOOLCHAIN = "clang" is just an unread variable. Verified on a
+        # DOM0_OS=linux -a -u build: build-dom0/tmp/work has no google-trout-* entry
+        # while build-domd/tmp/work has both. If anything ever pulls those recipes into
+        # the Dom0 rootfs, meta-clang has to be added to the dom0 layers too, or the
+        # recipes will silently fall back to gcc.
+        - "../meta-clang"
         - "../../meta-rpi-sodev/meta-xt-common/meta-xt-doma"
       # target_images lists what this component must build and deploy. Artifacts
       # that no partition item, image_path or additional_deps consumes are not
