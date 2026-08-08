@@ -70,6 +70,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
+# Downgrade tar version to workaround fakeroot issue
+RUN apt-get update && apt-get install -y \
+	--allow-downgrades \
+	--allow-change-held-packages \
+	tar=1.34+dfsg-1build3
+
 # moulin 0.28 (known-good git pin; pulls gpt-image, pyyaml,
 # mako, ...) + west (Zephyr meta-tool, required by the DOM0_OS=zephyr component)
 # + meson (AOSP host-tool build).
