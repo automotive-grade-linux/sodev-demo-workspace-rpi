@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 26 Jul 2026 00:00:00 +0900
+Subject: [PATCH] boards/rpi_4b: add Zephyr Dom0 board conf + overlay (BCM2711)
+
+Add the Raspberry Pi 4 (BCM2711) counterpart of boards/rpi_5.{conf,overlay}.
+Both are new files, so this patch adds nothing to the RPi5 board and the two can
+coexist in one checkout.
+
+The Zephyr-side fixes that patch 0008 root-caused on RPi5 hardware are folded
+into rpi_4b.conf rather than re-derived: the raised shell/main/ISR stacks plus
+HW_STACK_PROTECTION, MAX_XLAT_TABLES=32, LOG_MODE_IMMEDIATE, the 0x17 domctl
+interface version with XENTROOPS_ARCH_* = n, and DISK_DRIVER_SDMMC=n with
+FS_FATFS_WINDOW_ALIGNMENT=4 for an SD-less Dom0. None of them is BCM2712
+specific.
+
+Three things are genuinely different on BCM2711 and are commented in place:
+
+* CELLS. boards/arm64/rpi_4b/rpi_4b.dts declares the root as 1/1 and
+  dts/arm64/broadcom/bcm2711.dtsi does not give /soc its own cells, so /soc's
+  children rely on the root's single address cell. bcm2712.dtsi declares
+  #address-cells = <2> on /soc, which is why rpi_5.overlay can raise the root to
+  2 cells. This overlay therefore keeps the root at 1/1 and writes single-cell
+  addresses; everything it needs is below 4 GiB.
+
+* CONSOLE. rpi_4b.dts points zephyr,console at &uart1, the BCM2711 aux/mini
+  UART. Xen owns the console (boot.cmd passes dtuart=/soc/serial@7e201000, the
+  pl011) and Xen's rpi4 platform blacklists the aux peripheral's page
+  neighbours, so Dom0 uses the Xen PV console and &uart1 is disabled. No pl011
+  node is added: the pinned Zephyr rev has none for BCM2711 and none is needed.
+
+* SRAM RELINK to 0x20000000, derived rather than measured. Xen's rpi4 platform
+  sets .dma_bitsize = 30, so allocate_memory_11() confines Dom0's bank[0] to
+  below 1 GiB -- RPi5 has no platform entry, gets the 32-bit default and landed
+  at 0xc0000000. With dom0_mem=256M (get_allocation_size gives exactly order 16)
+  the only free naturally-aligned 256 MiB block under 1 GiB in the boot.cmd
+  memory map is 0x20000000-0x30000000. rpi4-port/tools/check-memory-map.py
+  recomputes this from the two files so it cannot drift silently.
+
+The hypervisor node's grant-table base is likewise derived (find_gnttab_region()
+uses __pa(_stext), i.e. boot.cmd's 0x02000000 Xen load address); its size and the
+extended region still have to be confirmed against the first boot's Xen log, and
+the exact log lines to read are quoted in the overlay.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/boards/rpi_4b.conf b/boards/rpi_4b.conf
+new file mode 100644
+index 0000000..de2a59d
+--- /dev/null
++++ b/boards/rpi_4b.conf
+@@ -0,0 +1,91 @@
++# Copyright (c) 2026 Yuichi Kusakabe
++# SPDX-License-Identifier: Apache-2.0
++#
++# Zephyr Dom0 configuration for Raspberry Pi 4 Model B (BCM2711).
++#
++# Derived from boards/rpi_5.conf with patch 0008's hardware-verified fixes folded
++# in, because they were all root-caused on the Zephyr side and are not BCM2712
++# specific:
++#   - the raised shell/main/ISR stacks + HW_STACK_PROTECTION (xu create's domain
++#     build has large VLAs and overflowed a 4 KiB shell stack),
++#   - MAX_XLAT_TABLES=32 (arch/arm64/core/Kconfig:335 defaults to 8 for this board
++#     -- no USERSPACE and ARM64_VA_BITS=36 < 40, so neither the 12/16/20 branch
++#     applies -- and mapping a multi-MiB guest kernel exhausts 8),
++#   - LOG_MODE_IMMEDIATE (async logging interleaved with the shell on the shared
++#     Xen console made failure lines unreadable),
++#   - the 0x17 domctl interface version and XENTROOPS_ARCH_* = n for Xen 4.21,
++#   - DISK_DRIVER_SDMMC=n + FS_FATFS_WINDOW_ALIGNMENT=4 for an SD-less Dom0.
++#
++# RPi4-specific notes are marked [rpi4].
++
++CONFIG_XEN_DOM0=y
++
++CONFIG_XSTAT=y
++CONFIG_XSTAT_SHELL_CMDS=y
++
++# xu create runs on the shell thread and its domain build (load_modules ->
++# gen_domain_fdt) has large VLAs; 4 KiB overflowed and corrupted adjacent
++# .data/.bss on RPi5. HW_STACK_PROTECTION makes any residual overflow fault
++# cleanly with ELR/FAR instead of silently corrupting.
++CONFIG_SHELL_STACK_SIZE=32768
++
++CONFIG_MAIN_STACK_SIZE=16384
++CONFIG_ISR_STACK_SIZE=16384
++# NOTE: silently DROPPED by Kconfig on this board — it is absent from the built
++# zephyr/.config. Kept for the day the dependency is met; do not rely on it.
++CONFIG_HW_STACK_PROTECTION=y
++CONFIG_MAX_XLAT_TABLES=32
++
++CONFIG_XEN_VCH=y
++CONFIG_XEN_DOM0LESS_BOOT=y
++
++CONFIG_USE_DEFAULT_DOM_CFG=n
++CONFIG_DOM_CFG_BUILTIN_IMAGES=n
++
++CONFIG_DOM_STORAGE_FATFS_ENABLE=y
++
++CONFIG_FILE_SYSTEM_SHELL=y
++
++CONFIG_NOCACHE_MEMORY=y
++CONFIG_FS_MULTI_PARTITION=y
++CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="1"
++# Guest images live in the FAT root of SD p1, not in a dom0/ subdirectory
++# (same as the RPi5 SoDeV build; patch 0002 makes that change for rpi_5.conf).
++CONFIG_DOM_STORAGE_FATFS_DIR=""
++CONFIG_XEN_LIBFDT=y
++
++CONFIG_DOM_CFG_LINUX_PV_DOMAIN=y
++
++CONFIG_XRUN_STORAGE_DMA_DEBOUNCE=4
++
++CONFIG_DOMU_MAX=5
++
++# Synchronous logging so a `xu create` failure line prints atomically on the
++# shared Xen console.
++CONFIG_LOG_MODE_IMMEDIATE=y
++
++# [rpi4] SD-less Dom0. boot.cmd.xen.zephyr-dom0.in marks
++# /emmc2bus/mmc@7e340000 xen,passthrough, so the SD controller belongs to DomD
++# (which owns the toolstack and serves the guest rootfs partitions over
++# virtio-blk). With its MMIO unmapped, an enabled SDHC controller would hang the
++# driver's SYS_INIT on the first register access and stop the init chain BEFORE
++# dom0less_init, so the dom0less DomD would never be introduced to xenstore.
++# rpi_4b.overlay therefore does not enable any SDHC node, and the disk driver is
++# turned off here so drivers/disk/sdmmc_subsys.c is not built against it.
++# FS_FATFS_WINDOW_ALIGNMENT is pinned because zephyr-dom0-xt/Kconfig defaults it
++# to SDHC_BUFFER_ALIGNMENT, which resolves empty once SDHC is inactive and breaks
++# the generated misc/generated/configs.c assembly.
++CONFIG_DISK_DRIVER_SDMMC=n
++CONFIG_FS_FATFS_WINDOW_ALIGNMENT=4
++
++# Xen 4.21 ABI. The two XENTROOPS_ARCH options add arm_sci_type (u16) and
++# vgsx_osid (u8) to xen_arch_domainconfig (16 -> 20 bytes) and grow
++# xen_domctl_getdomaininfo (120 -> 128 bytes); Xen 4.21 has neither field, so
++# leaving them =y mismatches getdomaininfolist.
++CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x17
++CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID=n
++CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE=n
++
++# SoDeV production guests (see src/dom_cfg/rpi_4b.c). Also settable from the
++# moulin builder vars in rpi4-sodev.yaml.
++CONFIG_DOM_CFG_SODEV=y
+diff --git a/boards/rpi_4b.overlay b/boards/rpi_4b.overlay
+new file mode 100644
+index 0000000..494f965
+--- /dev/null
++++ b/boards/rpi_4b.overlay
+@@ -0,0 +1,148 @@
++/*
++ * Copyright (C) 2026 Yuichi Kusakabe
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Zephyr Dom0 device-tree overlay for Raspberry Pi 4 Model B (BCM2711).
++ *
++ * Counterpart of boards/rpi_5.overlay. Three BCM2711 differences shape it:
++ *
++ *  1. CELLS. This overlay keeps the root at #address-cells = <1> /
++ *     #size-cells = <1> because every address it needs is below 4 GiB: the Dom0
++ *     bank is at 0x20000000 and the grant table at 0x02000000. That is a choice,
++ *     NOT a constraint — /soc gets its own #address-cells = <1> / #size-cells =
++ *     <1> from dts/arm64/armv8-a.dtsi:10-15, independently of the root, so its
++ *     children are unaffected by the root's cells and the root could be raised to
++ *     <2> exactly as rpi_5.overlay does (rpi_5.overlay:26-28) if a >4 GiB address
++ *     were ever needed here.
++ *
++ *  2. CONSOLE. rpi_4b.dts points zephyr,console at &uart1, the BCM2711 aux/mini
++ *     UART. Under Xen that UART is not Dom0's to use: Xen owns the console
++ *     (boot.cmd passes console=dtuart dtuart=/soc/serial@7e201000, the pl011) and
++ *     the aux peripheral's page neighbours are on Xen's rpi4 device blacklist.
++ *     Dom0 therefore talks over the Xen PV console, exactly as on RPi5, and the
++ *     board's UART is disabled. NOTE: no pl011 node is added — the pinned Zephyr
++ *     rev has none for BCM2711, and none is needed.
++ *
++ *  3. NO SDHC. The RPi4 SD controller (/emmc2bus/mmc@7e340000) is handed to DomD
++ *     by boot.cmd.xen.zephyr-dom0.in, and the pinned rpi_4b board does not define
++ *     an SDHC node at all — so unlike rpi_5.overlay there is nothing to disable
++ *     here. boards/rpi_4b.conf still sets CONFIG_DISK_DRIVER_SDMMC=n so the disk
++ *     driver is not built.
++ */
++
++/delete-node/ &sram0;
++
++#include <mem.h>
++
++/ {
++	chosen {
++		zephyr,console = &xen_consoleio_hvc;
++		zephyr,shell-uart = &xen_consoleio_hvc;
++	};
++
++	psci {
++		method = "hvc";
++	};
++
++	xen_consoleio_hvc: hvc {
++		compatible = "xen,hvc-consoleio";
++		status = "okay";
++	};
++
++	/*
++	 * reg[0] = grant table, reg[1..N] = extended regions.
++	 *
++	 * Xen writes the real values into the domain device tree, but Zephyr
++	 * cannot parse them at runtime, so they are hard-coded here and MUST be
++	 * confirmed against the first boot's Xen log:
++	 *   (XEN) Grant table range: 0x............-0x............
++	 *   (XEN) d0: extended region 1: 0x..........->0x..........
++	 *
++	 * Derivation of the values below (see also
++	 * rpi4-port/meta-rpi5-sodev/meta-xt-common/meta-xt-dom0-zephyr/RPI4-PORT.md):
++	 *
++	 *   grant table: find_gnttab_region() in xen/arch/arm/domain_build.c sets
++	 *     gnttab_start = __pa(_stext), i.e. where boot.cmd loaded the Xen binary
++	 *     -> 0x02000000, and gnttab_size = gnttab_dom0_frames() << PAGE_SHIFT
++	 *     = min(gnttab_max_frames, PFN_DOWN(_etext - _stext)) frames. MEASURED
++	 *     from this build's xen-syms map: _stext 0xa0000200000, _etext
++	 *     0xa0000277978 -> 0x77978 = 0.47 MiB = 119 frames, so the real region is
++	 *     0x77000 (rpi_5 measured 0x7b000). 0x100000 over-declares ~2x, which is
++	 *     harmless; under-declaring is not. Earlier text here guessed "about 1 MiB".
++	 *
++	 *   extended region 1: find_unallocated_memory()
++	 *     (xen/common/device-tree/domain-build.c) does NOT report holes in the
++	 *     memory map. It seeds a rangeset from bootinfo_get_mem() — the RAM banks
++	 *     only — and then subtracts the assigned ones, so a physical range that is
++	 *     not RAM can never come out of it. The gpu_mem carve-out is exactly that,
++	 *     which is why this used to name 0x3b400000-0x40000000 and was wrong. The
++	 *     value below mirrors rpi_5.overlay's measured shape: the unallocated RAM
++	 *     above Xen and below DomD's lowest static-mem bank. Confirm from the log.
++	 */
++	hypervisor: hypervisor@2000000 {
++		compatible = "xen,xen";
++		reg = <0x02000000 0x100000>, <0x02200000 0x05e00000>;
++		interrupts = <GIC_PPI 0x0 IRQ_TYPE_EDGE IRQ_DEFAULT_PRIORITY>;
++		interrupt-parent = <&gic>;
++		status = "okay";
++	};
++
++	/*
++	 * Dom0's direct-map RAM bank. Xen loads the Dom0 image at
++	 * bank[0].start + text_offset and cannot be told where to put it
++	 * (construct_hwdom -> allocate_memory_11 ignores xen,static-mem, which is a
++	 * dom0less-domU-only mechanism), while Zephyr is absolute-linked from
++	 * CONFIG_SRAM_BASE_ADDRESS, auto-derived from this node. A mismatch runs
++	 * garbage and faults before console init — on RPi5 the symptom was total UART
++	 * silence and no xu-create.
++	 *
++	 * 0x20000000 is derived, not copied from RPi5 (which uses 0xc0000000):
++	 *   - Xen's rpi4 platform sets .dma_bitsize = 30
++	 *     (xen/arch/arm/platforms/brcm-raspberry-pi.c), so allocate_memory_11()
++	 *     computes lowmem_bitsize = min(32, 30) = 30 and confines bank[0] to
++	 *     below 1 GiB. RPi5 has no platform entry, gets the 32-bit default, and
++	 *     therefore landed at 0xc0000000.
++	 *   - boot.cmd.xen.zephyr-dom0.in passes dom0_mem=128M, and
++	 *     get_allocation_size(128 MiB) is exactly order 15 = 128 MiB.
++	 *   - In that boot script's memory map the first free naturally-aligned
++	 *     128 MiB block below 1 GiB is 0x20000000: everything under it is taken
++	 *     (boot modules below 0x08000000, DomD static-mem bank1
++	 *     0x08000000-0x20000000), and the map deliberately leaves this hole.
++	 * rpi4-port/tools/check-memory-map.py recomputes this from the two files and
++	 * prints the expected address, so it cannot silently drift.
++	 *
++	 * SIZE IS 128 MiB, NOT 256 (changed 2026-08-04). dom0_mem used to be 256M,
++	 * but 256 MiB could never be satisfied as one block on this board: the
++	 * firmware places the host DT blob at 0x2eff1f00 (observed on hardware as
++	 * MODULE[1] 0x2eff1f00-0x2f000fff), which is inside 0x20000000-0x30000000,
++	 * so allocate_memory_11() halved the order and Dom0 actually received
++	 * 128 MiB @0x20000000 + 128 MiB @0x30000000 -- two banks with a hole between
++	 * them, while this node claimed one contiguous 256 MiB region. Zephyr would
++	 * have treated 0x28000000-0x30000000 as its own RAM and faulted on use.
++	 * Asking for 128M makes the request equal to the first bank, so the
++	 * declaration matches what Xen hands over, and it returns 128 MiB to the
++	 * guest budget -- which is what makes the 4 GiB three-domain cockpit fit.
++	 * Do NOT lower it further: the scan starts at address 0, so 64M matches
++	 * 0x04000000 and 32M matches 0x00000000, where config.txt's
++	 * armstub=bl31.bin (TF-A BL31 + the secondary-CPU spin tables) lives.
++	 *
++	 * CONFIRM on the first boot:
++	 *   (XEN) Allocating 1:1 mappings totalling 128MB for dom0:
++	 *   (XEN) BANK[0] 0x000020000000-0x000028000000 (128MB)
++	 *   (XEN) Loading zImage from 0x02400000 to 0x20000000-0x2.......
++	 */
++	sram0: memory@20000000 {
++		compatible = "mmio-sram";
++		reg = <0x20000000 DT_SIZE_M(128)>;
++	};
++};
++
++/*
++ * The BCM2711 aux/mini UART: Xen owns the console, Dom0 uses the PV console.
++ * Disabling it also keeps Dom0 away from the aux peripheral page that Xen's rpi4
++ * blacklist protects (brcm,bcm2835-aux / -aux-spi).
++ */
++&uart1 {
++	status = "disabled";
++};

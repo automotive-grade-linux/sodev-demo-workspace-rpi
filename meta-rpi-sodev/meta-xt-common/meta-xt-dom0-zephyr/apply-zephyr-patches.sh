@@ -82,4 +82,12 @@ apply_one zephyr-xenlib  0015-xenlib-toolstack-teardown-and-xsring-diag.patch
 apply_one zephyr-xenlib  0016-xenlib-toolstack-destroy-ownership-guards.patch
 apply_one zephyr-xenlib  0017-xenlib-guard-xu-console-unmanaged-domain.patch
 apply_one zephyr         0018-xen-domctl-zero-createdomain-hypercall-arg.patch
+# [rpi4] board + guest configs for rpi_4b. These two only ADD files
+# (boards/rpi_4b.{conf,overlay}, src/dom_cfg/rpi_4b.c) and never touch rpi_5, so they
+# stay last in the series. Without them the rpi_4b build configures with no Xen support
+# at all -- CONFIG_DT_HAS_XEN_XEN_ENABLED never gets set because the board overlay that
+# declares the xen,xen node is missing, so CONFIG_XEN and everything under it stay off
+# and xen-dom-mgmt.c fails to compile on GUEST_RAM0_BASE and friends.
+apply_one zephyr-dom0-xt 0019-boards-rpi_4b-zephyr-dom0-board.patch
+apply_one zephyr-dom0-xt 0020-dom_cfg-rpi_4b-add-guest-configs.patch
 echo "Zephyr Dom0 hybrid patches applied to $WS."

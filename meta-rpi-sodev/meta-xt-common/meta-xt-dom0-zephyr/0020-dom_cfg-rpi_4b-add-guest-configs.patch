@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 26 Jul 2026 00:00:00 +0900
+Subject: [PATCH] dom_cfg/rpi_4b: add the RPi4 guest domain configs
+
+CMakeLists.txt selects src/dom_cfg/${BOARD}.c, so BOARD="rpi_4b" needs its own
+file. This is a new file; src/dom_cfg/rpi_5.c is untouched.
+
+Content = rpi_5.c at the pinned rev plus the SoDeV additions patch 0004 makes to
+it, with three BCM2711 changes:
+
+* MEMORY BUDGET. RPi5 ran DomU 1 GiB + DomA 4 GiB on a 16 GiB board. An 8 GiB
+  RPi4 has Dom0 256 MiB + DomD 1920 MiB committed by
+  bcm2711-raspberrypi4-64-xen.dtso, so DomA is halved to 2 GiB, leaving about
+  2.9 GiB for the Xen heap, the boot modules and headroom.
+
+* DomA dt_passthrough is "/soc/firmware", not "/firmware": on BCM2711 the
+  VideoCore firmware interface node lives under /soc. It is a descriptive copy
+  for AAOS's android,firmware resolution and the node has no reg, so it does not
+  conflict with the same node being handed to DomD for the mailbox.
+
+* The upstream blinky-demo DomD gets BCM2711's GPIO bank
+  (/soc/gpio@7e200000, MFN 0xfe200) instead of the BCM2712 AON GPIO
+  (/soc/gpio@7d517c00, MFN 0x107D517). That demo is shell-only and not part of
+  the cockpit, where GPIO stays with the hardware domain; the comment says what
+  to do if the two are ever combined.
+
+GIC_V2 is kept for every guest: BCM2711 is a GIC-400 exactly like BCM2712, and
+the host has no vGICv3 emulation, so a guest requesting GIC_V3 fails to create
+with rc=-19.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/src/dom_cfg/rpi_4b.c b/src/dom_cfg/rpi_4b.c
+new file mode 100644
+index 0000000..197b38d
+--- /dev/null
++++ b/src/dom_cfg/rpi_4b.c
+@@ -0,0 +1,361 @@
++/*
++ * Copyright (c) 2024 EPAM Systems
++ * Copyright (c) 2026 Yuichi Kusakabe
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <domain.h>
++#include <zephyr/xen/public/domctl.h>
++#include <string.h>
++#include <xl_parser.h>
++#include "../dom0.h"
++
++/*
++ * Xen guest domain configuration for BOARD="rpi_4b" (Raspberry Pi 4 Model B,
++ * BCM2711). CMakeLists.txt selects src/dom_cfg/${BOARD}.c, so this file is the
++ * RPi4 counterpart of src/dom_cfg/rpi_5.c.
++ *
++ * It carries two independent sets:
++ *
++ *  - the upstream demo domains (domu_cfg_0..3), ported 1:1 from rpi_5.c. They are
++ *    only reachable through the shell (`xu create rpi_4b_domd` etc.) and are not
++ *    part of the SoDeV cockpit.
++ *  - the SoDeV production guests under CONFIG_DOM_CFG_SODEV (rpi_4b_sodev_domu /
++ *    _doma), which are what boards/rpi_4b.conf enables.
++ *
++ * BCM2711 differences from the RPi5 file are marked [rpi4].
++ */
++
++#if defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++static struct xen_domain_cfg domu_cfg_2 = {
++	.name = "helloworld_xen-arm64",
++	.mem_kb = 16384,
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 1,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "",
++	.ssidref = 12,
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++
++};
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++
++#if !defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++extern char __img_domu1_start[];
++extern char __img_domu1_end[];
++extern char __dtb_domu1_start[];
++extern char __dtb_domu1_end[];
++
++static int load_domu_image_bytes(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info)
++{
++	ARG_UNUSED(image_info);
++
++	memcpy(buf, __img_domu1_start + offset, bufsize);
++	return 0;
++}
++
++static ssize_t get_domu_image_size(void *image_info, uint64_t *size)
++{
++	ARG_UNUSED(image_info);
++
++	*size = __img_domu1_end - __img_domu1_start;
++	return 0;
++}
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++
++#if defined(CONFIG_DOM_CFG_LINUX_PV_DOMAIN)
++/* Lab convention: DomD = 192.168.10.10/24, DomU = 192.168.10.11/24, both on xenbr0. */
++static const char *params_vif =
++	"vif=[ 'backend=1,bridge=xenbr0,mac=08:00:27:ff:cb:ce,ip=192.168.10.11 "
++	"255.255.255.0 192.168.10.1' ]";
++
++static const char *params_vbd =
++	"disk=[ 'backend=1, format=raw, vdev=xvda, "
++	"access=rw, target=/etc/u-boot-initial-env' ]";
++
++static struct xen_domain_cfg domu_cfg_3 = {
++	.name = "linux_pv_domu",
++	/* Upstream PV example template. Not instantiated by the SoDeV demo, so its
++	 * memory size is left at the upstream default. */
++	.mem_kb = 256 * 1024,
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 2,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	/* quiet/systemd.show_status=no/log_color=0/audit=0 stop the boot console
++	 * being filled with ANSI colour bytes and audit syscall records. */
++	.cmdline = "root=/dev/ram0 rootwait console=hvc0 clk_ignore_unused "
++		   "quiet systemd.show_status=no systemd.log_color=0 audit=0",
++	.ssidref = 12,
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++};
++
++void pv_domu_init(void)
++{
++	parse_one_record_and_fill_cfg(params_vif, &domu_cfg_3.back_cfg);
++	parse_one_record_and_fill_cfg(params_vbd, &domu_cfg_3.back_cfg);
++}
++
++#endif /* CONFIG_DOM_CFG_LINUX_PV_DOMAIN */
++
++#if defined(CONFIG_DOM_CFG_SODEV)
++/*
++ * ---------------------------------------------------------------------------
++ * RPi4 SoDeV production guests (Zephyr Dom0 "hybrid" architecture).
++ *
++ * DomD -- the driver domain holding the whole BCM2711 display complex plus
++ * GENET, USB and the SD card -- stays a dom0less domain created by Xen from the
++ * U-Boot boot modules. Its direct-map/static-mem MMIO passthrough lives in
++ * meta-xt-rpi4/recipes-guest/domd-vc4/files/bcm2711-raspberrypi4-64-domd-vc4.dts
++ * and is NOT expressed here. The two virtio guests are described here:
++ *
++ *   rpi_4b_sodev_domu : AGL Qt6/Flutter Cluster IC (micro-HDMI-A-1)
++ *   rpi_4b_sodev_doma : AAOS / xenvm_trout            (micro-HDMI-A-2)
++ *
++ * Both are pure virtio-pci guests: every backend (net/blk/gpu/input/snd/vsock/
++ * serial) is a qemu virtio-pci device served by `xl devd` + qemu inside the
++ * dom0less DomD. Neither guest needs iomems or irqs, and back_cfg is left empty
++ * (the Zephyr PV vif/vbd path is unused). Field values mirror the deployed
++ * /etc/xen/{domu,doma}.cfg — including DomA at 2 GiB: that file used to say 4096,
++ * carried over from the 16 GiB rpi5 board, which does not fit an 8 GiB Pi 4
++ * (1920+1024+4096+1024+Xen+gpu = 8204 MiB). Both now say 2048.
++ *
++ * WHO ACTUALLY CREATES THEM. Not Zephyr, in this configuration. These entries
++ * load their kernels through storage_image_kernel_read(), i.e. the FATFS disk
++ * backend, and boards/rpi_4b.conf sets CONFIG_DISK_DRIVER_SDMMC=n because the SD
++ * controller is passed through to DomD (an enabled SDHC node with unmapped MMIO
++ * would hang Dom0). With no disk driver there is no volume to read from, so — as
++ * on RPi5, whose rpi_5.conf sets exactly the same CONFIG_DISK_DRIVER_SDMMC=n —
++ * the production path is `xl create` inside DomD, and these dom_cfg entries are
++ * reachable only from the Zephyr shell (`xu create rpi_4b_sodev_domu`) and only
++ * if a disk is given back to Dom0. They are kept because they are the single
++ * place the guest layout is written down, and because the RPi5 file keeps its
++ * equivalents for the same reason.
++ *
++ * [rpi4] MEMORY BUDGET differs from RPi5. RPi5 ran DomU 1 GiB + DomA 4 GiB on a
++ * 16 GiB board. An 8 GiB RPi4 has Dom0 256 MiB + DomD 1920 MiB committed by
++ * bcm2711-raspberrypi4-64-xen.dtso, leaving about 5.9 GiB, so DomA is halved to
++ * 2 GiB. That keeps roughly 2.9 GiB for the Xen heap, the boot modules and
++ * headroom. Raising DomA back to 4 GiB is the first thing to try if AAOS is
++ * memory-starved, and the first thing to cut if Xen runs out.
++ * ---------------------------------------------------------------------------
++ */
++
++/* DomU: AGL cluster IC. 1 GiB / 1 vCPU. root on virtio-blk (/dev/vda, backed by
++ * DomD's blkback over SD p3). GIC_V2 because BCM2711 is a GIC-400 exactly like
++ * BCM2712 -- the host has no vGICv3 emulation, so a guest asking for GIC_V3 gets
++ * "vGICv3 is not supported on this platform" and create fails with rc=-19.
++ * No hardware passthrough. */
++static struct xen_domain_cfg rpi_4b_sodev_domu = {
++	.name = "rpi_4b_sodev_domu",
++	.mem_kb = 1ULL * 1024 * 1024, /* 1 GiB (= deployed domu.cfg memory=1024) */
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 1,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "root=/dev/vda rw rootwait console=hvc0 cma=256M",
++	.ssidref = 12,
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++};
++
++/* DomA: AAOS guest. Split kernel + layered ramdisk; the cmdline MUST contain
++ * "bootconfig" so the CONFIG_BOOT_CONFIG kernel reads the #BOOTCONFIG trailer the
++ * prebuilt appends to the vendor_boot ramdisk. 2 GiB / 2 vCPU; cmdline mirrors
++ * the deployed doma.cfg extra=.
++ *
++ * [rpi4] dt_passthrough is "/soc/firmware", not RPi5's "/firmware": on BCM2711 the
++ * VideoCore firmware interface node lives under /soc (see
++ * meta-xt-rpi4/BCM2711-DT-TRUTH.md). It is a descriptive copy for AAOS's
++ * android,firmware resolution -- the node has no reg, so this does not conflict
++ * with the same node being passed to DomD for the mailbox.
++ *
++ * androidboot.boot_devices is a GUEST-side virtio-pci ECAM address generated by
++ * libxl, not a host address, so it carries over unchanged. */
++static char *sodev_doma_dt_passthrough[] = {
++	"/soc/firmware",
++};
++
++static struct xen_domain_cfg rpi_4b_sodev_doma = {
++	.name = "rpi_4b_sodev_doma",
++	.mem_kb = 2ULL * 1024 * 1024, /* 2 GiB -- see the MEMORY BUDGET note above */
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 2,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "loglevel=8 init=/init ro rootwait printk.devkmsg=off "
++		   "console=hvc0 bootconfig "
++		   "androidboot.boot_devices=33000000.pcie cma=256M "
++		   "androidboot.force_normal_boot=1 androidboot.slot_suffix=_a",
++	.ssidref = 12,
++
++	.dt_passthrough = sodev_doma_dt_passthrough,
++	.nr_dt_passthrough = ARRAY_SIZE(sodev_doma_dt_passthrough),
++
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++	.load_initrd_bytes = storage_image_initrd_read,
++	.get_initrd_size = storage_image_initrd_get_size,
++};
++#endif /* CONFIG_DOM_CFG_SODEV */
++
++static struct xen_domain_cfg domu_cfg_1 = {
++	.name = "rpi_4b_domu",
++	.mem_kb = 16384,
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 1,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "",
++	.ssidref = 12,
++
++#if !defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++	.load_image_bytes = load_domu_image_bytes,
++	.get_image_size = get_domu_image_size,
++
++	.dtb_start = __dtb_domu1_start,
++	.dtb_end = __dtb_domu1_end,
++#else
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++};
++
++/*
++ * [rpi4] Upstream blinky-demo DomD. RPi5 handed it the BCM2712 AON GPIO
++ * (/soc/gpio@7d517c00, MFN 0x107D517). BCM2711's GPIO bank is
++ * /soc/gpio@7e200000 -> physical 0xfe200000 -> MFN 0xfe200 (the /soc ranges map
++ * 0x7e000000 to 0xfe000000; see meta-xt-rpi4/BCM2711-DT-TRUTH.md).
++ *
++ * Only used by `xu create rpi_4b_domd` from the shell. It is NOT part of the
++ * SoDeV cockpit, where GPIO stays with the hardware domain -- if this demo is
++ * ever run alongside the cockpit, mark /soc/gpio@7e200000 xen,passthrough in the
++ * host DT first, or Xen will refuse the IRQ with -EBUSY.
++ */
++static struct xen_domain_iomem domd_iomems[] = {
++	{.first_mfn = 0xfe200, .nr_mfns = 0x1, .first_gfn = 0},
++};
++
++static char *domd_dt_passthrough[] = {
++	"/soc/gpio@7e200000",
++};
++
++#if !defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++extern char __img_domu0_start[];
++extern char __img_domu0_end[];
++extern char __dtb_domu0_start[];
++extern char __dtb_domu0_end[];
++
++static int load_domd_image_bytes(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info)
++{
++	ARG_UNUSED(image_info);
++
++	memcpy(buf, __img_domu0_start + offset, bufsize);
++	return 0;
++}
++
++static ssize_t get_domd_image_size(void *image_info, uint64_t *size)
++{
++	ARG_UNUSED(image_info);
++
++	*size = __img_domu0_end - __img_domu0_start;
++	return 0;
++}
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++
++static struct xen_domain_cfg domu_cfg_0 = {
++	.name = "rpi_4b_domd",
++	.mem_kb = 16384,
++	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
++	.max_evtchns = 10,
++	.max_vcpus = 1,
++	.gnt_frames = 32,
++	.max_maptrack_frames = 1,
++	.gic_version = XEN_DOMCTL_CONFIG_GIC_V2,
++	.tee_type = XEN_DOMCTL_CONFIG_TEE_NONE,
++	.cmdline = "",
++	.ssidref = 12,
++
++	.iomems = domd_iomems,
++	.nr_iomems = ARRAY_SIZE(domd_iomems),
++
++	.dt_passthrough = domd_dt_passthrough,
++	.nr_dt_passthrough = ARRAY_SIZE(domd_dt_passthrough),
++
++#if !defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++	.load_image_bytes = load_domd_image_bytes,
++	.get_image_size = get_domd_image_size,
++
++	.dtb_start = __dtb_domu0_start,
++	.dtb_end = __dtb_domu0_end,
++#else
++	.load_image_bytes = storage_image_kernel_read,
++	.get_image_size = storage_image_kernel_get_size,
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++
++};
++
++struct dom0_domain_cfg domain_cfgs[] = {
++	{
++		.domain_cfg = &domu_cfg_0,
++#if defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++		.image_kernel_path = DISK_BIN_PATH"z_blinky.bin",
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++	},
++	{
++		.domain_cfg = &domu_cfg_1,
++#if defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++		.image_kernel_path = DISK_BIN_PATH"z_sync.bin",
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++	},
++#if defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
++	{
++		.domain_cfg = &domu_cfg_2,
++		.image_kernel_path = DISK_BIN_PATH"helloworld_xen-arm64",
++	},
++#endif /* CONFIG_DOM_STORAGE_FATFS_ENABLE */
++#if defined(CONFIG_DOM_CFG_LINUX_PV_DOMAIN)
++	{
++		.domain_cfg = &domu_cfg_3,
++		.image_kernel_path = DISK_BIN_PATH"linux-pv-image",
++		.init = pv_domu_init,
++	},
++#endif /* CONFIG_DOM_CFG_LINUX_PV_DOMAIN */
++#if defined(CONFIG_DOM_CFG_SODEV)
++	/* RPi4 SoDeV production guests (hybrid: Zephyr Dom0 creates these two;
++	 * DomD stays dom0less). Kernel/ramdisk are staged in the FAT root of SD p1
++	 * by the image recipe, under DISK_BIN_PATH. */
++	{
++		.domain_cfg = &rpi_4b_sodev_domu,
++		.image_kernel_path = DISK_BIN_PATH"linux-domu",
++	},
++	{
++		.domain_cfg = &rpi_4b_sodev_doma,
++		.image_kernel_path = DISK_BIN_PATH"aaos-android-kernel",
++		.image_initrd_path = DISK_BIN_PATH"aaos-vendor-boot-ramdisk",
++	},
++#endif /* CONFIG_DOM_CFG_SODEV */
++	{ 0 },
++};
