@@ -1049,6 +1049,43 @@ else
     NINJA_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel doma && ninja ${NINJA_TARGET}"
   fi
 fi
+# ---------------------------------------------------------------------------
+# Name the SD image after what is in it
+# ---------------------------------------------------------------------------
+# rouge always writes full.img, so a second build silently replaces the first and
+# a saved image cannot be identified afterwards: nothing on it says which board,
+# which SKU, which Dom0, or whether the guests are present. Derive the name from
+# the options that were actually resolved, and leave full.img as a symlink to it
+# so every existing instruction (`dd if=full.img ...`), the .gitignore entry and
+# any caller's script keep working unchanged.
+#
+# The timestamp is taken now rather than after the build: it belongs to the
+# configuration being announced, and a name that depends on when the build
+# happened to finish is not reproducible from the command line.
+IMG_NAME=""
+if [ "$NINJA_TARGET" = "image-full" ]; then
+  case "$DOM0_OS" in
+    zephyr) img_dom0="Dom0Zephyr" ;;
+    linux)  img_dom0="Dom0Linux"  ;;
+  esac
+  # BOARD_RAM is 4g|8g|16g and was validated against this board above.
+  IMG_NAME="${BOARD}-${BOARD_RAM%g}GB-${img_dom0}"
+  [ "$ENABLE_DOMU" = yes ]    && IMG_NAME="${IMG_NAME}-DomU"
+  [ "$ENABLE_ANDROID" = yes ] && IMG_NAME="${IMG_NAME}-DomA"
+  IMG_NAME="${IMG_NAME}-$(date +%Y%m%d-%H%M).img"
+  echo ">> SD image will be ${IMG_NAME} (full.img -> it)"
+  # A leftover symlink from an earlier build has to go BEFORE rouge runs: rouge
+  # opens full.img for writing, which would follow the link and overwrite the
+  # previous build's image in place -- destroying the artifact this naming exists
+  # to preserve.
+  #
+  # `if` rather than `[ -L full.img ] && rm -f full.img`: as the last statement of
+  # this block the && form would make the whole `if` exit non-zero on the common
+  # path (no symlink present), which under `set -e` is a trap for whoever moves
+  # this code or sources the script.
+  if [ -L full.img ]; then rm -f full.img; fi
+fi
+
 echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
 in_docker "$XT_DOCKER" "
   set -e
@@ -1131,5 +1168,14 @@ else
   echo "  moulin output  : artifacts/ , yocto/"
 fi
 if [ "${NINJA_TARGET}" = "image-full" ]; then
-  echo "  SD image       : full.img  (flash: sudo dd if=full.img of=/dev/<sd> bs=4M conv=fsync)"
+  # rouge wrote a regular full.img; give it the descriptive name and point full.img
+  # at it. Renaming is a directory operation, so the 26 GiB sparse file is not
+  # copied and its holes survive.
+  if [ -f full.img ] && [ ! -L full.img ] && [ -n "${IMG_NAME}" ]; then
+    mv -f full.img "${IMG_NAME}"
+    ln -sfn "${IMG_NAME}" full.img
+  fi
+  echo "  SD image       : ${IMG_NAME:-full.img}"
+  echo "                   full.img is a symlink to it, so this still works:"
+  echo "                   sudo dd if=full.img of=/dev/<sd> bs=4M conv=fsync"
 fi

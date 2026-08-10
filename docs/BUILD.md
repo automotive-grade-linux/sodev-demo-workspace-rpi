@@ -189,8 +189,24 @@ failures each have an entry in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ### 6. Check what you got
 
-    ls -l full.img            # ~27.7 GB, sparse
+    ls -lL full.img           # ~27.7 GB, sparse (-L follows the symlink)
     sfdisk -l full.img        # four partitions
+
+`build.sh` names the image after the configuration that produced it and points
+`full.img` at the newest one:
+
+    <board>-<SKU>-Dom0<Zephyr|Linux>[-DomU][-DomA]-<YYYYmmdd-HHMM>.img
+
+so `rpi4-4GB-Dom0Zephyr-DomU-DomA-20260809-1750.img` is a 4 GiB Raspberry Pi 4
+image with a Zephyr Dom0 and both guests on it, built at 17:50 local time. A
+guest that was not built leaves its token out, so the name says what is on the
+card rather than what was asked for. The point is that a second build does not
+overwrite the first, and an image found later can still be identified — nothing
+inside a 27 GB file says which board or SKU it was assembled for.
+
+To judge a rebuild against an image that is known to boot — before spending an
+SD write and a board on it — see `tools/compare-sd-image.py`; its module
+docstring explains what "identical" can and cannot mean per artifact class.
 
 A complete image has four partitions:
 
@@ -382,7 +398,9 @@ ninja image-full     # assembles full.img (the GPT SD image)
 ```
 
 `ninja image-full` writes `full.img` into the build root (the directory you
-ran moulin in).
+ran moulin in). The descriptive name is `build.sh`'s doing, not rouge's, so on
+the manual path you get plain `full.img` and it is on you not to overwrite the
+previous one.
 
 Manual-path caveats (all handled automatically by `build.sh`):
 - stage the AAOS prebuilts **before** the first build (see *Staging the AAOS
@@ -639,6 +657,23 @@ instead of over the network:
 
     ./build.sh -u --aaos=source \
       --aaos-ref=/mirror/aosp --aaos-kernel-ref=/mirror/aosp-kernel
+
+The two mirrors are easy to pass the wrong way round, and the cost is invisible: both
+are repo clients full of bare `*.git` repositories, so `repo init --reference` accepts
+either, then falls back to the network for every project while the log looks entirely
+normal. `build.sh` therefore checks *which* tree each mirror holds, using projects that
+only one of the two manifests carries — `platform/bionic.git` for AOSP,
+`kernel/common.git` for the guest kernel — and refuses a swap by name. One mirror may
+still serve both flags; only a positive swap (the other tree's projects present and this
+tree's absent) is an error, and a mirror that carries neither is passed with a note.
+
+The AOSP and guest-kernel checkouts are also board-specific: `rpi4-sodev.yaml` puts them
+in `android-rpi4/` and `android_kernel-rpi4/` where the Pi 5 uses the historical
+`android/` and `android_kernel/`. Beyond keeping the two boards' trees apart — DomA is
+compiled for the host ISA, so they are not interchangeable — this is what makes a wrong
+mirror fail *now*: with one shared directory the second board finds the first board's
+populated checkout, moulin skips the `repo init`, and the wrong mirror goes unexercised
+until someone builds from a clean tree hours later.
 
 This is the AOSP analogue of `--west-cache`. Details worth knowing:
 

@@ -38,3 +38,11 @@ __pycache__/
 # file://NOTICE, so it has to be committed or a fresh clone fails at do_fetch.
 **/recipes-bsp/aaos-guest-binaries/files/aaos-android-kernel-xenbuilt-*
 **/recipes-bsp/aaos-guest-binaries/files/aaos-vendor-boot-ramdisk-xenbuilt-*
+
+# Build outputs: SD images. build.sh names each one after the configuration it
+# holds -- <board>-<SKU>-Dom0<flavour>[-DomU][-DomA]-<date>-<time>.img -- and
+# points full.img at the newest, so both shapes have to be ignored. The pattern is
+# written out rather than a bare *.img so that an image someone deliberately adds
+# to the tree is still noticed.
+/rpi[45]-*GB-Dom0*.img
+full*.img
