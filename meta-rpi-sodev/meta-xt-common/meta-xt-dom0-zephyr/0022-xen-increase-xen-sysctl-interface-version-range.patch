@@ -1,0 +1,28 @@
+From 31d2bd60ff29c135f9613b13481b0d50e3a66fc8 Mon Sep 17 00:00:00 2001
+From: Mykyta Poturai <mykyta_poturai@epam.com>
+Date: Mon, 6 Jul 2026 14:55:23 +0300
+Subject: [PATCH] xen: increase xen_sysctl_interface_version range
+
+Latest Xen changed interface version to 0x16, make Zephyr compatible with
+it.
+
+Backported to Zephyr v4.4.1: v4.4.1 was cut from the v4.4 maintenance branch
+(forked at v4.4.0, 2026-04-14) and does not contain this commit.
+
+Signed-off-by: Mykyta Poturai <mykyta_poturai@epam.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Backport [https://github.com/zephyrproject-rtos/zephyr/commit/31d2bd60ff29c135f9613b13481b0d50e3a66fc8]
+---
+diff --git a/arch/arm64/core/xen/Kconfig b/arch/arm64/core/xen/Kconfig
+index 768c17a7085..c4bfe4df8b6 100644
+--- a/arch/arm64/core/xen/Kconfig
++++ b/arch/arm64/core/xen/Kconfig
+@@ -48,7 +48,7 @@ config XEN_DOMCTL_INTERFACE_VERSION
+ config XEN_SYSCTL_INTERFACE_VERSION
+ 	hex "Xen Sysctl interface version"
+ 	default 0x15
+-	range 0x15 0x15
++	range 0x15 0x16
+ 	depends on XEN
+ 	help
+ 	  Xen Sysctl interface version to use. This is the version of the

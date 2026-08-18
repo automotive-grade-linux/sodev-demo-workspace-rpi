@@ -1,0 +1,413 @@
+From d58fbb8cfc587323f8c72584cf216b2827f57f5e Mon Sep 17 00:00:00 2001
+From: TOKITA Hiroshi <tokita.hiroshi@gmail.com>
+Date: Sat, 14 Jun 2025 09:07:46 +0900
+Subject: [PATCH] include: zephyr: xen: public: remove and migrate to the `zephyr-xenlib`
+
+This PR migrates the MIT-licensed Xen public headers into the
+`include/zephyr/xen/public` directory to the zephyr-xenlib module.
+
+Since the xen public headers require GCC extensions,
+enable GNU_C_EXTENSIONS along with enabling CONFIG_XEN.
+
+Backported to Zephyr v4.4.1: v4.4.1 was cut from the v4.4 maintenance branch
+(forked at v4.4.0, 2026-04-14) and does not contain this commit. Four things
+differ from the upstream commit:
+
+ - drivers/xen/gnttab.c: upstream carries `#include <zephyr/xen/regions.h>` as an
+   unchanged context line, added there by some later commit on main. v4.4.1 has no
+   such line, and gnttab.c uses nothing from that header, so it is NOT added here.
+   An earlier revision of this patch did add it, which stopped the patch being a
+   straight backport and created a bogus ordering dependency on 0023.
+
+ - doc/releases/migration-guide-4.5.rst: the upstream hunk anchors on a WiFi entry
+   that does not exist in v4.4.1, where the 4.5 guide is still an empty skeleton.
+   The same six lines therefore go into the empty zephyr-keep-sorted block
+   instead. The wording is upstream's, verbatim.
+
+ - include/zephyr/xen/gnttab.h additionally gains <stdbool.h> and <stdint.h>.
+   Upstream did not add them in this commit because an earlier one already had; on
+   v4.4.1 the bool/uintN_t it uses arrived transitively through the vendored
+   <zephyr/xen/public/grant_table.h> being replaced here, so without them the header
+   no longer compiles standalone.
+
+ - the 14 header deletions under include/zephyr/xen/public/ are performed by
+   apply-zephyr-patches.sh (rm -rf) rather than by this patch: the reset loop that
+   runs before it restores tracked files, so a deletion hunk would be undone on
+   every re-run and this patch would then fail its forward check.
+
+Signed-off-by: TOKITA Hiroshi <tokita.hiroshi@gmail.com>
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Backport [https://github.com/zephyrproject-rtos/zephyr/commit/d58fbb8cfc587323f8c72584cf216b2827f57f5e]
+---
+diff --git a/arch/arm64/core/xen/Kconfig b/arch/arm64/core/xen/Kconfig
+index c4bfe4df8b6..6c62379884a 100644
+--- a/arch/arm64/core/xen/Kconfig
++++ b/arch/arm64/core/xen/Kconfig
+@@ -8,6 +8,7 @@ config XEN
+ 	default y
+ 	depends on ARMV8_A
+ 	depends on DT_HAS_XEN_XEN_ENABLED
++	select GNU_C_EXTENSIONS
+ 	help
+ 	  Enables support of Xen hypervisor on arm64 platform. Get enabled
+ 	  when board device tree contains "hypervisor" node with "xen,xen"
+diff --git a/arch/arm64/core/xen/enlighten.c b/arch/arm64/core/xen/enlighten.c
+index 164947a09ff..afa76432bdb 100644
+--- a/arch/arm64/core/xen/enlighten.c
++++ b/arch/arm64/core/xen/enlighten.c
+@@ -4,11 +4,12 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/memory.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/events.h>
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/xen.h>
+-#include <zephyr/xen/public/memory.h>
+ 
+ #include <zephyr/device.h>
+ #include <zephyr/init.h>
+diff --git a/arch/arm64/core/xen/hypercall.S b/arch/arm64/core/xen/hypercall.S
+index a180cea5725..a8e6c473772 100644
+--- a/arch/arm64/core/xen/hypercall.S
++++ b/arch/arm64/core/xen/hypercall.S
+@@ -3,10 +3,11 @@
+  * Copyright (c) 2021-2023 EPAM Systems
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/arch-arm.h>
++
+ #include <zephyr/toolchain.h>
+ #include <zephyr/linker/sections.h>
+-#include <zephyr/xen/public/arch-arm.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ #define HYPERCALL(hypercall)			\
+ GTEXT(HYPERVISOR_##hypercall);			\
+diff --git a/drivers/serial/uart_hvc_xen.c b/drivers/serial/uart_hvc_xen.c
+index 3283a6ec1e5..3aff94476f7 100644
+--- a/drivers/serial/uart_hvc_xen.c
++++ b/drivers/serial/uart_hvc_xen.c
+@@ -4,14 +4,15 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/io/console.h>
++#include <xen/public/sched.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/console.h>
+ #include <zephyr/xen/events.h>
+ #include <zephyr/xen/generic.h>
+ #include <zephyr/xen/hvm.h>
+-#include <zephyr/xen/public/io/console.h>
+-#include <zephyr/xen/public/sched.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ #include <zephyr/device.h>
+ #include <zephyr/init.h>
+diff --git a/drivers/serial/uart_hvc_xen_consoleio.c b/drivers/serial/uart_hvc_xen_consoleio.c
+index 97d5392d750..0f5bba9765e 100644
+--- a/drivers/serial/uart_hvc_xen_consoleio.c
++++ b/drivers/serial/uart_hvc_xen_consoleio.c
+@@ -9,8 +9,9 @@
+  * should be used (uart_hvc_xen.c), this console will not be available.
+  */
+ 
++#include <xen/public/xen.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ #include <zephyr/device.h>
+ #include <zephyr/drivers/uart.h>
+diff --git a/drivers/xen/dom0/domctl.c b/drivers/xen/dom0/domctl.c
+index 5c4d214360a..7834b2fbb0b 100644
+--- a/drivers/xen/dom0/domctl.c
++++ b/drivers/xen/dom0/domctl.c
+@@ -4,11 +4,12 @@
+  *
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/domctl.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/dom0/domctl.h>
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/domctl.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ #include <zephyr/init.h>
+ #include <zephyr/kernel.h>
+diff --git a/drivers/xen/dom0/sysctl.c b/drivers/xen/dom0/sysctl.c
+index 2ff6af3ef3a..8c015f56171 100644
+--- a/drivers/xen/dom0/sysctl.c
++++ b/drivers/xen/dom0/sysctl.c
+@@ -4,10 +4,13 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include <xen/public/xen.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/dom0/sysctl.h>
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/xen.h>
++
++#include <errno.h>
+ 
+ static int do_sysctl(xen_sysctl_t *sysctl)
+ {
+diff --git a/drivers/xen/events.c b/drivers/xen/events.c
+index 2da1ec70de2..ddd29de39c3 100644
+--- a/drivers/xen/events.c
++++ b/drivers/xen/events.c
+@@ -5,9 +5,10 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/event_channel.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+-#include <zephyr/xen/public/xen.h>
+-#include <zephyr/xen/public/event_channel.h>
+ #include <zephyr/xen/events.h>
+ #include <zephyr/sys/barrier.h>
+ 
+diff --git a/doc/releases/migration-guide-4.5.rst b/doc/releases/migration-guide-4.5.rst
+--- a/doc/releases/migration-guide-4.5.rst
++++ b/doc/releases/migration-guide-4.5.rst
+@@ -44,6 +44,11 @@ Device Drivers and Devicetree
+ 
+ .. zephyr-keep-sorted-start re(^\w) ignorecase
+ 
++Xen
++===
++
++* With the introduction of zephyr-xenlib, the path to Xen's public headers has changed.
++  Please use ``xen/public/...`` instead of ``zephyr/xen/public/...``.
+ 
+ .. zephyr-keep-sorted-stop
+ 
+diff --git a/drivers/xen/gnttab.c b/drivers/xen/gnttab.c
+index 6733f9df9a2..a384c05af77 100644
+--- a/drivers/xen/gnttab.c
++++ b/drivers/xen/gnttab.c
+@@ -17,13 +17,15 @@
+  *
+  ****************************************************************************
+  */
++
++#include <xen/public/grant_table.h>
++#include <xen/public/memory.h>
++#include <xen/public/xen.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/generic.h>
+ #include <zephyr/xen/gnttab.h>
+ #include <zephyr/xen/memory.h>
+-#include <zephyr/xen/public/grant_table.h>
+-#include <zephyr/xen/public/memory.h>
+-#include <zephyr/xen/public/xen.h>
+ #include <zephyr/sys/barrier.h>
+ 
+ #include <zephyr/init.h>
+diff --git a/drivers/xen/hvm.c b/drivers/xen/hvm.c
+index 5244d34d433..065896bb41c 100644
+--- a/drivers/xen/hvm.c
++++ b/drivers/xen/hvm.c
+@@ -4,10 +4,11 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include <xen/public/hvm/hvm_op.h>
++#include <xen/public/hvm/params.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/hvm.h>
+-#include <zephyr/xen/public/hvm/hvm_op.h>
+-#include <zephyr/xen/public/hvm/params.h>
+ 
+ #include <zephyr/kernel.h>
+ 
+diff --git a/drivers/xen/memory.c b/drivers/xen/memory.c
+index 5deefbde108..29f0df89903 100644
+--- a/drivers/xen/memory.c
++++ b/drivers/xen/memory.c
+@@ -3,10 +3,11 @@
+  * Copyright (c) 2023 EPAM Systems
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/memory.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/memory.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ #include <zephyr/kernel.h>
+ 
+diff --git a/drivers/xen/version.c b/drivers/xen/version.c
+index 41fc7c1e97a..a0c7e45fdcf 100644
+--- a/drivers/xen/version.c
++++ b/drivers/xen/version.c
+@@ -4,10 +4,12 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include <xen/public/xen.h>
++#include <xen/public/version.h>
++
+ #include <zephyr/arch/arm64/hypercall.h>
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/version.h>
+-#include <zephyr/xen/public/xen.h>
++#include <errno.h>
+ #include <string.h>
+ 
+ int xen_version(void)
+diff --git a/include/zephyr/xen/dmop.h b/include/zephyr/xen/dmop.h
+index 9a174fe1e7f..d5a25dcfacb 100644
+--- a/include/zephyr/xen/dmop.h
++++ b/include/zephyr/xen/dmop.h
+@@ -7,7 +7,7 @@
+ #ifndef ZEPHYR_XEN_DMOP_H_
+ #define ZEPHYR_XEN_DMOP_H_
+ 
+-#include <zephyr/xen/public/hvm/dm_op.h>
++#include <xen/public/hvm/dm_op.h>
+ 
+ /**
+  * @brief Create an I/O request server in the given Xen domain.
+diff --git a/include/zephyr/xen/dom0/domctl.h b/include/zephyr/xen/dom0/domctl.h
+index eb6667352f3..cc1c9984ddb 100644
+--- a/include/zephyr/xen/dom0/domctl.h
++++ b/include/zephyr/xen/dom0/domctl.h
+@@ -13,9 +13,10 @@
+ #ifndef __XEN_DOM0_DOMCTL_H__
+ #define __XEN_DOM0_DOMCTL_H__
+ 
++#include <xen/public/xen.h>
++#include <xen/public/domctl.h>
++
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/domctl.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ #include <zephyr/kernel.h>
+ 
+diff --git a/include/zephyr/xen/dom0/sysctl.h b/include/zephyr/xen/dom0/sysctl.h
+index aeb90dc8569..1d761c4f958 100644
+--- a/include/zephyr/xen/dom0/sysctl.h
++++ b/include/zephyr/xen/dom0/sysctl.h
+@@ -12,9 +12,11 @@
+ 
+ #ifndef __XEN_DOM0_SYSCTL_H__
+ #define __XEN_DOM0_SYSCTL_H__
++
++#include <xen/public/xen.h>
++#include <xen/public/sysctl.h>
++
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/sysctl.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ /**
+  * @brief Retrieves information about the host system.
+diff --git a/include/zephyr/xen/events.h b/include/zephyr/xen/events.h
+index 0040bccfff5..4e6504dec2b 100644
+--- a/include/zephyr/xen/events.h
++++ b/include/zephyr/xen/events.h
+@@ -16,7 +16,7 @@
+ #ifndef __XEN_EVENTS_H__
+ #define __XEN_EVENTS_H__
+ 
+-#include <zephyr/xen/public/event_channel.h>
++#include <xen/public/event_channel.h>
+ 
+ #include <zephyr/kernel.h>
+ 
+diff --git a/include/zephyr/xen/generic.h b/include/zephyr/xen/generic.h
+index 756bf80d884..65b4098c32e 100644
+--- a/include/zephyr/xen/generic.h
++++ b/include/zephyr/xen/generic.h
+@@ -6,7 +6,7 @@
+ #ifndef __XEN_GENERIC_H__
+ #define __XEN_GENERIC_H__
+ 
+-#include <zephyr/xen/public/xen.h>
++#include <xen/public/xen.h>
+ 
+ #define XEN_PAGE_SIZE		4096
+ #define XEN_PAGE_SHIFT		12
+diff --git a/include/zephyr/xen/gnttab.h b/include/zephyr/xen/gnttab.h
+index 056b39984ef..740febf3dca 100644
+--- a/include/zephyr/xen/gnttab.h
++++ b/include/zephyr/xen/gnttab.h
+@@ -6,7 +6,10 @@
+ #ifndef __XEN_GNTTAB_H__
+ #define __XEN_GNTTAB_H__
+ 
+-#include <zephyr/xen/public/grant_table.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <xen/public/grant_table.h>
+ 
+ /*
+  * Assigns gref and permits access to 4K page for specific domain.
+diff --git a/include/zephyr/xen/hvm.h b/include/zephyr/xen/hvm.h
+index 1848705975a..d033b220a24 100644
+--- a/include/zephyr/xen/hvm.h
++++ b/include/zephyr/xen/hvm.h
+@@ -6,8 +6,8 @@
+ #ifndef __XEN_HVM_H__
+ #define __XEN_HVM_H__
+ 
+-#include <zephyr/xen/public/hvm/hvm_op.h>
+-#include <zephyr/xen/public/hvm/params.h>
++#include <xen/public/hvm/hvm_op.h>
++#include <xen/public/hvm/params.h>
+ 
+ #include <zephyr/kernel.h>
+ 
+diff --git a/include/zephyr/xen/memory.h b/include/zephyr/xen/memory.h
+index 1614d8fade8..88be68ffde5 100644
+--- a/include/zephyr/xen/memory.h
++++ b/include/zephyr/xen/memory.h
+@@ -6,9 +6,10 @@
+ #ifndef ZEPHYR_XEN_MEMORY_H_
+ #define ZEPHYR_XEN_MEMORY_H_
+ 
++#include <xen/public/xen.h>
++#include <xen/public/memory.h>
++
+ #include <zephyr/kernel.h>
+-#include <zephyr/xen/public/memory.h>
+-#include <zephyr/xen/public/xen.h>
+ 
+ /**
+  * Add mapping for specified page frame in Xen domain physmap.
+diff --git a/include/zephyr/xen/version.h b/include/zephyr/xen/version.h
+index 666c7fcd9a2..a25ac232167 100644
+--- a/include/zephyr/xen/version.h
++++ b/include/zephyr/xen/version.h
+@@ -6,8 +6,8 @@
+ #ifndef __XEN_DOM0_VERSION_H__
+ #define __XEN_DOM0_VERSION_H__
+ #include <zephyr/xen/generic.h>
+-#include <zephyr/xen/public/version.h>
+-#include <zephyr/xen/public/xen.h>
++#include <xen/public/version.h>
++#include <xen/public/xen.h>
+ 
+ /**
+  * Get Xen hypervisor version integer encoded information
