@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] dom0-xt: track the Zephyr 4.x FATFS Kconfig renames
+
+
+Two symbols this app referenced do not exist in upstream Zephyr 4.4.1:
+
+ - - CONFIG_FS_MULTI_PARTITION was never an upstream symbol at all; it was
+   added by the xen-troops Zephyr fork (subsys/fs/Kconfig.fatfs). Upstream
+   introduced the same feature in 4.0 as CONFIG_FS_FATFS_MULTI_PARTITION.
+ - - CONFIG_SDMMC_VOLUME_NAME was removed in Zephyr 4.0; the SDMMC disk name
+   now comes from the devicetree `disk-name` property (see
+   doc/releases/migration-guide-4.0.rst). Its default was "SD" for
+   FAT_FILESYSTEM_ELM, so the Kconfig default is spelled out as "SD" here. The
+   C-side use in src/dom0.h already has a "SD" fallback (0008).
+
+Zephyr 4.x promotes Kconfig warnings to errors (scripts/kconfig/kconfig.py),
+so these are build failures, not silently-ignored settings. Behaviour is
+unchanged: the same partition table is compiled and the same logical drive
+name results.
+
+Depends on 0002, 0008 (both carry the old spelling in boards/rpi_5.conf).
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
+---
+diff --git a/Kconfig b/Kconfig
+index 0147c98..4c0033b 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -41,7 +41,14 @@ config FS_FATFS_MOUNT_MKFS
+ 	default n
+ 
+ config FS_FATFS_WINDOW_ALIGNMENT
+-	default SDHC_BUFFER_ALIGNMENT
++	# `if SDHC`: SDHC_BUFFER_ALIGNMENT is only ever defined per vendor
++	# (drivers/sdhc/Kconfig.sdhc_cdns, .rcar, .imx, ...), so with CONFIG_SDHC off it
++	# is invisible and expands to the empty string - which reaches the generated
++	# configs.c as a blank alignment and breaks its asm. Boards had to pin
++	# FS_FATFS_WINDOW_ALIGNMENT to work around that; the second default removes the
++	# need, and boards/rpi_5.conf drops its pin in the same patch.
++	default SDHC_BUFFER_ALIGNMENT if SDHC
++	default 4
+ 
+ config FS_FATFS_LBA64
+ 	default y
+@@ -58,8 +65,13 @@ config DOM_STORAGE_FATFS_DIR
+ 
+ config DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME
+ 	string "FATFS logical drive name to be used as mount point"
+-	default "0" if FS_MULTI_PARTITION
+-	default SDMMC_VOLUME_NAME
++	# FS_MULTI_PARTITION was a xen-troops Zephyr fork symbol; upstream calls it
++	# FS_FATFS_MULTI_PARTITION (subsys/fs/Kconfig.fatfs). SDMMC_VOLUME_NAME was
++	# removed in Zephyr 4.0 (the SDMMC disk name moved to the devicetree
++	# `disk-name` property), so it cannot be referenced any more - fall back to
++	# the same string its default produced, "SD".
++	default "0" if FS_FATFS_MULTI_PARTITION
++	default "SD"
+ 	help
+ 	  FATFS logical drive name to be used as mount point.
+ 
+diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
+index 3fd7fd2..28ca4f9 100644
+--- a/boards/rpi_5.conf
++++ b/boards/rpi_5.conf
+@@ -51,7 +51,7 @@ CONFIG_DOM_STORAGE_FATFS_ENABLE=y
+ CONFIG_FILE_SYSTEM_SHELL=y
+ 
+ CONFIG_NOCACHE_MEMORY=y
+-CONFIG_FS_MULTI_PARTITION=y
++CONFIG_FS_FATFS_MULTI_PARTITION=y
+ CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="1"
+ CONFIG_DOM_STORAGE_FATFS_DIR=""
+ CONFIG_XEN_LIBFDT=y
+@@ -68,18 +68,19 @@ CONFIG_DOMU_MAX=5
+ # the shell thread -> "kernel will"->"kernbaill", failure reason unreadable).
+ CONFIG_LOG_MODE_IMMEDIATE=y
+ 
+-# [build-fix] SD-less Dom0: the SD belongs to DomD. The guests are not built into
+-# zephyr.bin either - CONFIG_DOM_CFG_BUILTIN_IMAGES is off in this topology and
+-# DomD's xl toolstack creates them. Pin FS_FATFS_WINDOW_ALIGNMENT, which
+-# zephyr-dom0-xt/Kconfig otherwise defaults to the inactive, empty
+-# SDHC_BUFFER_ALIGNMENT -> broken configs.c asm. (Patch 0026 fixes that default and
+-# drops this pin again.)
++# SD-less Dom0: the SD belongs to DomD. The guests are not built into zephyr.bin
++# either - CONFIG_DOM_CFG_BUILTIN_IMAGES is off in this topology and DomD's xl
++# toolstack creates them.
++#
++# FS_FATFS_WINDOW_ALIGNMENT is no longer pinned here: zephyr-dom0-xt/Kconfig now
++# reads `default SDHC_BUFFER_ALIGNMENT if SDHC` / `default 4`, so the empty,
++# invisible SDHC_BUFFER_ALIGNMENT can no longer leak into configs.c. Fixing the
++# default instead of overriding it is what makes that Kconfig submittable.
+ #
+ # CONFIG_DISK_DRIVER_SDMMC is deliberately NOT set here: upstream 4.4.1 has no
+ # bcm2712 SDHCI driver and no sdmmc-disk node, so the symbol is invisible and the
+ # subsystem is already off. Assigning to it would only risk a Kconfig warning,
+ # which Zephyr 4.x turns into a build error.
+-CONFIG_FS_FATFS_WINDOW_ALIGNMENT=4
+ CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
+ # CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n here.
+ # Those symbols only ever existed in the xen-troops Zephyr fork, to gate the extra
+diff --git a/src/storage.c b/src/storage.c
+index 0615151..1eef5fe 100644
+--- a/src/storage.c
++++ b/src/storage.c
+@@ -23,7 +23,12 @@ static struct fs_mount_t mp = {
+ 	.fs_data = &fat_fs,
+ };
+ 
+-#if defined(CONFIG_FS_MULTI_PARTITION)
++/* Upstream Zephyr spells this CONFIG_FS_FATFS_MULTI_PARTITION
++ * (subsys/fs/Kconfig.fatfs); CONFIG_FS_MULTI_PARTITION only ever existed in the
++ * xen-troops Zephyr fork. The table itself is unchanged - upstream also expects
++ * VolToPart[] to be supplied by the application.
++ */
++#if defined(CONFIG_FS_FATFS_MULTI_PARTITION)
+ PARTITION VolToPart[FF_VOLUMES] = {
+     [0] = {3, 1},     /* "0:" ==> 1st partition on the pd#0 */
+     [1] = {3, 2},     /* "1:" ==> 2nd partition on the pd#0 */
+@@ -34,7 +39,7 @@ PARTITION VolToPart[FF_VOLUMES] = {
+     [6] = {0, -1},
+     [7] = {0, -1},
+ };
+-#endif /* CONFIG_FS_MULTI_PARTITION */
++#endif /* CONFIG_FS_FATFS_MULTI_PARTITION */
+ 
+ int storage_image_kernel_read(uint8_t *buf, size_t bufsize, uint64_t offset, void *image_info)
+ {

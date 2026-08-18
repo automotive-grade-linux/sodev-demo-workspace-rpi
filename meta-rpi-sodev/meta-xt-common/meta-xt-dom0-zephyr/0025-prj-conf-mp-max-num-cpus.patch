@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] prj.conf: MP_NUM_CPUS -> MP_MAX_NUM_CPUS for Zephyr 4.x
+
+
+CONFIG_MP_NUM_CPUS was already deprecated in Zephyr 3.6 (kernel/Kconfig
+defined it as `default MP_MAX_NUM_CPUS`, so the assignment here never did
+anything on its own) and was removed outright in 4.0, see
+doc/releases/migration-guide-4.0.rst. Zephyr 4.x turns Kconfig warnings into
+errors (scripts/kconfig/kconfig.py), so an assignment to a now-undefined
+symbol fails the build rather than being ignored.
+
+The value is unchanged: the 3.6 build's .config already had both
+CONFIG_MP_NUM_CPUS=1 and CONFIG_MP_MAX_NUM_CPUS=1.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
+---
+diff --git a/prj.conf b/prj.conf
+index 569941c..4f9d242 100644
+--- a/prj.conf
++++ b/prj.conf
+@@ -1,4 +1,4 @@
+-CONFIG_MP_NUM_CPUS=1
++CONFIG_MP_MAX_NUM_CPUS=1
+ CONFIG_XEN_STORE_SRV=y
+ CONFIG_XEN_DOMAIN_MANAGEMENT=y
+ CONFIG_XEN_SHELL=y

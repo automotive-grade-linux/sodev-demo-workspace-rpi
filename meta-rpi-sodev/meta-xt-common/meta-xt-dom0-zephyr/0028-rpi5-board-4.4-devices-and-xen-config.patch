@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] boards/rpi_5: adapt the board to Zephyr 4.4
+
+
+Three things the 4.4 board needs that the 3.6 one did not.
+
+1. Keep 4.4.1's newly-enabled devices out of Dom0. Upstream's rpi_5 board
+turns on
+   PCIe (pcie1/pcie2), the RP1 peripheral controller's GPIO bank behind it
+   (gpio0_0) and the iProc RNG200 (rng); the 3.6 xen-troops board had none of
+   them.
+   Their drivers are all `default y` gated on DT_HAS_*_ENABLED, so each probes
+   from
+   SYS_INIT. None of that hardware is Dom0's here (the RP1/PCIe complex is
+   DomD's)
+   and soc/brcm/bcm2712/mmu_regions.c statically maps only the GIC, so this is
+   exactly the failure 0008 documents for the 3.6 SDHCI node: the probe faults
+   or
+   hangs on its first register access and stops the init chain before
+   init_domain0/dom0less_init, leaving the dom0less DomD un-introduced to
+   xenstore.
+
+2. Give FatFs one volume to compile against. Upstream derives FF_VOLUMES from
+the
+   devicetree — FF_VOLUME_STRS is the disk-name of every status-okay disk node
+   (modules/fatfs/zephyr_fatfs_config.h) — and with the SD passed through to
+   DomD
+   this Dom0 has no disk node at all, so FF_VOLUMES is 0 and src/storage.c's
+   VolToPart[] has nowhere to live. The 3.6 fork hardcoded 8 volumes instead.
+   CONFIG_FS_FATFS_CUSTOM_MOUNT_POINT_COUNT cannot be used for this: it
+   undefines
+   FF_VOLUME_STRS, and ff.c only declares VolumeStr[] when that macro is defined
+   while still referencing it under FF_STR_VOLUME_ID == 1.
+   So declare one 4 KiB RAM disk. It is never mounted. storage_init() fails before
+   f_mount() is reached, at disk_access_init("SD") with -ENODEV, exactly as it did
+   on 3.6, because the SD controller is DomD's. Dom0 does not load guest images in
+   this topology; DomD's xl toolstack does. The logical drive name moves from "1"
+   to "0" to stay in range (see also rpi5-sodev.yaml's builder var), and the
+   physical drive moves from 3 to 0 - see the VolToPart bullet below.
+
+3. State two Xen settings explicitly:
+   - CONFIG_XEN_REGIONS=y. Dom0 maps guest kernels/dtbs temporarily while
+     building
+     a domain. The 3.6 fork had `default y`; upstream made it opt-in. Without it
+     xenlib falls back to carving the window out of Dom0's own heap with
+     k_aligned_alloc() plus physmap removal, which does not fit a 24 MiB guest
+     kernel in CONFIG_HEAP_MEM_POOL_SIZE (2 MiB) and whose rollback is not
+     failure-safe.
+   - CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16, what Xen 4.21's sysctl.h
+     declares.
+     Zephyr defaults to 0x15; every sysctl then fails its version check and
+     `xu list` / `xstat physinfo` print nothing at all, silently.
+
+   - - CONFIG_PCIE=n. With pcie1/pcie2 disabled, drivers/pcie/host/pcie.c is
+     still compiled (the board defconfig sets PCIE=y) and still does
+     DEVICE_DT_GET(DT_CHOSEN(zephyr_pcie_controller)), which no longer
+     resolves: "error: '__device_dts_ord_12' undeclared".
+
+   - - gio_aon and the leds node that references it are disabled too. gio_aon
+     is harmless only while CONFIG_GPIO is off, and that is one `select GPIO`
+     away.
+   - - VolToPart[0] is {0, 2}, not {3, 2}: upstream resolves pd by indexing
+     pdrv_str[] = {FF_VOLUME_STRS}, so 3 is out of bounds with FF_VOLUMES ==
+     1. A BUILD_ASSERT pins that assumption.
+   - - the chosen zephyr,pcie-controller / zephyr,entropy properties are
+     deleted, not merely left pointing at the now-disabled pcie1/rng.
+     gen_defines resolves a chosen phandle regardless of status, so the first
+     subsystem to select the matching driver expands
+     DEVICE_DT_GET(DT_CHOSEN(...)) to a __device_dts_ord_N that was never
+     emitted. That is the same failure CONFIG_PCIE=n works around above;
+     deleting the property removes the class of bug instead of one instance.
+   - - CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME is left to the moulin
+     builder var in rpi5-sodev.yaml, which wins over the board .conf anyway.
+
+Depends on 0008 (boards/rpi_5.{conf,overlay}), 0026 (src/storage.c), 0022 and
+0023 (zephyr).
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
+---
+diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
+index 28ca4f9..b9387e4 100644
+--- a/boards/rpi_5.conf
++++ b/boards/rpi_5.conf
+@@ -52,7 +52,7 @@ CONFIG_FILE_SYSTEM_SHELL=y
+ 
+ CONFIG_NOCACHE_MEMORY=y
+ CONFIG_FS_FATFS_MULTI_PARTITION=y
+-CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="1"
++# (set by the moulin builder var in rpi5-sodev.yaml; see the note at the end)
+ CONFIG_DOM_STORAGE_FATFS_DIR=""
+ CONFIG_XEN_LIBFDT=y
+ 
+@@ -90,3 +90,46 @@ CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
+ # unconditionally. It is zeroed by 0018's `xen_domctl_t domctl = { 0 }`, which is
+ # XEN_DOMCTL_CONFIG_ARM_SCI_NONE - the same behaviour the old `=n` produced.
+ # Assignments to undefined symbols are a hard Kconfig error in Zephyr 4.x.
++
++# Dom0 maps guest kernels/dtbs temporarily while building a domain. Keep that on
++# the Xen extended-region path (drivers/xen/regions.c, restored by 0023) rather
++# than xenlib's fallback: the fallback carves the mapping window out of Dom0's own
++# heap with k_aligned_alloc() and then removes those pages from Dom0's physmap, so
++# a 24 MiB guest kernel does not fit in CONFIG_HEAP_MEM_POOL_SIZE (2 MiB) and its
++# rollback path is not failure-safe. Zephyr 3.6 got this via the fork's
++# `default y`; upstream made XEN_REGIONS opt-in, so it has to be set explicitly.
++CONFIG_XEN_REGIONS=y
++
++# Xen 4.21's sysctl.h declares XEN_SYSCTL_INTERFACE_VERSION 0x16. Zephyr defaults
++# to 0x15, which makes every sysctl fail its version check - `xu list` and
++# `xstat physinfo` then print nothing at all, with no error. 0022 widens the
++# Kconfig range so this value is accepted.
++CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16
++
++# The board defconfig (boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig) turns PCIe
++# on for the RP1 complex. With pcie1/pcie2 disabled above, drivers/pcie/host/pcie.c
++# is still compiled and still does DEVICE_DT_GET(DT_CHOSEN(zephyr_pcie_controller)),
++# which then refers to a device that was never instantiated:
++#   device.h: error: '__device_dts_ord_12' undeclared
++# PCIE is a menuconfig, so this is a normal override of the board default rather
++# than an assignment to a hidden symbol. PCIE_CONTROLLER is deliberately not set:
++# its prompt lives inside `if PCIE`, so it becomes invisible - and n - once PCIE is
++# off, and assigning to it would be the same silent no-op that hid the dead
++# CONFIG_HW_STACK_PROTECTION for so long.
++CONFIG_PCIE=n
++
++# CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME is NOT set here, and does not need to
++# be set anywhere: zephyr-dom0-xt/Kconfig has
++# `default "0" if FS_FATFS_MULTI_PARTITION`, which is the configuration this board
++# uses ("1:" would be out of range, FF_VOLUMES being 1 - the single ramdisk0 above).
++# rpi5-sodev.yaml also passes it as a moulin builder var, and a `west build -D...`
++# var wins over both this file and the Kconfig default, so a value here would be
++# silently ignored. The two now agree by construction rather than by coincidence.
++
++# Deepest path this system writes is 8 components
++# (.../backend/vbd/<fe>/<devid>/multi-queue-max-queues), and the PV protocol headers
++# document 8 too; pvUSB reaches 9 and pvSCSI 10. xenlib patch 0031 bounds tree depth
++# at creation time with this symbol to keep the recursive free off the end of the
++# xenstore worker stack, so leaving it at the default 8 would sit exactly at the
++# limit. Use the Kconfig maximum; 0031 sized the worker stack (8 KiB) for it.
++CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16
+diff --git a/boards/rpi_5.overlay b/boards/rpi_5.overlay
+index 0356db2..5dfb735 100644
+--- a/boards/rpi_5.overlay
++++ b/boards/rpi_5.overlay
+@@ -20,17 +20,106 @@
+  * Upstream Zephyr 4.4.1 has no such node and no bcm2712 SDHCI driver at all, so
+  * there is nothing to disable - keeping that override would leave an unresolved
+  * DTC label. storage_init() in main() still fails cleanly with -ENODEV, which is
+- * all this topology needs (the FATFS/xu-create path is unused; guests are
+- * .incbin'd into zephyr.bin).
++ * all this topology needs.
+  */
+ 
++/*
++ * Same reasoning, for the devices upstream 4.4.1's rpi_5 board turns on that the
++ * 3.6 fork's board did not have: PCIe (pcie1/pcie2), the RP1 peripheral
++ * controller's GPIO bank behind it (gpio0_0), the iProc RNG200 (rng), and the
++ * always-on GPIO block (gio_aon) that the board's ACT-LED node hangs off.
++ *
++ * None of them belong to this Dom0 - the RP1/PCIe complex goes to DomD - and
++ * soc/brcm/bcm2712/mmu_regions.c statically maps only the GIC, so their MMIO is
++ * not in Dom0's address space. Their drivers are all `default y` gated on
++ * DT_HAS_*_ENABLED, so each would probe from SYS_INIT and fault or hang on its
++ * first register access, before init_domain0/dom0less_init runs. Disabling the
++ * nodes is what switches the drivers off; no Kconfig assignment is needed (and an
++ * assignment would be to a symbol that is invisible once the node is gone).
++ *
++ * gio_aon is harmless today only because CONFIG_GPIO is off, and that is one
++ * `select GPIO` away: anything pulling in the LED or GPIO subsystem turns
++ * GPIO_BRCMSTB on (it is `default y`) and reintroduces exactly the fault above.
++ * The leds node goes with it (deleted by name inside the root node below - it
++ * has no label - since its led_act child references &gio_aon).
++ *
++ * The board's chosen zephyr,pcie-controller/zephyr,entropy point at pcie1/rng, so
++ * those properties are deleted below rather than left dangling at a disabled node.
++ * Disabling alone is not enough: gen_defines resolves a chosen phandle regardless of
++ * status, so the first subsystem to select the matching driver expands
++ * DEVICE_DT_GET(DT_CHOSEN(...)) to a __device_dts_ord_N that was never emitted - an
++ * undeclared-identifier error. That is exactly why CONFIG_PCIE=n is needed below for
++ * pcie1; zephyr,entropy would have failed the same way the moment anything selected
++ * CONFIG_ENTROPY_GENERATOR.
++ */
++
++&pcie1 {
++	status = "disabled";
++};
++
++&pcie2 {
++	status = "disabled";
++};
++
++&gpio0_0 {
++	status = "disabled";
++};
++
++&rng {
++	status = "disabled";
++};
++
++&gio_aon {
++	status = "disabled";
++};
++
+ / {
+ 	#address-cells = <2>;
+ 	#size-cells = <1>;
+ 
++	/*
++	 * Board's ACT-LED node; its led_act child points at the now-disabled gio_aon.
++	 * The board also aliases led0 to it, so that has to go first - a dangling
++	 * alias is a devicetree error ("/aliases: undefined node label 'led_act'").
++	 */
++	aliases {
++		/delete-property/ led0;
++	};
++	/delete-node/ leds;
++
++	/*
++	 * FatFs needs at least one volume to build, and upstream Zephyr derives the
++	 * count from the devicetree: FF_VOLUME_STRS is the disk-name of every
++	 * status-okay disk node (modules/fatfs/zephyr_fatfs_config.h). With the SD
++	 * controller passed through to DomD this Dom0 has no disk node at all, so
++	 * FF_VOLUMES comes out 0 - which leaves src/storage.c's VolToPart[] with
++	 * nowhere to live. The 3.6 xen-troops fork sidestepped this by hardcoding 8
++	 * volumes regardless of the devicetree.
++	 *
++	 * CONFIG_FS_FATFS_CUSTOM_MOUNT_POINT_COUNT is not an alternative: setting it
++	 * undefines FF_VOLUME_STRS, and ff.c only declares VolumeStr[] when that
++	 * macro is defined, while still referencing it under FF_STR_VOLUME_ID == 1.
++	 *
++	 * So declare one deliberately tiny RAM disk. It is never mounted: the FATFS
++	 * path maps to a partition that does not exist, so storage_init() still fails
++	 * with -ENODEV exactly as it did on 3.6. 4 KiB is the cost of keeping the
++	 * storage code compiling.
++	 */
++	ramdisk0: ramdisk0 {
++		compatible = "zephyr,ram-disk";
++		disk-name = "RAM";
++		sector-size = <512>;
++		sector-count = <8>;
++	};
++
+ 	chosen {
+ 		zephyr,console = &xen_consoleio_hvc;
+ 		zephyr,shell-uart = &xen_consoleio_hvc;
++		/* See the header comment: these point at pcie1/rng, which this overlay
++		 * disables, and a dangling chosen phandle is a link error waiting for
++		 * the first driver that consumes it. */
++		/delete-property/ zephyr,pcie-controller;
++		/delete-property/ zephyr,entropy;
+ 	};
+ 
+ 	psci {
+diff --git a/src/storage.c b/src/storage.c
+index 1eef5fe..edde013 100644
+--- a/src/storage.c
++++ b/src/storage.c
+@@ -23,21 +23,29 @@ static struct fs_mount_t mp = {
+ 	.fs_data = &fat_fs,
+ };
+ 
+-/* Upstream Zephyr spells this CONFIG_FS_FATFS_MULTI_PARTITION
+- * (subsys/fs/Kconfig.fatfs); CONFIG_FS_MULTI_PARTITION only ever existed in the
+- * xen-troops Zephyr fork. The table itself is unchanged - upstream also expects
+- * VolToPart[] to be supplied by the application.
++/* The fork hardcoded FF_VOLUMES to 8, which is what the old eight-entry table was
++ * sized for. Upstream derives it from the devicetree instead (FF_VOLUME_STRS = the
++ * disk-name of every status-okay disk node), and this Dom0 has exactly one: the
++ * inert ramdisk0 in boards/rpi_5.overlay, which exists only so FatFs has a volume
++ * to compile against, because the SD controller belongs to DomD.
++ *
++ * `pd` cannot stay 3 either: upstream resolves a physical drive by indexing
++ * zfs_diskio.c's `pdrv_str[] = {FF_VOLUME_STRS}`, so 0 is the only valid drive here
++ * and {3, ...} would be an out-of-bounds read handing a garbage pointer to
++ * disk_access_status(). Its __ASSERT is compiled out (CONFIG_ASSERT is not set) and
++ * `fs mount fat /0:` from the Dom0 shell reaches it.
++ *
++ * The mapping is nominal: drive 0 is the ramdisk, which has no partition table, so
++ * f_mount() fails cleanly. Nothing is lost - storage_init() already fails earlier at
++ * disk_access_init("SD") with -ENODEV, exactly as on 3.6. Dom0 does not load guest
++ * images in this topology; DomD's xl toolstack does.
+  */
+ #if defined(CONFIG_FS_FATFS_MULTI_PARTITION)
++BUILD_ASSERT(FF_VOLUMES == 1,
++	     "VolToPart[] is sized for the single inert ramdisk0 volume; a new "
++	     "devicetree disk node changes FF_VOLUMES and the pd numbering");
+ PARTITION VolToPart[FF_VOLUMES] = {
+-    [0] = {3, 1},     /* "0:" ==> 1st partition on the pd#0 */
+-    [1] = {3, 2},     /* "1:" ==> 2nd partition on the pd#0 */
+-    [2] = {0, -1},     /* "2:" ==> 3rd partition on the pd#0 */
+-    [3] = {0, -1},
+-    [4] = {0, -1},
+-    [5] = {0, -1},
+-    [6] = {0, -1},
+-    [7] = {0, -1},
++    [0] = {0, 2},     /* volume "0:" ==> partition 2 of physical drive 0 */
+ };
+ #endif /* CONFIG_FS_FATFS_MULTI_PARTITION */
+ 
