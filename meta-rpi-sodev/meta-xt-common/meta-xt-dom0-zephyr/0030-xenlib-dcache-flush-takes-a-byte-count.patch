@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] xen-dom-mgmt: flush the whole mapping, not nr_pages bytes
+
+
+arch_dcache_flush_and_invd_range() takes a byte count:
+
+  include/zephyr/arch/cache.h:157:
+      int arch_dcache_flush_and_invd_range(void *addr, size_t size);
+
+All three call sites pass a *page* count instead, so only a few bytes at the
+start of each mapping are actually flushed:
+
+  allocate_magic_pages()   NR_MAGIC_PAGES   -> 4 bytes of a 16 KiB mapping
+  load_dtb()        nr_pages         -> 1 byte per 4 KiB of dtb
+  probe_zimage()      nr_pages         -> 6 KiB of a 24 MiB kernel
+
+Dom0 writes the guest kernel, dtb and magic pages through a cached mapping and
+then unmaps it. The guest starts with its MMU and caches off, so anything
+still sitting in Dom0's D-cache is invisible to it: the guest boots from
+whatever was in RAM before, which is stale or uninitialised. That this has not
+been observed is a property of the current topology - DomD's xl toolstack
+loads the guests here, not Dom0 - and it would surface the moment `xu create`
+is used from the Dom0 shell.
+
+This is an upstream defect, not a rebase artifact; 0005 already passes a byte
+count in the initrd path it adds, and this brings the other three in line.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index 9a1529d..aabe352 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -152,7 +152,8 @@ static int allocate_magic_pages(int domid)
+ 	 * This is not critical, so try to restore memory to dom0
+ 	 * and then return error code.
+ 	 */
+-	rc = arch_dcache_flush_and_invd_range(mapped_magic, NR_MAGIC_PAGES);
++	rc = arch_dcache_flush_and_invd_range(mapped_magic,
++					      NR_MAGIC_PAGES * XEN_PAGE_SIZE);
+ 	if (rc) {
+ 		LOG_ERR("Failed to flush memory for domid#%d (rc=%d)",
+ 			domid, rc);
+@@ -318,7 +319,8 @@ static int load_dtb(int domid, uint64_t dtb_addr, const char *dtb_start,
+ 	 * This is not critical, so try to restore memory to dom0
+ 	 * and then return error code.
+ 	 */
+-	rc = arch_dcache_flush_and_invd_range(mapped_dtb_addr, nr_pages);
++	rc = arch_dcache_flush_and_invd_range(mapped_dtb_addr,
++					      nr_pages * XEN_PAGE_SIZE);
+ 	if (rc) {
+ 		LOG_ERR("Failed to flush memory for domid#%d (rc=%d)",
+ 			domid, rc);
+@@ -487,7 +489,8 @@ static int probe_zimage(int domid, uint64_t base_addr,
+ 	 * This is not critical, so try to restore memory to dom0
+ 	 * and then return error code.
+ 	 */
+-	rc = arch_dcache_flush_and_invd_range(mapped_image, nr_pages);
++	rc = arch_dcache_flush_and_invd_range(mapped_image,
++					      nr_pages * XEN_PAGE_SIZE);
+ 	if (rc) {
+ 		LOG_ERR("Failed to flush memory for domid#%d (rc=%d)",
+ 			domid, rc);

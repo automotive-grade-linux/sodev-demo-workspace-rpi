@@ -1,0 +1,1080 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] xenlib: xenstore-srv: input validation and resource bounds
+
+
+Defects found by adversarial review of the 4.4.1 series. All of them predate
+this work - none is a regression from the Zephyr upgrade - but all are
+reachable from a guest or from the Dom0 shell, so they are fixed here rather
+than left in a tree we are about to run on hardware. 0014 hardened the reply
+path; this hardens the inputs and the resource bounds around it.
+
+1. The request payload is not NUL-terminated on the wire, yet every path handler
+   treats it as a C string (construct_path -> strlen, deserialize_perms ->
+   strlen,
+   handle_watch -> indexes past strnlen). `header.len == 0` puts `payload` one
+   byte
+   past the allocation, and `len` bytes without a NUL walks off the end -
+   construct_path() then memcpy()s whatever it found into a xenstore key,
+   which the
+   guest reads back with XS_DIRECTORY. That is a Dom0 heap disclosure.
+   Allocate one
+   extra byte and terminate at the boundary, which fixes every handler at once.
+
+2. `xs rm /` from the Dom0 shell, or XS_RM "/" from the toolstack domain,
+reaches
+   free_node(&root_xenstore): sys_dlist_remove() writes through the NULL
+   prev/next
+   left by sys_dnode_init(), and k_free() is handed a .bss address. Reject the
+   root
+   in xss_do_rm() and guard free_node().
+
+3. xss_do_write() links a new node into the tree before setting its
+permissions but
+   only arms the rollback afterwards, so a perms allocation failure on the
+   first new
+   node leaves a node with an EMPTY perms list. check_perms() then
+   dereferences the
+   NULL from SYS_SLIST_PEEK_HEAD_CONTAINER, and so does
+   remove_ref_entries_recursive() at teardown. Arm the rollback first, and make
+   check_perms() deny instead of crashing if it ever sees one.
+
+4. key_to_watcher() searched the global watch list without filtering by
+domain, so
+   a matching key+token from another domain was returned: handle_watch()
+   overwrote
+   that entry's is_relative (corrupting fire_watcher()'s payload trim) and
+   created
+   no watch for the caller, while handle_unwatch() found the foreign entry,
+   skipped
+   the removal and still replied "OK". Token comparison was also a prefix match.
+
+5. Watch prefix matching was a bare strncmp, so a watch on .../foo fired for
+   .../foobar. Require the match to end on a path boundary.
+
+6. pending_watch_event_list was unbounded and got one entry per matching watch
+   rather than per domain, so K watches on one prefix cost K*K output buffers
+   per
+   write, and a guest that watches "/" and stops reading pins Dom0 heap until
+   unrelated domains fail their input allocations. Coalesce per (domain, path)
+   and
+   cap per domain.
+
+7. process_pending_watch_events() held the global tree lock across the whole
+   backlog. With CONFIG_TIMESLICE_SIZE=20 (it was 0 on Zephyr 3.6) this thread
+   can
+   be preempted mid-drain while holding it, stalling every other domain's
+   reads and
+   writes. Bound the work per pass, and skip the lock entirely when nothing is
+   queued.
+
+8. A watch event whose path+token exceeds XENSTORE_PAYLOAD_MAX made
+send_reply_sz()
+   emit an XS_ERROR with req_id 0 - the same unsolicited-reply problem 0014
+   fixed
+   for ENOSYS. Report -EMSGSIZE and let fire_watcher() drop the event.
+
+9. free_node()/remove_recurse() recurse without a depth limit on a 4 KiB worker
+   stack, and CONFIG_HW_STACK_PROTECTION is not available on Cortex-A (only
+   Cortex-R selects ARCH_HAS_STACK_PROTECTION), so an overflow corrupts the
+   neighbouring thread's stack silently. A guest can create ~1500 levels within
+   XENSTORE_ABS_PATH_MAX and then remove them. Bound creation depth with the
+   existing CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH, which already bounds reads.
+
+Second-round review follow-ups (defects in the first version of this patch):
+ - handle_watch()/handle_unwatch() now reject a payload with no "path\0token"
+   separator. The input terminator sits at payload[len]; path_len can be len +
+   1,
+   so `token` pointed one byte past the allocation and key_to_watcher() ran
+   strlen()/strcmp() off the heap. handle_set_perms() already had this check.
+ - the stored watch token is NUL-terminated. Copying exactly (len - path_len)
+   bytes left it unterminated, and fire_watcher() reads it with strlen() and
+   memcpy()s the result into the XS_WATCH_EVENT payload sent to the guest - a
+   more direct heap disclosure than the one the input terminator closes.
+ - the pending-watch drain is no longer gated on !running_transaction. A cap
+   plus
+   that gate means events queued during a libxl transaction are dropped once the
+   cap is reached, and losing a frontend state change hangs `xl create`. The
+   transactions here are non-isolating stubs, so there is nothing to defer for.
+ - the depth bound is the Kconfig maximum (16) and the worker stack was raised
+   to
+   8 KiB to match. 8 was exactly the deepest path xen-dom-xs.c writes, leaving
+   no
+   margin; pvUSB needs 9 and pvSCSI 10. The claim that
+   CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH already bounded reads was wrong and the
+   comment is corrected.
+ - remove_ref_entries_recursive() got the same empty-perms guard as
+   check_perms().
+
+Depends on 0006, 0007, 0012, 0014.
+
+Third-round review follow-ups (defects found in this patch's own area):
+ - a per-domain watch quota (CONFIG_XENSTORE_MAX_WATCHES_PER_DOMAIN, 128, matching
+   the reference xenstored). The pending-event cap this patch added does nothing for
+   a guest that drains its ring: `XS_WATCH <path> <fresh token>` in a loop is
+   answered OK every time and pins entry+key+token per call until Dom0's 2 MiB heap
+   is gone, at which point unrelated domains fail their input allocations.
+ - fire_watcher() takes a delivery cursor. It restarts from the head of
+   watch_entry_list every call and gives up with -ENOMEM once the domain's
+   out-buffer budget is spent, so a domain with more watches on one prefix than
+   XENSTORE_MAX_OUT_BUF_NUM got duplicate events forever and the pending entry never
+   retired - and because this patch coalesces to one entry per (domain, path), that
+   also head-of-line-blocked every later event for the domain.
+ - both pending-event producers go through one helper. handle_watch() appended
+   directly, bypassing the cap and the coalescing, and notify_watchers() released
+   pfl_mutex between counting and appending so the cap could be overtaken.
+ - CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH defaults to 16, not 8. The depth reject this
+   patch added made the Kconfig default reject legitimate writes: the comment here
+   already notes pvUSB needs 9 and pvSCSI 10, so xenlib on its own defaults was
+   broken for those device types and only worked because the boards set 16.
+ - an empty token is no longer a wildcard in key_to_watcher(). It short-circuited
+   the comparison, so `XS_UNWATCH "path\0\0"` removed another token's watch on that
+   path and still replied OK.
+ - xss_read() NUL-terminates. strncpy() does not when the source fills the buffer,
+   and the source is guest-controlled while callers hand the result to atoi() or
+   print it with %s.
+ - XS_RM fires the removed node's descendants, not just the node. notify_watchers()
+   only matches watches whose key is a PREFIX of the path, so removing
+   .../device/vbd/<n> told a backend watching .../device/vbd/<n>/state nothing -
+   the teardown hang this series exists to remove. XS_RM with an empty path is now
+   EINVAL instead of wiping the caller's whole subtree.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/Kconfig b/Kconfig
+index 35efccb..d60c2af 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -102,9 +102,26 @@ config XENSTORE_SHELL_READ_SIZE
+ 	help
+ 	  Sets the maximum size that xs read cmd can handle
+ 
++config XENSTORE_MAX_WATCHES_PER_DOMAIN
++	int "Maximum number of xenstore watches one domain may register"
++	default 128
++	range 1 4096
++	help
++	  Per-domain quota on XS_WATCH registrations. Each watch is a permanent heap
++	  allocation (entry plus its path and token), and a guest can ask for them in
++	  a loop, so without a quota one domain can exhaust Dom0's heap and take
++	  unrelated domains down with it. 128 matches the default
++	  quota_nb_watch_per_domain of the reference xenstored.
++
+ config XENSTORE_TREE_TRAVERSE_DEPTH
+ 	int "Maximum xs traverse depth"
+-	default 8
++	# 16, not 8. This bounds the depth a guest may create, and the shallowest real
++	# PV path is already 8 components
++	# (.../backend/vbd/<fe>/<devid>/multi-queue-max-queues) - pvUSB reaches 9 and
++	# pvSCSI 10 - so a default of 8 rejects legitimate writes with a bare EINVAL and
++	# hangs `xl create` for those device types. Boards used to have to raise it
++	# themselves; the default now covers the protocols in tree.
++	default 16
+ 	range 1 16
+ 	help
+ 	  Sets the maximum xs traverse depth to avoid stack overflow
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 2413d65..af9695e 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -36,7 +36,18 @@ LOG_MODULE_REGISTER(xenstore);
+ /* max length of string that holds '/local/domain/%domid/' (domid 0-32767) */
+ #define XENSTORE_MAX_LOCALPATH_LEN	21
+ 
+-#define XENSTORE_STACK_SIZE_PER_DOM	4096
++/*
++ * 8 KiB, not 4. free_node()/remove_recurse() recurse once per tree level and
++ * remove_ref_entries_recursive() does too, at roughly 190 bytes of frame per
++ * level; CONFIG_HW_STACK_PROTECTION is unavailable on Cortex-A (only Cortex-R
++ * selects ARCH_HAS_STACK_PROTECTION), so an overflow would silently corrupt the
++ * neighbouring thread's stack. With the depth bound in xss_do_write() at
++ * CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH (max 16) the worst case is ~3.1 KiB, which
++ * needs more than 4 KiB once the handler frames and LOG_MODE_IMMEDIATE's
++ * synchronous formatting are counted. The extra 4 KiB x CONFIG_DOMU_MAX is 20 KiB
++ * out of 128 MiB.
++ */
++#define XENSTORE_STACK_SIZE_PER_DOM	8192
+ /*
+  * Max number of possible allocated output buffers.
+  * This limit is needed to prevent Denial of Service attacks,
+@@ -55,6 +66,19 @@ LOG_MODULE_REGISTER(xenstore);
+  * single request is ever seen to overshoot the quota from this level.
+  */
+ #define XENSTORE_OUT_BUF_INPUT_GATE (XENSTORE_MAX_OUT_BUF_NUM - 36)
++
++/*
++ * Per-domain bound on pending_watch_event_list. Matched to the input gate: past
++ * this many queued events the domain is not draining anyway, so more queueing
++ * only consumes Dom0 heap that other domains need. See notify_watchers().
++ */
++#define XENSTORE_MAX_PENDING_WATCH_EVENTS XENSTORE_OUT_BUF_INPUT_GATE
++
++/*
++ * How many queued watch events one pass of process_pending_watch_events() may
++ * deliver while holding the global tree lock. See the comment there.
++ */
++#define XENSTORE_WATCH_EVENTS_PER_PASS 8
+ #define INIT_XENSTORE_UUID_BUF_SIZE 40
+ 
+ struct xs_permissions {
+@@ -85,6 +109,20 @@ struct pending_watch_event_entry {
+ 	char *key;
+ 	struct xen_domain *domain;
+ 
++	/*
++	 * How many of this domain's matching watches have already been sent an
++	 * XS_WATCH_EVENT for this path.
++	 *
++	 * fire_watcher() walks watch_entry_list from the head every call and gives up
++	 * with -ENOMEM as soon as the domain's out-buffer budget is spent. Without a
++	 * cursor the retry re-sent to everyone it had already served and never reached
++	 * the rest, so a domain with more watches on one prefix than
++	 * XENSTORE_MAX_OUT_BUF_NUM got duplicate events forever and the entry never
++	 * retired - which, now that notify_watchers() coalesces to one entry per
++	 * (domain, path), also blocked every later event for that domain behind it.
++	 */
++	size_t delivered;
++
+ 	sys_dnode_t node;
+ };
+ 
+@@ -195,16 +233,31 @@ static void free_stack_idx(int idx)
+  * Should be called with wel_mutex lock and unlock mutex
+  * only after all actions with entry will be performed.
+  */
+-struct watch_entry *key_to_watcher(char *key, bool complete, char *token)
++/*
++ * `domain` scopes the lookup. watch_entry_list is global, and without this the
++ * function returns another domain's entry whenever the key and token happen to
++ * match: handle_watch() would then overwrite that entry's is_relative (corrupting
++ * the payload trim in fire_watcher()) and silently create no watch for the caller,
++ * while handle_unwatch() would find the foreign entry, skip the removal, and still
++ * answer "OK" - leaking the caller's own watch. Pass NULL to search every domain.
++ *
++ * Token comparison is exact. memcmp() over strlen(iter->token) made it a prefix
++ * match, so a registered token "ab" answered a request for "abcd".
++ */
++struct watch_entry *key_to_watcher(char *key, bool complete, char *token,
++				   struct xen_domain *domain)
+ {
+ 	struct watch_entry *iter;
+ 	size_t keyl = strlen(key);
+ 
+ 	SYS_DLIST_FOR_EACH_CONTAINER (&watch_entry_list, iter, node) {
+-		if ((!complete || strlen(key) == strlen(iter->key)) &&
++		if (domain && iter->domain != domain) {
++			continue;
++		}
++		if ((!complete || keyl == strlen(iter->key)) &&
+ 		    memcmp(iter->key, key, keyl) == 0 &&
+ 		    (token == NULL || strlen(token) == 0 ||
+-		     0 == memcmp(iter->token, token, strlen(iter->token)))) {
++		     strcmp(iter->token, token) == 0)) {
+ 			return iter;
+ 		}
+ 	}
+@@ -213,6 +266,28 @@ struct watch_entry *key_to_watcher(char *key, bool complete, char *token)
+ }
+ 
+ 
++/*
++ * True when `path` is `prefix` itself or a node below it.
++ *
++ * The watch machinery used a bare strncmp(key, path, strlen(key)), which is a
++ * plain string prefix test: a watch on /local/domain/1/foo then fired for
++ * /local/domain/1/foobar as well. Require the match to end on a path boundary.
++ */
++static bool path_has_prefix(const char *path, const char *prefix)
++{
++	size_t plen = strlen(prefix);
++
++	if (strncmp(path, prefix, plen) != 0) {
++		return false;
++	}
++
++	/* Exact match, or the prefix ended right before a separator. A prefix
++	 * that already ends in '/' (including the root "/") needs no separator.
++	 */
++	return path[plen] == '\0' || path[plen] == '/' ||
++	       (plen > 0 && prefix[plen - 1] == '/');
++}
++
+ static int construct_path(char *payload, uint32_t domid, char **path)
+ {
+ 	size_t path_len = xenstore_str_byte_size(payload);
+@@ -289,6 +364,15 @@ static bool check_perms(struct xs_entry *entry, uint32_t perms, uint32_t caller_
+ 	}
+ 
+ 	default_perms = SYS_SLIST_PEEK_HEAD_CONTAINER(&entry->perms, default_perms, node);
++	if (!default_perms) {
++		/*
++		 * An entry with no permissions at all should not exist - see the
++		 * rollback ordering in xss_do_write(). Deny rather than
++		 * dereference NULL if one ever does.
++		 */
++		LOG_ERR("xenstore entry with empty perms list; denying access");
++		return false;
++	}
+ 
+ 	/*
+ 	 * According to specification (https://wiki.xenproject.org/wiki/XenBus):
+@@ -500,6 +584,18 @@ static int send_reply_sz(struct xenstore *xenstore, uint32_t req_id,
+ 	if (len > XENSTORE_PAYLOAD_MAX) {
+ 		LOG_ERR("Failed to reply: payload size too big (%zu max=%d)",
+ 			len, XENSTORE_PAYLOAD_MAX);
++		if (type == XS_WATCH_EVENT) {
++			/*
++			 * A watch event carries no request id, so answering it with
++			 * send_errno() would push an XS_ERROR with req_id 0 into the
++			 * reply stream. The guest's xenbus matches replies by req_id
++			 * and does not expect an unsolicited error, so that message
++			 * is either dropped or mis-paired with a later reply - the
++			 * same class of bug as the ENOSYS req_id fixed above. Report
++			 * it to the caller instead and let it drop the event.
++			 */
++			return -EMSGSIZE;
++		}
+ 		send_errno(xenstore, req_id, E2BIG);
+ 		return 0;
+ 	}
+@@ -626,8 +722,10 @@ static void handle_directory(struct xenstore *xenstore, uint32_t id,
+ 	k_free(dir_list);
+ }
+ 
+-static int fire_watcher(struct xen_domain *domain, char *pending_path)
++static int fire_watcher(struct xen_domain *domain, char *pending_path,
++			size_t *delivered)
+ {
++	size_t matched = 0;
+ 	struct watch_entry *iter;
+ 	char local[XENSTORE_MAX_LOCALPATH_LEN];
+ 	size_t pendkey_len, loc_len;
+@@ -651,7 +749,17 @@ static int fire_watcher(struct xen_domain *domain, char *pending_path)
+ 		int rc;
+ 
+ 		if ((iter->domain->domid != domain->domid) ||
+-		     memcmp(iter->key, epath_buf, strlen(iter->key))) {
++		    !path_has_prefix(epath_buf, iter->key)) {
++			continue;
++		}
++
++		/*
++		 * Resume where the previous attempt stopped. `matched` counts matching
++		 * watches in list order, which is stable because entries are only ever
++		 * appended, so anything below the cursor has already been sent (or
++		 * deliberately dropped) for this pending entry.
++		 */
++		if (matched++ < *delivered) {
+ 			continue;
+ 		}
+ 
+@@ -683,12 +791,24 @@ static int fire_watcher(struct xen_domain *domain, char *pending_path)
+ 				   payload_len);
+ 
+ 		k_free(payload);
++		if (rc == -EMSGSIZE) {
++			/* Path + token exceed XENSTORE_PAYLOAD_MAX: this event can
++			 * never be delivered, so retrying it would pin the pending
++			 * entry forever. Drop it and carry on with the other
++			 * watchers. */
++			LOG_WRN("dom%u watch event too large to deliver, dropped",
++				domain->domid);
++			(*delivered)++;
++			continue;
++		}
+ 		if (rc < 0) {
+ 			/* Out of buffers/memory: propagate so the caller defers
+ 			 * this event and retries when the guest drains. Never
+-			 * kill the connection for a transient watch-event failure. */
++			 * kill the connection for a transient watch-event failure.
++			 * *delivered is not advanced, so the retry resumes here. */
+ 			return rc;
+ 		}
++		(*delivered)++;
+ 	}
+ 
+ 	return 0;
+@@ -719,6 +839,19 @@ static void remove_recurse(sys_dlist_t *children)
+  */
+ static void free_node(struct xs_entry *entry)
+ {
++	/*
++	 * root_xenstore is a static object in .bss, and key_to_entry() returns
++	 * &root_xenstore for the path "/". Freeing it would (a) call
++	 * sys_dlist_remove() on a node whose prev/next are NULL after
++	 * sys_dnode_init(), writing through a NULL pointer, and (b) hand a .bss
++	 * address to k_free(). `xs rm /` from the Dom0 shell, or an XS_RM "/"
++	 * from the privileged toolstack domain, is enough to reach it.
++	 */
++	if (entry == &root_xenstore) {
++		LOG_ERR("Refusing to free the xenstore root node");
++		return;
++	}
++
+ 	if (entry->key) {
+ 		k_free(entry->key);
+ 		entry->key = NULL;
+@@ -906,6 +1039,46 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
+ 	}
+ 
+ 	strcpy(path, const_path);
++
++	/*
++	 * Bound the depth of what a guest can create.
++	 *
++	 * free_node() and remove_recurse() are mutually recursive with no depth
++	 * limit, and remove_ref_entries_recursive() recurses too, while the xenstore
++	 * worker stack is XENSTORE_STACK_SIZE_PER_DOM. A guest could otherwise write
++	 * "a/a/a/..." up to XENSTORE_ABS_PATH_MAX (3072) - about 1500 levels - and
++	 * then remove it, overflowing that stack into the next thread's.
++	 *
++	 * The bound has to leave room for the paths this system really uses. The
++	 * deepest ones xen-dom-xs.c writes are 8 components
++	 * (.../backend/vbd/<fe>/<devid>/multi-queue-max-queues), and the PV protocol
++	 * headers document 8 as well (.../device/vif/0/queue-0/tx-ring-ref); pvUSB
++	 * reaches 9 and pvSCSI 10. So 8 would be exactly at the limit - hence the
++	 * Kconfig maximum of 16 is used, and the stack was sized for it.
++	 *
++	 * CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH is reused as the knob, but note it does
++	 * NOT already bound reads: its only other user is xss_list_traverse_entry(),
++	 * a shell diagnostic, and it counts levels relative to the traversal root
++	 * rather than absolute path components. The read paths (key_to_entry,
++	 * handle_read, handle_directory) iterate with strtok and do not recurse.
++	 */
++	{
++		size_t depth = 0;
++		const char *p = const_path;
++
++		while (*p) {
++			if (*p++ == '/') {
++				depth++;
++			}
++		}
++		if (depth > CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH) {
++			LOG_ERR("Path too deep (%zu > %d): %s", depth,
++				CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH, const_path);
++			k_free(path);
++			return -EINVAL;
++		}
++	}
++
+ 	k_mutex_lock(&xsel_mutex, K_FOREVER);
+ 	parent_entry = &root_xenstore;
+ 
+@@ -945,6 +1118,21 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
+ 			sys_dlist_init(&iter->child_list);
+ 			sys_dnode_init(&iter->node);
+ 			sys_dlist_append(&parent_entry->child_list, &iter->node);
++			/*
++			 * Arm the rollback BEFORE the permissions are set, not
++			 * after. The node is already linked into the tree at this
++			 * point, so if the perms allocation below fails on the very
++			 * first node created by this call, insert_entry would still
++			 * be NULL and free_allocated would have nothing to unwind -
++			 * leaving a node in the tree with an EMPTY perms list.
++			 * check_perms() then dereferences the NULL it gets from
++			 * SYS_SLIST_PEEK_HEAD_CONTAINER, and so does
++			 * remove_ref_entries_recursive() on domain teardown.
++			 */
++			if (!insert_entry) {
++				insert_entry = iter;
++			}
++
+ 			if (perms && perms_num) {
+ 				rc = set_perms_by_array(iter, perms, perms_num);
+ 			} else {
+@@ -954,10 +1142,6 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
+ 				LOG_ERR("Failed to set permissions (rc=%d)", rc);
+ 				goto free_allocated;
+ 			}
+-
+-			if (!insert_entry) {
+-				insert_entry = iter;
+-			}
+ 		}
+ 
+ 		parent_entry = iter;
+@@ -1001,50 +1185,147 @@ free_allocated:
+ 	return rc;
+ }
+ 
+-static void notify_watchers(const char *path, uint32_t caller_domid)
++/*
++ * Queue one pending watch event for `domain`/`path`, applying the coalescing rule and
++ * the per-domain cap. Returns true if an entry is queued afterwards (newly appended, or
++ * already present).
++ *
++ * Both producers go through this: notify_watchers() on a write, and handle_watch() for
++ * the initial event a new watch is owed. handle_watch() used to append directly,
++ * bypassing both the cap and the coalescing, so re-registering a watch in a loop grew
++ * the list without bound - exactly what the cap exists to stop. Counting and appending
++ * happen under one pfl_mutex hold so the count cannot be overtaken in between; the two
++ * split helpers this replaces released the lock between the check and the append.
++ *
++ * Takes pfl_mutex itself; callers must NOT hold it.
++ */
++static bool queue_pending_watch_event(struct xen_domain *domain, const char *path)
+ {
+-	struct watch_entry *iter;
+-	struct pending_watch_event_entry *pentry;
++	struct pending_watch_event_entry *iter, *pentry;
++	size_t n = 0;
+ 
+-	k_mutex_lock(&wel_mutex, K_FOREVER);
+-	SYS_DLIST_FOR_EACH_CONTAINER(&watch_entry_list, iter, node) {
+-		if (strncmp(iter->key, path, strlen(iter->key))) {
++	k_mutex_lock(&pfl_mutex, K_FOREVER);
++	SYS_DLIST_FOR_EACH_CONTAINER(&pending_watch_event_list, iter, node) {
++		if (iter->domain != domain) {
+ 			continue;
+ 		}
+-
+-		pentry = k_malloc(sizeof(*pentry));
+-		if (!pentry) {
+-			goto pentry_fail;
++		if (strcmp(iter->key, path) == 0) {
++			k_mutex_unlock(&pfl_mutex);
++			return true;
+ 		}
++		n++;
++	}
+ 
+-		pentry->key = k_malloc(xenstore_str_byte_size(path));
+-		if (!pentry->key) {
+-			goto pkey_fail;
+-		}
++	if (n >= XENSTORE_MAX_PENDING_WATCH_EVENTS) {
++		k_mutex_unlock(&pfl_mutex);
++		LOG_WRN("dom%u pending watch events at cap (%d), dropping event for %s",
++			domain->domid, XENSTORE_MAX_PENDING_WATCH_EVENTS, path);
++		return false;
++	}
+ 
+-		strcpy(pentry->key, path);
+-		pentry->domain = iter->domain;
++	pentry = k_malloc(sizeof(*pentry));
++	if (!pentry) {
++		k_mutex_unlock(&pfl_mutex);
++		LOG_ERR("Failed to allocate pending watch event");
++		return false;
++	}
+ 
+-		sys_dnode_init(&pentry->node);
+-		k_mutex_lock(&pfl_mutex, K_FOREVER);
+-		sys_dlist_append(&pending_watch_event_list,
+-				 &pentry->node);
++	pentry->key = k_malloc(xenstore_str_byte_size(path));
++	if (!pentry->key) {
++		k_free(pentry);
+ 		k_mutex_unlock(&pfl_mutex);
++		LOG_ERR("Failed to allocate pending watch event key");
++		return false;
++	}
+ 
+-		/* Wake watcher thread up */
+-		k_sem_give(&iter->domain->xenstore.xb_sem);
++	strcpy(pentry->key, path);
++	pentry->domain = domain;
++	pentry->delivered = 0;
++	sys_dnode_init(&pentry->node);
++	sys_dlist_append(&pending_watch_event_list, &pentry->node);
++	k_mutex_unlock(&pfl_mutex);
++
++	/* Wake the domain's watcher thread up. */
++	k_sem_give(&domain->xenstore.xb_sem);
++	return true;
++}
+ 
++static void notify_watchers(const char *path, uint32_t caller_domid);
++
++/*
++ * Fire the watches of every node BELOW `entry`, whose absolute path is already in
++ * buf[0..used).
++ *
++ * notify_watchers() only fires watches whose key is a PREFIX of the path it is given,
++ * so removing /local/domain/1/device told a backend watching
++ * /local/domain/1/device/vbd/51712/state nothing at all: its key is longer than the
++ * removed path, not a prefix of it. The reference xenstored fires the removed node and
++ * all of its descendants, and a frontend/backend state machine that never sees its
++ * state node disappear hangs with no diagnostic - the class of DomD wedge this series
++ * exists to remove.
++ *
++ * Must be called with xsel_mutex held and BEFORE the subtree is freed; the paths do not
++ * exist afterwards. notify_watchers() takes wel_mutex, which is the correct order
++ * (xsel -> wel -> pfl). Depth is bounded by the same knob that bounds creation, so this
++ * cannot recurse deeper than the tree can legally be.
++ */
++static void notify_watchers_below(struct xs_entry *entry, char *buf, size_t buflen,
++				  size_t used, uint32_t caller_domid, unsigned int depth)
++{
++	struct xs_entry *child;
++
++	if (depth >= CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH) {
++		return;
+ 	}
+-	k_mutex_unlock(&wel_mutex);
+ 
+-	return;
++	SYS_DLIST_FOR_EACH_CONTAINER(&entry->child_list, child, node) {
++		size_t klen;
+ 
+-pkey_fail:
+-	k_free(pentry);
+-pentry_fail:
++		if (!child->key) {
++			continue;
++		}
++		klen = strlen(child->key);
++		/* '/' + key + NUL */
++		if (used + 1 + klen + 1 > buflen) {
++			continue;
++		}
++		buf[used] = '/';
++		memcpy(buf + used + 1, child->key, klen + 1);
++		notify_watchers(buf, caller_domid);
++		notify_watchers_below(child, buf, buflen, used + 1 + klen, caller_domid,
++				      depth + 1);
++	}
++	buf[used] = '\0';
++}
++
++static void notify_watchers(const char *path, uint32_t caller_domid)
++{
++	struct watch_entry *iter;
++
++	k_mutex_lock(&wel_mutex, K_FOREVER);
++	SYS_DLIST_FOR_EACH_CONTAINER(&watch_entry_list, iter, node) {
++		if (!path_has_prefix(path, iter->key)) {
++			continue;
++		}
++
++		/*
++		 * One pending entry per (domain, path), not per matching watch, and a
++		 * hard per-domain cap - both enforced inside
++		 * queue_pending_watch_event().
++		 *
++		 * fire_watcher() already walks every matching watch of the domain it is
++		 * given, so queueing one entry per watch made a domain with K watches on
++		 * the same prefix cost K*K output buffers for a single write; ten watches
++		 * was enough to hit XENSTORE_MAX_OUT_BUF_NUM. The cap exists because the
++		 * list had no bound at all: a guest that watches "/" and never reads its
++		 * ring pinned one allocation per write, system-wide, until Dom0's 2 MiB
++		 * heap was gone - at which point unrelated domains start failing their
++		 * input-buffer allocations and get invalidated. Dropping events is
++		 * visible and recoverable; exhausting the heap is neither.
++		 */
++		queue_pending_watch_event(iter->domain, path);
++	}
+ 	k_mutex_unlock(&wel_mutex);
+-	LOG_WRN("Failed to notify Domain#%d about path %s, no memory",
+-		iter->domain->domid, path);
+ }
+ 
+ int xss_write(const char *path, const char *value)
+@@ -1167,11 +1448,24 @@ int xss_read(const char *path, char *value, size_t len)
+ 	int rc = -ENOENT;
+ 	struct xs_entry *entry;
+ 
++	/* value[len - 1] below needs at least one byte to terminate. */
++	if (!value || len == 0) {
++		return -EINVAL;
++	}
++
+ 	k_mutex_lock(&xsel_mutex, K_FOREVER);
+ 	entry = key_to_entry_check_perm(path, 0, XS_PERM_READ);
+ 	if (entry) {
+ 		if (entry->value) {
++			/*
++			 * strncpy() does not terminate when the source is at least
++			 * `len` long, and the source is guest-controlled. Callers pass
++			 * small stack buffers and then treat the result as a C string:
++			 * xss_read_integer() hands it to atoi(), get_domain_name() and
++			 * xstat print it with %s.
++			 */
+ 			strncpy(value, entry->value, len);
++			value[len - 1] = '\0';
+ 		} else {
+ 			strcpy(value, "");
+ 		}
+@@ -1349,6 +1643,14 @@ static void handle_mkdir(struct xenstore *xenstore, uint32_t id, char *payload,
+ static void process_pending_watch_events(struct xen_domain *domain)
+ {
+ 	struct pending_watch_event_entry *iter, *next;
++	unsigned int budget = XENSTORE_WATCH_EVENTS_PER_PASS;
++
++	/* Nothing queued for anyone: do not take the global tree lock at all.
++	 * The worker calls this on every loop iteration, and since the xb_sem
++	 * wait has a 100 ms timeout that is ~10 times a second per domain. */
++	if (sys_dlist_is_empty(&pending_watch_event_list)) {
++		return;
++	}
+ 
+ 	/* xsel_mutex must be held: fire_watcher() walks the
+ 	 * xenstore tree via key_to_entry_check_perm(), which races with node
+@@ -1364,7 +1666,19 @@ static void process_pending_watch_events(struct xen_domain *domain)
+ 			continue;
+ 		}
+ 
+-		rc = fire_watcher(domain, iter->key);
++		/*
++		 * Bounded work per pass. xsel is the global tree lock, so holding
++		 * it across an unbounded backlog stalls every other domain's reads
++		 * and writes - and with CONFIG_TIMESLICE_SIZE=20 (0 on Zephyr 3.6)
++		 * this thread can be preempted mid-drain while still holding it.
++		 * The worker is called again immediately, so the remainder is
++		 * processed on the next pass.
++		 */
++		if (budget-- == 0) {
++			break;
++		}
++
++		rc = fire_watcher(domain, iter->key, &iter->delivered);
+ 		if (rc == -ENOMEM) {
+ 			/* Out-buffer quota: retry after the guest drains. */
+ 			LOG_WRN("Watch event delivery deferred (out of buffers)");
+@@ -1572,6 +1886,15 @@ static int xss_do_rm(const char *key, uint32_t caller_id)
+ {
+ 	struct xs_entry *entry;
+ 
++	/*
++	 * The root is not a removable entry - see free_node(). Reject it here so
++	 * the caller gets an error it can reply with, rather than relying on the
++	 * guard further down.
++	 */
++	if (!key || xenstore_is_root_path(key)) {
++		return -EINVAL;
++	}
++
+ 	k_mutex_lock(&xsel_mutex, K_FOREVER);
+ 	entry = key_to_entry_check_perm(key, caller_id, XS_PERM_WRITE);
+ 	if (!entry) {
+@@ -1612,12 +1935,52 @@ static void handle_rm(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	 * an unrelated node directly under the root. notify_watchers() needs the
+ 	 * resolved path too, or absolute watchers never see the event.
+ 	 */
++	/*
++	 * An empty payload resolved to "/local/domain/<id>/" and wiped the caller's
++	 * whole subtree. That was already reachable and became deterministic once the
++	 * request payload gained a guaranteed NUL terminator. The reference xenstored
++	 * answers EINVAL.
++	 */
++	if (len == 0 || payload[0] == '\0') {
++		LOG_ERR("XS_RM with empty path from dom%u", xenstore->domain->domid);
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++
+ 	rc = construct_path(payload, xenstore->domain->domid, &path);
+ 	if (rc) {
+ 		send_errno(xenstore, id, (rc < 0) ? -rc : rc);
+ 		return;
+ 	}
+ 
++	/*
++	 * Fire the descendants' watches first: after xss_do_rm() the subtree is gone
++	 * and there is nothing left to walk. Failing to allocate the scratch buffer only
++	 * costs the descendant events, so it is not fatal - the removal still happens
++	 * and the node's own watchers are still told below.
++	 */
++	{
++		struct xs_entry *rm_entry;
++		size_t plen = strlen(path);
++		char *buf = k_malloc(XENSTORE_ABS_PATH_MAX + 1);
++
++		if (buf) {
++			k_mutex_lock(&xsel_mutex, K_FOREVER);
++			rm_entry = key_to_entry(path);
++			if (rm_entry && plen <= XENSTORE_ABS_PATH_MAX) {
++				memcpy(buf, path, plen + 1);
++				notify_watchers_below(rm_entry, buf,
++						      XENSTORE_ABS_PATH_MAX + 1, plen,
++						      xenstore->domain->domid, 0);
++			}
++			k_mutex_unlock(&xsel_mutex);
++			k_free(buf);
++		} else {
++			LOG_WRN("dom%u XS_RM: no memory for subtree watch events",
++				xenstore->domain->domid);
++		}
++	}
++
+ 	/*
+ 	 * xss_do_rm() returns 0 on success, so a non-zero return is the error
+ 	 * path. Getting this backwards costs more than a wrong reply: the
+@@ -1642,7 +2005,6 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	char *path;
+ 	char *token;
+ 	struct watch_entry *wentry;
+-	struct pending_watch_event_entry *pentry;
+ 	size_t path_len = 0, full_plen;
+ 	/* '@' special watches (@introduceDomain/@releaseDomain)
+ 	 * are global names, not per-domain node paths. xenstore_is_abs_path() only
+@@ -1662,6 +2024,20 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	if (path_len > XENSTORE_ABS_PATH_MAX) {
+ 		goto path_fail;
+ 	}
++	/*
++	 * The wire format is "path\0token\0", so the separator must actually be
++	 * inside the payload. Without this, a payload carrying no NUL at all gives
++	 * path_len == len + 1, and `token` below points one byte past the
++	 * allocation - the NUL that handle_input() appends is at payload[len], not
++	 * payload[len + 1]. key_to_watcher() then runs strlen()/strcmp() off the
++	 * end of the heap. handle_set_perms() already checks this; watch/unwatch
++	 * did not.
++	 */
++	if (path_len >= len) {
++		LOG_ERR("XS_WATCH payload has no token separator (len=%u)", len);
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
+ 
+ 	rc = construct_path(payload, xenstore->domain->domid, &path);
+ 	if (rc) {
+@@ -1671,7 +2047,41 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 
+ 	token = payload + path_len;
+ 	k_mutex_lock(&wel_mutex, K_FOREVER);
+-	wentry = key_to_watcher(path, true, token);
++	wentry = key_to_watcher(path, true, token, domain);
++
++	/*
++	 * Per-domain watch quota.
++	 *
++	 * Each watch is a permanent allocation (entry + key + token, the key up to
++	 * XENSTORE_ABS_PATH_MAX), and nothing bounded how many a domain could register:
++	 * `XS_WATCH <path> <fresh token>` in a loop is answered "OK" every time and
++	 * pins heap until Dom0's 2 MiB pool is gone, at which point unrelated domains
++	 * start failing their input-buffer allocations and get invalidated. The
++	 * pending-event cap does not help here - a guest that drains its ring never
++	 * accumulates pending events at all.
++	 *
++	 * Counted inside the same wel_mutex hold as the duplicate lookup, so the count
++	 * cannot be overtaken. Re-registering an existing watch allocates nothing and is
++	 * allowed through.
++	 */
++	if (!wentry) {
++		struct watch_entry *witer;
++		size_t nwatch = 0;
++
++		SYS_DLIST_FOR_EACH_CONTAINER(&watch_entry_list, witer, node) {
++			if (witer->domain == domain) {
++				nwatch++;
++			}
++		}
++		if (nwatch >= CONFIG_XENSTORE_MAX_WATCHES_PER_DOMAIN) {
++			k_mutex_unlock(&wel_mutex);
++			LOG_ERR("dom%u watch quota reached (%d), refusing %s", domain->domid,
++				CONFIG_XENSTORE_MAX_WATCHES_PER_DOMAIN, path);
++			k_free(path);
++			send_errno(xenstore, id, ENOSPC);
++			return;
++		}
++	}
+ 
+ 	if (wentry) {
+ 		/* Same watch, different path form */
+@@ -1691,13 +2101,23 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 			goto wkey_fail;
+ 		}
+ 
+-		wentry->token = k_malloc(len - path_len);
++		/*
++		 * +1 and an explicit terminator. The stored token is read back with
++		 * strlen() by fire_watcher(), and copying exactly (len - path_len)
++		 * bytes leaves it unterminated whenever the payload's last byte is
++		 * not a NUL. fire_watcher() then walks past the allocation and
++		 * memcpy()s whatever it finds into the XS_WATCH_EVENT payload it
++		 * sends to the guest - a direct heap disclosure, worse than the
++		 * indirect one the input terminator closes.
++		 */
++		wentry->token = k_malloc(len - path_len + 1);
+ 		if (!wentry->token) {
+ 			goto wtoken_fail;
+ 		}
+ 
+ 		memcpy(wentry->key, path, full_plen);
+ 		memcpy(wentry->token, token, len - path_len);
++		wentry->token[len - path_len] = '\0';
+ 		wentry->domain = domain;
+ 		wentry->is_relative = path_is_relative;
+ 		sys_dnode_init(&wentry->node);
+@@ -1710,26 +2130,11 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 
+ 	k_mutex_lock(&xsel_mutex, K_FOREVER);
+ 	if (key_to_entry_check_perm(path, domain->domid, XS_PERM_READ)) {
+-		pentry = k_malloc(sizeof(*pentry));
+-		if (!pentry) {
+-			goto pentry_fail;
+-		}
+-
+-		pentry->key = k_malloc(full_plen);
+-		if (!pentry->key) {
+-			goto pkey_fail;
+-		}
+-
+-		memcpy(pentry->key, path, full_plen);
+-		pentry->domain = domain;
+-		sys_dnode_init(&pentry->node);
+-
+-		k_mutex_lock(&pfl_mutex, K_FOREVER);
+-		sys_dlist_append(&pending_watch_event_list, &pentry->node);
+-		k_mutex_unlock(&pfl_mutex);
+-
+-		/* Notify domain thread about new pending event */
+-		k_sem_give(&domain->xenstore.xb_sem);
++		/* Through the same producer as notify_watchers(), so the initial event a
++		 * new watch is owed obeys the coalescing rule and the per-domain cap too.
++		 * Appending directly here let a guest grow the pending list without bound
++		 * just by re-registering a watch. */
++		queue_pending_watch_event(domain, path);
+ 	}
+ 	k_mutex_unlock(&xsel_mutex);
+ 	k_free(path);
+@@ -1751,20 +2156,6 @@ wentry_fail:
+ 	LOG_WRN("Failed to create watch for Domain#%d, no memory",
+ 		domain->domid);
+ 	send_reply(xenstore, id, XS_ERROR, "ENOMEM");
+-
+-	return;
+-
+-pkey_fail:
+-	k_free(pentry);
+-pentry_fail:
+-	k_mutex_unlock(&xsel_mutex);
+-	k_free(path);
+-	/*
+-	 * We can't notify domain that this file already exists,
+-	 * so leave it without first WATCH_EVENT
+-	 */
+-	LOG_WRN("Failed to notify Domain#%d, no memory for event",
+-		domain->domid);
+ }
+ 
+ static void handle_unwatch(struct xenstore *xenstore, uint32_t id,
+@@ -1777,6 +2168,14 @@ static void handle_unwatch(struct xenstore *xenstore, uint32_t id,
+ 	int rc;
+ 	struct xen_domain *domain = xenstore->domain;
+ 
++	/* Same "path\0token\0" separator check as handle_watch(): without it
++	 * `token` below points one byte past the input allocation. */
++	if (path_len >= len) {
++		LOG_ERR("XS_UNWATCH payload has no token separator (len=%u)", len);
++		send_errno(xenstore, id, EINVAL);
++		return;
++	}
++
+ 	rc = construct_path(payload, domain->domid, &path);
+ 	if (rc) {
+ 		LOG_ERR("Failed to construct path (rc=%d)", rc);
+@@ -1786,7 +2185,7 @@ static void handle_unwatch(struct xenstore *xenstore, uint32_t id,
+ 
+ 	token = payload + path_len;
+ 	k_mutex_lock(&wel_mutex, K_FOREVER);
+-	entry = key_to_watcher(path, true, token);
++	entry = key_to_watcher(path, true, token, domain);
+ 	k_free(path);
+ 	if (entry) {
+ 		if (entry->domain == domain) {
+@@ -1803,16 +2202,13 @@ static void handle_transaction_start(struct xenstore *xenstore, uint32_t id,
+ {
+ 	char buf[INT32_MAX_STR_LEN] = { 0 };
+ 
+-	/* This server's transactions are non-isolating
+-	 * stubs (writes apply directly), so do NOT enforce single-transaction
+-	 * exclusion — a toolstack domain (DomD) multiplexes several clients
+-	 * (xl, xenconsoled, xl devd) over one xenbus connection and legitimately
+-	 * has multiple transactions open at once; the old EBUSY rejection made the
+-	 * 2nd concurrent XS_TRANSACTION_START fail ("transaction already started")
+-	 * and libxl's console/backend setup retried forever. Track a COUNT of open
+-	 * transactions instead of a single flag so pending watch events are still
+-	 * deferred while ANY transaction is open (see the worker loop). The tx id
+-	 * itself is a monotonic counter, unique per start. */
++	/*
++	 * running_transaction is a COUNT of open transactions, kept so `xu xsring` can
++	 * report it and so XS_TRANSACTION_END cannot drive it negative. It does NOT gate
++	 * anything: pending watch events are drained whether or not a transaction is
++	 * open, because the transactions here are non-isolating stubs and deferring the
++	 * events only risked losing them against the per-domain cap. The tx id itself is
++	 * a monotonic counter, unique per start. */
+ 	xenstore->running_transaction++;
+ 	snprintf(buf, sizeof(buf), "%d", ++xenstore->transaction);
+ 	send_reply(xenstore, id, XS_TRANSACTION_START, buf);
+@@ -2132,7 +2528,23 @@ static void handle_input(struct xenstore *xenstore)
+ 
+ 		xenstore->in->total_size += header.len;
+ 		k_free(xenstore->in->buffer);
+-		xenstore->in->buffer = k_malloc(xenstore->in->total_size);
++		/*
++		 * One byte more than the wire message, and NUL it below once the
++		 * payload has been read.
++		 *
++		 * Nothing on the wire guarantees the payload is NUL-terminated,
++		 * yet every path handler treats it as a C string: construct_path()
++		 * calls xenstore_str_byte_size() (strlen + 1), deserialize_perms()
++		 * calls strlen(), handle_watch() indexes past strnlen(). A guest
++		 * that sends header.len == 0, or len bytes with no NUL, makes those
++		 * read off the end of this allocation - and construct_path() then
++		 * memcpy()s whatever it found into a xenstore key, which the guest
++		 * can read back with XS_DIRECTORY. That is a Dom0 heap disclosure.
++		 *
++		 * Terminating here fixes every handler at once, which is why it is
++		 * done at the boundary rather than in each of them.
++		 */
++		xenstore->in->buffer = k_malloc(xenstore->in->total_size + 1);
+ 		if (!xenstore->in->buffer) {
+ 			goto alloc_err;
+ 		}
+@@ -2151,6 +2563,7 @@ static void handle_input(struct xenstore *xenstore)
+ 		return;
+ 	}
+ 
++	xenstore->in->buffer[xenstore->in->total_size] = '\0';
+ 	process_message(xenstore);
+ 	return;
+ 
+@@ -2184,9 +2597,26 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
+ 			xenstore->pending_stop_transaction = false;
+ 		}
+ 
+-		if (!xenstore->running_transaction) {
+-			process_pending_watch_events(domain);
+-		}
++		/*
++		 * Drain unconditionally, including while a transaction is open.
++		 *
++		 * This used to be gated on !running_transaction. That gate is safe
++		 * only while the pending list is unbounded: once it has a cap
++		 * (XENSTORE_MAX_PENDING_WATCH_EVENTS), holding a transaction open
++		 * stops the drain while notify_watchers() keeps queueing, and past
++		 * the cap events are DROPPED. libxl writes a whole device
++		 * configuration inside one transaction, so exactly the events DomD
++		 * needs to see a frontend reach Connected are the ones at risk -
++		 * losing one hangs `xl create` with no diagnostic. Unbounded growth
++		 * and silent loss are both unacceptable; removing the gate removes
++		 * the accumulation instead.
++		 *
++		 * There is no isolation to protect: this server's transactions are
++		 * non-isolating stubs (see handle_transaction_start - writes apply
++		 * directly), so a watch event delivered "during" a transaction
++		 * reports a change that is already visible to every reader.
++		 */
++		process_pending_watch_events(domain);
+ 
+ 		/* Backpressure: processing a request while the
+ 		 * out queue is near XENSTORE_MAX_OUT_BUF_NUM lets a reply/watch
+@@ -2362,6 +2792,12 @@ static void remove_ref_entries_recursive(uint32_t domid, sys_dlist_t *chlds)
+ 
+ 	SYS_DLIST_FOR_EACH_CONTAINER_SAFE(chlds, entry, next, node) {
+ 		perms = SYS_SLIST_PEEK_HEAD_CONTAINER(&entry->perms, perms, node);
++		if (!perms) {
++			/* Same defence as check_perms(): an entry with no permissions
++			 * should not exist, but do not dereference NULL if one does. */
++			LOG_ERR("xenstore entry with empty perms list during teardown");
++			continue;
++		}
+ 		if (perms->domid == domid) {
+ 			free_node(entry);
+ 		} else {

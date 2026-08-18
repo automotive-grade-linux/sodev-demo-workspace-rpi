@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] xenlib: make include/xen/public the only Xen header tree
+
+
+Two loose ends from making zephyr-xenlib the single source of the Xen public
+headers (0024 on the Zephyr side, 0027/0029 on the consumers).
+
+1. vch/include/ carried a second copy of xen/public/io/libxenvchan.h at the same
+   relative path as the shared one, and vch.h reached it with a quoted include -
+   which searches the including file's directory first, so the vch copy always
+   won
+   and the authoritative one was never compiled. The two differed only in that
+   the
+   vch copy had added an include guard (upstream Xen's has none), so nothing was
+   broken today, but the guard is also the reason a future <angle-bracket>
+   include
+   of the shared copy alongside vch.h would have redefined struct
+   vchan_interface.
+   Drop the duplicate and put the guard in vch.h, where it does not mean
+   modifying
+   a public Xen header.
+
+2. __XEN_TOOLS__ was defined inside xen-compat.h, which is reached via xen.h -
+   but domctl.h and sysctl.h test it with #error *before* they include xen.h. So
+   a translation unit whose first include was <xen/public/domctl.h> failed with
+   "domctl operations are intended for use by node control tools only", and the
+   four files that include it only work because <domain.h> or
+   <xen/public/version.h>
+   happens to come first. Pass it from the build instead, the way upstream Xen's
+   tools do, which also removes one more local deviation from xen-compat.h (the
+   only file in include/xen/public/ that is not a byte-for-byte copy of Xen
+   4.21.0).
+
+CONFIG_XEN_INTERFACE_VERSION keeps driving __XEN_INTERFACE_VERSION__; that is
+a deliberate fork behaviour (it lets the board pick) and changing it would
+alter DEFINE_RING_TYPES' flex-array dimension.
+
+Depends on 0024 (zephyr).
+
+Also corrects the one remaining reference to the old path: a comment in
+xstat/include/xstat.h that still pointed at include/zephyr/xen/public/domctl.h,
+which no longer exists anywhere.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 69456cd..59c0c98 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,6 +9,22 @@ if(CONFIG_XEN)
+ 
+   zephyr_include_directories(${ZEPHYR_XENLIB_DIR}/include)
+ 
++  # The Xen public headers gate the control-plane definitions on __XEN_TOOLS__, and
++  # domctl.h/sysctl.h test it with #error BEFORE they include xen.h. Defining it
++  # inside xen-compat.h (reached via xen.h) therefore only worked when some other
++  # header pulled xen.h in first: a translation unit whose first include was
++  # <xen/public/domctl.h> failed with
++  #   "domctl operations are intended for use by node control tools only".
++  # Pass it from the build, the way upstream Xen's tools do, so include order stops
++  # mattering. Kept under CONFIG_XEN_DOM0 - the same condition xen-compat.h used.
++  # Unconditional under CONFIG_XEN, not gated on CONFIG_XEN_DOM0. XSTAT,
++  # XEN_DOMAIN_MANAGEMENT and XEN_SHELL have no `depends on XEN_DOM0`, so a
++  # XEN=y/XEN_DOM0=n build compiles xstat.c and friends, which include
++  # <xen/public/domctl.h> and would hit its "node control tools only" #error.
++  # (That configuration was equally broken before, when xen-compat.h defined the
++  # macro under the same #ifdef - this fixes it rather than preserving it.)
++  zephyr_compile_definitions(__XEN_TOOLS__)
++
+   add_subdirectory_ifdef(CONFIG_XEN_STORE_COMMON xenstore-common)
+   add_subdirectory_ifdef(CONFIG_XEN_STORE_SRV xenstore-srv)
+   add_subdirectory_ifdef(CONFIG_XEN_DOMAIN_MANAGEMENT xen-dom-mgmt)
+diff --git a/include/xen/public/xen-compat.h b/include/xen/public/xen-compat.h
+index 5748e3a..b60e5ef 100644
+--- a/include/xen/public/xen-compat.h
++++ b/include/xen/public/xen-compat.h
+@@ -13,10 +13,6 @@
+ 
+ #define __XEN_LATEST_INTERFACE_VERSION__ 0x00041300
+ 
+-#ifdef CONFIG_XEN_DOM0
+-#define __XEN_TOOLS__
+-#endif
+-
+ #ifdef CONFIG_XEN_INTERFACE_VERSION
+ #define __XEN_INTERFACE_VERSION__ CONFIG_XEN_INTERFACE_VERSION
+ #else
+diff --git a/vch/include/vch.h b/vch/include/vch.h
+index 12ee584..2bdb5b5 100644
+--- a/vch/include/vch.h
++++ b/vch/include/vch.h
+@@ -13,7 +13,23 @@
+ #include <xen/public/grant_table.h>
+ #include <xen/public/xen.h>
+ 
+-#include "xen/public/io/libxenvchan.h"
++/*
++ * The shared copy under include/xen/public/ is a byte-for-byte copy of Xen's,
++ * which deliberately carries no include guard. vch/include/ used to hold a second,
++ * locally guarded copy of the same file at the same relative path; because this was
++ * a quoted include it always won, so the authoritative copy was never compiled and
++ * the two could drift apart silently. Include the shared one and provide the guard
++ * here instead of modifying a public Xen header.
++ *
++ * Note the guard only protects the "vch.h first" order: a translation unit that
++ * includes <xen/public/io/libxenvchan.h> directly and then vch.h still gets the
++ * header twice, because upstream Xen's copy carries no guard of its own. Nothing
++ * in the tree does that today (vch.h is the only includer).
++ */
++#ifndef _XEN_PUBLIC_IO_LIBXENVCHAN_H
++#define _XEN_PUBLIC_IO_LIBXENVCHAN_H
++#include <xen/public/io/libxenvchan.h>
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+diff --git a/vch/include/xen/public/io/libxenvchan.h b/vch/include/xen/public/io/libxenvchan.h
+deleted file mode 100644
+index 4b10af5..0000000
+--- a/vch/include/xen/public/io/libxenvchan.h
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/* SPDX-License-Identifier: MIT */
+-/**
+- * @file
+- * @section AUTHORS
+- *
+- * Copyright (C) 2010  Rafal Wojtczuk  <rafal@invisiblethingslab.com>
+- *
+- *  Authors:
+- *       Rafal Wojtczuk  <rafal@invisiblethingslab.com>
+- *       Daniel De Graaf <dgdegra@tycho.nsa.gov>
+- *
+- * @section LICENSE
+- *
+- * @section DESCRIPTION
+- *
+- *  Originally borrowed from the Qubes OS Project, http://www.qubes-os.org,
+- *  this code has been substantially rewritten to use the gntdev and gntalloc
+- *  devices instead of raw MFNs and map_foreign_range.
+- *
+- *  This is a library for inter-domain communication.  A standard Xen ring
+- *  buffer is used, with a datagram-based interface built on top.  The grant
+- *  reference and event channels are shared in XenStore under a user-specified
+- *  path.
+- *
+- *  The ring.h macros define an asymmetric interface to a shared data structure
+- *  that assumes all rings reside in a single contiguous memory space. This is
+- *  not suitable for vchan because the interface to the ring is symmetric except
+- *  for the setup. Unlike the producer-consumer rings defined in ring.h, the
+- *  size of the rings used in vchan are determined at execution time instead of
+- *  compile time, so the macros in ring.h cannot be used to access the rings.
+- */
+-
+-#ifndef _XEN_PUBLIC_IO_LIBXENVCHAN_H
+-#define _XEN_PUBLIC_IO_LIBXENVCHAN_H
+-
+-#include <stdint.h>
+-#include <sys/types.h>
+-
+-struct ring_shared {
+-	uint32_t cons, prod;
+-};
+-
+-#define VCHAN_NOTIFY_WRITE 0x1
+-#define VCHAN_NOTIFY_READ 0x2
+-
+-/**
+- * vchan_interface: primary shared data structure
+- */
+-struct vchan_interface {
+-	/**
+-	 * Standard consumer/producer interface, one pair per buffer
+-	 * left is client write, server read
+-	 * right is client read, server write
+-	 */
+-	struct ring_shared left, right;
+-	/**
+-	 * size of the rings, which determines their location
+-	 * 10   - at offset 1024 in ring's page
+-	 * 11   - at offset 2048 in ring's page
+-	 * 12+  - uses 2^(N-12) grants to describe the multi-page ring
+-	 * These should remain constant once the page is shared.
+-	 * Only one of the two orders can be 10 (or 11).
+-	 */
+-	uint16_t left_order, right_order;
+-	/**
+-	 * Shutdown detection:
+-	 *  0: client (or server) has exited
+-	 *  1: client (or server) is connected
+-	 *  2: client has not yet connected
+-	 */
+-	uint8_t cli_live, srv_live;
+-	/**
+-	 * Notification bits:
+-	 *  VCHAN_NOTIFY_WRITE: send notify when data is written
+-	 *  VCHAN_NOTIFY_READ: send notify when data is read (consumed)
+-	 * cli_notify is used for the client to inform the server of its action
+-	 */
+-	uint8_t cli_notify, srv_notify;
+-	/**
+-	 * Grant list: ordering is left, right. Must not extend into actual ring
+-	 * or grow beyond the end of the initial shared page.
+-	 * These should remain constant once the page is shared, to allow
+-	 * for possible remapping by a client that restarts.
+-	 */
+-	uint32_t grants[0];
+-};
+-
+-#endif /* _XEN_PUBLIC_IO_LIBXENVCHAN_H */
+diff --git a/xstat/include/xstat.h b/xstat/include/xstat.h
+index d2b8e65..d3ed9f3 100644
+--- a/xstat/include/xstat.h
++++ b/xstat/include/xstat.h
+@@ -31,7 +31,7 @@ struct xenstat_vcpu {
+ struct xenstat_domain {
+ 	unsigned short id;
+ 	char name[CONTAINER_NAME_SIZE];
+-	/* XEN_DOMCTL_* flags are defined in include/zephyr/xen/public/domctl.h */
++	/* XEN_DOMCTL_* flags are defined in include/xen/public/domctl.h */
+ 	unsigned int state;
+ 	unsigned long long cpu_ns;
+ 	unsigned int num_vcpus;		/* No. vcpus configured for domain */

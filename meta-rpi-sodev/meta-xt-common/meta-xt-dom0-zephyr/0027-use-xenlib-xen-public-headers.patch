@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] dom0-xt: take the Xen public headers from zephyr-xenlib
+
+
+Zephyr used to vendor its own trimmed copy of the Xen public headers under
+include/zephyr/xen/public/. Upstream removed it (commit d58fbb8cfc58,
+backported here as 0024) and made zephyr-xenlib the single source: xenlib's
+include/xen/public/ is a byte-for-byte copy of Xen 4.21.0's public headers,
+and its CMakeLists.txt puts that directory on the include path
+unconditionally.
+
+This matters beyond the missing file. The two header trees used identical
+include guards (__XEN_PUBLIC_DOMCTL_H__ and friends) while defining
+*different* layouts, so whichever tree a translation unit reached first won
+and the other became a silent no-op. sizeof(struct xen_arch_domainconfig) was
+12 in the Zephyr copy and 16 in xenlib's (the latter has the trailing
+`arm_sci_type` that Xen 4.21 actually expects), which is a one-definition-rule
+violation the linker cannot see: xstat.c got 16 bytes while xen-dom-mgmt.c got
+12. With the vendored copy gone there is exactly one definition, and it is the
+one Xen agrees with.
+
+src/dom_cfg/rpi_4b.c is included here rather than fixed in 0020, which adds it:
+0020 is the RPi4 board's guest configuration and stays as close to what it was as
+possible, while this patch's whole job is the header move for zephyr-dom0-xt. The
+consequence is an ordering constraint - 0019/0020 must be applied before this one,
+which is why apply-zephyr-patches.sh no longer keeps them at the end of the series.
+
+Depends on 0024 (zephyr), and on 0020 for src/dom_cfg/rpi_4b.c.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
+---
+diff --git a/src/dom_cfg/rpi_4b.c b/src/dom_cfg/rpi_4b.c
+--- a/src/dom_cfg/rpi_4b.c
++++ b/src/dom_cfg/rpi_4b.c
+@@ -5,7 +5,7 @@
+  */
+ 
+ #include <domain.h>
+-#include <zephyr/xen/public/domctl.h>
++#include <xen/public/domctl.h>
+ #include <string.h>
+ #include <xl_parser.h>
+ #include "../dom0.h"
+diff --git a/src/dom_cfg/rpi_5.c b/src/dom_cfg/rpi_5.c
+index a07337f..381f2a7 100644
+--- a/src/dom_cfg/rpi_5.c
++++ b/src/dom_cfg/rpi_5.c
+@@ -5,7 +5,7 @@
+  */
+ 
+ #include <domain.h>
+-#include <zephyr/xen/public/domctl.h>
++#include <xen/public/domctl.h>
+ #include <string.h>
+ #include <xl_parser.h>
+ #include "../dom0.h"
+diff --git a/src/dom_cfg/rpi_5_domd.c b/src/dom_cfg/rpi_5_domd.c
+index 6a6c784..9e5d2ea 100644
+--- a/src/dom_cfg/rpi_5_domd.c
++++ b/src/dom_cfg/rpi_5_domd.c
+@@ -5,7 +5,7 @@
+  */
+ 
+ #include <domain.h>
+-#include <zephyr/xen/public/domctl.h>
++#include <xen/public/domctl.h>
+ 
+ #include <string.h>
+ 
+diff --git a/src/domu_cfg.c b/src/domu_cfg.c
+index a6d0cc9..0c83810 100644
+--- a/src/domu_cfg.c
++++ b/src/domu_cfg.c
+@@ -5,7 +5,7 @@
+  */
+ 
+ #include <domain.h>
+-#include <zephyr/xen/public/domctl.h>
++#include <xen/public/domctl.h>
+ 
+ #include <string.h>
+ 

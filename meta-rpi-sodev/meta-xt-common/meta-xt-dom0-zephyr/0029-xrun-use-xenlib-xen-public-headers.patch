@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 00:36:57 +0900
+Subject: [PATCH] xrun: take the Xen public headers from zephyr-xenlib
+
+
+Same change as 0027 does for zephyr-dom0-xt, for the one include in xrun.
+
+Zephyr's vendored copy of the Xen public headers under
+include/zephyr/xen/public/ is gone as of upstream commit d58fbb8cfc58
+(backported as 0024); zephyr-xenlib is the single source now, and its
+include/xen/public/ is a byte-for-byte copy of Xen 4.21.0's. Without this the
+build stops at:
+
+  zephyr-xrun/src/xrun.c:18:10: fatal error: zephyr/xen/public/domctl.h:
+      No such file or directory
+
+Depends on 0024 (zephyr).
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-xrun]
+---
+diff --git a/src/xrun.c b/src/xrun.c
+index 3c23d4d..58f0de8 100644
+--- a/src/xrun.c
++++ b/src/xrun.c
+@@ -15,7 +15,7 @@
+ #include <zephyr/sys/slist.h>
+ 
+ #if !defined(CONFIG_BOARD_NATIVE_POSIX)
+-#include <zephyr/xen/public/domctl.h>
++#include <xen/public/domctl.h>
+ #endif
+ 
+ #include <storage.h>
