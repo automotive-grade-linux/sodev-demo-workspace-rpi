@@ -3,7 +3,19 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] xenlib: optional initrd loading
 
-Add the initrd_info field + load_initrd_bytes/get_initrd_size callbacks on struct xen_domain_cfg, the linux,initrd-start/end chosen-FDT props, and the physmap initrd load. Needed by the AAOS layered ramdisk.
+
+Add the initrd_info field + load_initrd_bytes/get_initrd_size callbacks on
+struct xen_domain_cfg, the linux,initrd-start/end chosen-FDT props, and the
+physmap initrd load. Needed by the AAOS layered ramdisk.
+
+Local-Modifications: regenerated against zephyrproject-rtos/zephyr-xenlib main
+ (7f08845). The initrd path used xenmem_cacheflush_mapped_pfns(nr_pages, gfn),
+ which upstream removed in 4e5b0a6/2368b08 when it moved to Zephyr's cache
+ API. It now calls arch_dcache_flush_and_invd_range() like the neighbouring
+ kernel and dtb paths do. Note those two call sites pass nr_pages where the
+ API wants a byte count (include/zephyr/arch/cache.h), so they under-flush;
+ this patch passes the size in bytes rather than copying that. Worth reporting
+ upstream separately.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
@@ -51,7 +63,7 @@ index a5a8947..d2739c7 100644
  /**
   * Frees the memory allocated for a device tree blob (FDT).
 diff --git a/xen-dom-mgmt/src/xen-dom-fdt.c b/xen-dom-mgmt/src/xen-dom-fdt.c
-index df366ad..23603eb 100644
+index 06d6bd9..b77e979 100644
 --- a/xen-dom-mgmt/src/xen-dom-fdt.c
 +++ b/xen-dom-mgmt/src/xen-dom-fdt.c
 @@ -192,11 +192,12 @@ static int fdt_property_regs(void *fdt, unsigned int addr_cells,
@@ -131,10 +143,10 @@ index df366ad..23603eb 100644
  	*fdtaddr = pfdt;
  	*fdtsize = pfdt_size;
 diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
-index f766122..41e7867 100644
+index 966b2a0..926d0e5 100644
 --- a/xen-dom-mgmt/src/xen-dom-mgmt.c
 +++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
-@@ -33,6 +33,8 @@ LOG_MODULE_REGISTER(xen_dom_mgmt);
+@@ -35,6 +35,8 @@ LOG_MODULE_REGISTER(xen_dom_mgmt);
  struct modules_address {
    uint64_t ventry;
    uint64_t dtb_addr;
@@ -143,7 +155,7 @@ index f766122..41e7867 100644
  };
  
  /* Number of active domains, used as an indicator to not exhaust allocated stack area.
-@@ -379,10 +381,51 @@ static int probe_zimage(int domid, uint64_t base_addr,
+@@ -380,10 +382,51 @@ static int probe_zimage(int domid, uint64_t base_addr,
  		zhdr.text_offset, base_addr, nr_pages,
  		nr_pages * XEN_PAGE_SIZE);
  
@@ -196,7 +208,7 @@ index f766122..41e7867 100644
  	if (rc || fdt_size == 0) {
  		LOG_ERR("Failed to generate domain FDT (rc=%d)", rc);
  		return -ENOMEM;
-@@ -395,6 +438,22 @@ static int probe_zimage(int domid, uint64_t base_addr,
+@@ -396,6 +439,22 @@ static int probe_zimage(int domid, uint64_t base_addr,
  		goto out_dtb;
  	}
  
@@ -219,7 +231,7 @@ index f766122..41e7867 100644
  	modules->dtb_addr = dtb_addr;
  	rc = load_dtb(domid, dtb_addr, fdt, fdt + fdt_size);
  	if (rc) {
-@@ -450,6 +509,53 @@ static int probe_zimage(int domid, uint64_t base_addr,
+@@ -450,6 +509,59 @@ static int probe_zimage(int domid, uint64_t base_addr,
  
  	/* .text start address in domU memory */
  	modules->ventry = load_addr;
@@ -253,8 +265,14 @@ index f766122..41e7867 100644
 +			goto out_dtb;
 +		}
 +
-+		err_flush2 = xenmem_cacheflush_mapped_pfns(
-+			initrd_pages, xen_virt_to_gfn(mapped_initrd));
++		/* xenmem_cacheflush_mapped_pfns() was dropped upstream in favour of
++		 * Zephyr's own cache API; the surrounding kernel/dtb paths use
++		 * arch_dcache_flush_and_invd_range(). Its second argument is a byte
++		 * count (include/zephyr/arch/cache.h), which is why this passes a
++		 * size and not initrd_pages.
++		 */
++		err_flush2 = arch_dcache_flush_and_invd_range(
++			mapped_initrd, initrd_pages * XEN_PAGE_SIZE);
 +		if (err_flush2)
 +			LOG_ERR("Failed to flush initrd memory (rc=%d)",
 +				err_flush2);

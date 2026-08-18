@@ -3,6 +3,7 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] xenlib: xenstore toolstack domid support
 
+
 Let xenstore accept a control/toolstack domid distinct from Dom0, so that a
 disaggregated driver domain can act as the toolstack, via is_privileged()
 instead of a hardcoded domid==0 owner check.
@@ -20,17 +21,25 @@ call is in place a build that places DomD at a domid other than 1 would grant
 xenstore privilege -- including XS_INTRODUCE and XS_RELEASE -- to whichever
 domain happened to get domid 1.
 
+Local-Modifications: regenerated against zephyrproject-rtos/zephyr-xenlib main
+(7f08845). Kconfig gained an `if XEN` wrapper and a XEN_STORE_COMMON symbol,
+and xenstore_srv.c was reorganised by d506546 (xenstore-common split), so the
+diff was retaken rather than force-fitted. The change itself is unchanged,
+including the handle_set_perms() fix - `!entry && is_owner(entry, ...)` is
+still present upstream, where it dereferences a NULL entry and returns without
+a reply.
+
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
 diff --git a/Kconfig b/Kconfig
-index 200cdec..07c06c4 100644
+index 57e4340..35efccb 100644
 --- a/Kconfig
 +++ b/Kconfig
-@@ -9,6 +9,15 @@ config XEN_STORE_SRV
- 	  Enable xenstore server library. It should be included
- 	  if you are running Zephyr as Dom0.
+@@ -23,6 +23,15 @@ config XEN_STORE_SRV_SHELL_CMDS
+ 	help
+ 	  Enable shell for XenStore server.
  
 +config XENSTORE_TOOLSTACK_DOMID
 +	int "Domid of the privileged toolstack domain (DomD)"
@@ -66,10 +75,10 @@ index 43a422b..cd5138a 100644
  }
  #endif
 diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
-index 2dfe538..c19478f 100644
+index 52aec2c..9bbc4ff 100644
 --- a/xenstore-srv/src/xenstore_srv.c
 +++ b/xenstore-srv/src/xenstore_srv.c
-@@ -218,12 +218,30 @@ static bool is_owner(struct xs_entry *entry, uint32_t caller_domid)
+@@ -215,12 +215,30 @@ static bool is_owner(struct xs_entry *entry, uint32_t caller_domid)
  	return false;
  }
  
@@ -102,7 +111,7 @@ index 2dfe538..c19478f 100644
  		return true;
  	}
  
-@@ -1436,7 +1454,8 @@ static void handle_set_perms(struct xenstore *xenstore, uint32_t id,
+@@ -1373,7 +1391,8 @@ static void handle_set_perms(struct xenstore *xenstore, uint32_t id,
  	k_mutex_lock(&xsel_mutex, K_FOREVER);
  	entry = key_to_entry_check_perm(path, xenstore->domain->domid, XS_PERM_NONE);
  	k_free(path);

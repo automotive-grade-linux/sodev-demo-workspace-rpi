@@ -9,49 +9,86 @@ coexist in one checkout.
 
 The Zephyr-side fixes that patch 0008 root-caused on RPi5 hardware are folded
 into rpi_4b.conf rather than re-derived: the raised shell/main/ISR stacks plus
-HW_STACK_PROTECTION, MAX_XLAT_TABLES=32, LOG_MODE_IMMEDIATE, the 0x17 domctl
+HW_STACK_PROTECTION, MAX_XLAT_TABLES=32, LOG_MODE_IMMEDIATE, the 0x18 domctl
 interface version with XENTROOPS_ARCH_* = n, and DISK_DRIVER_SDMMC=n with
 FS_FATFS_WINDOW_ALIGNMENT=4 for an SD-less Dom0. None of them is BCM2712
 specific.
 
 Three things are genuinely different on BCM2711 and are commented in place:
 
-* CELLS. boards/arm64/rpi_4b/rpi_4b.dts declares the root as 1/1 and
-  dts/arm64/broadcom/bcm2711.dtsi does not give /soc its own cells, so /soc's
-  children rely on the root's single address cell. bcm2712.dtsi declares
-  #address-cells = <2> on /soc, which is why rpi_5.overlay can raise the root to
-  2 cells. This overlay therefore keeps the root at 1/1 and writes single-cell
-  addresses; everything it needs is below 4 GiB.
+* CELLS. This overlay keeps the root at 1/1 and writes single-cell addresses
+  because everything it needs is below 4 GiB (Dom0 bank at 0x20000000, grant table
+  at 0x02000000). That is a choice, not a constraint: /soc gets its own
+  #address-cells = <1> / #size-cells = <1> from dts/arm64/armv8-a.dtsi
+  independently of the root, so raising the root to <2> as rpi_5.overlay does would
+  not disturb its children. (An earlier revision of this paragraph claimed
+  bcm2711.dtsi gives /soc no cells and that /soc's children therefore depend on the
+  root -- the opposite of what the overlay body says, and wrong.)
 
 * CONSOLE. rpi_4b.dts points zephyr,console at &uart1, the BCM2711 aux/mini
   UART. Xen owns the console (boot.cmd passes dtuart=/soc/serial@7e201000, the
   pl011) and Xen's rpi4 platform blacklists the aux peripheral's page
-  neighbours, so Dom0 uses the Xen PV console and &uart1 is disabled. No pl011
-  node is added: the pinned Zephyr rev has none for BCM2711 and none is needed.
+  neighbours, so Dom0 uses the Xen PV console and &uart1 is disabled. The pinned
+  Zephyr rev does define pl011 nodes for BCM2711 (uart0 at 0xfe201000, which is the
+  very UART Xen takes, plus uart2..uart5), but they are all status = "disabled"
+  there and none is enabled here.
 
 * SRAM RELINK to 0x20000000, derived rather than measured. Xen's rpi4 platform
   sets .dma_bitsize = 30, so allocate_memory_11() confines Dom0's bank[0] to
   below 1 GiB -- RPi5 has no platform entry, gets the 32-bit default and landed
-  at 0xc0000000. With dom0_mem=256M (get_allocation_size gives exactly order 16)
-  the only free naturally-aligned 256 MiB block under 1 GiB in the boot.cmd
-  memory map is 0x20000000-0x30000000. rpi4-port/tools/check-memory-map.py
-  recomputes this from the two files so it cannot drift silently.
+  at 0xc0000000. boot.cmd.xen.zephyr-dom0.in passes dom0_mem=128M
+  (get_allocation_size(128 MiB) is exactly order 15), and the first free
+  naturally-aligned 128 MiB block below 1 GiB in that memory map is
+  0x20000000-0x28000000. (dom0_mem used to be 256M; the overlay body records why
+  that could never be satisfied as one block on this board. An earlier revision of
+  this paragraph still derived the address from 256M / order 16.)
+
+  There is NO automatic guard on this value. tools/check-memory-map.py models
+  BCM2712 only -- meta-xt-rpi4/README.md says so, and its ZEPHYR_SRAM_PATCH is
+  hardcoded to 0008-rpi5-board-domd-owns-sd.patch -- so a drift here is silent.
+  Read BANK[0] off the Xen console on the first boot; a mismatch is total UART
+  silence with no Dom0 console at all.
 
 The hypervisor node's grant-table base is likewise derived (find_gnttab_region()
 uses __pa(_stext), i.e. boot.cmd's 0x02000000 Xen load address); its size and the
 extended region still have to be confirmed against the first boot's Xen log, and
 the exact log lines to read are quoted in the overlay.
 
+Rebased onto Zephyr 4.4.1 (the pins moved in 0021; the west manifest is shared by
+every board, so rpi_4b moves with rpi_5):
+ - CONFIG_FS_MULTI_PARTITION -> CONFIG_FS_FATFS_MULTI_PARTITION, and the two
+   CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_* lines are dropped. All three were hard
+   Kconfig errors on 4.x: the first is spelled differently upstream, the other two
+   existed only in the xen-troops Zephyr fork.
+ - CONFIG_HW_STACK_PROTECTION=y is dropped and CONFIG_STACK_SENTINEL=y takes its
+   place. Only CPU_AARCH64_CORTEX_R selects ARCH_HAS_STACK_PROTECTION on arm64, so
+   the assignment was invisible and never reached .config - the comment that said so
+   was right, but the substitute it claimed did not exist does.
+ - the logical drive moves from "1" to "0" and an inert ramdisk0 is declared:
+   4.4.1 derives FF_VOLUMES from the status-okay devicetree disk nodes, and rpi_4b
+   had none, which fails to compile ff.c and fails the BUILD_ASSERT(FF_VOLUMES == 1)
+   that 0028 adds to the shared src/storage.c.
+ - CONFIG_DISK_DRIVER_SDMMC=n and the FS_FATFS_WINDOW_ALIGNMENT pin are dropped:
+   the symbol is invisible without an SDHC node, and 0026 fixes the Kconfig default
+   the pin was working around.
+ - CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16, CONFIG_XEN_REGIONS=y and
+   CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16 are added, matching rpi_5.conf: 0022
+   widens the sysctl range, 0023 backports the extended-regions driver (opt-in
+   upstream, where the fork defaulted it on) and 0031 needs the depth bound.
+ - the chosen zephyr,entropy property, the gpio-leds node and its led0 alias are
+   deleted, and gpio1 disabled - the same dangling-phandle class of failure that
+   CONFIG_PCIE=n works around for rpi_5.
+
 Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/boards/rpi_4b.conf b/boards/rpi_4b.conf
 new file mode 100644
 index 0000000..de2a59d
 --- /dev/null
 +++ b/boards/rpi_4b.conf
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,131 @@
 +# Copyright (c) 2026 Yuichi Kusakabe
 +# SPDX-License-Identifier: Apache-2.0
 +#
@@ -60,15 +97,22 @@ index 0000000..de2a59d
 +# Derived from boards/rpi_5.conf with patch 0008's hardware-verified fixes folded
 +# in, because they were all root-caused on the Zephyr side and are not BCM2712
 +# specific:
-+#   - the raised shell/main/ISR stacks + HW_STACK_PROTECTION (xu create's domain
-+#     build has large VLAs and overflowed a 4 KiB shell stack),
++#   - the raised shell/main/ISR stacks (xu create's domain build has large VLAs
++#     and overflowed a 4 KiB shell stack) plus STACK_SENTINEL, which is the only
++#     overflow detection available on Cortex-A,
 +#   - MAX_XLAT_TABLES=32 (arch/arm64/core/Kconfig:335 defaults to 8 for this board
 +#     -- no USERSPACE and ARM64_VA_BITS=36 < 40, so neither the 12/16/20 branch
 +#     applies -- and mapping a multi-MiB guest kernel exhausts 8),
 +#   - LOG_MODE_IMMEDIATE (async logging interleaved with the shell on the shared
 +#     Xen console made failure lines unreadable),
-+#   - the 0x17 domctl interface version and XENTROOPS_ARCH_* = n for Xen 4.21,
-+#   - DISK_DRIVER_SDMMC=n + FS_FATFS_WINDOW_ALIGNMENT=4 for an SD-less Dom0.
++#   - the 0x18 domctl interface version for Xen 4.22,
++#   - the SD-less Dom0 handling.
++#
++# Written for Zephyr 4.4.1. The 3.6-era spellings this file used to carry are gone:
++# FS_MULTI_PARTITION is FS_FATFS_MULTI_PARTITION upstream, and
++# XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} existed only in the xen-troops
++# Zephyr fork -- on 4.x an assignment to an undefined symbol is a hard Kconfig
++# error, so all three would fail the build outright.
 +#
 +# RPi4-specific notes are marked [rpi4].
 +
@@ -79,15 +123,27 @@ index 0000000..de2a59d
 +
 +# xu create runs on the shell thread and its domain build (load_modules ->
 +# gen_domain_fdt) has large VLAs; 4 KiB overflowed and corrupted adjacent
-+# .data/.bss on RPi5. HW_STACK_PROTECTION makes any residual overflow fault
-+# cleanly with ELR/FAR instead of silently corrupting.
++# .data/.bss on RPi5. Overflow detection comes from CONFIG_STACK_SENTINEL below;
++# HW stack protection is not available on this platform.
 +CONFIG_SHELL_STACK_SIZE=32768
 +
 +CONFIG_MAIN_STACK_SIZE=16384
 +CONFIG_ISR_STACK_SIZE=16384
-+# NOTE: silently DROPPED by Kconfig on this board — it is absent from the built
-+# zephyr/.config. Kept for the day the dependency is met; do not rely on it.
-+CONFIG_HW_STACK_PROTECTION=y
++# CONFIG_HW_STACK_PROTECTION is deliberately NOT set: on arm64 only
++# CPU_AARCH64_CORTEX_R selects ARCH_HAS_STACK_PROTECTION (arch/arm64/core/Kconfig),
++# so on this Cortex-A72 the symbol is invisible and the assignment never reached
++# .config. Kconfig does not error on assignments to *invisible* symbols (only
++# undefined ones), which is why an earlier revision of this file could carry it
++# for so long without anyone noticing.
++#
++# CONFIG_STACK_SENTINEL is the substitute that does work here (subsys/debug/Kconfig;
++# MULTITHREADING=y, !USERSPACE, and MPU_STACK_GUARD is arm32-only, so all its
++# dependencies are met). It writes a magic word at the low end of every stack and
++# checks it on context switch, on an interrupt that does not switch, on thread exit
++# and on k_yield(), turning an overflow into a reported thread kill instead of
++# silent corruption of whatever follows in RAM. That matters most for the recursive
++# xenstore teardown paths bounded by patch 0031.
++CONFIG_STACK_SENTINEL=y
 +CONFIG_MAX_XLAT_TABLES=32
 +
 +CONFIG_XEN_VCH=y
@@ -101,8 +157,13 @@ index 0000000..de2a59d
 +CONFIG_FILE_SYSTEM_SHELL=y
 +
 +CONFIG_NOCACHE_MEMORY=y
-+CONFIG_FS_MULTI_PARTITION=y
-+CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="1"
++# FS_FATFS_MULTI_PARTITION, not the fork's FS_MULTI_PARTITION (upstream spelling,
++# subsys/fs/Kconfig.fatfs).
++CONFIG_FS_FATFS_MULTI_PARTITION=y
++# Volume "0:", not "1:". On Zephyr 4.4 FF_VOLUMES is derived from the number of
++# status-okay devicetree disk nodes, and rpi_4b.overlay declares exactly one (the
++# inert ramdisk0 it adds so FatFs compiles at all), so "1:" is out of range.
++CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="0"
 +# Guest images live in the FAT root of SD p1, not in a dom0/ subdirectory
 +# (same as the RPi5 SoDeV build; patch 0002 makes that change for rpi_5.conf).
 +CONFIG_DOM_STORAGE_FATFS_DIR=""
@@ -124,21 +185,37 @@ index 0000000..de2a59d
 +# virtio-blk). With its MMIO unmapped, an enabled SDHC controller would hang the
 +# driver's SYS_INIT on the first register access and stop the init chain BEFORE
 +# dom0less_init, so the dom0less DomD would never be introduced to xenstore.
-+# rpi_4b.overlay therefore does not enable any SDHC node, and the disk driver is
-+# turned off here so drivers/disk/sdmmc_subsys.c is not built against it.
-+# FS_FATFS_WINDOW_ALIGNMENT is pinned because zephyr-dom0-xt/Kconfig defaults it
-+# to SDHC_BUFFER_ALIGNMENT, which resolves empty once SDHC is inactive and breaks
-+# the generated misc/generated/configs.c assembly.
-+CONFIG_DISK_DRIVER_SDMMC=n
-+CONFIG_FS_FATFS_WINDOW_ALIGNMENT=4
++# rpi_4b.overlay therefore does not enable any SDHC node.
++#
++# Neither CONFIG_DISK_DRIVER_SDMMC=n nor a FS_FATFS_WINDOW_ALIGNMENT pin is set:
++# with no SDHC node upstream 4.4.1 leaves DISK_DRIVER_SDMMC invisible (assigning to
++# it risks a Kconfig warning, which 4.x turns into a build error), and patch 0026
++# fixes zephyr-dom0-xt/Kconfig to read `default SDHC_BUFFER_ALIGNMENT if SDHC` /
++# `default 4`, so the empty, invisible SDHC_BUFFER_ALIGNMENT can no longer leak
++# into the generated misc/generated/configs.c assembly.
 +
-+# Xen 4.21 ABI. The two XENTROOPS_ARCH options add arm_sci_type (u16) and
-+# vgsx_osid (u8) to xen_arch_domainconfig (16 -> 20 bytes) and grow
-+# xen_domctl_getdomaininfo (120 -> 128 bytes); Xen 4.21 has neither field, so
-+# leaving them =y mismatches getdomaininfolist.
-+CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x17
-+CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID=n
-+CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE=n
++# Xen 4.21 ABI. XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n
++# here to keep arm_sci_type/vgsx_osid out of xen_arch_domainconfig; those symbols
++# exist only in the xen-troops Zephyr fork and are absent from 4.4.1, where patch
++# 0024 removes the vendored public headers entirely and the ABI comes from
++# zephyr-xenlib's copy of Xen 4.21.0's.
++CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
++# Xen 4.21's sysctl.h declares 0x16. Patch 0022 widens the Kconfig range that far;
++# at 0x15 `xu list` and `xstat physinfo` print nothing at all, silently.
++CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16
++
++# Extended regions (patch 0023 backports the upstream driver). Without this xenlib
++# carves the guest-image mapping window out of Dom0's own 2 MiB heap, which a
++# multi-MiB guest kernel does not fit.
++CONFIG_XEN_REGIONS=y
++
++# Deepest path this system writes is 8 components
++# (.../backend/vbd/<fe>/<devid>/multi-queue-max-queues), and the PV protocol headers
++# document 8 too; pvUSB reaches 9 and pvSCSI 10. Patch 0031 bounds tree depth at
++# creation time with this symbol to keep the recursive free off the end of the
++# xenstore worker stack, so leaving it at the default 8 would sit exactly at the
++# limit. Use the Kconfig maximum; 0031 sized the worker stack (8 KiB) for it.
++CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16
 +
 +# SoDeV production guests (see src/dom_cfg/rpi_4b.c). Also settable from the
 +# moulin builder vars in rpi4-sodev.yaml.
@@ -148,7 +225,7 @@ new file mode 100644
 index 0000000..494f965
 --- /dev/null
 +++ b/boards/rpi_4b.overlay
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,219 @@
 +/*
 + * Copyright (C) 2026 Yuichi Kusakabe
 + *
@@ -172,8 +249,9 @@ index 0000000..494f965
 + *     (boot.cmd passes console=dtuart dtuart=/soc/serial@7e201000, the pl011) and
 + *     the aux peripheral's page neighbours are on Xen's rpi4 device blacklist.
 + *     Dom0 therefore talks over the Xen PV console, exactly as on RPi5, and the
-+ *     board's UART is disabled. NOTE: no pl011 node is added — the pinned Zephyr
-+ *     rev has none for BCM2711, and none is needed.
++ *     board's UART is disabled. NOTE: bcm2711.dtsi DOES define pl011 nodes (uart0
++ *     at 0xfe201000 is the one Xen takes, plus uart2..uart5), but they ship
++ *     status = "disabled" and none is enabled here.
 + *
 + *  3. NO SDHC. The RPi4 SD controller (/emmc2bus/mmc@7e340000) is handed to DomD
 + *     by boot.cmd.xen.zephyr-dom0.in, and the pinned rpi_4b board does not define
@@ -190,6 +268,15 @@ index 0000000..494f965
 +	chosen {
 +		zephyr,console = &xen_consoleio_hvc;
 +		zephyr,shell-uart = &xen_consoleio_hvc;
++		/*
++		 * rpi_4b.dts points zephyr,entropy at &rng. Delete the property rather
++		 * than merely disabling the node: gen_defines resolves a chosen phandle
++		 * regardless of status, so the first subsystem to select
++		 * CONFIG_ENTROPY_GENERATOR would expand DEVICE_DT_GET(DT_CHOSEN(...)) to
++		 * a __device_dts_ord_N that was never emitted -- an undeclared-identifier
++		 * error. rpi_5 needed CONFIG_PCIE=n for exactly this reason.
++		 */
++		/delete-property/ zephyr,entropy;
 +	};
 +
 +	psci {
@@ -260,8 +347,10 @@ index 0000000..494f965
 +	 *     128 MiB block below 1 GiB is 0x20000000: everything under it is taken
 +	 *     (boot modules below 0x08000000, DomD static-mem bank1
 +	 *     0x08000000-0x20000000), and the map deliberately leaves this hole.
-+	 * rpi4-port/tools/check-memory-map.py recomputes this from the two files and
-+	 * prints the expected address, so it cannot silently drift.
++	 * NOTE: nothing checks this automatically. tools/check-memory-map.py models
++	 * BCM2712 only (meta-xt-rpi4/README.md; its ZEPHYR_SRAM_PATCH is hardcoded to
++	 * the rpi5 patch), so a drift here is silent. Confirm BANK[0] from the Xen
++	 * console on the first boot -- the CONFIRM block below is that check.
 +	 *
 +	 * SIZE IS 128 MiB, NOT 256 (changed 2026-08-04). dom0_mem used to be 256M,
 +	 * but 256 MiB could never be satisfied as one block on this board: the
@@ -287,6 +376,65 @@ index 0000000..494f965
 +		compatible = "mmio-sram";
 +		reg = <0x20000000 DT_SIZE_M(128)>;
 +	};
++
++	/*
++	 * rpi_4b.dts declares a gpio-leds node whose led_act child drives &gpio1. Dom0
++	 * does not own that GPIO block, and a node referencing a disabled controller is
++	 * the same dangling-phandle hazard as the chosen property above, so the node and
++	 * the alias that names it both go. The alias has to go FIRST - a dangling alias
++	 * is a devicetree error ("/aliases: undefined node label 'led_act'").
++	 *
++	 * By node name, not by label: rpi_4b.dts spells it `leds {`, with no label, so
++	 * `/delete-node/ &leds;` would not resolve.
++	 */
++	aliases {
++		/delete-property/ led0;
++	};
++	/delete-node/ leds;
++
++	/*
++	 * Zephyr 4.x derives FatFs's FF_VOLUMES from the devicetree instead of letting
++	 * a board hardcode it: FF_VOLUME_STRS is the disk-name of every status-okay disk
++	 * node. rpi_4b has none, which leaves FF_VOLUMES at 0 -- the generated
++	 * zephyr_fatfs_config.h then undefines FF_VOLUME_STRS while ff.c still
++	 * references VolumeStr[] under FF_STR_VOLUME_ID == 1, so the build fails. It
++	 * would also fail the BUILD_ASSERT(FF_VOLUMES == 1) that patch 0028 adds to the
++	 * shared src/storage.c.
++	 *
++	 * So declare one deliberately tiny RAM disk, exactly as rpi_5.overlay does. It
++	 * is never mounted: storage_init() fails earlier, at disk_access_init("SD") with
++	 * -ENODEV, because the SD controller is DomD's. 4 KiB is the cost of keeping the
++	 * storage code compiling.
++	 */
++	ramdisk0: ramdisk0 {
++		compatible = "zephyr,ram-disk";
++		disk-name = "RAM";
++		sector-size = <512>;
++		sector-count = <8>;
++	};
++};
++
++/*
++ * Dom0 has no GPIO here, and gpio1 is the controller the deleted leds node
++ * referenced. Harmless only while CONFIG_GPIO is off, and that is one
++ * `select GPIO` away.
++ */
++&gpio1 {
++	status = "disabled";
++};
++
++/*
++ * Same reasoning for the RNG, and deleting the chosen zephyr,entropy property is
++ * NOT enough on its own: drivers/entropy/Kconfig.iproc has
++ * `default y` under `depends on DT_HAS_BRCM_IPROC_RNG200_ENABLED`, and leaving the
++ * node status = "okay" sets that symbol. The moment anything selects
++ * CONFIG_ENTROPY_GENERATOR the driver builds and its init touches 0xfe104000, MMIO
++ * this Dom0 does not own -- the failure 0008 documents for the RPi5 SDHCI node,
++ * where SYS_INIT hangs before dom0less_init and DomD is never introduced to
++ * xenstore. rpi_5.overlay disables &rng for exactly this reason.
++ */
++&rng {
++	status = "disabled";
 +};
 +
 +/*

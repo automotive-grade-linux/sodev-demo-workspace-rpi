@@ -3,11 +3,12 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] xenlib: DomD-as-toolstack xenstore support
 
-DomD-as-toolstack: let an external privileged control domain (DomD, a
-dom0less domain with capabilities=0x1) create/destroy guests via `xl create`/
-`xl destroy` against the thin Zephyr Dom0 xenstore server. Verified on RPi5:
-DomD `xl create` completes (rc=0) and the guest reaches RUNNING (with a
-DomD-side console seeder that satisfies libxl's console waits).
+
+DomD-as-toolstack: let an external privileged control domain (DomD, a dom0less
+domain with capabilities=0x1) create/destroy guests via `xl create`/ `xl
+destroy` against the thin Zephyr Dom0 xenstore server. Verified on RPi5: DomD
+`xl create` completes (rc=0) and the guest reaches RUNNING (with a DomD-side
+console seeder that satisfies libxl's console waits).
 
   * xen-dom-mgmt.c/.h: xs_introduce_domain() / xs_release_domain() — register/
     release a toolstack-created guest in xenstore (shadow xen_domain, ring map,
@@ -20,14 +21,58 @@ DomD-side console seeder that satisfies libxl's console waits).
     DomD's multiplexed xl+xenconsoled transactions no longer collide.
 
 Depends on 0005 (xenlib initrd) and 0006 (xenstore toolstack-domid).
+
+Local-Modifications: regenerated against zephyrproject-rtos/zephyr-xenlib main
+(7f08845). d506546 split xenstore-common out of xenstore-srv, which moved
+every line number in xenstore_srv.c and added an <xenstore_common.h> include
+ahead of the block this patch extends. The xen-dom-mgmt.c hunks moved too.
+Content is unchanged; only context was retaken.
+
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+diff --git a/xen-dom-mgmt/include/xen_dom_mgmt.h b/xen-dom-mgmt/include/xen_dom_mgmt.h
+index 1a49896..94777c7 100644
+--- a/xen-dom-mgmt/include/xen_dom_mgmt.h
++++ b/xen-dom-mgmt/include/xen_dom_mgmt.h
+@@ -29,6 +29,31 @@ extern "C" {
+  */
+ int domain_create(struct xen_domain_cfg *domcfg, uint32_t domid);
+ 
++/**
++ * Introduce a domain created by an external privileged toolstack
++ * (DomD via `xl create`) into Zephyr Dom0's xenstore server. Allocates the
++ * shadow xen_domain, maps the store ring at @store_pfn, binds @remote_evtchn,
++ * seeds the guest xenstore tree and tracks it in domain_list. Idempotent.
++ * Called from xenstore_srv's XS_INTRODUCE (op 8) handler.
++ *
++ * @param domid         The domid to introduce (must already exist at Xen).
++ * @param store_pfn     Guest gfn of the xenstore ring page (from XS_INTRODUCE).
++ * @param remote_evtchn Guest-side xenstore event channel port (from XS_INTRODUCE).
++ * @return 0 on success, or a negative error code on failure.
++ */
++int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtchn);
++
++/**
++ * Release a toolstack-introduced domain from Zephyr Dom0's xenstore
++ * server (counterpart to xs_introduce_domain). Tears down xenstore state only;
++ * the external toolstack (DomD) owns the hypervisor destroy. Idempotent.
++ * Called from xenstore_srv's XS_RELEASE (op 9) handler.
++ *
++ * @param domid The domid to release.
++ * @return 0 on success, or a negative error code on failure.
++ */
++int xs_release_domain(uint32_t domid);
++
+ /**
+  * Destroys the specified domain.
+  *
 diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index e490247..5262d94 100644
 --- a/xen-dom-mgmt/src/xen-dom-mgmt.c
 +++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
-@@ -24,6 +24,9 @@
+@@ -26,6 +26,9 @@
  #include <xen_console.h>
  #endif
  #include <xss.h>
@@ -37,7 +82,7 @@ diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
  #ifdef CONFIG_XSTAT
  #include <xstat.h>
  #endif
-@@ -1130,14 +1133,25 @@ static int dom0less_init_domain(uint32_t domid, struct xen_domctl_getdomaininfo
+@@ -1167,14 +1170,25 @@ static int dom0less_init_domain(uint32_t domid, struct xen_domctl_getdomaininfo
  	LOG_DBG("dom0less: remote_domid=%d, xenstore.remote_evtchn = %d", domain->domid,
  		domain->xenstore.remote_evtchn);
  
@@ -67,7 +112,7 @@ diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
  
  	/* init Xenstore */
  	rc = start_domain_stored(domain, magic_base_pfn);
-@@ -1178,12 +1192,210 @@ err_free:
+@@ -1215,12 +1229,210 @@ err_free:
  	return rc;
  }
  
@@ -278,7 +323,7 @@ diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
  
  	do {
  		rc = dom0less_get_next_domain(domid_start, &dominfo);
-@@ -1197,12 +1409,24 @@ static int dom0less_init(void)
+@@ -1234,12 +1446,24 @@ static int dom0less_init(void)
  			break;
  		}
  
@@ -303,53 +348,19 @@ diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
  	return rc == -ESRCH ? 0 : rc;
  }
  #endif /* CONFIG_XEN_DOM0LESS_BOOT */
-diff --git a/xen-dom-mgmt/include/xen_dom_mgmt.h b/xen-dom-mgmt/include/xen_dom_mgmt.h
---- a/xen-dom-mgmt/include/xen_dom_mgmt.h
-+++ b/xen-dom-mgmt/include/xen_dom_mgmt.h
-@@ -30,6 +30,31 @@
- int domain_create(struct xen_domain_cfg *domcfg, uint32_t domid);
- 
- /**
-+ * Introduce a domain created by an external privileged toolstack
-+ * (DomD via `xl create`) into Zephyr Dom0's xenstore server. Allocates the
-+ * shadow xen_domain, maps the store ring at @store_pfn, binds @remote_evtchn,
-+ * seeds the guest xenstore tree and tracks it in domain_list. Idempotent.
-+ * Called from xenstore_srv's XS_INTRODUCE (op 8) handler.
-+ *
-+ * @param domid         The domid to introduce (must already exist at Xen).
-+ * @param store_pfn     Guest gfn of the xenstore ring page (from XS_INTRODUCE).
-+ * @param remote_evtchn Guest-side xenstore event channel port (from XS_INTRODUCE).
-+ * @return 0 on success, or a negative error code on failure.
-+ */
-+int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtchn);
-+
-+/**
-+ * Release a toolstack-introduced domain from Zephyr Dom0's xenstore
-+ * server (counterpart to xs_introduce_domain). Tears down xenstore state only;
-+ * the external toolstack (DomD) owns the hypervisor destroy. Idempotent.
-+ * Called from xenstore_srv's XS_RELEASE (op 9) handler.
-+ *
-+ * @param domid The domid to release.
-+ * @return 0 on success, or a negative error code on failure.
-+ */
-+int xs_release_domain(uint32_t domid);
-+
-+/**
-  * Destroys the specified domain.
-  *
-  * @param domid The ID of the domain to destroy.
 diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 9bbc4ff..d62898e 100644
 --- a/xenstore-srv/src/xenstore_srv.c
 +++ b/xenstore-srv/src/xenstore_srv.c
-@@ -20,6 +20,7 @@
- 
+@@ -22,6 +22,7 @@
+ #include <xenstore_common.h>
  #include <mem-mgmt.h>
  #include "domain.h"
 +#include "xen_dom_mgmt.h"
  #include "xen/public/io/xs_wire.h"
  #include "xenstore_srv.h"
  #include "xss.h"
-@@ -1712,14 +1713,18 @@
+@@ -1649,14 +1650,18 @@ static void handle_transaction_start(struct xenstore *xenstore, uint32_t id,
  {
  	char buf[INT32_MAX_STR_LEN] = { 0 };
  
@@ -376,7 +387,7 @@ diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
  	send_reply(xenstore, id, XS_TRANSACTION_START, buf);
  }
  
-@@ -1727,9 +1732,12 @@
+@@ -1664,9 +1669,12 @@ static void handle_transaction_stop(struct xenstore *xenstore, uint32_t id,
  				    char *payload, uint32_t len)
  {
  	// TODO check contents, transaction completion, etc
@@ -392,7 +403,7 @@ diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
  }
  
  static void handle_get_domain_path(struct xenstore *xenstore, uint32_t id,
-@@ -1779,6 +1787,125 @@
+@@ -1716,6 +1724,125 @@ static void cleanup_domain_watches(struct xen_domain *domain)
  	k_mutex_unlock(&pfl_mutex);
  }
  
@@ -518,7 +529,7 @@ diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
  const struct message_handle message_handle_list[XS_TYPE_COUNT] = { [XS_CONTROL] = { handle_control },
  					    [XS_DIRECTORY] = { handle_directory },
  					    [XS_READ] = { handle_read },
-@@ -1787,8 +1914,8 @@
+@@ -1724,8 +1851,8 @@ const struct message_handle message_handle_list[XS_TYPE_COUNT] = { [XS_CONTROL]
  					    [XS_UNWATCH] = { handle_unwatch },
  					    [XS_TRANSACTION_START] = { handle_transaction_start },
  					    [XS_TRANSACTION_END] = { handle_transaction_stop },

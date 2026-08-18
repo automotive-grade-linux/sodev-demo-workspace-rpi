@@ -1,7 +1,8 @@
-From 56ee5a686ee257d77f5e5728facd16c3e7e0c329 Mon Sep 17 00:00:00 2001
+From 92473f243d386beb6b32f4ac6a6aabc1f18179a4 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] boards/rpi_5: HW-verified Dom0 bring-up + DomD-owns-SD fixes
+
 
 Root-caused on RPi5 hardware, Xen 4.21, Zephyr Dom0 + dom0less DomD topology.
 Every change below was verified on hardware, including the sram0 base value: the
@@ -16,10 +17,15 @@ board reports BANK[0] 0xa0000000-0xc0000000 and loads the Dom0 Image there.
     MEASURED ON HARDWARE (2026-08-03): BANK[0] 0xa0000000-0xc0000000 and
     "Loading zImage from 0000000004000000 to 00000000a0000000". An earlier
     derivation had predicted 0xe0000000 by assuming the HIGHEST free block in a
-    MEMF_bits tier wins; the board takes the LOWEST of the candidates
-    (0xa0000000 / 0xc0000000 / 0xe0000000). For dom0_mem=1024M the measured
-    value is 0xc0000000, where only one candidate existed -- which is why that
-    data point could not discriminate the rule.
+    MEMF_bits tier wins; this configuration landed on the LOWEST of its three
+    candidates (0xa0000000 / 0xc0000000 / 0xe0000000) instead. That is an
+    observation, not a rule: a thin Linux Dom0 at the same dom0_mem=512M measures
+    bank[0] = 0xe0000000, the HIGHEST of its two candidates, so neither "lowest"
+    nor "highest" holds in general -- tools/check-memory-map.py pins both
+    measurements in DOM0_BANK0_MEASURED and says so. For dom0_mem=1024M the
+    measured value is 0xc0000000, where only one candidate existed, so that data
+    point could not discriminate anything either. Read BANK[0] off the Xen console
+    after any change to dom0_mem or the static-mem layout.
   - hypervisor node grant-table/extended-region resized to the actual Xen
     assignment (grant 0x80000, ext region 0x5e00000; from HW UART log).
   - &sdio1 status="disabled" : the SoC SDHCI is passed through to DomD
@@ -42,8 +48,8 @@ board reports BANK[0] 0xa0000000-0xc0000000 and loads the Dom0 Image there.
     undeclared). The FATFS window alignment is pinned because zephyr-dom0-xt/
     Kconfig defaults it to the now-inactive SDHC_BUFFER_ALIGNMENT symbol, which
     resolves empty and breaks the generated misc/generated/configs.c asm.
-  - XEN_DOMCTL_INTERFACE_VERSION 0x16 -> 0x17 and XENTROOPS_ARCH_{VGSX_OSID,
-    SCI_TYPE} y -> n: align the domctl ABI with our Xen 4.21. The two XENTROOPS
+  - XEN_DOMCTL_INTERFACE_VERSION 0x16 -> 0x18 and XENTROOPS_ARCH_{VGSX_OSID,
+    SCI_TYPE} y -> n: align the domctl ABI with our Xen 4.22. The two XENTROOPS
     options insert fork-specific fields into the middle of
     xen_arch_domainconfig: a u16 arm_sci_type between tee_type and nr_spis, and
     a u8 vgsx_osid between nr_spis and clock_frequency, taking the vendored
@@ -62,42 +68,143 @@ board reports BANK[0] 0xa0000000-0xc0000000 and loads the Dom0 Image there.
     because that field lands in tail padding; patch 0018 zeroes the createdomain
     hypercall argument so Xen reads it as ARM_SCI_NONE rather than as
     uninitialised stack. (Previously required as manual `west build` -D flags;
-    now carried by this patch. The sysctl version is handled by 0010.)
+    now carried by this patch. The sysctl version is handled by the 0022 backport
+    plus the value in 0028 - 0010, which used to carry it, is a vacant number.)
 * src/dom0.h: CONFIG_SDMMC_VOLUME_NAME fallback so the FATFS code keeps
   compiling with CONFIG_SDHC disabled (runtime storage_init fails cleanly
   with ENODEV; the storage path is unused in the DomD-as-toolstack topology).
 
 Depends on 0002-0004.
+
+Rebased onto Zephyr 4.4.1 (upstream v4.4.1, no xen-troops fork deltas):
+ - the `&sdio1 { status = "disabled"; }` override is dropped. Upstream has no
+   sdio1 node and no bcm2712 SDHCI driver, so the label does not resolve and DTC
+   would fail. Nothing needs disabling; storage_init() still returns -ENODEV.
+ - CONFIG_DISK_DRIVER_SDMMC=n is dropped (symbol is invisible without the node).
+ - CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE}=n are dropped: those
+   symbols exist only in the fork. Assigning to an undefined symbol is a hard
+   Kconfig error in Zephyr 4.x.
+
+ - - CONFIG_HW_STACK_PROTECTION=y is dropped. Only CPU_AARCH64_CORTEX_R
+   selects ARCH_HAS_STACK_PROTECTION on arm64, so on this Cortex-A76 the
+   symbol is invisible and the assignment never reached .config - not on 4.4.1
+   and not on 3.6 either. Kconfig only hard-errors on *undefined* symbols, not
+   invisible ones, which is why it went unnoticed. The comment claiming
+   residual overflows would fault cleanly was therefore never true.
+
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
+diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
+index 4e74787..3fd7fd2 100644
+--- a/boards/rpi_5.conf
++++ b/boards/rpi_5.conf
+@@ -6,10 +6,39 @@ CONFIG_XEN_DOM0=y
+ CONFIG_XSTAT=y
+ CONFIG_XSTAT_SHELL_CMDS=y
+ 
+-CONFIG_SHELL_STACK_SIZE=4096
++# xu create runs on the shell thread. The domain build
++# (load_modules -> gen_domain_fdt) has large VLAs; 4 KiB overflowed and
++# corrupted adjacent .data/.bss -> data-abort -> "Abort taken without a change
++# in exception level" (fault-in-fault) during `xu create rpi_5_sodev_domu`
++# (hardware). Raise the shell stack. (HW stack protection is unavailable on this
++# platform - see the CONFIG_HW_STACK_PROTECTION note below - so overflow detection
++# comes from CONFIG_STACK_SENTINEL instead.)
++CONFIG_SHELL_STACK_SIZE=32768
+ 
+-CONFIG_MAIN_STACK_SIZE=8192
+-CONFIG_ISR_STACK_SIZE=8192
++CONFIG_MAIN_STACK_SIZE=16384
++CONFIG_ISR_STACK_SIZE=16384
++# CONFIG_HW_STACK_PROTECTION is deliberately NOT set: on arm64 only
++# CPU_AARCH64_CORTEX_R selects ARCH_HAS_STACK_PROTECTION (arch/arm64/core/Kconfig),
++# so on this Cortex-A76 the symbol is invisible and the assignment was silently
++# dropped - it never appeared in .config, on Zephyr 3.6 either. Kconfig does not
++# error on assignments to *invisible* symbols (only undefined ones), which is why
++# it went unnoticed.
++#
++# CONFIG_STACK_SENTINEL is the substitute, and it DOES exist in 4.4.1
++# (subsys/debug/Kconfig). An earlier version of this comment claimed it did not,
++# which left this Dom0 with no overflow detection at all on a false premise. Its
++# dependencies are all met here (MULTITHREADING=y, !USERSPACE, and MPU_STACK_GUARD
++# is arm32-only), and its own help text names this exact case: "systems which lack
++# hardware support for stack overflow protection". It writes a magic word at the low
++# end of every stack and checks it on context switch, on an interrupt that does not
++# switch, on thread exit and on k_yield(), so an overflow becomes a reported thread
++# kill instead of silent corruption of whatever follows in RAM. That matters most for
++# the recursive xenstore teardown paths that xenlib patch 0031 bounds, whose worst
++# case is an estimate rather than a measurement.
++CONFIG_STACK_SENTINEL=y
++# 24 MiB guest kernel is mapped into Dom0 to load it; bump the xlat table pool
++# so the map does not exhaust CONFIG_MAX_XLAT_TABLES (default 12).
++CONFIG_MAX_XLAT_TABLES=32
+ 
+ CONFIG_XEN_VCH=y
+ CONFIG_XEN_DOM0LESS_BOOT=y
+@@ -33,6 +62,30 @@ CONFIG_XRUN_STORAGE_DMA_DEBOUNCE=4
+ 
+ CONFIG_DOMU_MAX=5
+ 
+-CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x16
+-CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID=y
+-CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE=y
++# Synchronous logging so the `xu create` failure line
++# ("Failed to <step> for domain#2 (rc=N)") prints atomically and is readable
++# on the shared Xen UART (async log thread was interleaving char-by-char with
++# the shell thread -> "kernel will"->"kernbaill", failure reason unreadable).
++CONFIG_LOG_MODE_IMMEDIATE=y
++
++# [build-fix] SD-less Dom0: the SD belongs to DomD. The guests are not built into
++# zephyr.bin either - CONFIG_DOM_CFG_BUILTIN_IMAGES is off in this topology and
++# DomD's xl toolstack creates them. Pin FS_FATFS_WINDOW_ALIGNMENT, which
++# zephyr-dom0-xt/Kconfig otherwise defaults to the inactive, empty
++# SDHC_BUFFER_ALIGNMENT -> broken configs.c asm. (Patch 0026 fixes that default and
++# drops this pin again.)
++#
++# CONFIG_DISK_DRIVER_SDMMC is deliberately NOT set here: upstream 4.4.1 has no
++# bcm2712 SDHCI driver and no sdmmc-disk node, so the symbol is invisible and the
++# subsystem is already off. Assigning to it would only risk a Kconfig warning,
++# which Zephyr 4.x turns into a build error.
++CONFIG_FS_FATFS_WINDOW_ALIGNMENT=4
++CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
++# CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n here.
++# Those symbols only ever existed in the xen-troops Zephyr fork, to gate the extra
++# arch_domainconfig fields in its vendored Xen headers. Upstream 4.4.1 does not
++# define them, and the vendored headers are gone anyway (see 0024): the ABI now
++# comes from zephyr-xenlib, whose arch-arm.h carries `arm_sci_type`
++# unconditionally. It is zeroed by 0018's `xen_domctl_t domctl = { 0 }`, which is
++# XEN_DOMCTL_CONFIG_ARM_SCI_NONE - the same behaviour the old `=n` produced.
++# Assignments to undefined symbols are a hard Kconfig error in Zephyr 4.x.
 diff --git a/boards/rpi_5.overlay b/boards/rpi_5.overlay
+index 14df219..0356db2 100644
 --- a/boards/rpi_5.overlay
 +++ b/boards/rpi_5.overlay
-@@ -8,6 +8,21 @@
+@@ -8,6 +8,22 @@
  
  #include <mem.h>
  
 +/*
-+ * The SoC SDHCI (sdio1) is passed through to DomD
-+ * (the toolstack domain owns the SD and serves guest rootfs partitions via
-+ * qemu virtio-blk), so its MMIO is no longer mapped into this Zephyr Dom0.
-+ * The board dts enables sdio1 for the FATFS storage path; with the MMIO gone
-+ * the SDHC driver's SYS_INIT hangs on the first register access, which stops
-+ * the whole init chain BEFORE init_domain0/dom0less_init -> the dom0less DomD
-+ * is never introduced to xenstore (xenbus_probe state D on HW). Disable the
-+ * controller: storage_init() in main() then fails cleanly with ENODEV (the
-+ * FATFS/xu-create path is unused in this topology) and dom0less_init runs normally.
++ * The SoC SDHCI is passed through to DomD (the toolstack domain owns the SD and
++ * serves guest rootfs partitions via qemu virtio-blk), so its MMIO is not mapped
++ * into this Zephyr Dom0. On Zephyr 3.6 the xen-troops fork's bcm2712.dtsi had an
++ * `sdio1` node that had to be disabled here, or the SDHC driver's SYS_INIT hung
++ * on the first register access and stopped the whole init chain BEFORE
++ * init_domain0/dom0less_init (the dom0less DomD was then never introduced to
++ * xenstore -> xenbus_probe stuck in state D on HW).
++ *
++ * Upstream Zephyr 4.4.1 has no such node and no bcm2712 SDHCI driver at all, so
++ * there is nothing to disable - keeping that override would leave an unresolved
++ * DTC label. storage_init() in main() still fails cleanly with -ENODEV, which is
++ * all this topology needs (the FATFS/xu-create path is unused; guests are
++ * .incbin'd into zephyr.bin).
 + */
-+&sdio1 {
-+	status = "disabled";
-+};
 +
  / {
  	#address-cells = <2>;
  	#size-cells = <1>;
-@@ -38,7 +53,11 @@
+@@ -38,7 +54,11 @@
  	 */
  	hypervisor: hypervisor@2000000 {
  		compatible = "xen,xen";
@@ -110,7 +217,7 @@ diff --git a/boards/rpi_5.overlay b/boards/rpi_5.overlay
  		interrupts = <GIC_PPI 0x0 IRQ_TYPE_EDGE IRQ_DEFAULT_PRIORITY>;
  		interrupt-parent = <&gic>;
  		status = "okay";
-@@ -55,9 +74,19 @@
+@@ -55,9 +75,19 @@
  	 * Xen passes actual values for setup in domain device tree, but Zephyr
  	 * is not capable to parse and handle it in runtime.
  	 */
@@ -132,60 +239,11 @@ diff --git a/boards/rpi_5.overlay b/boards/rpi_5.overlay
  	};
  };
  
-diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
---- a/boards/rpi_5.conf
-+++ b/boards/rpi_5.conf
-@@ -6,10 +6,20 @@
- CONFIG_XSTAT=y
- CONFIG_XSTAT_SHELL_CMDS=y
- 
--CONFIG_SHELL_STACK_SIZE=4096
--
--CONFIG_MAIN_STACK_SIZE=8192
--CONFIG_ISR_STACK_SIZE=8192
-+# xu create runs on the shell thread. The domain build
-+# (load_modules -> gen_domain_fdt) has large VLAs; 4 KiB overflowed and
-+# corrupted adjacent .data/.bss -> data-abort -> "Abort taken without a change
-+# in exception level" (fault-in-fault) during `xu create rpi_5_sodev_domu`
-+# (hardware). Raise the shell stack and enable HW stack protection so any
-+# residual overflow faults cleanly (with ELR/FAR) instead of silently corrupting.
-+CONFIG_SHELL_STACK_SIZE=32768
-+
-+CONFIG_MAIN_STACK_SIZE=16384
-+CONFIG_ISR_STACK_SIZE=16384
-+CONFIG_HW_STACK_PROTECTION=y
-+# 24 MiB guest kernel is mapped into Dom0 to load it; bump the xlat table pool
-+# so the map does not exhaust CONFIG_MAX_XLAT_TABLES (default 12).
-+CONFIG_MAX_XLAT_TABLES=32
- 
- CONFIG_XEN_VCH=y
- CONFIG_XEN_DOM0LESS_BOOT=y
-@@ -33,6 +43,18 @@
- 
- CONFIG_DOMU_MAX=5
- 
-+# Synchronous logging so the `xu create` failure line
-+# ("Failed to <step> for domain#2 (rc=N)") prints atomically and is readable
-+# on the shared Xen UART (async log thread was interleaving char-by-char with
-+# the shell thread -> "kernel will"->"kernbaill", failure reason unreadable).
-+CONFIG_LOG_MODE_IMMEDIATE=y
-+
-+# [build-fix] SD-less Dom0 (sdio1 -> DomD, guests built into zephyr.bin):
-+# turn the SD-disk driver off so drivers/disk/sdmmc_subsys.c is not built against the
-+# disabled sdio1 controller, and pin FS_FATFS_WINDOW_ALIGNMENT (zephyr-dom0-xt/Kconfig
-+# defaults it to the now-inactive, empty SDHC_BUFFER_ALIGNMENT -> broken configs.c asm).
-+CONFIG_DISK_DRIVER_SDMMC=n
-+CONFIG_FS_FATFS_WINDOW_ALIGNMENT=4
--CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x16
-+CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x17
--CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID=y
--CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE=y
-+CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID=n
-+CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE=n
 diff --git a/src/dom0.h b/src/dom0.h
+index fb0133d..6252b94 100644
 --- a/src/dom0.h
 +++ b/src/dom0.h
-@@ -28,6 +28,14 @@
+@@ -28,6 +28,14 @@ struct dom0_domain_cfg {
  };
  
  #if defined(CONFIG_DOM_STORAGE_FATFS_ENABLE)
