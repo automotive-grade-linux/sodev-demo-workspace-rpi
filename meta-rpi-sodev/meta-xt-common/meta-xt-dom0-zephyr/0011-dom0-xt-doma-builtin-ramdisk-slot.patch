@@ -3,11 +3,12 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] dom0-xt: doma: built-in ramdisk slot
 
+
 Add a built-in ramdisk slot for the AAOS (DomA) domain config.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/Kconfig b/Kconfig
 index c8899ab..c067b99 100644

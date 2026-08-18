@@ -3,6 +3,7 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Fri, 31 Jul 2026 12:00:00 +0900
 Subject: [PATCH] xen: domctl: zero the createdomain hypercall argument
 
+
 xen_domctl_createdomain() is the only function in drivers/xen/dom0/domctl.c
 that declares its xen_domctl_t without an initialiser; the other nineteen use
 a designated initialiser, which zeroes the members they do not name. It is
@@ -25,8 +26,8 @@ Zeroing the argument makes the byte read as XEN_DOMCTL_CONFIG_ARM_SCI_NONE,
 which is what this Dom0 means.
 
 While here, the three assignments that follow ended in commas rather than
-semicolons, which made the last of them a comma expression with the do_domctl()
-call. That parses and behaves correctly; it is still a typo.
+semicolons, which made the last of them a comma expression with the
+do_domctl() call. That parses and behaves correctly; it is still a typo.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>

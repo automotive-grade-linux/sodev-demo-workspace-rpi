@@ -3,11 +3,13 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] dom0-xt: Kconfig: add DOM_CFG_SODEV and AAOS domain symbols
 
-Add DOM_CFG_SODEV (gates the SoDeV DomU/DomA guests) and DOM_CFG_AAOS_DOMAIN (upstream single-AAOS example). Neither exists at the pinned rev.
+
+Add DOM_CFG_SODEV (gates the SoDeV DomU/DomA guests) and DOM_CFG_AAOS_DOMAIN
+(upstream single-AAOS example). Neither exists at the pinned rev.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/Kconfig b/Kconfig
 index 039ace4..04b5607 100644

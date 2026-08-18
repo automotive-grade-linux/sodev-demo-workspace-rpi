@@ -3,6 +3,7 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] xenlib: guard xu console against unmanaged (toolstack-introduced) domains
 
+
 `xu console <domid>` on a toolstack-introduced guest (a DomU/DomA created by
 the DomD `xl` toolstack) crashed the whole Zephyr Dom0 (NULL/unmapped-ring
 dereference -> CPU exception -> "Halting system").
@@ -11,8 +12,8 @@ Such a guest is tracked in domain_list via xs_introduce() (sys_dlist_append),
 but its console ring is never mapped by this Dom0: xen_init_domain_console()
 runs only in the Dom0-driven domain_create() path (xen_start_domain_console),
 so domain->console.intf stays NULL (the domain struct is memset to 0). The
-attach handler only checked !domain and domain->f_dom0less, not the
-console-init state, so it armed the shell bypass and the display thread then
+attach handler only checked !domain and domain->f_dom0less, not the console-
+init state, so it armed the shell bypass and the display thread then
 dereferenced the unmapped ring and faulted.
 
 Guard xen_attach_domain_console(): after taking &domain->console, refuse the

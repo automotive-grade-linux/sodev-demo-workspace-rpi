@@ -3,22 +3,23 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] dom_cfg/rpi_5: add SoDeV domu/doma configs (HW-verified)
 
+
 RPi5 SoDeV production guest configs for the Zephyr-Dom0 topology
 (rpi_5_sodev_domu = AGL cluster IC, rpi_5_sodev_doma = AAOS), plus the lab
 vif/network convention for the upstream PV example.
 
 Two changes that were verified on hardware are folded in here: the sodev
-guests use GIC_V2 rather than GIC_V3, because vgic v3 initialisation fails with
-rc=-19 on this board, and the builtin-image load path is retained. That load
-path is not exercised by the SD-boot configuration this series targets; it is
-kept because it is the only way to start a guest whose image is linked into the
-Zephyr binary, which is useful when no storage is attached.
+guests use GIC_V2 rather than GIC_V3, because vgic v3 initialisation fails
+with rc=-19 on this board, and the builtin-image load path is retained. That
+load path is not exercised by the SD-boot configuration this series targets;
+it is kept because it is the only way to start a guest whose image is linked
+into the Zephyr binary, which is useful when no storage is attached.
 
 Applies on top of 0002 and 0003.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/src/dom_cfg/rpi_5.c b/src/dom_cfg/rpi_5.c
 --- a/src/dom_cfg/rpi_5.c

@@ -3,14 +3,15 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] xrun: compile without CONFIG_SDHC (DomD owns the SD)
 
-With the SoC SDHCI passed through to DomD (DomD-as-toolstack), the Zephyr
-Dom0 disables CONFIG_SDHC and CONFIG_SDHC_BUFFER_ALIGNMENT no longer exists.
+
+With the SoC SDHCI passed through to DomD (DomD-as-toolstack), the Zephyr Dom0
+disables CONFIG_SDHC and CONFIG_SDHC_BUFFER_ALIGNMENT no longer exists.
 Provide a safe fallback so the xrun storage path keeps compiling; it is unused
 at runtime in this topology.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-xrun]
 ---
 diff --git a/src/storage.c b/src/storage.c
 index 4452fd7..8ee601d 100644

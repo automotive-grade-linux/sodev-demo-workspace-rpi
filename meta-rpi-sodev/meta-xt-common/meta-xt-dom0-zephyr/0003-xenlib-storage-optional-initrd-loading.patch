@@ -3,11 +3,14 @@ From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Wed, 08 Jul 2026 00:00:00 +0900
 Subject: [PATCH] dom0-xt: storage: optional initrd loading callbacks
 
-Add storage_image_initrd_read/_get_size, the image_initrd_path field on dom0_domain_cfg, and the dom0.c wiring that points initrd_info at the config when a path is set. Needed by rpi_5_sodev_doma.
+
+Add storage_image_initrd_read/_get_size, the image_initrd_path field on
+dom0_domain_cfg, and the dom0.c wiring that points initrd_info at the config
+when a path is set. Needed by rpi_5_sodev_doma.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/src/dom0.c b/src/dom0.c
 index ad3e7e4..d736712 100644
