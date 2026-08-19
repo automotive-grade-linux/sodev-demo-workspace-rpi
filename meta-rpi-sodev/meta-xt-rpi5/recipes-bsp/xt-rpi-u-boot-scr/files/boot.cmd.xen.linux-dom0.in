@@ -1,6 +1,6 @@
 # u-boot boot script for the thin-Linux Dom0 flavour (DOM0_OS=linux).
 #
-# Boots: Xen 4.21 + a thin Linux Dom0 (hardware domain, running from an
+# Boots: Xen 4.22 + a thin Linux Dom0 (hardware domain, running from an
 # initramfs) + the dom0less DomD that Xen builds from /chosen/domD. DomU and
 # DomA are created later by the DomD toolstack, not as boot modules here.
 #

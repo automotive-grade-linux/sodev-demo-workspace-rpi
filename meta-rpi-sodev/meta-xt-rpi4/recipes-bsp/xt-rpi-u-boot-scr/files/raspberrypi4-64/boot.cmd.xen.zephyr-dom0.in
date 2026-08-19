@@ -1,7 +1,7 @@
 # =============================================================================
 # Raspberry Pi 4 / BCM2711 — U-Boot boot script, DOM0_OS=zephyr
 #
-# Boots: Xen 4.21 + Zephyr Dom0 (xenstore server only — no toolstack, no
+# Boots: Xen 4.22 + Zephyr Dom0 (xenstore server only — no toolstack, no
 # drivers) + dom0less direct-mapped DomD, which owns the display complex, the
 # NIC *and* the SD card, and runs the xl toolstack that creates DomU/DomA.
 #

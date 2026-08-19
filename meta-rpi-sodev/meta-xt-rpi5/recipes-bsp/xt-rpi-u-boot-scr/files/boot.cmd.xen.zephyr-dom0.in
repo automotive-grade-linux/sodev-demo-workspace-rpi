@@ -4,7 +4,7 @@
 #  DomD's root is the SD p2 ext4 filesystem). Only /chosen/dom0
 # swaps Image -> zephyr.bin, avoiding the address clashes of the broken .2.in
 # template (packed at 0x1200000, Image.gz name, no initramfs). xsm=dummy.
-# Boots: Xen 4.21 hypervisor + Zephyr Dom0 (xenstore server, zephyr.bin) +
+# Boots: Xen 4.22 hypervisor + Zephyr Dom0 (xenstore server, zephyr.bin) +
 # dom0less DomD (direct-map + static-mem boot modules below); DomU/DomA are
 # created later by the DomD toolstack (xl create), not as boot modules here.
 #

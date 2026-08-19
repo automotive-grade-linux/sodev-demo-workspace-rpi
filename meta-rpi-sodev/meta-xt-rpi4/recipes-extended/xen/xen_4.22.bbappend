@@ -1,36 +1,37 @@
 # ============================================================================
 # The rpi4 hypervisor series is the 29 patches listed in SRC_URI below.
-# It does NOT include 4.21-0002-route-msi-ranges (see the REMOVED note further
-# down); the 29 are the ones actually fetched.
+# It does NOT include 4.22-0002-route-msi-ranges (see the REMOVED note further
+# down); the 29 are the ones actually fetched. The rpi5 bbappend fetches 30 --
+# the same set plus that one.
 # ============================================================================
 # This bbappend attaches to the STOCK meta-virtualization recipe
-# xen_4.21.bb (PV "4.21.0+stable", SRCREV 1c72306b, branch stable-4.21) instead
+# xen_4.22.bb (PV "4.22.0+stable", SRCREV d45d5687f1, branch stable-4.22) instead
 # of the xen-troops fork _git recipe. It is selected by
-#   PREFERRED_VERSION_xen = "4.21.0+stable"
+#   PREFERRED_VERSION_xen = "4.22.0+stable"
 # (set in the DomD build's local.conf / rpi4-sodev.yaml linux_domain_conf).
 #
 # The whole RPi5 delta that the fork branch (xen-4.21-xt-gen5) used to carry is
 # reconstructed here as an ordered file:// patch series applied on top of the
-# pristine xenbits stable-4.21 tree:
+# pristine xenbits stable-4.22 tree:
 #
 #   0002-0024  the 23 xen-troops fork commits that sat on top of stable-4.21
 #              (virtio-pci / vgsx / DTB-passthrough / cacheable-iomem / Flask /
 #               legacy-PCI level IRQ emulation), extracted with git format-patch.
-#   4.21-0001  working-delta-rebased  (BCM2712 dom0-MMIO / vGIC SPI relax /
-#              nr_spis floor / iomem-irq grant / SCI via 4.21
+#   4.22-0001  working-delta-rebased  (BCM2712 dom0-MMIO / vGIC SPI relax /
+#              nr_spis floor / iomem-irq grant / SCI via
 #              firmware/sci.c / domctl renumber) = former 0007-0021, squashed.
 #              (No pl011 change: the former BCM2712 console RX poll timer was
 #              removed once overlays/bcm2712d0.dtbo on p1 corrected uart10 to
 #              INTID 152 so the stock pl011 RX IRQ fires; 2-arg IRQ handler is
-#              stock 4.21.)
-#   4.21-0002  route-msi-ranges       (RP1 MSI-X route via 4.21
-#              arch_handle_passthrough_prop() hook, commit d16f10d5a4).
-#   4.21-0003  revert-bufioreq-arm-restriction (re-revert upstream 2fbd7e609e so
+#              stock upstream.)
+#   4.22-0002  route-msi-ranges       (RP1 MSI-X route via the
+#              arch_handle_passthrough_prop() hook, xen-troops fork commit d16f10d5a4 (not in xenbits)).
+#   4.22-0003  revert-bufioreq-arm-restriction (re-revert upstream 2fbd7e609e so
 #              create_ioreq_server() accepts HVM_IOREQSRV_BUFIOREQ_ATOMIC from
 #              the DomD qemu device-model; without it DomU/DomA go black).
-#   4.21-0004  vgic-pci-irq-level-race-fix (fix the pci_irq_level race in the
+#   4.22-0004  vgic-pci-irq-level-race-fix (fix the pci_irq_level race in the
 #              legacy-PCI level IRQ emulation on the vGIC).
-#   4.21-0005  build-honour-external-toolchain-vars. NOT board-specific: it makes
+#   4.22-0005  build-honour-external-toolchain-vars. NOT board-specific: it makes
 #              config/StdGNU.mk use `?=` for CC/CXX/CPP/LD so an OE-supplied
 #              compiler command line survives, and quotes the multi-word CC that
 #              tools/firmware/Makefile passes to the seabios/ovmf sub-makes.
@@ -38,29 +39,41 @@
 #                No rule to make target '-mcpu=cortex-a76'
 #              — and the equivalent on this board would name -mcpu=cortex-a72.
 #
-# NOTE on ThumbEE: the stock xen_4.21.bb SRC_URI already carries
+#   4.22-0006  dom0less-seed-next-phandle-below-reserved-range. NOT board-specific
+#              and an upstream regression fix: 4.22's a010efd323 seeds
+#              kinfo->next_phandle with fdt_generate_phandle() and then refuses
+#              the domain when that lands in the Xen-reserved phandle range. The
+#              dummy /gic placeholder in every partial DT carries
+#              GUEST_PHANDLE_GIC (65000) -- libxl gives its generated GIC node
+#              that value, and dom0less used the same constant unconditionally
+#              up to 4.21 -- so the seed is always 65001 and DomD creation dies
+#              with "Device tree generation failed (-75)" followed by
+#              "Panic on CPU 0: Could not set up domain domD (rc = -22)".
+#              Measured on hardware 2026-08-18: without it NO configuration of
+#              this workspace boots on either board.
+# NOTE on ThumbEE: [4.22] no longer relevant. In 4.21 the stock xen_4.21.bb SRC_URI carried
 # 0001-ARM-Drop-ThumbEE-support.patch (Andrew Cooper 5bbe1fe413, binutils/gcc15
-# fix), so it is NOT re-added here. Verified: on the stable-4.21 tree with the
-# stock ThumbEE patch applied first, the whole 0002-0024 + 4.21-0001..5 series
+# fix), so it was NOT re-added here. That commit is IN 4.22, so the interim
+# xen_4.22.bb drops the pre-patch entirely. Nothing to add or exclude here.
 # still applies clean (git apply --check and patch -p1 --fuzz=2, no reject/fuzz).
 #
 # The fork _git bbappends (meta-rpi5-xen / meta-rpi5-domd / xt-prod-devel-...
 # xen_git.bbappend, which retarget XEN_URL/XEN_REV) attach only to xen_git.bb,
-# so once PREFERRED_VERSION_xen selects 4.21.0+stable they become inert.
+# so once PREFERRED_VERSION_xen selects 4.22.0+stable they become inert.
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
-# 0002-0024 + 4.21-000{1,2,3,4,5} are byte-identical to the xen-tools toolstack copies
+# 0002-0024 + 4.22-000{1,3,4,5} are the same files the xen-tools toolstack bbappend
 # and live in a shared dir (meta-xt-common/recipes-extended/xen-common/files) that
 # both this hypervisor bbappend and the xen-tools bbappend point at. Only the
 # hypervisor-only 0025 and the Kconfig .cfg fragments remain in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series ---
-# REMOVED(rpi4): file://4.21-0002-route-msi-ranges.patch — it routed the BCM2712 MIP MSI
+# REMOVED(rpi4): file://4.22-0002-route-msi-ranges.patch — it routed the BCM2712 MIP MSI
 #   (GIC SPI 128-191) so RP1-over-PCIe MSI-X works. RPi4 has NO RP1/MIP; the only PCIe MSI
 #   consumer is the VL805 USB3 controller behind the BCM2711 PCIe RC. If VL805 passthrough
 #   needs guest MSI, re-derive an equivalent for brcm,bcm2711-pcie (NOT the MIP).
-#   The remaining series (0002-0025, 4.21-0001/0003/0004/0005) is SoC-agnostic and carries over.
+#   The remaining series (0002-0025, 4.22-0001/0003/0004/0005) is SoC-agnostic and carries over.
 SRC_URI:append = " \
     file://0002-xen-arm-ignore-spurious-interrupts-from-virtual-time.patch \
     file://0003-Adjust-guest-memory-map.patch \
@@ -85,11 +98,12 @@ SRC_URI:append = " \
     file://0022-xen-extend-XEN_DOMCTL_memory_mapping-to-handle-cache.patch \
     file://0023-libxc-introduce-xc_domain_memory_mapping_cache-to-ha.patch \
     file://0024-libxl-xl-add-cacheability-option-to-iomem.patch \
-    file://4.21-0001-working-delta-rebased.patch \
-    file://4.21-0003-revert-bufioreq-arm-restriction.patch \
+    file://4.22-0001-working-delta-rebased.patch \
+    file://4.22-0003-revert-bufioreq-arm-restriction.patch \
     file://0025-dom0less-arm-xenstore-page-from-domain-static-mem.patch \
-    file://4.21-0004-vgic-pci-irq-level-race-fix.patch \
-    file://4.21-0005-build-honour-external-toolchain-vars.patch \
+    file://4.22-0004-vgic-pci-irq-level-race-fix.patch \
+    file://4.22-0005-build-honour-external-toolchain-vars.patch \
+    file://4.22-0006-dom0less-seed-next-phandle-below-reserved-range.patch \
 "
 
 # --- hypervisor Kconfig fragments ---
@@ -99,7 +113,7 @@ SRC_URI:append = " \
 #   Without the rest Xen panics on the first hardware boot with "direct-map is
 #   not valid for domain domD without static allocation", because the DomD node
 #   in bcm2711-raspberrypi4-64-xen.dtso uses direct-map + xen,static-mem and both
-#   are EXPERT/UNSUPPORTED-gated in stable-4.21.
+#   are EXPERT/UNSUPPORTED-gated in stable-4.22.
 # xen-config-ioreq.cfg: CONFIG_IOREQ_SERVER (qemu virtio backend). NOTE: it is
 #   EXPERT-gated too, so it only takes effect together with xen-hyp-config.cfg —
 #   listed after it so the merged fragment order matches the dependency.
@@ -107,7 +121,7 @@ SRC_URI:append = " \
 #   caps + guest passthrough IRQ type default + guest nr_spis floor). Like
 #   xen-config-ioreq.cfg these are UNSUPPORTED-gated, so the file MUST come after
 #   xen-hyp-config.cfg in SRC_URI or olddefconfig drops the lines. Added on the v93
-#   rebase: v93 split these out of 4.21-0001-working-delta into a board fragment,
+#   rebase: v93 split these out of 4.22-0001-working-delta into a board fragment,
 #   and the RPi4 port had no counterpart -- see the header of that file for why the
 #   gap was invisible until G4 (dom0less DomD is wired up by Xen itself; these
 #   symbols govern the `xl create` path that DomA uses).
@@ -121,22 +135,20 @@ SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://
 # xen-scmi.cfg was deleted along with the rest of the SCMI plumbing (TF-A's
 # SCMI_SERVER_SUPPORT, the *-scmi.dtso overlays and the SCMI dtbo deploy list).
 
-# Tolerate patch-fuzz from base offset drift in the local RPi5 hot-fix patches
-# (the 0002-0024 series and the 4.21-000x squashes apply clean today, but keep the
-# QA demotion so future stable-4.21 point updates that shift context only warn
-# instead of failing the build). Upstream-Status is present on every patch, so the
-# separate patch-status QA is satisfied and is not touched here.
-# CAVEAT: demoting patch-fuzz from ERROR to WARN *permanently* means a future patch
-# that no longer applies cleanly (fuzz, or a hunk landing at the wrong offset after a
-# context shift) can pass do_patch with only a warning instead of failing the build --
-# a silently mis-applied patch. Behaviour is intentionally left as-is (all patches
-# apply clean at the current SRCREV); on any base bump, re-check the do_patch log for
-# "Fuzz"/offset warnings and refresh the affected patch rather than relying on this.
-WARN_QA:append = " patch-fuzz"
-ERROR_QA:remove = "patch-fuzz"
+# --- patch-fuzz QA: left at ERROR (the OE default) ---------------------------
+# [4.22] The 4.21 revision of this bbappend demoted patch-fuzz to a warning here
+# (WARN_QA:append / ERROR_QA:remove) with its own CAVEAT noting that a permanent
+# demotion lets a silently mis-applied patch pass do_patch with only a warning.
+# Both lines are REMOVED for 4.22: the series applies to stable-4.22 with zero
+# fuzz and zero offset warnings (0008/0018 regenerated, 0022/4.22-0001 rebased),
+# so there is nothing left to tolerate and a mis-apply should fail the build. If a
+# stable-4.22.x bump shifts context, refresh the affected patch -- do not re-add
+# the demotion. Kept in sync with the rpi5 bbappend.
+# Upstream-Status is present on every patch, so the separate patch-status QA is
+# satisfied and is not touched here.
 
 # =============================================================================
-# BCM2711 notes on the carried-over 4.21-0001-working-delta-rebased.patch
+# BCM2711 notes on the carried-over 4.22-0001-working-delta-rebased.patch
 # =============================================================================
 # That patch is shared with the RPi5 layer (meta-xt-common/recipes-extended/
 # xen-common/files) and is kept byte-identical. Three of its hunks were written
@@ -152,18 +164,26 @@ ERROR_QA:remove = "patch-fuzz"
 #     change is right here too — it just is not fixing a bug on this SoC.
 #
 #  3. route_irq_to_guest() forcing IRQ_TYPE_LEVEL_HIGH when desc->arch.type is
-#     IRQ_TYPE_INVALID: *** the one to watch on RPi4. *** BCM2711's display/HDMI
-#     L2 interrupt controller (/soc/interrupt-controller@7ef00100, GIC SPI 96) is
-#     EDGE_RISING, not LEVEL_HIGH — the only edge-triggered line in this design.
-#     It is safe as shipped, because the dom0less path reaches that IRQ through
-#     handle_passthrough_prop -> map_interrupts_to_domain -> platform_get_irq,
-#     which calls irq_set_type() with the type read from the HOST device tree, so
-#     desc->arch.type is already EDGE_RISING and the override never fires. The
-#     override only triggers on the libxl path (domd.cfg `irqs=[...]`), which
-#     carries no type information. So: if DomD is ever switched from dom0less to
-#     `xl create`, do NOT put SPI 96 (Xen irq 128) in irqs=[] without first
-#     making that fallback read the type from the DT — a level-configured GIC line
-#     on an edge source either misses interrupts or storms.
+#     IRQ_TYPE_INVALID: harmless here, and the fallback value is the correct one.
+#     Every BCM2711 peripheral SPI is active-high level, the display/HDMI L2
+#     controller (/soc/interrupt-controller@7ef00100, GIC SPI 96) included.
+#     [CORRECTED 2026-09-02] This comment used to claim SPI 96 was EDGE_RISING and
+#     "the only edge-triggered line in this design". That came from the
+#     bcm2711-rpi-4-b.dtb that raspberrypi/firmware distributes, which still
+#     carries the pre-rpi-6.1.y value and is stale; mainline and the pinned
+#     rpi-6.18.y both say IRQ_TYPE_LEVEL_HIGH. Following the stale value in the
+#     DomD partial DT panicked DomD on hardware -- see docs/TROUBLESHOOTING.md,
+#     "DomD panics in brcmstb_l2_intc during boot", and section 4 of
+#     meta-xt-rpi4/BCM2711-DT-TRUTH.md.
+#     Note the two device trees are separate inputs: Xen programs the PHYSICAL
+#     GIC from the host DT (handle_passthrough_prop -> map_device_irqs_to_domain
+#     on the node resolved through xen,path), while DomD's own kernel programs its
+#     view from the guest partial DT. The p1 dtb shipped here is still the stale
+#     firmware prebuilt, so those two currently disagree for SPI 96 -- tracked as
+#     an open item; the partial DT is the one that governs what DomD's probe sees,
+#     which is why fixing it was what stopped the panic.
+#     The override still only triggers on the libxl path (domd.cfg `irqs=[...]`),
+#     which carries no type information at all.
 #     (GIC SPI n maps to Xen/libxl irq n+32: msi SPI 148 -> 180, pcie SPI 147 ->
 #     179, INTA-D SPI 143..146 -> 175..178, HDMI L2 SPI 96 -> 128.)
 #

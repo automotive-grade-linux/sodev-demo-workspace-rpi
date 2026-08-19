@@ -1,7 +1,7 @@
 # =============================================================================
 # Raspberry Pi 4 / BCM2711 — U-Boot boot script, DOM0_OS=linux
 #
-# Boots: Xen 4.21 + thin Linux Dom0 (control plane) + dom0less direct-mapped
+# Boots: Xen 4.22 + thin Linux Dom0 (control plane) + dom0less direct-mapped
 # DomD (vc4 display driver domain). DomU/DomA are created later by Dom0's xl.
 #
 # Board differences that shape this file (see ../../../../BCM2711-DT-TRUTH.md
