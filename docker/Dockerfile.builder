@@ -33,18 +33,15 @@ FROM ubuntu:22.04
 
 ARG USER_ID=1000
 ARG USER_GID=1000
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
-ARG NO_PROXY=""
+# No ENV for the proxy variables: that would bake them into the image, and with no
+# proxy configured that means http_proxy is defined-but-EMPTY at run time -- which
+# makes the AOSP `repo` launcher (`if "http_proxy" in os.environ:`) proxy through
+# nothing and fail every fetch with "urlopen error no host given". They are Docker
+# predefined build args, so `--build-arg http_proxy=...` still reaches the RUN steps
+# below; build.sh passes them only when they have a value.
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 ENV LANG=en_US.UTF-8
-ENV http_proxy=${HTTP_PROXY} \
-    https_proxy=${HTTPS_PROXY} \
-    no_proxy=${NO_PROXY} \
-    HTTP_PROXY=${HTTP_PROXY} \
-    HTTPS_PROXY=${HTTPS_PROXY} \
-    NO_PROXY=${NO_PROXY}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         # base

@@ -404,6 +404,16 @@ fi
 if [ -n "$PROXY" ]; then
   export HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" https_proxy="$PROXY" http_proxy="$PROXY"
 fi
+# "Empty" is not the same as "unset", and the AOSP `repo` launcher is the tool that
+# cares: it does `if "http_proxy" in os.environ:` and builds a ProxyHandler from the
+# value, so an empty one proxies through nothing and every fetch fails with
+# "urlopen error no host given" (this is what stopped `repo init` from fetching
+# clone.bundle). Drop the empty ones here, once, so everything below -- the bare
+# `-e VAR` forms in in_docker and the build args in build_img -- passes on only the
+# variables that really are configured.
+for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+  if [ -z "${!v:-}" ]; then unset "$v"; fi
+done
 
 cmdcheck() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required tool not found: $1" >&2; exit 1; }; }
 cmdcheck docker
@@ -651,10 +661,9 @@ in_docker() {  # $1=image, rest=command
   docker run --rm "${NET_OPTS[@]}" \
     "${DOCKER_RUN_OPTS[@]}" \
     -v "$workdir":"$workdir" "${CACHE_MOUNTS[@]}" -w "$workdir" \
-    -e HTTPS_PROXY="$PROXY" -e HTTP_PROXY="$PROXY" \
-    -e https_proxy="$PROXY" -e http_proxy="$PROXY" \
-    -e NO_PROXY="${NO_PROXY:-}" -e no_proxy="${NO_PROXY:-}" \
-    -e REPO_SKIP_SELF_UPDATE="${REPO_SKIP_SELF_UPDATE:-}" \
+    -e HTTPS_PROXY -e HTTP_PROXY -e https_proxy -e http_proxy \
+    -e NO_PROXY -e no_proxy \
+    -e REPO_SKIP_SELF_UPDATE \
     -e XT_DISABLE_SPDX="${XT_DISABLE_SPDX:-}" \
     -e CONNECTIVITY_CHECK_URIS \
     -e AAOS_KERNEL_MD5="${AAOS_KERNEL_MD5:-}" -e AAOS_RAMDISK_MD5="${AAOS_RAMDISK_MD5:-}" \
@@ -668,9 +677,16 @@ in_docker() {  # $1=image, rest=command
 build_img() {  # $1=image tag, $2=dockerfile path relative to workdir
   if [ "${REBUILD_IMAGES}" != "1" ] && docker image inspect "$1" >/dev/null 2>&1; then return 0; fi
   echo ">> docker build $1  (-f $2)"
+  # Proxy build args, for the configured variables only (see the unset loop above).
+  # These are Docker's predefined proxy args: they reach every RUN in the Dockerfile
+  # without being declared there, and are not stored in the image.
+  local pargs=() v
+  for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    if [ -n "${!v:-}" ]; then pargs+=(--build-arg "$v=${!v}"); fi
+  done
   docker build "${NET_OPTS[@]}" -f "$workdir/$2" \
     --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
-    --build-arg HTTP_PROXY="$PROXY" --build-arg HTTPS_PROXY="$PROXY" --build-arg NO_PROXY="${NO_PROXY:-}" \
+    "${pargs[@]}" \
     -t "$1" "$workdir/docker"
 }
 
