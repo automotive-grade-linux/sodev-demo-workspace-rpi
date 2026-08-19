@@ -25,9 +25,19 @@
 #      just to make the layer directory exist). Fetching the same sources by git
 #      removes that ordering constraint entirely.
 #
-# All 14 sources are public and anonymously reachable; revisions are pinned to the
-# same commits the AOSP manifest (yhamamachi/android_manifest @ aff3224d) resolves,
-# so the binaries match what the AAOS guest in this workspace expects.
+# All 14 sources are public and anonymously reachable. The two halves of that list are
+# pinned from different places, which matters when the guest's Android version moves:
+#
+#   device/google/trout  -- the revision the DomA manifest's AOSP tag resolves for
+#       platform/device/google/trout, so the DomD services are built from the same trout
+#       tree the guest's HALs come from. This one has to move with the AAOS version.
+#   the other 13         -- the revisions the upstream meta-google layer pins itself
+#       (agl_services_build/yocto-layer/.../agl-services/sources.inc in the epam device
+#       repo, where trout itself is a file:// entry rather than a git fetch). They are
+#       Android-12L-era build dependencies of the CMake build and do NOT track the guest:
+#       verified byte-identical between the android-15 and android-17 revisions of that
+#       upstream file, whose ONLY change across the two was the dumpstate path in
+#       SRC_SYMLINKS below.
 
 # The 14 sources are NOT all Apache-2.0, so neither is this recipe. What each tree
 # actually carries, read from the fetched trees rather than assumed:
@@ -50,6 +60,13 @@
 # upstream breaks the build instead of passing silently. The three AOSP trees without a
 # top-level file are covered by the nearest NOTICE they do ship. The generic Apache-2.0
 # text is referenced once for the trout layer itself, which ships no licence file.
+#
+# That last one is a gap worth naming: because the reference is to Yocto's own copy of the
+# Apache-2.0 text rather than to anything inside device/google/trout, moving the trout
+# revision -- which this recipe does when the guest's Android version moves -- is NOT
+# checked on the licence side. There is nothing to point at (trout carries no LICENSE,
+# NOTICE or MODULE_LICENSE* at its root, confirmed at the android-17.0.0_r1 revision), so
+# the break-on-change property above holds for the other 13 sources only.
 #
 # This states what the material is; it is not a judgement on how the licences combine
 # in a redistributed image. Whoever redistributes one is the party that has to make that
@@ -91,10 +108,10 @@ def trout_git_uri(d, remote, name, path, revision):
 # device/google/trout is fetched as a git source here. The upstream layer instead
 # ships a committed symlink (mode 120000) pointing 11 levels up into the enclosing
 # AOSP checkout -- which is why it only works when the layer lives inside that
-# checkout. Pinned to the revision AOSP tag android-15.0.0_r12 resolves for
+# checkout. Pinned to the revision AOSP tag android-17.0.0_r1 resolves for
 # platform/device/google/trout.
 SRC_URI = "\
-    ${@trout_git_uri(d, 'ANDROID_REMOTE', 'device/google/trout', 'device/google/trout', '9da712e8261c80c7377d93e4517d09bf223b4fae')} \
+    ${@trout_git_uri(d, 'ANDROID_REMOTE', 'device/google/trout', 'device/google/trout', '26ebd2c5706f28ec3a925b3b7f133a7b575abded')} \
     ${@trout_git_uri(d, 'ANDROID_REMOTE', 'platform/external/fmtlib', 'third_party/fmtlib', '75cbc736e0160e1a6b3d841c18e7a65938a7347c')} \
     ${@trout_git_uri(d, 'ANDROID_REMOTE', 'platform/external/grpc-grpc', 'third_party/grpc-grpc', '8428b748ea53814c5eb4751196f76586571b0146')} \
     ${@trout_git_uri(d, 'ANDROID_REMOTE', 'platform/external/jsoncpp', 'third_party/jsoncpp', '1b2c7506fd0ea96c1ffa5de4fc0342ceed420416')} \
@@ -114,13 +131,26 @@ SRC_URI = "\
 # <linkfile>; repo is not used here, so the same links are made after unpack.
 # (That manifest also points at sso://googleplex-android/, i.e. Google-internal --
 # another reason it cannot be used directly.)
+#
+# dumpstate: Android 17's trout replaced the HIDL dumpstate HAL with an AIDL one and moved
+# the tree -- hal/dumpstate/1.1 is gone, hal/dumpstate/aidl/1.0 is its replacement. The
+# upstream meta-google layer made exactly this one-line change between the android-15 and
+# android-17 revisions of the epam device repo, and it is the only change it made. Only
+# the path moved: agl_build/CMakeLists.txt is byte-identical across the two (same
+# dumpstate_grpc_server target, same source list) and so is proto/DumpstateServer.proto,
+# so the vsock gRPC contract with the guest -- and therefore xt-aaos-host-services'
+# aaos.dumpstate.xml and dumpstate_grpc_server.service -- is unaffected.
+#
+# Note this list and the device/google/trout revision in SRC_URI have to move together:
+# do_unpack below fails with bb.fatal if a rule no longer matches the fetched sources,
+# which is what catches the pair being updated one at a time.
 SRC_SYMLINKS = "\
     device/google/trout/agl_services_build/build.sh:build.sh \
     device/google/trout/agl_services_build/CMakeLists.txt:CMakeLists.txt \
     device/google/trout/agl_services_build/cmake:cmake \
     device/google/trout/agl_services_build/toolchain:toolchain \
     device/google/trout/hal/audiocontrol:audiocontrol \
-    device/google/trout/hal/dumpstate/1.1:dumpstate_server \
+    device/google/trout/hal/dumpstate/aidl/1.0:dumpstate_server \
     device/google/trout/hal/vehicle/2.0:vehicle_hal_server \
     device/google/trout/hal/common/agl/watchdog:watchdog_test_server \
     hardware/interfaces/automotive/vehicle/2.0/default:third_party/default_native_vehicle_hal \

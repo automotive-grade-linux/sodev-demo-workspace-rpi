@@ -10,7 +10,7 @@
 # the boundary check.
 #
 # Both are mechanically derivable from what this workspace already builds:
-#   kernel  = the doma_kernel component's bazel output (GKI 6.1.118 + xen-virtual-device)
+#   kernel  = the doma_kernel component's bazel output (GKI 6.18.32 + xen-virtual-device)
 #   ramdisk = the doma component's vendor_boot.img, repacked with its bootconfig
 #
 # ⚠ Only vendor_boot's ramdisk is used. docs/BUILD.md used to say to "concatenate the
@@ -55,13 +55,28 @@ AAOS_PRODUCT_OUT ??= "${AAOS_SRC_TREE}/out/target/product/${AAOS_DEVICE}"
 AAOS_KERNEL_IMAGE ??= "${AAOS_KERNEL_TREE}/out/deploy/common-modules/xen-virtual-device/xen_virtual_device_aarch64/Image"
 AAOS_UNPACK_BOOTIMG ??= "${AAOS_SRC_TREE}/system/tools/mkbootimg/unpack_bootimg.py"
 
+# The copy of the guest kernel that lives INSIDE the AOSP checkout, which is what the AOSP
+# build actually reads (Android 16+ Soong rejects a source path outside the tree, so the
+# kernel cannot be handed over as "../<kernel checkout>/..." any more --
+# meta-xt-doma/stage-doma-kernel.sh explains it in full). The product yaml passes the
+# directory name; this default matches the one both boards use.
+#
+# It is checked against AAOS_KERNEL_IMAGE below rather than used, because the staging is a
+# script rather than a ninja edge and therefore cannot be kept fresh by the graph. p1's
+# kernel comes from AAOS_KERNEL_IMAGE (the dist) while p4's vendor_dlkm modules come from
+# this copy, so a stale copy ships a kernel and a set of modules from different builds:
+# module_layout disagrees, ~97 modules fail to load, and the guest never reaches
+# SurfaceFlinger while still setting sys.boot_completed=1. Nothing downstream would notice.
+AAOS_KERNEL_STAGE_DIR ??= "xt-doma-kernel"
+AAOS_STAGED_KERNEL_IN_TREE ??= "${AAOS_SRC_TREE}/${AAOS_KERNEL_STAGE_DIR}/Image"
+
 # --aaos=prebuilt escape hatch. Deriving needs the AOSP checkout (unpack_bootimg.py) and
 # the bazel guest kernel, and prebuilt mode deliberately has neither -- it stages a
 # bundle's six p4 images and skips the AOSP build entirely. So in that mode build.sh
 # stages the bundle's two boot artifacts here and the derivation is skipped. Present =>
 # use verbatim; absent => derive. Deliberately NOT in SRC_URI: a file:// entry must
 # exist at do_fetch, which would make every source-mode build require them again.
-AAOS_STAGED_KERNEL ??= "${THISDIR}/files/aaos-android-kernel-xenbuilt-6.1.118"
+AAOS_STAGED_KERNEL ??= "${THISDIR}/files/aaos-android-kernel-xenbuilt-6.18.32"
 AAOS_STAGED_RAMDISK ??= "${THISDIR}/files/aaos-vendor-boot-ramdisk-xenbuilt-padded"
 
 DEPENDS += "lz4-native cpio-native"
@@ -110,14 +125,40 @@ python do_compile() {
                      "  (./build.sh -u --aaos=source, or --aaos-src=<AOSP checkout>),\n"
                      "  or point AAOS_SRC_TREE / AAOS_KERNEL_TREE at them.\n"
                      "  Running `ninja image-full` directly does NOT order the AOSP\n"
-                     "  components before this build -- run `ninja doma_kernel doma`\n"
-                     "  first, or use build.sh, which does it for you." % (what, p))
+                     "  components before this build. Use build.sh: the AOSP build also\n"
+                     "  needs the guest kernel staged into the checkout between\n"
+                     "  `ninja doma_kernel` and `ninja doma`, which only build.sh does\n"
+                     "  (meta-xt-doma/stage-doma-kernel.sh)." % (what, p))
         return p
 
     out = d.getVar('AAOS_PRODUCT_OUT')
     unp = need(d.getVar('AAOS_UNPACK_BOOTIMG'), 'unpack_bootimg.py')
     kern = need(d.getVar('AAOS_KERNEL_IMAGE'), 'AAOS guest kernel (bazel Image)')
     vb = need(os.path.join(out, 'vendor_boot.img'), 'vendor_boot.img')
+
+    # The AOSP build read the kernel from a COPY inside its checkout, not from the dist this
+    # recipe ships to p1, and that copy is made by a script rather than by a ninja edge (see
+    # the AAOS_KERNEL_STAGE_DIR note above). So the two can disagree, and the only place that
+    # can still catch it is here, before either one is shipped. p1 would get this kernel while
+    # p4's vendor_dlkm got the other one's modules: module_layout disagrees and the guest
+    # boots to a black panel with sys.boot_completed=1, which no later check would flag.
+    staged = d.getVar('AAOS_STAGED_KERNEL_IN_TREE')
+    if not os.path.exists(staged):
+        bb.fatal("the AAOS guest kernel was never staged into the AOSP checkout\n"
+                 "  (expected %s).\n"
+                 "  The AOSP build reads the kernel from there, so its p4 images were\n"
+                 "  built against something else. Re-run via build.sh, which stages it\n"
+                 "  between `ninja doma_kernel` and `ninja doma`." % staged)
+    with open(staged, 'rb') as f1, open(kern, 'rb') as f2:
+        if f1.read() != f2.read():
+            bb.fatal("the staged guest kernel does not match the one being deployed:\n"
+                     "    staged (what the AOSP build used): %s (%d B)\n"
+                     "    dist   (what p1 would get):        %s (%d B)\n"
+                     "  p4's vendor_dlkm modules come from the first, p1's kernel from the\n"
+                     "  second. Shipping both mismatches module_layout: ~97 modules fail to\n"
+                     "  load and the guest never reaches SurfaceFlinger, while still setting\n"
+                     "  sys.boot_completed=1. Re-run via build.sh so the staging is redone."
+                     % (staged, os.path.getsize(staged), kern, os.path.getsize(kern)))
 
     work = os.path.join(d.getVar('B'), 'aaos-derive')
     bb.utils.remove(work, True)

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+
+  Product overlay for SettingsProvider's Settings.Global defaults. Only the three
+  values below are overridden; everything else keeps the AOSP default, because a
+  DEVICE_PACKAGE_OVERLAYS resource file is merged per resource name rather than
+  swapped in whole.
+
+  These defaults apply to a FRESH userdata only. SettingsProvider seeds
+  Settings.Global once, on the first boot of an empty /data. On a board whose
+  /data is already provisioned, set the same values live instead:
+
+      settings put global bluetooth_on 0        (or: svc bluetooth disable)
+      settings put global window_animation_scale 0
+      settings put global transition_animation_scale 0
+      settings put global animator_duration_scale 0    (no resource default
+                                                        exists; runtime only)
+
+  def_bluetooth_on=false  (DOES NOT TAKE EFFECT ON AAOS; kept for the record)
+    Measured on a fresh userdata, 2026-08-18 on the RPi5 P4 image: the two animation
+    scales below came up at 0.0 as intended, but bluetooth_on was still 1. AAOS ships
+    CarSettingsProviderConfigRRO (packages/services/Car/car_product/rro/
+    overlay-config/SettingsProviderRRO/res/values/defaults.xml line 24) which sets
+    def_bluetooth_on=true, and a runtime resource overlay outranks a build-time
+    DEVICE_PACKAGE_OVERLAYS resource. Beating it would mean shipping our own RRO with
+    a higher priority; until someone does, turn Bluetooth off at run time:
+      svc bluetooth disable        (persists in /data)
+    The value below is left in place because it is correct for a non-automotive
+    product and because removing it would hide why the runtime step is needed.
+
+    There is no Bluetooth transport in this guest. AAOS brings the adapter up
+    anyway, the HAL never becomes ready, and com.android.bluetooth crash loops:
+    measured on hardware 2026-08-18 it restarted about every 44 s, each time
+    running crash_dump64 and writing a tombstone to /data, which reaches the SD
+    through DomD's device model, so the cost lands on the whole cockpit. The
+    console shows the framework giving up on it:
+      GceEventReporter: VIRTUAL_DEVICE_BOOT_FAILED: Dependencies not ready
+                        after 10 checks: Bluetooth
+    Leaving the adapter off stops the loop. The packages stay installed, so
+    turning Bluetooth on by hand still works if a transport is ever added.
+
+  def_window_animation_scale / def_window_transition_scale = 0%
+    Window and transition animations are pure compositor work on a platform whose
+    GPU is not the bottleneck: with three Settings/Home transitions driven in a
+    loop, V3D render sat at about 24% while DomD's device model burned 83% of a
+    core translating and copying frames. Turning the two scales off removes that
+    work from every screen change. Measured together with loglevel=4 and
+    Bluetooth off: DomD went from 120.4% to 89.6% of a core over the same
+    workload. Set them to 50% instead of 0% if the demo wants the motion back at
+    half the cost.
+
+  Note for editors: XML comments may not contain a double hyphen, which is why
+  this block uses none.
+-->
+<resources>
+    <bool name="def_bluetooth_on">false</bool>
+    <fraction name="def_window_animation_scale">0%</fraction>
+    <fraction name="def_window_transition_scale">0%</fraction>
+</resources>

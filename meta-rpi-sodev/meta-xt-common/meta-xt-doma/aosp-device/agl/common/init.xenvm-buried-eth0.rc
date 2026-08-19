@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Hand DomA's first virtio NIC to the radio HAL as buried_eth0.
+#
+# WHY THIS EXISTS
+# ---------------
+# The product inherits minradio through
+#     device/epam/aosp-xenvm-trout/aosp_xenvm_trout_arm64.mk
+#       -> device/google/trout/aosp_trout_arm64.mk
+#         -> device/google/cuttlefish/vsoc_arm64_only/auto/aosp_cf.mk
+#           -> device/google/cuttlefish/shared/auto/device_vendor.mk
+#              PRODUCT_PACKAGES += com.android.hardware.radio.minradio.virtual
+#
+# minradio's data implementation does not invent an interface. It hard-codes one:
+#
+#     radio/aidl/minradio/minradio-example/impl/RadioData.cpp
+#       bool ifaceOk = netdevice::setAddr4("buried_eth0", "192.168.97.2", 30);
+#       ifaceOk = ifaceOk && netdevice::up("buried_eth0");
+#       if (!ifaceOk) {
+#           respond()->setupDataCallResponse(
+#               errorResponse(serial, RadioError::INTERNAL_ERR), {});
+#           return ok();
+#       }
+#       ...
+#       .ifname = "buried_eth0",
+#
+# On cuttlefish that interface exists because com.google.cf.wifi renames eth0 to
+# it. Everything needed for that is installed here too -- the APEX, the binary,
+# and the rc that starts it:
+#
+#     /apex/com.google.cf.wifi/bin/rename_netiface
+#     /apex/com.google.cf.wifi/etc/com.google.cf.wifi.rc
+#         service rename_eth0 .../rename_netiface eth0 buried_eth0
+#             user root
+#             oneshot                      <- no class, no trigger of its own
+#     /vendor/etc/init/init.cutf_cvm.rc    (built from cuttlefish's
+#                                           shared/config/init.vendor.rc)
+#         on post-fs-data && property:ro.vendor.disable_rename_eth0=
+#             wait /sys/class/net/eth0
+#             start rename_eth0
+#
+# WHY THIS ONLY MATTERS FROM ANDROID 17
+# -------------------------------------
+# The disabled trigger is not new -- trout has set the property since the 15 era --
+# and neither is the hard-coded interface name: cuttlefish's own reference-ril
+# hard-codes it too (guest/hals/ril/reference-ril/reference-ril.c:62
+# `#define PPP_TTY_PATH_ETH0 "buried_eth0"`). What changed is that until 17 no radio
+# HAL on this product ever asked for the interface:
+#
+#   Android 15  hardware/interfaces/radio/aidl/minradio does not exist, and
+#               device/google/cuttlefish/shared/auto/device_vendor.mk mentions
+#               minradio nowhere. trout keeps TARGET_USES_CF_RILD ?= false
+#               (aosp_trout_arm64.mk:19), so the cuttlefish RIL is not installed
+#               either. Nothing attempts a data call, so nothing needs buried_eth0
+#               and the disabled rename is invisible.
+#
+#   Android 17  device/google/cuttlefish/shared/auto/device_vendor.mk:209-212
+#               "Telephony: Use Minradio RIL instead of Cuttlefish RIL" --
+#               TARGET_USES_CF_RILD := false, PRODUCT_PACKAGES +=
+#               com.android.hardware.radio.minradio.virtual (+
+#               ConnectivityOverlayMinradio). minradio publishes IRadioData/slot1
+#               and its setupDataCall requires buried_eth0.
+#
+# So the three preconditions -- a radio HAL that requires the interface, a trout
+# property that keeps it from being created, and a failure response the framework
+# retries -- first line up in 17. Nothing about this board or Xen is involved.
+#
+# TROUT TURNS THAT TRIGGER OFF ON PURPOSE, and that is the whole reason this file
+# exists:
+#
+#     device/google/trout/aosp_trout_common.mk:59
+#         PRODUCT_VENDOR_PROPERTIES += ro.vendor.disable_rename_eth0=true
+#     device/google/trout/aosp_trout_arm64.mk:80
+#         PRODUCT_PROPERTY_OVERRIDES += ro.vendor.disable_rename_eth0?=true
+#
+# The trigger is written to fire only while that property is EMPTY, so with
+# `true` it never runs. Measured on hardware: `getprop
+# ro.vendor.disable_rename_eth0` is `true`, `/vendor/etc/init/init.cutf_cvm.rc`
+# does carry the block at line 57, and eth0 keeps its own DHCP lease. The service
+# has no second route either -- AOSP's init.rc issues class_start for early_hal,
+# hal, core, main, late_start and charger but never for `default`, which is the
+# class a service with no `class` line lands in (init/service.cpp:172). So the
+# only thing missing is somebody saying `start`.
+#
+# Trout sets the property because trout wants eth0 for its own virtwifi
+# (DEVICE_VIRTWIFI_PORT := eth0, two lines above it). Overriding that is
+# deliberate here, for two reasons measured on this board:
+#   - trout's virtwifi does not actually produce a wlan0 on this product. Its
+#     setup service is a oneshot that runs `cmd wifi set-wifi-enabled` /
+#     `connect-network VirtWifi`, and cuttlefish's setup_wifi, which is what
+#     creates the interface, is gated on ro.boot.wifi_impl=virt_wifi -- empty
+#     here. There is no wlan0 to protect.
+#   - doma.cfg gives DomA two vifs on the same bridge, so eth0 and eth1 were both
+#     taking a lease out of 192.168.10.0/24 (.14 and .13) and
+#     ConnectivityService carried two ETHERNET networks, one of which never
+#     validated. Spending one of them on the radio HAL removes that duplication.
+#     eth1 keeps .13, which is the address dnsmasq reserves for DomA and the one
+#     adb connects to.
+# Clearing the property instead of starting the service was considered and
+# rejected: aosp_trout_common.mk sets it with an unconditional `+=` into
+# PRODUCT_VENDOR_PROPERTIES, so a later assignment does not remove it.
+#
+# WHAT GOES WRONG WITHOUT IT
+# --------------------------
+# Measured on a 4 GiB board 2026-08-17, AAOS 17. setupDataCall fails and the
+# failure response is the empty one above -- no cause, no suggestedRetryTime --
+# so the framework reads it as an unknown, immediately retryable error:
+#
+#     E minradio: ioctl(8916) failed: No such device   (0x8916 = SIOCSIFADDR)
+#     D RILJ    : [1006]< SETUP_DATA_CALL error 38     (38 = INTERNAL_ERR)
+#     D DN-40963-C: ConnectingState: onSetupResponse: RESULT_ERROR_ILLEGAL_STATE
+#     D DN-40964-C: ConnectingState: onSetupResponse: RESULT_ERROR_ILLEGAL_STATE
+#
+# The DataNetwork id climbs with every attempt, at roughly 7 to 13 Hz. In the
+# shipping state it did not converge: DomA burned 186 % of one physical core for
+# 1 h 42 m (xl list CPU 11,385 s over 6,120 s of wall clock, com.android.phone 64
+# min cumulative) with nothing on screen and nobody interacting, dragging
+# system_server, netd -- which respawned iptables-restore and ip6tables-restore
+# to 1 m 46 s each -- resolv and ConnectivityService along with it. Screen
+# transitions are slow because there is no CPU left for them.
+#
+# Two things it is NOT, both checked so nobody spends time on them again:
+#   - Not the VINTF warnings for IRadioMessaging / IRadioVoice / IRadioIms.
+#     minradio declares only config, data, modem, network and sim, so the RIL
+#     leaves those three proxies null and carries on, by design.
+#   - Not the radio HAL dying and being rebound. Measured while the loop was
+#     running: the minradio pid never changes, its ETIME only increases, and
+#     binderDied / resetProxy / "Radio Available" appear zero times in 30 s.
+#     The retry is entirely on the framework side.
+#
+# A V4H board on the same AAOS 17, the same trout product and the same
+# ro.vendor.disable_rename_eth0=true is idle -- but only by accident. It reaches
+# carrierId 2256 exactly as this board does and then stops one step earlier
+# because its APN database is empty (`content://telephony/carriers` returns 0
+# rows against 3652 here), so no data call is ever attempted. Give that board an
+# apns-conf.xml and it meets this bug too. This fix does not depend on the APN
+# database, the carrier match or the preferred APN, which is why it is the one
+# worth carrying.
+#
+# WHY `on boot`
+# -------------
+# rename_netiface uses SIOCSIFNAME, which needs the interface administratively
+# DOWN, so this has to run after the virtio NIC exists and before anything
+# configures it. Boot timings from this board (ro.boottime.*):
+#
+#     early-init  2.91 s
+#     init        5.72 s
+#     apexd       8.26 s   <- APEX rc parsed, so rename_eth0 exists from here on
+#     zygote-start / netd  13.29 s / 13.28 s
+#     EthernetService brings eth0 up   ~200 s (dumpsys connectivity, created
+#                                              199564 ms)
+#
+# `on boot` fires at about 13 s. Verified on a fresh DomA boot: at uptime 19.9 s
+# eth0 was present and `state DOWN`, and the rename succeeded at 26.2 s. The
+# margin to the far end is over three minutes. `wait` mirrors what cuttlefish
+# does in init.cutf_cvm.rc and costs nothing when the NIC is already there.
+#
+# Result, on a fresh boot with telephony left enabled:
+#     DomA CPU, idle          186 %  ->  10.4 %  of one physical core
+#     all domains, idle      57.2 %  ->   8.3 %  of the four physical cores
+#     mDataConnectionState        0  ->   2      (CONNECTED)
+#     ioctl(8916) / INTERNAL_ERR  ~7 Hz -> none
+
+on boot
+    wait /sys/class/net/eth0
+    start rename_eth0

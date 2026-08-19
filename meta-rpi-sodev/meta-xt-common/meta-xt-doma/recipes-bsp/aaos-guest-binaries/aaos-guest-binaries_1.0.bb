@@ -8,8 +8,9 @@ DESCRIPTION = "\
     after mounting /mnt. \
 \
     Binary provenance: \
-    - kernel  = self-built GKI 6.1.118 (CONFIG_XEN=y/XEN_VIRTIO=y, from the \
-      xen-troops android_kernel_manifest). CONFIG_XEN=y is required to avoid \
+    - kernel  = self-built GKI 6.18.32 (CONFIG_XEN=y/XEN_VIRTIO=y, from the \
+      android_kernel_manifest pinned in the product yaml). CONFIG_XEN=y is \
+      required to avoid \
       the virtio-pci vp_interrupt spurious data-abort panic. \
     - ramdisk = vendor_boot ramdisk with AVB removed, all virtio modules \
       replaced, and a zero pad inserted before the bootconfig trailer so the \
@@ -23,9 +24,18 @@ DESCRIPTION = "\
     can pin a specific validated build via local.conf/env; see docs/BUILD.md."
 
 # What the two artefacts are, for the record (measured on one build's output):
-#   - the guest kernel is a GKI 6.1.118 build, i.e. the Linux kernel, so it is
-#     GPL-2.0-only material. Corresponding source: the xen-troops
-#     android_kernel_manifest (see README, "Building the prebuilts from source").
+#   - the guest kernel is a GKI 6.18.32 build, i.e. the Linux kernel, so it is
+#     GPL-2.0-only material. Corresponding source: the manifest the product yaml
+#     pins for the doma_kernel component --
+#     the yaml's doma_kernel component is the authority, and it currently pins
+#     https://github.com/yuichi-kusakabe/android_kernel_manifest at the rev recorded
+#     there, branch android-17-xenvm-rpi-pinned, entry point
+#     pinned-common-android17-6.18.xml, which carries Google's common-android17-6.18
+#     manifest with every project pinned to a SHA -- see README, "Building the
+#     prebuilts from source". That repository is a fork of
+#     yhamamachi/android_kernel_manifest carrying one pull request that has not been
+#     merged yet; when it is, the yaml moves back to yhamamachi and so does this
+#     statement. Read the rev out of the yaml rather than trusting this comment.
 #   - the vendor_boot ramdisk is AOSP userspace, repacked with AVB removed and the
 #     virtio modules replaced. Measured on one such artefact (lz4 -dc | cpio -i;
 #     52 MiB unpacked, 334 files / 224 symlinks / 46 dirs):
@@ -97,9 +107,14 @@ SRC_URI = " \
 # match a self-built kernel and would break every clean build. Left empty, do_deploy
 # accepts whatever was derived (a --aaos-prebuilt bundle's MANIFEST.md5 covers bundle
 # integrity separately). To pin one specific validated artifact, set these via
-# local.conf / the environment; the values for this project's HW-verified bundle are:
-#   AAOS_KERNEL_MD5  = "c1700f50019c7a07baefa428abb3c41e"
-#   AAOS_RAMDISK_MD5 = "e201569f233c3cfa20cb1fc3cdc402bf"
+# local.conf / the environment. The two values below are the ones measured on the
+# Android 15 / GKI 6.1.118 bundle this recipe originally shipped with, and they are
+# kept only as an example of the FORM the variables take -- the guest kernel is now
+# 6.18.32, so pasting them into local.conf pins a kernel this tree no longer builds
+# and every build stops at the md5 check. Derive the pair from the artifacts of the
+# build being pinned (`md5sum` on the staged kernel and the ramdisk) instead:
+#   AAOS_KERNEL_MD5  = "c1700f50019c7a07baefa428abb3c41e"   # 6.1.118, historical
+#   AAOS_RAMDISK_MD5 = "e201569f233c3cfa20cb1fc3cdc402bf"   # 6.1.118, historical
 # (NB: what actually has to agree is the ABI, not the md5. The guest kernel and the
 # super.img vendor_dlkm modules must share ONE module_layout CRC; a stale-kernel /
 # fresh-super mismatch makes ~97 guest modules fail "disagrees about version of symbol
