@@ -12,14 +12,23 @@ LICENSE = "Apache-2.0"
 
 IMAGE_FSTYPES = "cpio.gz"
 
-# [4.21] xen-tools-flask removed from IMAGE_INSTALL: on 4.21 /boot/xenpolicy-4.21.0
-# is not claimed by any package in the meta-virtualization recipe, so
-# xen-tools-flask becomes empty and the image cannot be built (dnf "No match for
-# argument: xen-tools-flask"). The XSM policy is not module-loaded during this
-# demo's boot (the hypervisor deploys xenpolicy-raspberrypi5 separately), so it is
-# not needed in the Dom0 rootfs. If XSM enforcing is ever used, adjust the recipe
-# FILES for 4.21 to claim xenpolicy (a packaging fix akin to adding the
-# libxenmanage package).
+# xen-tools-flask is deliberately NOT in IMAGE_INSTALL: the XSM policy is not
+# module-loaded during this demo's boot (the hypervisor's own
+# xenpolicy-raspberrypi5 is deployed separately to the boot partition), so it is
+# not needed in the Dom0 rootfs.
+#
+# [4.22] The *other* reason the 4.21 revision of this comment gave -- "xenpolicy
+# is claimed by no package, so xen-tools-flask is empty and dnf fails with
+# 'No match for argument: xen-tools-flask'" -- NO LONGER HOLDS, and the comment
+# has been corrected rather than version-bumped. Measured on 4.22 in build-dom0
+# (the build that assembles this image, where PACKAGECONFIG includes xsm):
+#   FILES:xen-tools-flask = "/boot/xenpolicy-*"      <- claimed, and version-agnostic
+#   package/boot/xenpolicy-4.22.0                    <- produced
+#   packages-split/xen-tools-flask                   <- 20K, NOT empty
+# So adding it back would build today. It stays out on the "not needed" ground
+# above only. If XSM enforcing is ever wanted in the Dom0 rootfs, just add
+# xen-tools-flask to IMAGE_INSTALL -- no packaging fix is required any more.
+# (In build-domd xsm is not in PACKAGECONFIG, so no policy is built there at all.)
 IMAGE_INSTALL = " \
     packagegroup-core-boot \
     base-files \

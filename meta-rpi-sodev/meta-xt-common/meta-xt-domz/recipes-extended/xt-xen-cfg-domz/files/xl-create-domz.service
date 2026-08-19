@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Launch DomZ (Zephyr RTOS domain) via xl create
+# Runs in the toolstack domain: DomD in the Zephyr-Dom0 flavour (which is why the
+# dependency is domd-toolstack-prep, exactly as for xl-create-domu/doma -- there is
+# no xl-created DomD to wait for, Xen builds it dom0less from boot.cmd), Dom0 in
+# the thin-Linux flavour, where xt-linux-dom0-guests ships a drop-in that adds the
+# real toolstack (xenstored) to the dependencies.
+Requires=domd-toolstack-prep.service
+After=domd-toolstack-prep.service
+# Started after the two heavy guests so a slow DomZ start can never delay the
+# cockpit's displays. Ordering only (no Requires): DomZ must still come up when
+# DomU/DomA are not part of the build, or fail to start.
+After=xl-create-doma.service xl-create-domu.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Mount SD p1 (FAT) at /mnt -- domz.cfg has kernel=/mnt/zephyr-domz.bin. Guarded
+# so it is a no-op when another xl-create-* unit mounted it first.
+ExecStartPre=/bin/sh -c '[ -f /mnt/zephyr-domz.bin ] || mount /dev/mmcblk0p1 /mnt'
+# No weston/wayland environment and no display wait here (contrast
+# xl-create-domu.service): DomZ has no device model and no output of its own, its
+# console is the Xen PV console (`xl console DomZ`).
+ExecStart=/usr/sbin/xl create /etc/xen/domz.cfg
+# destroy, NOT `xl shutdown -w`, which the DomU/DomA units use. Those guests are
+# Linux/Android and answer the PV shutdown request; this Zephyr build has no
+# xenstore client at all (its .config has no CONFIG_XEN_STORE_SRV and there is no
+# control/shutdown watcher anywhere in the image), so nothing would ever consume
+# the request: `-w` would block until systemd's stop timeout, get SIGKILLed, and
+# leave DomZ running -- every `systemctl stop`, reboot and shutdown of the
+# toolstack domain would take DefaultTimeoutStopSec longer for nothing.
+# destroy is safe here in a way it is not for DomA: DomZ has no disks, no device
+# model and no filesystem to flush (`disk = []`, `virtio = []`), so there is no
+# state to lose. domz.cfg's on_reboot/on_poweroff never fire for the same reason.
+ExecStop=/usr/sbin/xl destroy DomZ
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

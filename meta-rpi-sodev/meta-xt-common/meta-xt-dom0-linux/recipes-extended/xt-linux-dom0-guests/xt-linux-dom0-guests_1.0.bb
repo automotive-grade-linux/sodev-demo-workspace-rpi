@@ -6,7 +6,7 @@ DESCRIPTION = "\
     (p3 -> xvdb, p4 -> xvdc) to the dom0less DomD, whose `xl devd` then spawns the \
     guest device-models against them. Provides: \
       - xl-attach-disks.service : the Dom0 -> DomD block-attach (existence-guarded). \
-      - xl-create-{domu,doma}.service.d/10-linux-dom0.conf : drop-ins that replace \
+      - xl-create-{domu,doma,domz}.service.d/10-linux-dom0.conf : drop-ins that replace \
         the DomD-only Requires=domd-toolstack-prep.service (a Zephyr-xenstore seeder \
         absent from a Linux Dom0) with Requires on the real toolstack (xenstored) + \
         xl-attach-disks.service. Shipped as drop-ins so the shared xl-create-* units \
@@ -21,6 +21,7 @@ SRC_URI = " \
     file://domd-toolstack-prep.service \
     file://xl-create-domu.service.d/10-linux-dom0.conf \
     file://xl-create-doma.service.d/10-linux-dom0.conf \
+    file://xl-create-domz.service.d/10-linux-dom0.conf \
     "
 
 S = "${UNPACKDIR}"
@@ -48,6 +49,11 @@ do_install() {
     install -d ${D}${systemd_system_unitdir}/xl-create-doma.service.d
     install -m 0644 ${UNPACKDIR}/xl-create-doma.service.d/10-linux-dom0.conf \
         ${D}${systemd_system_unitdir}/xl-create-doma.service.d/10-linux-dom0.conf
+
+    # DomZ (Zephyr RTOS domain): no xl-attach-disks dependency, DomZ has no disk.
+    install -d ${D}${systemd_system_unitdir}/xl-create-domz.service.d
+    install -m 0644 ${UNPACKDIR}/xl-create-domz.service.d/10-linux-dom0.conf \
+        ${D}${systemd_system_unitdir}/xl-create-domz.service.d/10-linux-dom0.conf
 }
 
 FILES:${PN} = " \
@@ -55,4 +61,5 @@ FILES:${PN} = " \
     ${systemd_system_unitdir}/domd-toolstack-prep.service \
     ${systemd_system_unitdir}/xl-create-domu.service.d/10-linux-dom0.conf \
     ${systemd_system_unitdir}/xl-create-doma.service.d/10-linux-dom0.conf \
+    ${systemd_system_unitdir}/xl-create-domz.service.d/10-linux-dom0.conf \
     "

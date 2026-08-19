@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "DomZ (Zephyr DomU) application"
+
+config DOMZ_HEARTBEAT_INTERVAL_MS
+	int "Interval of the liveness log line (ms), 0 to disable"
+	default 10000
+	help
+	  DomZ has no display and no network, so a periodic log line on the Xen
+	  PV console (`xl console DomZ`) is how a bench operator sees that the
+	  domain is alive.
+
+source "Kconfig.zephyr"

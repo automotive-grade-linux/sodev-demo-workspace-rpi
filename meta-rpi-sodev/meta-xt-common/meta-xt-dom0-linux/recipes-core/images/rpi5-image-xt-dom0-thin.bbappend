@@ -15,3 +15,9 @@
 # build must not ship a service that fails every boot). Default "" for standalone parse.
 XT_DOMU_CFG_INSTALL ??= ""
 IMAGE_INSTALL:append = " ${XT_DOMU_CFG_INSTALL}"
+# [ENABLE_DOMZ gate] Same for DomZ (the Zephyr RTOS domain). In THIS flavour Dom0
+# owns the xl toolstack, so domz.cfg + xl-create-domz.service belong in the Dom0
+# rootfs; the moulin dom0-linux conf sets XT_DOMZ_CFG_INSTALL="xt-xen-cfg-domz"
+# when DomZ is built (--domz), else "".
+XT_DOMZ_CFG_INSTALL ??= ""
+IMAGE_INSTALL:append = " ${XT_DOMZ_CFG_INSTALL}"

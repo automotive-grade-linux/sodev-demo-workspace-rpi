@@ -122,6 +122,12 @@ DOMD_RUNTIME_PACKAGES = " \
 # otherwise, so a guest-less build does not pull an unbuildable provider.
 XT_DOMU_CFG_INSTALL ??= ""
 
+# Same gate for DomZ (the Zephyr RTOS domain): the moulin domd conf sets
+# XT_DOMZ_CFG_INSTALL="xt-xen-cfg-domz" for ENABLE_DOMZ=yes and "" otherwise.
+# xt-xen-cfg-domz carries an auto-enabled
+# xl-create-domz.service, so a DomZ-less build must not ship it.
+XT_DOMZ_CFG_INSTALL ??= ""
+
 # Dev-convenience posture, matching the V4H SoDeV reference (see the security note
 # in the top-level README before deploying outside a closed lab).
 IMAGE_FEATURES:append = " empty-root-password allow-empty-password allow-root-login ssh-server-openssh"
@@ -133,6 +139,7 @@ IMAGE_INSTALL:append = " \
     ${DEBUG_PACKAGES} \
     ${DOMD_RUNTIME_PACKAGES} \
     ${XT_DOMU_CFG_INSTALL} \
+    ${XT_DOMZ_CFG_INSTALL} \
 "
 
 BAD_RECOMMENDATIONS += "busybox-syslog"
