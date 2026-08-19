@@ -50,7 +50,11 @@
 	gic: gic {
 		#interrupt-cells = <0x3>;
 		interrupt-controller;
-		phandle = <0xfde8>;		/* GUEST_PHANDLE_GIC */
+		/* GUEST_PHANDLE_GIC: required by libxl (it hard-codes this value for
+		 * the GIC node it generates); the dom0less path reads it back from
+		 * here instead (init_intc_phandle) and needs xen 4.22-0006 to accept
+		 * a reserved-range phandle in a fragment. */
+		phandle = <0xfde8>;
 		linux,phandle = <0xfde8>;
 	};
 
@@ -232,7 +236,11 @@
 			#address-cells = <0x2>;
 			#size-cells = <0x2>;
 			ranges;
-			dma-ranges = <0x0 0xc8000000 0x0 0x08000000 0x0 0x18000000>;
+			/* identity: the firmware rewrites /emmc2bus dma-ranges to
+			 * <0x0 0x0 0x0 0x0 0xfc000000> before boot -- emmc2 is NOT
+			 * behind the low-1 GiB VideoCore alias. See the long note in
+			 * ../../../recipes-guest/domd-vc4/files/*-domd-vc4.dts. */
+			dma-ranges = <0x0 0x0 0x0 0x0 0x0 0xfc000000>;
 		};
 	};
 };

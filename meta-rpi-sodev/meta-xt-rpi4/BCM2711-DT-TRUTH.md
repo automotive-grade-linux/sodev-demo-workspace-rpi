@@ -44,7 +44,11 @@ These values are the sole justification for the board DTS, the boot scripts, the
 
 /emmc2bus        simple-bus  2/1
   ranges     = <0x0 0x7e000000 0x0 0xfe000000 0x1800000>
-  dma-ranges = <0x0 0xc0000000 0x0 0x00000000 0x40000000> <- SD (emmc2) also low 1 GB only
+  dma-ranges = <0x0 0xc0000000 0x0 0x00000000 0x40000000> <- IN THE FILE ONLY
+  dma-ranges = <0x0 0x00000000 0x0 0x00000000 0xfc000000> <- RUNNING DT: the firmware
+     rewrites this one to IDENTITY over the usable 3.94 GiB, so emmc2 is NOT behind the
+     low-1 GiB VideoCore alias (verified 2026-08-18 with `fdt print /emmc2bus` in U-Boot).
+     Carrying the file value into a guest DT corrupts every SD DMA transfer.
 
 /scb             simple-bus  2/2
   ranges     = <0x0 0x7c000000 0x0 0xfc000000 0x0 0x3800000>,
@@ -186,9 +190,23 @@ For `clocks = <&firmware_clocks N>`:
 
 ## 4. Interrupt types to watch on this board
 
-* The HDMI L2 intc (`@7ef00100`) has GIC `interrupts = <0x0 96 0x1>`, i.e.
-  **EDGE_RISING** — not BCM2712's LEVEL_HIGH. The type has to be preserved when the
-  line is handed to Xen's vGIC.
+* The HDMI L2 intc (`@7ef00100`) is **LEVEL_HIGH**, the same as BCM2712's.
+  ⚠ **Do not take this one from the prebuilt dtb.** The `bcm2711-rpi-4-b.dtb` that
+  `raspberrypi/firmware` distributes — and that section 5 below tells you to decompile —
+  still says `<0x0 96 0x1>` (EDGE_RISING). That value is **stale**: it is what
+  raspberrypi/linux carried up to `rpi-5.15.y`. Measured 2026-09-02:
+
+  | source | SPI 96 |
+  |---|---|
+  | mainline Linux v5.19 / v6.0 / v6.1 / master | `IRQ_TYPE_LEVEL_HIGH` |
+  | raspberrypi/linux `rpi-6.1.y` … `rpi-6.18.y` (pinned here) | `IRQ_TYPE_LEVEL_HIGH` |
+  | raspberrypi/linux `rpi-5.10.y` / `rpi-5.15.y` | `IRQ_TYPE_EDGE_RISING` |
+  | `raspberrypi/firmware` prebuilt dtb (shipped on p1) | `EDGE_RISING` — stale |
+
+  So for interrupt **types**, read the kernel source of the pinned tree, not the prebuilt.
+  Everything else in this document is a faithful record of the prebuilt and stands.
+  Getting this wrong is not academic: it panicked DomD on hardware, see
+  `docs/TROUBLESHOOTING.md`, "DomD panics in `brcmstb_l2_intc` during boot".
 * `hvs` is wired **straight to the GIC as SPI 97**, unlike BCM2712 where it goes through
   an L2 controller.
 * `pixelvalve1` and `pixelvalve4` **share SPI 110**. That is what the real DT says.

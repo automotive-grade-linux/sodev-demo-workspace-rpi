@@ -16,7 +16,7 @@
  *   &cpu_l2_irq  &disp_intr  &bsc_irq  &mop  &moplet  &dma32  &dma40
  * On BCM2711 there is a single display L2 interrupt controller — labelled
  * `aon_intr` here as well (/soc/interrupt-controller@7ef00100, GIC SPI 96,
- * EDGE_RISING) — HVS is wired straight to GIC SPI 97, and the transposer role
+ * LEVEL_HIGH) — HVS is wired straight to GIC SPI 97, and the transposer role
  * that BCM2712 splits into mop/moplet is the plain `txp`.
  *
  * Pixelvalves: vc4_crtc.c binds HDMI0 to bcm2711_pv2_data and HDMI1 to

@@ -174,7 +174,7 @@
  * present in the shipped DTB (BCM2711-DT-TRUTH.md §2).
  *
  * `aon_intr` is BCM2711's single display/HDMI L2 interrupt controller
- * (/soc/interrupt-controller@7ef00100, GIC SPI 96, EDGE_RISING). BCM2712's
+ * (/soc/interrupt-controller@7ef00100, GIC SPI 96, LEVEL_HIGH). BCM2712's
  * separate disp_intr / bsc_irq / mop / moplet do not exist here, and HVS is
  * wired straight to GIC SPI 97 instead of through an L2 controller.
  *

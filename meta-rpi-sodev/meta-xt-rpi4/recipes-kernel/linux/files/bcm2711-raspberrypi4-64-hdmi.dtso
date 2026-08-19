@@ -33,7 +33,11 @@
 
 &soc_bus {
 	/*
-	 * Display/HDMI L2 interrupt controller. Owns the 0xfef00000 page, which
+	 * Display/HDMI L2 interrupt controller. LEVEL_HIGH, per mainline Linux and
+	 * raspberrypi/linux >= rpi-6.1.y (the bcm2711-rpi-4-b.dtb that
+	 * raspberrypi/firmware distributes still carries the pre-6.1 EDGE_RISING
+	 * value and is stale -- see BCM2711-DT-TRUTH.md section 4).
+	 * Owns the 0xfef00000 page, which
 	 * also contains dvp, HDMI0's hdmi/dvp/phy/rm/csc blocks, HDMI1's csc and
 	 * ddc0's auto-i2c window — so it is the single xen,reg owner for that
 	 * page and the one node that needs GIC SPI 96 routed.
@@ -41,7 +45,7 @@
 	aon_intr: interrupt-controller@fef00100 {
 		compatible = "brcm,bcm2711-l2-intc", "brcm,l2-intc";
 		reg = <0x0 0xfef00100 0x0 0x30>;
-		interrupts = <0x0 96 0x1>;		/* GIC SPI 96 EDGE_RISING */
+		interrupts = <0x0 96 0x4>;		/* GIC SPI 96 LEVEL_HIGH */
 		interrupt-parent = <&gic>;
 		interrupt-controller;
 		#interrupt-cells = <0x1>;

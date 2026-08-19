@@ -47,17 +47,26 @@
  * DMA: the central BCM2711 difference
  * ===========================================================================
  * BCM2711 has no IOMMU and its legacy peripherals address DRAM through the
- * VideoCore bus alias at 0xc0000000, limited to the low 1 GiB:
- *     /soc      dma-ranges = <0xc0000000 0x0 0x0     0x40000000>
- *     /emmc2bus dma-ranges = <0x0 0xc0000000 0x0 0x0 0x40000000>
- * A `dma_addr` handed to the VideoCore, the HVS or emmc2 must therefore be
- * (phys + 0xc0000000) and phys must be < 1 GiB. GENET (/scb, 16 GiB) and V3D
+ * VideoCore bus alias at 0xc0000000, limited to the low 1 GiB. Read the values
+ * from the RUNNING tree, not from bcm2711-rpi-4-b.dtb: the firmware rewrites
+ * some of them before boot (`fdt print /soc` / `/emmc2bus` at the U-Boot
+ * prompt). What the two look like on a 4 GiB board:
+ *     /soc      dma-ranges = <0xc0000000 0x0 0x0 0x40000000>   (alias, low 1 GiB)
+ *                            <0x7c000000 0x0 0xfc000000 0x3800000>
+ *     /emmc2bus dma-ranges = <0x0 0x0 0x0 0x0 0xfc000000>      (IDENTITY, 3.94 GiB)
+ * The file ships <0x0 0xc0000000 0x0 0x0 0x40000000> for /emmc2bus; the
+ * firmware replaces it. So a dma_addr handed to the VideoCore or the HVS must
+ * be (phys + 0xc0000000) with phys < 1 GiB, but one handed to emmc2 is the
+ * plain physical address -- see the note at emmc2_bus below for what carrying
+ * the pre-fixup alias to emmc2 did on hardware. GENET (/scb, 16 GiB) and V3D
  * (/v3dbus, own MMU) are identity-mapped and unrestricted.
  *
  * That is modelled with three intermediate simple-bus wrappers, each carrying
  * only the dma-ranges its children need (MMIO stays identity via `ranges;`):
- *     soc_bus   / emmc2_bus  ->  <0x0 0xc8000000  0x0 0x08000000  0x0 0x18000000>
+ *     soc_bus                ->  <0x0 0xc8000000  0x0 0x08000000  0x0 0x18000000>
  *                                bus 0xc8000000 == phys 0x08000000, 384 MiB
+ *     emmc2_bus              ->  <0x0 0x0  0x0 0x0  0x0 0xfc000000>
+ *                                identity, as the firmware-fixed host DT has it
  *     scb_bus   / v3d_bus    ->  identity
  * 0x08000000+0x18000000 is exactly DomD static-mem bank1 from
  * bcm2711-raspberrypi4-64-xen.dtso, i.e. the only DomD RAM the VideoCore can see.
@@ -96,11 +105,20 @@
 	 * <&gic> references inside /passthrough at build time.
 	 *
 	 * The phandle is hard-coded to GUEST_PHANDLE_GIC (65000 = 0xfde8) from
-	 * xen/include/public/device_tree_defs.h, which is the value Xen gives
-	 * the vGIC node it generates (prepare_dtb_domU: kinfo->phandle_intc =
-	 * GUEST_PHANDLE_GIC). Without the hard-code dtc would pick a small
-	 * phandle and every interrupt-parent inside /passthrough would point at
-	 * a non-existent node -> no IRQs in DomD -> vc4-drm never binds.
+	 * xen/include/public/device_tree_defs.h because THIS FRAGMENT IS ALSO
+	 * USED BY libxl: domd.cfg names it in `device_tree =`, and libxl gives
+	 * the GIC node it generates a hard-coded GUEST_PHANDLE_GIC
+	 * (libxl_arm.c make_gicv{2,3}_node()). A lower value would leave every
+	 * interrupt-parent inside /passthrough pointing at a non-existent node
+	 * on that path -> no IRQs in DomD -> vc4-drm never binds.
+	 *
+	 * On the dom0less path the value is NOT required to be 65000: Xen reads
+	 * it back from this node (init_intc_phandle()) and gives its generated
+	 * vGIC the same phandle -- GUEST_PHANDLE_GIC is merely the default
+	 * prepare_dtb_domU() starts from. Xen 4.22 then REJECTS a fragment whose
+	 * highest phandle is in the reserved range ("Device tree generation
+	 * failed (-75)", panic, reboot loop); that is an upstream regression
+	 * fixed here by xen patch 4.22-0006, not a reason to change this value.
 	 */
 	gic: gic {
 		#interrupt-cells = <0x3>;
@@ -315,10 +333,35 @@
 			 * ---- Display/HDMI L2 interrupt controller ----
 			 * BCM2711 has exactly ONE L2 controller in the display
 			 * area (/soc/interrupt-controller@7ef00100, host label
-			 * "aon_intr"), GIC SPI 96 and — note — EDGE_RISING, not
-			 * LEVEL_HIGH. BCM2712's disp_intr / bsc_irq / mop /
-			 * moplet have no BCM2711 equivalent, and BCM2711's HVS
-			 * is wired straight to the GIC instead.
+			 * "aon_intr"), GIC SPI 96, LEVEL_HIGH. BCM2712's
+			 * disp_intr / bsc_irq / mop / moplet have no BCM2711
+			 * equivalent, and BCM2711's HVS is wired straight to the
+			 * GIC instead.
+			 *
+			 * The type is LEVEL_HIGH, matching mainline Linux (which
+			 * has said so since at least v5.19) and raspberrypi/linux
+			 * from rpi-6.1.y onwards, including the 6.18 pinned here.
+			 * It is NOT edge, despite what the bcm2711-rpi-4-b.dtb
+			 * that raspberrypi/firmware distributes still says: that
+			 * prebuilt carries the pre-6.1 EDGE_RISING value and is
+			 * simply stale. rpi-5.10.y/5.15.y had EDGE_RISING too.
+			 *
+			 * This is load-bearing, measured on hardware 2026-09-02.
+			 * The brcmstb-l2 driver masks all 32 child sources and
+			 * clears their status at the top of its probe, so the
+			 * controller's output line is low by the time it chains
+			 * the parent. With a level type that means no pending
+			 * parent and the probe finishes quietly. With an edge
+			 * type a rising edge latched earlier -- during the
+			 * firmware's HDMI/EDID work, before Linux runs -- stays
+			 * pending regardless of the line, gets re-sent the moment
+			 * irq_set_chained_handler_and_data() starts the parent,
+			 * and DomD dies in an initcall with
+			 *   brcmstb_l2_intc_irq_handle+0x40
+			 *   Kernel panic: Fatal exception in interrupt
+			 * (the handler's first dereference happens before the
+			 * driver assigns data->gc; see the 0013 patch in
+			 * meta-xt-driver-domain, which closes that window too).
 			 *
 			 * aon_intr owns the 0xfef00000 page, which also contains
 			 * dvp (0xfef00000), the HDMI0 csc/dvp/hdmi/phy/rm blocks
@@ -328,7 +371,7 @@
 			aon_intr: interrupt-controller@fef00100 {
 				compatible = "brcm,bcm2711-l2-intc", "brcm,l2-intc";
 				reg = <0x0 0xfef00100 0x0 0x30>;
-				interrupts = <0x0 96 0x1>;	/* GIC SPI 96 EDGE_RISING */
+				interrupts = <0x0 96 0x4>;	/* GIC SPI 96 LEVEL_HIGH */
 				interrupt-parent = <&gic>;
 				interrupt-controller;
 				#interrupt-cells = <0x1>;
@@ -732,7 +775,7 @@
 			 *     (msi-controller + msi-parent = <&pcie0>), raising
 			 *     GIC SPI 148; there is no separate MIP to pass
 			 *     through and no msi-ranges quirk, so the RPi5
-			 *     `4.21-0002-route-msi-ranges` patch has no RPi4
+			 *     `4.22-0002-route-msi-ranges` patch has no RPi4
 			 *     counterpart and was dropped from the bbappend.
 			 *   - the MSI doorbell is a PCI bus address captured by
 			 *     the RC's internal MSI BAR; the write never reaches
@@ -968,17 +1011,37 @@
 		 * dtc drops comments, so the zephyr DTB is byte-identical with these
 		 * markers present.
 		 * ------------------------------------------------------------------
-		 * emmc2_bus mirrors the host /emmc2bus wrapper, including its
-		 * dma-ranges: the SD controller is subject to the same low-1 GiB
-		 * VideoCore alias as the mailbox, which is exactly why SD and the
-		 * display complex have to live in the SAME domain on RPi4.
+		 * emmc2_bus mirrors the host /emmc2bus wrapper, but NOT its dma-ranges
+		 * as they appear in the shipped bcm2711-rpi-4-b.dtb. The RPi4 firmware
+		 * REWRITES that property before handing the DT to the bootloader:
+		 *
+		 *   bcm2711-rpi-4-b.dtb (file)   dma-ranges = <0x0 0xc0000000 0x0 0x0 0x40000000>
+		 *   running DT (after fixup)     dma-ranges = <0x0 0x0        0x0 0x0 0xfc000000>
+		 *
+		 * i.e. emmc2 addresses RAM DIRECTLY, identity-mapped over the whole
+		 * usable 3.94 GiB -- it is NOT behind the low-1 GiB VideoCore alias that
+		 * /soc (mailbox, VPU) still uses. Read back from the live tree with
+		 * `fdt print /emmc2bus` at the U-Boot prompt.
+		 *
+		 * Carrying the file's pre-fixup alias here made DomD add 0xc0000000 to
+		 * every SD DMA address, so the controller read and wrote at addresses
+		 * that were not the buffers Linux had prepared. The data came back
+		 * corrupted, which surfaced as (hardware, 2026-08-05 and 2026-08-18,
+		 * two cards from different vendors):
+		 *   ADMA:  mmc0: ADMA error: 0x02000000 -> error -5, retried forever
+		 *          mmc0: unrecognised SCR structure version 4   (garbage SCR)
+		 *   SDMA:  mmc0: invalid bus width -> error -22          (garbage SCR)
+		 *   PIO:   works (no bus-master DMA at all)
+		 * and was very nearly written off as a media-specific quirk needing a
+		 * PIO fallback. With the identity mapping below the card comes up at
+		 * full DDR50 with ADMA and zero errors, no quirk needed.
 		 * ------------------------------------------------------------------ */
 		emmc2_bus: emmc2-bus {
 			compatible = "simple-bus";
 			#address-cells = <0x2>;
 			#size-cells = <0x2>;
 			ranges;
-			dma-ranges = <0x0 0xc8000000 0x0 0x08000000 0x0 0x18000000>;
+			dma-ranges = <0x0 0x0 0x0 0x0 0x0 0xfc000000>;
 
 			emmc2: mmc@fe340000 {
 				compatible = "brcm,bcm2711-emmc2";
