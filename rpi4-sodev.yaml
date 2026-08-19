@@ -1336,8 +1336,8 @@ components:
     build-dir: "%{ANDROID_KERNEL_DIR}"
     sources:
       - type: repo
-        url: https://github.com/yhamamachi/android_kernel_manifest.git
-        rev: ac2ea7005b35c3151af33fa6a7ddac3a775688c6
+        url: https://github.com/yuichi-kusakabe/android_kernel_manifest.git
+        rev: a3dfad8b370ca1a68894e477e9d2a0fd35cb604e
         manifest: pinned-common-android17-6.18.xml
         depth: 1
         groups: "%{XT_DOMA_SOURCE_GROUP}"
