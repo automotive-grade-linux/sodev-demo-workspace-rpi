@@ -1,0 +1,42 @@
+From 9530cdb2de5bc3da182b4273fa706f8354721e7c Mon Sep 17 00:00:00 2001
+From: Bruce Ashfield <bruce.ashfield@gmail.com>
+Date: Fri, 21 Nov 2025 15:05:25 -0500
+Subject: [PATCH] tests/vpci: drop explicit -g use
+
+The explicit use of -g is embedded debug information and paths
+into the output files, which breaks QA. Investigating how to
+mitigate this via prefix maps is a future TODO item. For now,
+we just stop using -g
+
+Upstream-Status: Inappropriate [oe specific]
+
+Local-Modifications: refreshed against xenbits stable-4.22 (d45d5687f1) by
+ Yuichi Kusakabe <yuichi_kusakabe@jp.honda>. Only the hunk context changed:
+ upstream c6f5590c93 ("vPCI: introduce private header") added a `private.h`
+ prerequisite and `-include emul.h` to the $(TARGET) rule, so the 4.21-era
+ context no longer matched. The change itself is unaltered -- the same removal
+ of the explicit `-g` token, one line, nothing else. The `-g` is still present
+ in 4.22, so this patch is still required; it is NOT upstream (see the
+ Upstream-Status above) and must not be dropped from SRC_URI.
+
+Signed-off-by: Bruce Ashfield <bruce.ashfield@gmail.com>
+---
+ tools/tests/vpci/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/tests/vpci/Makefile b/tools/tests/vpci/Makefile
+index 28b6009332..f678aed911 100644
+--- a/tools/tests/vpci/Makefile
++++ b/tools/tests/vpci/Makefile
+@@ -15,7 +15,7 @@ else
+ endif
+ 
+ $(TARGET): vpci.c vpci.h list.h private.h main.c emul.h
+-	$(CC) $(CFLAGS_xeninclude) -include emul.h -g -o $@ vpci.c main.c
++	$(CC) $(CFLAGS_xeninclude) -include emul.h -o $@ vpci.c main.c
+ 
+ .PHONY: clean
+ clean:
+-- 
+2.39.2
+
