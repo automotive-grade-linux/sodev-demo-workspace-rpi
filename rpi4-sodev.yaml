@@ -1320,17 +1320,38 @@ components:
   #                            and 1086 without, the device being the difference. See
   #                            XT_DOMA_SOURCE_GROUP at the top of this file.
   #
-  # Both components point at the upstream manifest repositories, pinned by commit.
-  # This is the end state; the two commits after this one move each url to a fork of
-  # it, because one change per manifest is not in the upstream branch. Read those
-  # commits for which is which and why, and revert them to come back here.
+  # ⚠ THE TWO url VALUES BELOW NAME THE AUTHOR'S FORKS, not the upstream repositories.
+  # Each fork is upstream's own branch with exactly one commit on top, and nothing else:
   #
-  #   git ls-remote https://github.com/yhamamachi/android_manifest        android-17-xenvm-sh-main
-  #   git ls-remote https://github.com/yhamamachi/android_kernel_manifest android-17-xenvm-sh-main
+  #   AOSP tree   fork branch android-17-xenvm-rpi-device (tag rpi4-device-v1)
+  #               = upstream android-17-xenvm-sh-main + the Pi 4 device project.
+  #               That project is NOT submitted upstream and there is no pull request
+  #               for it: the change is one <project> line naming an AGL-hosted
+  #               repository, in the notdefault group, which is of no use to anyone
+  #               who does not build this board, so it is carried on the fork instead
+  #               of asking the upstream manifest to hold it.
+  #               The Mesa 25.3.6 pin is NO LONGER carried here: it was merged upstream
+  #               (squashed, so the commit id differs, but the resulting tree is
+  #               identical -- verified) and now comes from the branch itself.
+  #   GKI kernel  fork branch android-17-xenvm-rpi-pinned
+  #               = upstream android-17-xenvm-sh-main + the pinned manifest.
+  #               https://github.com/yhamamachi/android_kernel_manifest/pull/1 (open)
   #
-  # Move BOTH boards' yaml in the same change -- if one board went to upstream while
-  # the other stayed on a fork they would stop sharing one revision, which is the
-  # asymmetry a single pinned rev exists to avoid.
+  # So DomA builds from a clean checkout as it stands, and each fork is one commit away
+  # from upstream. The branches and the tag are never force-pushed, and the fork stays
+  # public: a revision pinned here has to stay fetchable for as long as this file names
+  # it, and for the AOSP side that is open-ended rather than until a merge.
+  #
+  # What would move each url back to yhamamachi:
+  #   GKI kernel  its pull request landing. Then take the upstream revision:
+  #               git ls-remote https://github.com/yhamamachi/android_kernel_manifest android-17-xenvm-sh-main
+  #   AOSP tree   only a decision to submit the Pi 4 device project upstream after all.
+  #               Until then this url stays on the fork by design, not by oversight.
+  # Move BOTH boards' yaml in the same change -- if one board went to upstream while the
+  # other stayed on a fork they would stop sharing one revision, which is the asymmetry
+  # a single pinned rev exists to avoid.
+  # Everything else in this workspace builds and runs without either fork
+  # (--aaos=prebuilt, or a build without -a).
   # =========================================================================
   doma_kernel:
     build-dir: "%{ANDROID_KERNEL_DIR}"
@@ -1372,8 +1393,8 @@ components:
     build-dir: "%{DOMA_DIR}"
     sources:
       - type: repo
-        url: https://github.com/yhamamachi/android_manifest.git
-        rev: 97bc72216187c83f6fb02a33607d31feab442162
+        url: https://github.com/yuichi-kusakabe/android_manifest.git
+        rev: 0fbae046b5f6d10ee721c9f71a60cc21c03139b9
         manifest: default.xml
         depth: 1
         groups: "%{XT_DOMA_SOURCE_GROUP}"

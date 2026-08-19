@@ -855,10 +855,16 @@ manifest added alongside the branch-tracking one (the kernel component selects i
 AGL-hosted repository in the `notdefault` group, of no use to anyone not building this
 board, so it is carried on a fork rather than asked of the upstream manifest.
 
-Both `url:` values name the upstream repositories, pinned by commit. The two commits at
-the end of this series move each of them to a fork that carries the change missing from
-the upstream branch; read those two for which is which, and revert them to come back
-here. The upstream Google
+⚠ **Both `url:` values therefore point at the author's forks** —
+`yuichi-kusakabe/android_manifest` @ `android-17-xenvm-rpi-device` (tag
+`rpi4-device-v1`) and `yuichi-kusakabe/android_kernel_manifest` @
+`android-17-xenvm-rpi-pinned`. Each is upstream's own branch plus that one commit and
+nothing else, so DomA builds from a clean checkout. **Each pin is its own commit at the
+end of the series**, so the kernel one can be reverted when its pull request lands
+without touching the AOSP one. Those refs are never force-pushed and the fork stays
+public, because a pinned revision has to stay fetchable for as long as the yaml names
+it — open-ended on the AOSP side, until the merge on the kernel side. The yamls say what
+would move each url back. The upstream Google
 copy of the trout Yocto layer points at `partner-android.googlesource.com` and
 `sso://googleplex-android/`, neither of which is anonymously reachable — the EPAM fork
 is what makes a clean build possible.
