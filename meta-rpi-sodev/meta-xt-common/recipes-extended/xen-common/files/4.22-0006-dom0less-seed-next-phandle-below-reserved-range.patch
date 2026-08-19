@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 18 Aug 2026 10:18:06 +0900
+Subject: [PATCH] xen/dom0less: seed next_phandle below the reserved range
+
+a010efd323 ("xen/dom0less: introduce next_phandle in struct kernel_info")
+seeds kinfo->next_phandle with fdt_generate_phandle(), which returns one
+past the *highest* phandle in the partial FDT, and then refuses the domain
+when that value falls inside the Xen-reserved range:
+
+    if ( kinfo->next_phandle >= GUEST_PHANDLE_GIC )
+        res = -EOVERFLOW;
+
+Every partial FDT written for the documented passthrough idiom trips this.
+The dummy /gic placeholder is expected to carry GUEST_PHANDLE_GIC (65000):
+
+  * libxl gives the GIC node it generates for an xl-created guest exactly
+    that value (tools/libs/light/libxl_arm.c: make_gicv{2,3}_node()), so a
+    fragment shared between `xl create device_tree=` and dom0less has to use
+    it or its interrupt-parent references dangle;
+  * dom0less itself used the same constant unconditionally up to 4.21 --
+    prepare_dtb_domU() set kinfo->phandle_intc = GUEST_PHANDLE_GIC and only
+    then let init_intc_phandle() override it from the fragment -- so every
+    existing fragment was written against it;
+  * a010efd323's own commit message says the pfdt "may already contain a
+    dummy interrupt controller node with a phandle assigned to it".
+
+fdt_generate_phandle() therefore returns GUEST_PHANDLE_GIC + 1, which is
+GUEST_PHANDLE_IOMMU, and the domain is rejected before any node is copied.
+On a dom0less system that is fatal: construct_domU() fails, the toolstack
+domain is never built, and Xen panics with
+
+    (XEN) Device tree generation failed (-75).
+    (XEN) Panic on CPU 0: Could not set up domain domD (rc = -22)
+
+The purpose of next_phandle is to let Xen allocate phandles for the nodes
+it generates without colliding with the fragment's own, and alloc_phandle()
+must keep those below the reserved range. A phandle the fragment merely
+declares in that range does not constrain that: what matters is the highest
+phandle Xen must not reuse *among the values it may allocate*. So seed
+next_phandle from the highest phandle strictly below GUEST_PHANDLE_GIC,
+which leaves the guarantee intact while accepting the reserved placeholder.
+
+The >= GUEST_PHANDLE_GIC check is kept: a fragment that really has consumed
+the phandle space right up to the reserved range still has to be refused,
+because alloc_phandle() would have nothing left to hand out.
+
+Scope note for review: this ignores every phandle at or above the limit, not
+just the intc placeholder's. A fragment that put a reserved-range phandle on
+some other node would be accepted here where upstream refused it; if that node
+is copied into the guest DT (only /aliases and /passthrough are), its phandle
+could then collide with the vGIC node Xen generates at GUEST_PHANDLE_GIC. The
+fragments in this workspace do not do that -- the rpi4 DomD partial FDT carries
+65000 on /gic and 1..16 under /passthrough, nothing else -- but narrowing the
+exemption to the node init_intc_phandle() accepts would be the stricter form,
+and is the shape to propose if this goes to xen-devel.
+
+Upstream-Status: Pending
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+---
+ xen/common/device-tree/dom0less-build.c | 44 +++++++++++++++++++++-----
+ 1 file changed, 36 insertions(+), 8 deletions(-)
+
+--- a/xen/common/device-tree/dom0less-build.c
++++ b/xen/common/device-tree/dom0less-build.c
+@@ -388,6 +388,33 @@
+     return 0;
+ }
+ 
++/*
++ * Highest phandle in the partial FDT that is strictly below @limit, or 0 when
++ * the FDT declares none. Values at or above @limit are ignored on purpose: the
++ * documented passthrough idiom has the dummy /gic placeholder carry
++ * GUEST_PHANDLE_GIC, and libxl gives the GIC node it generates for xl-created
++ * guests the same value, so a fragment usable from both paths always declares
++ * one. Those phandles are never handed out by alloc_phandle(), so they do not
++ * constrain where Xen's own allocations have to start.
++ */
++static uint32_t __init pfdt_max_phandle_below(const void *pfdt, uint32_t limit)
++{
++    uint32_t max = 0;
++    int offset;
++
++    for ( offset = fdt_next_node(pfdt, -1, NULL);
++          offset >= 0;
++          offset = fdt_next_node(pfdt, offset, NULL) )
++    {
++        uint32_t phandle = fdt_get_phandle(pfdt, offset);
++
++        if ( phandle && phandle < limit && phandle > max )
++            max = phandle;
++    }
++
++    return max;
++}
++
+ static int __init domain_handle_dtb_boot_module(struct domain *d,
+                                                 struct kernel_info *kinfo)
+ {
+@@ -403,16 +430,17 @@
+         goto out;
+ 
+     /*
+-     * Find the highest phandle in the partial FDT so next_phandle starts
+-     * above it, avoiding collisions with pfdt's own phandle assignments.
++     * Find the highest phandle below the Xen-reserved range so next_phandle
++     * starts above it, avoiding collisions with the pfdt's own assignments
++     * without rejecting the reserved GUEST_PHANDLE_GIC that the dummy
++     * interrupt controller placeholder is expected to carry.
+      */
+-    res = fdt_generate_phandle(pfdt, &kinfo->next_phandle);
+-    if ( res )
+-    {
+-        res = (res == -FDT_ERR_NOPHANDLES) ? -EOVERFLOW : -EINVAL;
+-        goto out;
+-    }
++    kinfo->next_phandle = pfdt_max_phandle_below(pfdt, GUEST_PHANDLE_GIC) + 1;
+ 
++    /*
++     * Only reachable when the fragment has consumed the phandle space right up
++     * to the reserved range, leaving alloc_phandle() nothing to hand out.
++     */
+     if ( kinfo->next_phandle >= GUEST_PHANDLE_GIC )
+     {
+         dprintk(XENLOG_ERR, "Phandle allocation overlaps Xen reserved range\n");
+--
+2.43.0
+

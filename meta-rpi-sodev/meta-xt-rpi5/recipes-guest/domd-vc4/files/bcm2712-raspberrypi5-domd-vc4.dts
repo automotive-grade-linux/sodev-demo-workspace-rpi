@@ -48,14 +48,22 @@
 		interrupt-controller;
 		/*
 		 * Hard-code phandle to GUEST_PHANDLE_GIC (= 65000 = 0xfde8) from
-		 * xen/include/public/device_tree_defs.h. libxl prepare_dtb() does
-		 * NOT copy this root-level dummy gic node (only /passthrough +
-		 * /aliases get copied). However, all `interrupt-parent = <&gic>`
-		 * references inside /passthrough are emitted as phandle values that
-		 * must match the libxl-generated GIC node (make_gicv2_node sets
-		 * phandle=65000). Without this hard-code, dtc auto-assigns a small
-		 * phandle (e.g. 1) and partial-DT &gic refs point to a non-existent
-		 * node -> DomD kernel IRQ resolution fails -> vc4-drm bind fails.
+		 * xen/include/public/device_tree_defs.h. This fragment is used on
+		 * BOTH paths and only libxl constrains the value: domd.cfg names it
+		 * in `device_tree =`, libxl does NOT copy this root-level dummy gic
+		 * node (only /passthrough + /aliases get copied), and it gives the
+		 * GIC node it generates a hard-coded GUEST_PHANDLE_GIC
+		 * (make_gicv{2,3}_node()). Every `interrupt-parent = <&gic>` inside
+		 * /passthrough is emitted as that phandle value, so a lower one
+		 * would dangle there -> DomD kernel IRQ resolution fails -> vc4-drm
+		 * bind fails.
+		 *
+		 * The dom0less path does not constrain it: Xen reads the value back
+		 * from this node (init_intc_phandle()) and gives its generated vGIC
+		 * the same phandle. Xen 4.22 does reject a fragment whose highest
+		 * phandle is in the reserved range ("Device tree generation failed
+		 * (-75)" then a panic on domain creation) -- an upstream regression
+		 * fixed by xen patch 4.22-0006, not a reason to change this value.
 		 */
 		phandle = <0xfde8>;
 		linux,phandle = <0xfde8>;
