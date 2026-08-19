@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 17 Aug 2026 16:18:17 +0900
+Subject: [PATCH] xen/public: allow domctl interface version 0x18 (Xen 4.22)
+
+Widen CONFIG_XEN_DOMCTL_INTERFACE_VERSION's Kconfig range to 0x18 and move the
+default there, so this Dom0 can talk to Xen 4.22.
+
+Xen bumped XEN_DOMCTL_INTERFACE_VERSION from 0x17 to 0x18 for 4.22 (the "Last
+version bump" comment in xen/include/public/domctl.h moves from 4.19 to 4.22).
+The vendored symbol was capped at `range 0x15 0x17`, and an out-of-range value
+is not an error in kconfiglib -- it is discarded with a warning and the symbol
+falls back to its default. Measured with this tree's own
+scripts/kconfig/kconfiglib.py, feeding CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
+to a symbol declared `range 0x15 0x17`:
+
+  warning: user value 0x18 on the hex symbol XEN_DOMCTL_INTERFACE_VERSION
+  ignored due to being outside the active range ([0x15, 0x17])
+  -- falling back on defaults
+  resulting str_value = 0x17
+
+So without this patch, setting 0x18 in boards/rpi_5.conf (0008) or boards/rpi_4b.conf (0019), or via a
+`west build -D` flag from the moulin builder (rpi5-sodev.yaml) has no effect:
+the build stays green, the hypercall interface_version keeps saying 0x17, and
+Xen 4.22 rejects every domctl. The visible symptom is a Dom0 that boots but
+whose `xu list` prints nothing and whose domain creation fails -- with nothing
+in the build log to point at.
+
+This is the same treatment patch 0022 applied to
+CONFIG_XEN_SYSCTL_INTERFACE_VERSION for 4.21 (range 0x15 0x15 -> 0x15 0x16),
+for the same reason and with the same failure mode. The sysctl version is
+unchanged in 4.22 (still 0x16), so 0022 needs no follow-up.
+
+No ABI struct change accompanies this. struct xen_arch_domainconfig is 16 bytes
+in both 4.21 and 4.22 -- 4.22's new v8r_el1_msa/pad fields occupy padding 4.21
+already had -- and on this stack the struct comes from zephyr-xenlib, whose copy
+is 16 bytes too (0024 removed Zephyr's vendored 12-byte one), so there is no size
+difference left to reconcile. xen_domctl_getdomaininfo is 120 bytes on both
+sides. Patch 0018
+zeroes the createdomain argument, so Xen 4.22 reads v8r_el1_msa as
+XEN_DOMCTL_CONFIG_ARM_V8R_EL1_MSA_NONE, which
+v8r_el1_msa_domain_sanitise_config() accepts on a non-MPU build.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/arch/arm64/core/xen/Kconfig b/arch/arm64/core/xen/Kconfig
+index d6b640b0331..9686b716b00 100644
+--- a/arch/arm64/core/xen/Kconfig
++++ b/arch/arm64/core/xen/Kconfig
+@@ -36,8 +36,16 @@ config XEN_INTERFACE_VERSION
+ 
+ config XEN_DOMCTL_INTERFACE_VERSION
+ 	hex "Xen Domctl interface version"
+-	default 0x17
+-	range 0x15 0x17
++	default 0x18
++	# allow 0x18 = Xen 4.22 (same treatment as the sysctl range widened by
++	# 0022). Without widening the range, a CONFIG_XEN_DOMCTL_INTERFACE_VERSION
++	# =0x18 coming from a board .conf or a `west build -D` flag is *ignored*:
++	# kconfiglib emits only "user value 0x18 ... ignored due to being outside
++	# the active range ([0x15, 0x17]) -- falling back on defaults" and the
++	# symbol silently keeps 0x17. Every domctl hypercall then fails Xen 4.22's
++	# interface-version check, so `xu list` prints nothing and domain creation
++	# fails -- with a green build and no error to point at.
++	range 0x15 0x18
+ 	depends on XEN
+ 	help
+ 	  Xen Domctl interface version to use. This is the version of the
