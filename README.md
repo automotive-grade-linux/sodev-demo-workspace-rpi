@@ -5,7 +5,7 @@
 > [`docs/DESIGN.md`](docs/DESIGN.md) why the tree looks like this |
 > [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) when it does not work
 A **Raspberry Pi 5** port of the AGL (Automotive Grade Linux) SoDeV
-disaggregated-cockpit demo (R-Car V4H / Sparrow Hawk): **Xen 4.21** running a
+disaggregated-cockpit demo (R-Car V4H / Sparrow Hawk): **Xen 4.22** running a
 minimal control Dom0 (Zephyr by default, thin Linux as an alternative), a GPU
 driver domain, an AGL instrument cluster and Android Automotive OS — dual
 display, one board. **The build produces a bootable SD-card image (`full.img`)**
@@ -23,23 +23,25 @@ see *Differences vs the V4H AGL SoDeV* (`docs/DESIGN.md`) below for exactly what
 was kept identical.
 
 ```
-  Xen 4.21.0 (stock meta-virtualization recipe + RPi5/virtio patch series)
+  Xen 4.22.0 (interim local 4.22 recipe + RPi5/virtio patch series)
   on Yocto Wrynose 6.0 LTS / Linux 6.18.33
 
   DOM0_OS=zephyr (default — disaggregated control plane)
   |- Dom0 : Zephyr, xenstore server only (no toolstack, no drivers)      [1 vCPU  @ pCPU 0]
   |- DomD : dom0less direct-mapped driver domain — vc4/v3d GPU, RP1,
   |         SDHCI, Mesa 26.0.5 + weston 15.0.0 + qemu 7.0.0 device-models,
-  |         AND the xl toolstack that creates DomU/DomA                  [2 vCPUs @ pCPU 0-1]
+  |         AND the xl toolstack that creates DomU/DomA/DomZ             [2 vCPUs @ pCPU 0-1]
   |- DomU : AGL instrument cluster (Flutter cluster demo) -> HDMI-A-1    [1 vCPU  @ pCPU 1]
   |- DomA : Android Automotive OS (trout/xenvm)           -> HDMI-A-2    [2 vCPUs @ pCPU 2-3]
+  |- DomZ : Zephyr RTOS domain (xenvm board)                             [1 vCPU  @ pCPU 0]
 
   DOM0_OS=linux (alternative — classic control plane)
   |- Dom0 : thin Linux control domain (xl toolstack, SD owner); DomD is
-            still dom0less; Dom0's xl service chain creates DomU/DomA.
+            still dom0less; Dom0's xl service chain creates DomU/DomA/DomZ.
 ```
-The diagram shows the full 4-domain cockpit; **the default build is Dom0 + DomD
-only** — the DomU and DomA guests are opt-in (`-u`/`-a`, see *Build configuration*).
+The diagram shows the full 5-domain cockpit; **the default build is Dom0 + DomD
+only** — the DomU, DomA and DomZ guests are opt-in (`-u`/`-a`/`-z`, see *Build
+configuration*).
 
 ## Quick start (build the SD image)
 
@@ -55,7 +57,8 @@ git submodule update --init --recursive
 # 2. Build the SD image  ->  full.img   (build.sh applies the Zephyr Dom0 patches for you)
 ./build.sh                       # DEFAULT: Raspberry Pi 5, Dom0(Zephyr) + DomD   (guest-less, fast)
 # ./build.sh -u                  # + DomU (AGL instrument cluster)
-# ./build.sh -u -a               # + DomU + DomA (AAOS) = full 4-domain cockpit
+# ./build.sh -u -a               # + DomU + DomA (AAOS) = the 4-domain cockpit
+# ./build.sh -z                  # + DomZ (Zephyr RTOS domain)
 # ./build.sh --dom0=linux -u -a  # thin Linux control Dom0 instead of Zephyr
 # ./build.sh --board=rpi4 -u -a  # Raspberry Pi 4 (BCM2711) instead of Pi 5
 
@@ -106,12 +109,13 @@ Before you build:
 - **git** and **bash** on the host — `build.sh` checks for git, initialises the
   `external/` submodules, and runs `meta-rpi-sodev/scripts/sync-guest-pins.sh`
   before entering any container.
-- **Disk**: ~300 GiB free for a full `-a` (AAOS) build — one measured run used 272 GiB
+- **Disk**: ~400 GiB free for a full `-a` (AAOS) build — one measured Android 17 run used 336 GiB
   of workspace and AOSP dominates it; the
   guest-less default build (no AOSP) needs far less. Do not build on a
   filesystem with filename-length limits (e.g. ecryptfs).
-- **RAM**: an AOSP/Yocto build is memory-hungry — 16 GiB is marginal, ≥32 GiB is
-  comfortable for `-a`.
+- **RAM**: an AOSP/Yocto build is memory-hungry — for `-a` on Android 17, `soong_build`
+  alone peaks at 42.6 GiB, so this tree is built with **64 GiB** and `--memory=48g`;
+  32 GiB is not enough for `-a` (it is killed during soong analysis).
 - Host is assumed Debian/Ubuntu (the Docker install links below are Ubuntu).
 
 ## Build configuration
@@ -128,12 +132,15 @@ disables the heavy Android/Flatcar guests by default).
 | `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 256 + DomD 1920 + DomU 1024 + DomA 2560; `4g` takes DomD to 1024 MiB (bank2 dropped, bank0 to 640 MiB) and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
+| `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. See [`domz/README.md`](domz/README.md) |
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
 | `--aaos=<mode>` (`AAOS_MODE`) | off (`-a`⇒auto) | `off` \| `auto` \| `source` \| `prebuilt`. **auto** = prebuilt if a bundle is found (default probe `<workspace>/aaos-prebuilt`), else source if an AOSP checkout is found, else off (or a hard error when DomA was required via `-a`) |
 | `--aaos-prebuilt=<dir>` (`AAOS_PREBUILT_DIR`) | `<ws>/aaos-prebuilt` | Prebuilt AAOS bundle (`files/` + `images/` + `MANIFEST.md5`); consumed by `prebuilt`/`auto`. **Skips the AOSP source build entirely.** See *AAOS build modes* |
 | `--aaos-src=<dir>` (`AAOS_SRC_DIR`) | — | Reuse an existing AOSP checkout for `source` mode (skip the repo sync; still builds AOSP from it) |
 | `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from `rpi5-sodev.yaml`, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
+| `--rebuild-images` | off | Force-rebuild `docker/sodev-builder`. **Required once for this series**: it moves the image to Zephyr SDK 1.0.1 and adds the python3.12 virtualenv that Zephyr 4.4 needs (`PYTHON_MINIMUM_REQUIRED 3.12`). An image built before that change fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` |
+| `--west-cache=<dir>` (`XT_WEST_CACHE_DIR`) | — | Point the Zephyr west fetches at a pre-populated reference workspace, so `west update` runs offline (the AAOS analogue is `--aaos-ref`). Used for both west workspaces: Dom0's and DomZ's |
 | `--memory=<size>` (`XT_DOCKER_MEMORY`) | — (unlimited) | Cap each build container's RAM via docker `--memory` **and** `--memory-swap` (equal ⇒ no host-swap spill, so an unbounded moulin/AOSP/Yocto build cannot OOM the host), e.g. `24g` |
 | (`XT_DOCKER_NETWORK`) | — (Docker bridge) | `--network` value for the build containers, e.g. `host`. Needed when the build has to reach a proxy or package mirror bound to the **host's** loopback: a bridged container's `127.0.0.1` is its own, not the host's. Applies to `docker run` and `docker build` |
 | (`XT_DOCKER_RUN_OPTS`) | — | Extra `docker run` options applied verbatim to every builder, for anything `--memory` does not cover (e.g. `--cpus 8`) |
@@ -205,14 +212,15 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | Component | Version |
 |---|---|
 | Yocto / OpenEmbedded | Wrynose 6.0 LTS (bitbake 2.18, oe-core `wrynose`, meta-raspberrypi master @6d81e22c) |
-| Hypervisor | **Xen 4.21.0 — stock meta-virtualization recipe** + an ordered patch series in the shared `recipes-extended/xen-common` recipe (28 `.patch` files, required by both Dom0 flavours' Xen bbappends) plus the RPi5-only `0025` dom0less static-mem xenstore-page patch in `meta-xt-rpi5` (29 applied to the hypervisor). Of the 28, **23 come from the xen-troops fork** — 16 carried verbatim and 7 (`0004`, `0008`, `0010`, `0013`, `0016`, `0019`, `0024`) with local modifications declared on a `Local-Modifications:` line — and **5 are authored here** (`4.21-000{1..5}`). The fork-derived patches keep their original authors and carry `Upstream-Status: Inappropriate` with an `Origin:` line naming the fork commit, because xen-troops is a downstream fork and not the upstream of Xen. The five authored here are build-verified (compile+link clean on arm64 Xen 4.21.0); three carry `Upstream-Status: Pending` (`0002`, `0004`, `0005`) and two carry `Upstream-Status: Inappropriate` because they are deliberately downstream: `0001` is the RPi5/BCM2712 working delta, and `0003` reverts upstream hardening `2fbd7e609e` to re-permit bufioreq on Arm for this virtio-heavy configuration -- a security relaxation for the demo, not for upstream |
-| Virtualization layer | **meta-virtualization, pinned** (`781735b9`) — fetched by moulin at build time, not vendored; the stock `xen_4.21.bb` (PV `4.21.0+stable`, xenbits `stable-4.21` @ `1c72306b`) is selected via `PREFERRED_VERSION_xen` |
+| Hypervisor | **Xen 4.22.0 — interim local `xen_4.22.bb`** (meta-virtualization master at `526c9725` stops at 4.21; the copy lives in `meta-xt-common/meta-xt-domx` so both board products see it, and is to be submitted upstream and deleted once accepted) + an ordered patch series in the shared `recipes-extended/xen-common` recipe (29 `.patch` files, required by both Dom0 flavours' Xen bbappends) plus the `0025` dom0less static-mem xenstore-page patch, which each board layer carries a copy of and both apply (**30 applied on rpi5, 29 on rpi4** -- that board excludes `4.22-0002`, which routes the BCM2712 MIP MSI it has no equivalent of; the exclusion and its reasoning are in `meta-xt-rpi4`'s bbappend). Of the 29, **23 come from the xen-troops fork** — 14 carried verbatim and 9 (`0004`, `0008`, `0010`, `0013`, `0016`, `0018`, `0019`, `0022`, `0024`) with local modifications declared on a `Local-Modifications:` line — and **6 are authored here** (`4.22-000{1..6}`). Moving 4.21 → 4.22 left 25 of the 29 untouched: `0008`/`0018` were regenerated against stable-4.22 (context drift only, emitted code identical) and `0022`/`4.22-0001` were rebased, each recording it on its `Local-Modifications:` line. The fork-derived patches keep their original authors and carry `Upstream-Status: Inappropriate` with an `Origin:` line naming the fork commit, because xen-troops is a downstream fork and not the upstream of Xen. The six authored here are build-verified (compile+link clean on arm64 Xen 4.22.0); three carry `Upstream-Status: Pending` (`0002`, `0005`, `0006` -- `0006` is the 4.22 dom0less phandle regression fix this series exists on top of, measured on hardware) and three carry `Upstream-Status: Inappropriate` because they are deliberately downstream: `0001` is the RPi5/BCM2712 working delta, `0003` reverts upstream hardening `2fbd7e609e` to re-permit bufioreq on Arm for this virtio-heavy configuration -- a security relaxation for the demo, not for upstream -- and `0004` locks a field that only the fork's legacy-PCI series (`0013`/`0019`) creates, so it cannot be submitted as-is |
+| Virtualization layer | **meta-virtualization, pinned** (`781735b9`) — fetched by moulin at build time, not vendored. It supplies `xen.inc`/`xen-hypervisor.inc`/`xen-tools.inc` but **not** a 4.22 version recipe, so `xen_4.22.bb` / `xen-tools_4.22.bb` (PV `4.22.0+stable` / `4.22+stable`, xenbits `stable-4.22` @ `d45d5687f1`) are carried locally in `meta-xt-common/meta-xt-domx` and selected via `PREFERRED_VERSION_xen` / `PREFERRED_VERSION_xen-tools`. Both are interim, pending upstream acceptance |
 | Dom0 (zephyr) | Zephyr xenstore server (patch series under `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`, applied on the upstream Zephyr Dom0 tree) |
 | Dom0 (linux) / DomD kernel | Linux 6.18.33 (`linux-raspberrypi`) |
 | DomD graphics | Mesa 26.0.5, weston 15.0.0 (kiosk-shell), libdrm 2.4.131 |
 | DomD device-model | QEMU 7.0.0 (Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock) |
 | DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch, plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
-| DomA guest | AAOS (`aosp_xenvm_trout_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). A V4H-built AAOS image boots unmodified (portability proof) |
+| DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). A V4H-built AAOS image boots unmodified (portability proof) |
+| DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`domz/`](domz/README.md) |
 
 
 See also:
@@ -222,25 +230,30 @@ See also:
 ```
 .
 ├── build.sh                 # orchestrator (Docker; mirror of AGL sodev-demo-workspace/build.sh)
-├── rpi5-sodev.yaml          # moulin entry (Raspberry Pi 5): Dom0/DomD/DomU/DomA build + SD-image wiring
-├── rpi4-sodev.yaml          # moulin entry (Raspberry Pi 4 / BCM2711); ./build.sh --board=rpi4
+├── rpi5-sodev.yaml          # moulin entry (Raspberry Pi 5): Dom0/DomD/DomU/DomA/DomZ build + SD-image wiring
+├── rpi4-sodev.yaml          # moulin entry (Raspberry Pi 4 / BCM2711), same domain set; ./build.sh --board=rpi4
 ├── docker/                  # unified sodev-builder build image (built on demand)
 ├── docs/                    # BUILD.md (build detail) / DESIGN.md (why) / TROUBLESHOOTING.md
+├── domz/                    # DomZ = the Zephyr RTOS guest (-z)
+│   ├── app/                 #   Zephyr application for the `xenvm` board
+│   ├── tools/               #   QEMU harness (xl create on a PC) + its Yocto layer
+│   └── README.md            #   what the domain is, and how to bring it up
 ├── external/
 │   ├── meta-xt-prod-devel-rpi5/   # submodule: pristine xen-troops base (byte-identical)
 │   └── sodev-demo-workspace/      # submodule: AGL SoDeV — DomU/DomA source of truth (V4H)
 ├── meta-rpi-sodev/          # ALL RPi5/Xen delta, consolidated on the upstream meta-xt-* layout
 │   ├── meta-xt-common/
 │   │   ├── meta-xt-dom0-linux/      # thin LINUX Dom0 image, xl-create service chain, xen-tools cfg
-│   │   ├── meta-xt-dom0-zephyr/     # ZEPHYR Dom0 patch series (xenstore server, dom_cfg, altp2m,
-│   │   │                            #   static-mem xenstore page fix)
+│   │   ├── meta-xt-dom0-zephyr/     # ZEPHYR Dom0 patch series (Zephyr 4.4.1 +
+│   │   │                            #   zephyrproject-rtos xenlib, xenstore server, dom_cfg,
 │   │   ├── meta-xt-driver-domain/   # DomD image (p2 rootfs), kernel (vhost_xen/vc4), weston, qemu, xen-network
 │   │   ├── meta-xt-domu/            # DomU xl cfg + cluster recipes + virtio kernel
+│   │   ├── meta-xt-domz/            # DomZ xl cfg (domz.cfg) + xl-create-domz.service
 │   │   ├── meta-xt-doma/            # DomA xl cfg + AAOS host services + guest binaries
 │   │   ├── meta-xt-domx/            # shared cross-guest recipes (libc-headers, base-files, ...)
 │   │   ├── meta-xt-{qemu,security}/ # vendored upstream
-│   │   └── recipes-extended/xen-common/   # shared Xen 4.21 hypervisor patch series (both Dom0 flavours)
-│   ├── meta-xt-rpi5/                # RPi5 BSP: u-boot/TFA/boot.scr, Xen 4.21 patch series, xen dtso, kernel DT/cfg
+│   │   └── recipes-extended/xen-common/   # shared Xen 4.22 hypervisor patch series (both Dom0 flavours)
+│   ├── meta-xt-rpi5/                # RPi5 BSP: u-boot/TFA/boot.scr, Xen 4.22 bbappend + patch series, xen dtso, kernel DT/cfg
 │   ├── meta-xt-rpi4/                # RPi4 BSP, the sibling of the above (BCM2711). Mutually exclusive with it
 │   ├── xt-prod-devel-rpi5-domd/     # vendored upstream DomD product layer
 │   ├── meta-rpi-sodev-devel/        # opt-in diagnostic/debug/prototype layer (NOT in the shipping build; p4-tool etc.)
@@ -253,7 +266,12 @@ See also:
     ├── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
     ├── check-yaml-drift.py         # the two product yamls share ~750 lines by copy; fails on
     │                                   unrecorded divergence (yaml-drift-baseline.txt records the
-    │                                   64+ differences that are there by design)
+    │                                   74 differences that are there by design)
+    ├── check-domz.sh               # every DomZ check that works without hardware, in one
+    │                               #   command (check-yaml-drift + the domz.cfg memory invariant +
+    │                               #   checkpatch + moulin graph + the xenvm guest build).
+    │                               #   To go further and actually BOOT DomZ on a PC, see
+    │                               #   domz/tools/qemu-xen-domz.sh (Xen + Dom0 in QEMU)
     └── compare-sd-image.py         # compare a fresh SD image against one that booted, judging
                                         deterministic / timestamp-contaminated / deliberately-
                                         different artifacts by different criteria
@@ -278,6 +296,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — what this port changed relative 
 | Dom0 (linux) | **UART**: physical debug UART — press `Ctrl-A` three times to cycle input to `DOM0` (Linux login). **SSH**: Dom0 sits on the private point-to-point link `192.168.0.1` (the DomD netfront is deliberately *not* bridged into the flat segment — bridging wedges DomD's xenbus). `sshd` is socket-activated. Reach it from the bench PC via DomD's IP forwarding: `sudo ip route add 192.168.0.0/24 via 192.168.10.10 && ssh root@192.168.0.1` |
 | DomD | **SSH** (primary): `ssh root@192.168.10.10` — DomD runs the toolstack, so `xl list` / `xl console <domU/domA>` run from here. **UART**: DomD is a dom0less **vpl011** domain (console → hypervisor ring), so `xl console 1` / `xu console 1` cannot attach it (no PV console ring/evtchn is allocated for dom0less vpl011). On the debug UART press `Ctrl-A` three times to cycle input to `DOM1` (`raspberrypi5-domd login:`); or read its log with `xl dmesg \| grep DOM1`. |
 | DomU (AGL) | `ssh root@192.168.10.12`; or `xl console 3` from the toolstack domain (`domu login:`) |
+| DomZ (Zephyr) | **`xl console DomZ`** from the toolstack domain (DomD in the zephyr flavour, Dom0 in the linux one) — Zephyr's Xen **PV console**, which is why the `xenvm` board is used rather than a vpl011 dom0less domain. `xenconsole` needs a tty, so over ssh use `ssh -tt root@192.168.10.10 'xl console DomZ'`. No network, no display: this console is the only interface. Exit with `Ctrl-]` |
 | DomA (AAOS) | `adb connect 192.168.10.13:5555` (Android has no sshd); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The `virtconsole` sockets in `doma.cfg` are **inert** — see the note below. |
 
 
@@ -299,9 +318,15 @@ the AGL cluster renders on HDMI-A-1 and the shipping **`--aaos=prebuilt` AAOS**
 renders on HDMI-A-2 (all guest modules load, SurfaceFlinger up) — the guest
 kernel and the `super.img` vendor_dlkm modules must come from one coherent build
 (same `module_layout` ABI; see *How the DomA artifacts are produced* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
-is build- and wiring-complete, but its end-to-end boot has not been re-validated
-on the current tree (see the *Verification status* note under *Boot process* (`docs/DESIGN.md`)).
-The Zephyr full-image HW checklist:
+has since been booted end to end on both boards on this tree (P2 and P3 below).
+The Zephyr full-image HW checklist. **[4.22] The list below was first measured on Xen
+4.21.** On **Xen 4.22** the four verification patterns of this tree were run on hardware
+on 2026-08-18 and all passed -- RPi4 and RPi5 x Zephyr-Dom0 and thin-Linux-Dom0 -- with
+`xu list` answering in the Zephyr-Dom0 flavour, which is the one place a missed
+domctl-ABI bump would show. What that campaign did **not** re-measure, and is therefore
+still open: the dual display was confirmed only as configuration (both connectors
+`connected`, weston defining two outputs), **adb over TCP could not be reached on the
+RPi5 guest**, and touch input was not exercised. The per-item list:
 - Xen 4.21 boots (0 panics); all 4 domains auto-start; qemu device-models auto-spawn.
 - Dual display + native touch, no scanout artifacts.
 - SSH from the PC to DomD/DomU, adb to DomA; consoles for all domains.
@@ -312,6 +337,41 @@ The Zephyr full-image HW checklist:
 
 As a portability proof, the **V4H-built DomA image boots unmodified**
 on this stack (guest kernel/ramdisk/super swapped as binaries — no rebuild).
+
+**DomZ (`-z`) is verified on hardware in all four verification patterns** (RPi4 and
+RPi5, Zephyr-Dom0 and thin-Linux-Dom0): `xl list` shows the domain at 16 MiB / 1 vCPU,
+`xl console DomZ` prints `DomZ up: Zephyr 4.4.1 as Xen DomU (AGL SoDeV)` and the
+heartbeat, and the interval measured 10 s with no missed ticks. The unit that creates it
+lands in the toolstack domain of either flavour (DomD for Zephyr-Dom0, the thin Dom0 for
+the Linux one) and is `active` in both.
+
+On a PC, before that:
+
+- the moulin graph resolves for every flag combination (`-z`, both Dom0 flavours, with
+  and without `-u`/`-a`, both `--ram` values) and `ninja image-full` has a rule for
+  every artifact;
+- the DomZ image builds through the real path (`moulin` + `ninja domz`, second west
+  workspace, Zephyr SDK 1.0.1) for the `xenvm` board -- 304 KB of the domain's 16 MiB
+  (1.86%; the figure is Zephyr's own RAM report, not the size of zephyr.bin, which is
+  44 KB);
+- bitbake parses the whole layer set with the new layer in it (3350 recipes, 0 errors)
+  and builds `xt-xen-cfg-domz`;
+- **the whole SD image builds end to end** (`./build.sh -z` -> `full.img`) and its
+  contents check out without root or loop devices: p1 (FAT) carries `zephyr-domz.bin`
+  byte-identical to the built artifact (same md5), and the DomD rootfs that becomes p2
+  carries `/etc/xen/domz.cfg`, `/usr/lib/systemd/system/xl-create-domz.service` and the
+  `multi-user.target.wants` symlink that auto-enables it;
+- **DomZ was created and booted under QEMU first** -- aarch64 with Xen 4.21.1-pre and a
+  minimal Linux Dom0 (`domz/tools/qemu-xen-domz.sh`): `xl create` accepted the image,
+  `xl list` showed `DomZ ... -b----` (idle, i.e. healthy) and `xl console DomZ` printed
+  the banner (that run predates the move to 4.4.1). The image format holds for the
+  reason libxc's loaders say it should: Zephyr's arm64 output carries a Linux arm64
+  Image header (`"ARM\x64"` at offset 0x38), which `xc_dom_probe_zimage64_kernel()`
+  claims (the multiboot `bin` loader would have rejected a bare blob).
+
+The bring-up order and how to iterate over `scp` **without reflashing the SD card** are
+in [`domz/README.md`](domz/README.md); the failure signatures are in *DomZ does not
+start* (`docs/TROUBLESHOOTING.md`).
 
 ## Known issues
 
@@ -349,7 +409,7 @@ not password-protected at all:
   and `adb` is open on `192.168.10.13:5555` with no authentication.
 
 `xen,static-mem`-related hypervisor hardening is also relaxed for the demo: the
-`4.21-0003` patch reverts an upstream restriction on buffered ioreq for Arm so the
+`4.22-0003` patch reverts an upstream restriction on buffered ioreq for Arm so the
 DomD device model can serve the guests. That revert is deliberate and is documented in
 the patch header; it should not be carried into a production hypervisor.
 

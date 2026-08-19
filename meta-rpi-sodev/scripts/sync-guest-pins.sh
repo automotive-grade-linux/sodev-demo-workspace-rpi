@@ -1,13 +1,30 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Follow V4H (AGL SoDeV) DomU/DomA pins from the external/sodev-demo-workspace submodule.
-# moulin has no cross-file include, so DomU/DomA pins are duplicated into our build.sh /
-# rpi5-sodev.yaml; this script keeps them in sync with the upstream submodule.
+# Follow V4H (AGL SoDeV) pins from the external/sodev-demo-workspace submodule.
+# moulin has no cross-file include, so the pins are duplicated into our build.sh /
+# rpi5-sodev.yaml; this script reports the upstream values so drift stays visible.
+#
+# The DomA manifest pins are NO LONGER derived from V4H and --apply refuses to touch
+# them, for two reasons. V4H is on Android 15 (yhamamachi/android_manifest @ aff3224d,
+# branch android-15-xenvm-trout-ih-main) with an Android 14 era kernel manifest
+# (xen-troops/android_kernel_manifest @ 23e08b76, common-android14-6.1-xenvm-trout-main),
+# while this workspace is on Android 17 (android-17.0.0_r1) with the GKI android17-6.18
+# guest kernel, so copying V4H's revisions over ours would downgrade the guest by two
+# releases. The two workspaces also select different entry points: this one asks the
+# kernel manifest for its pinned manifest by name (see `manifest:` in the yamls), so a
+# revision copied from V4H would be paired with the wrong one. --check still prints
+# both sides, which is what keeps the difference auditable; use it, then decide
+# deliberately.
+#
+# --check reads our side by keying on the `manifest:` line rather than on a repository
+# URL, because the URL is not stable: the two components currently point at the author's
+# forks while the upstream pull requests are open, and they move back to yhamamachi when
+# those land (the yamls carry the switch-back procedure).
 #
 # Usage:
 #   meta-rpi-sodev/scripts/sync-guest-pins.sh --print {agl-branch|android-rev|android-kernel-rev}
 #   meta-rpi-sodev/scripts/sync-guest-pins.sh --check     # show V4H pins vs our pins (drift)
-#   meta-rpi-sodev/scripts/sync-guest-pins.sh --apply     # rewrite our pins to match V4H
+#   meta-rpi-sodev/scripts/sync-guest-pins.sh --apply     # refuses; see the note above
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -48,19 +65,23 @@ case "${1:-}" in
     echo "  android rev        : $(android_rev)"
     echo "  android-kernel rev : $(android_kernel_rev)"
     echo "[our rpi5-sodev.yaml]"
-    grep -nE 'yhamamachi/android_manifest|android_kernel_manifest' -A2 "$OUR_YAML" 2>/dev/null \
-      | grep -E 'rev:' || echo "  (no doma pins found yet)" ;;
+    # Key on the `manifest:` line: both repo components have one, and their names are
+    # what distinguishes the AOSP tree from the pinned kernel manifest.
+    grep -nE '^ +manifest: [-a-z0-9.]+\.xml' -B2 "$OUR_YAML" 2>/dev/null \
+      | grep -E 'rev:|manifest:' || echo "  (no doma pins found yet)" ;;
   --apply)
-    a="$(android_rev)"; k="$(android_kernel_rev)"
-    [ -n "$a" ] && [ -n "$k" ] || die "could not read V4H android revs"
-    # Rewrite the rev: line that follows each manifest URL line.
-    awk -v ar="$a" -v kr="$k" '
-      { print_line=$0 }
-      prev ~ /yhamamachi\/android_manifest/      && $1=="rev:" { sub($2, ar) }
-      prev ~ /android_kernel_manifest/           && $1=="rev:" { sub($2, kr) }
-      { print; prev=print_line }
-    ' "$OUR_YAML" > "$OUR_YAML.tmp" && mv "$OUR_YAML.tmp" "$OUR_YAML"
-    echo "applied: android rev=$a / android-kernel rev=$k -> $OUR_YAML"
-    echo "NOTE: also confirm build.sh AGL_BRANCH default matches: $(agl_branch)" ;;
+    cat >&2 <<'EOT'
+ERROR: --apply is disabled for the DomA manifest pins.
+
+This workspace pins Android 17 (AOSP android-17.0.0_r1 + GKI android17-6.18); V4H
+pins Android 15 with an Android 14 era kernel manifest. Rewriting our revisions to
+match V4H would downgrade the Android guest by two releases, and the 17 manifests
+are forks that carry changes the V4H ones do not have (Mesa 25.3.6 for the Android 17
+toolchain; all 59 kernel projects pinned to a SHA).
+
+Use --check to see both sides, then edit rpi5-sodev.yaml / rpi4-sodev.yaml by hand if
+a change is really intended.
+EOT
+    exit 1 ;;
   *) die "usage: $0 --print <key> | --check | --apply" ;;
 esac

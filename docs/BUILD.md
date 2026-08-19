@@ -27,21 +27,65 @@ build (see *How the DomA artifacts are produced*).
 
 | | Needed | Why |
 |---|---|---|
-| Disk | **~300 GiB free** for a build including DomA | One measured from-scratch run used 272 GiB of workspace, of which `android/` was 231 GiB |
-| RAM | 32 GiB is comfortable; the AOSP step is the peak | A cold AOSP build peaked at ~19 GiB with `nproc`=16 |
+| Disk | **~400 GiB free** for a build including DomA | Measured on Android 17: 336 GiB of workspace — `android/` 277 GiB (of which `out/` 138 GiB), `android_kernel/` 35 GiB, `agl/` 11 GiB, `yocto/` 11 GiB — plus the 27 GiB SD image, so 363 GiB in total; ~400 is that rounded up for headroom (a cold Yocto sstate alone was 31 GiB on 15 against the 11 GiB measured here with a warm one). The Android 15 figure was 272 GiB, so add ~90 GiB if you are following older notes |
+| RAM | **64 GiB**, capped at `--memory=48g` (below); the AOSP step is the peak | On Android 17 `soong_build` alone peaked at **42.6 GiB** doing analysis, before any compiling, so the cap has to sit above that and the host has to have room for the cap plus whatever else it runs. (The Android 15 figure was ~19 GiB with `nproc`=16 — the analysis got much heavier, and it is a single process, so `--cpuset-cpus` does not bound it.) Measured on a 64 GiB host: 48g cap left ~14 GiB, which was enough but not generous — a 48 GiB host cannot both grant the cap and stay alive |
 | Cores | more is faster, but see the warning below | `soong_ui` sizes its job count from `nproc`, not from any memory cap |
-| Docker | engine, usable as a non-root user | every heavy step runs in a container |
+| Docker | engine, usable as a non-root user, **and able to relax its sandbox** (below) | every heavy step runs in a container, and one Android 17 build step runs its own sandbox inside it |
 | Network | anonymous HTTPS to `github.com`, `android.googlesource.com`, `boringssl.googlesource.com`, the Yocto/AGL mirrors | no registration, no NDA, no partner Gerrit |
 
-> **If the host has many cores, cap them for the AOSP step.** `soong_ui` sets its `-j` from
-> `runtime.NumCPU()+2` and never looks at the cgroup limit, so a 32-core machine will
-> OOM-kill the container no matter what `--memory` you pass. `docker --cpus` does not help
-> either -- it leaves `nproc` unchanged. Use `--cpuset-cpus`:
+> **Cap the container's RAM, and cap the cores too.** The two limits fix different things
+> and you want both:
 >
->     XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh ...
+>     XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh --memory=48g ...
+>
+> `--memory` bounds `soong_build`, which is a single Go process whose appetite comes from
+> the size of the module graph, not from any job count -- so `--cpuset-cpus` cannot bound
+> it. Without a `--memory` cap its 42.6 GiB peak is charged against the whole host, and on
+> a 64 GiB machine the kernel picks a global OOM victim: measured, that killed the editor
+> session rather than the build (`oom-kill: constraint=CONSTRAINT_NONE ... global_oom,
+> task=soong_build`). With the cap the same overrun is a cgroup kill, i.e. the build dies
+> and nothing else does.
+>
+> `--cpuset-cpus` bounds the *compile* phase: `soong_ui` sets ninja's `-j` from
+> `runtime.NumCPU()+2` and never looks at the cgroup limit, so a many-core machine will
+> OOM-kill the container no matter what `--memory` you pass. `docker --cpus` does not help
+> either -- it leaves `nproc` unchanged.
 >
 > `build.sh` recognises the kill and stops with this advice rather than retrying, but you
 > save a few hours by setting it up front. See *Bounding a cold AOSP build*.
+
+> **Android 17 needs nsjail to work inside the container.** AOSP 17 builds
+> `trusty_security_vm_arm64.bin` with a genrule that invokes `prebuilts/build-tools/nsjail`
+> directly, and nsjail has to create namespaces, change mount propagation and `pivot_root`.
+> Docker's default sandbox blocks all three, so the build fails on that one target after
+> hours of otherwise successful compiling:
+>
+>     [E] initCloneNs():432 pivot_root('/tmp/nsjail.1000.root', ...): Operation not permitted
+>
+> Three `--security-opt`s are needed, and each one covers a different step (measured
+> separately -- dropping any of them moves the failure rather than removing it):
+>
+>     XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15 \
+>       --security-opt seccomp=unconfined \
+>       --security-opt apparmor=unconfined \
+>       --security-opt systempaths=unconfined" ./build.sh --memory=48g ...
+>
+> | | blocks |
+> |---|---|
+> | `seccomp=unconfined` | the `clone` namespace flags, and `pivot_root` |
+> | `apparmor=unconfined` | `mount('/','/',MS_REC\|MS_PRIVATE)` |
+> | `systempaths=unconfined` | the same `mount`, via Docker's masked/read-only paths |
+>
+> No capability is required: `--cap-add=SYS_ADMIN` gets past `clone` but not `pivot_root`,
+> and `--cap-add=ALL` does not help at all. `--privileged` works because it implies all
+> three, but it also opens device access, which none of this needs. Android 15 did not
+> require any of it -- that build has no nsjail-invoking target.
+>
+> The target this unblocks is **not part of the image**: nothing in `PRODUCT_PACKAGES`,
+> `device/google/trout` or `device/epam/aosp-xenvm-trout` references it. It is pulled in
+> because AOSP's default goal check-builds every module, so there is nothing to gain by
+> excluding it from the product -- and moulin's android builder always runs a plain
+> `m -j`, so the goal is not ours to change.
 
 ### 1. Install Docker
 
@@ -66,6 +110,13 @@ Follow *Docker usage* below -- in particular the post-install step that lets you
 | `./build.sh` | Dom0(Zephyr) + DomD | no |
 | `./build.sh -u` | + DomU (AGL instrument cluster) | no |
 | `./build.sh -u --aaos=source` | + DomA (AAOS) = **all four** | **yes** |
+| `./build.sh -z` | + DomZ (Zephyr RTOS domain) | no |
+
+`-z` adds a second **west** workspace (`zephyr-domz/`) and one more Zephyr build; it
+costs a few minutes and no Yocto work, so it combines freely with any of the rows
+above. The guest is board-independent (`xenvm`), so the same image is valid under Xen on
+either board — see [`domz/README.md`](../domz/README.md) for what the domain is and how
+to bring it up.
 
 The rest of this walkthrough uses the third row, which is the full cockpit on the Zephyr
 Dom0 (`--dom0=zephyr` is the default, so it needs no flag). `-a` is a synonym for
@@ -79,6 +130,13 @@ configuration (`rpi4-sodev.yaml` instead of `rpi5-sodev.yaml`, `meta-xt-rpi4` in
 `meta-xt-rpi5`, BCM2711 device trees and memory map) and changes what `--ram` accepts --
 `8g`/`4g` there, `16g`/`8g` on the Pi 5. Nothing else in this walkthrough differs. What
 is verified on that board is listed in `meta-rpi-sodev/meta-xt-rpi4/README.md`.
+
+> **This series needs `--rebuild-images` once.** The builder image gains Zephyr SDK
+> 1.0.1 and a python3.12 virtualenv here, because Zephyr 4.4 sets
+> `PYTHON_MINIMUM_REQUIRED 3.12` and Ubuntu 22.04 ships 3.10. An image built before
+> that change fails in cmake with `Could NOT find Python3: Found unsuitable version
+> "3.10.12", but required is at least "3.12"` -- see *A Zephyr build cannot find
+> Python 3.12* (`docs/TROUBLESHOOTING.md`).
 
 ### 4. Build the container image
 
@@ -107,13 +165,16 @@ docker build -f docker/Dockerfile.builder docker/ \
   -t sodev-builder
 ```
 
-Behind a proxy, add the same values `build.sh` would pass (they are baked in, see below):
+Behind a proxy, add the same build args `build.sh` would pass. Pass **only the ones you
+actually have a value for**: these are Docker's predefined proxy build args, so the
+Dockerfile declares no `ARG` for them and nothing is stored in the image -- but a
+*defined-but-empty* `http_proxy` is worse than an unset one (see the note below the
+Dockerfile):
 
 ```sh
 docker build -f docker/Dockerfile.builder docker/ \
   --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
-  --build-arg HTTP_PROXY="$HTTPS_PROXY" --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
-  --build-arg NO_PROXY="${NO_PROXY:-}" \
+  --build-arg https_proxy="$HTTPS_PROXY" --build-arg http_proxy="$HTTPS_PROXY" \
   --network=host \
   -t sodev-builder
 ```
@@ -121,9 +182,9 @@ docker build -f docker/Dockerfile.builder docker/ \
 `--network=host` is only needed when the proxy or a mirror listens on the **host's**
 loopback; `build.sh` does the same via `XT_DOCKER_NETWORK=host`.
 
-To force a rebuild -- **required after changing `--proxy` or the Dockerfile**, because the
-proxy value is baked into the image and `build.sh` reuses an existing tag without
-checking it:
+To force a rebuild -- **required after changing the Dockerfile**, because `build.sh`
+reuses an existing tag without checking it. A *proxy* change does not need one: the
+proxy reaches the `RUN` layers as a build arg and is never stored in the image:
 
 ```sh
 ./build.sh --rebuild-images -u --aaos=source      # via build.sh
@@ -197,8 +258,9 @@ failures each have an entry in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
     <board>-<SKU>-Dom0<Zephyr|Linux>[-DomU][-DomA]-<YYYYmmdd-HHMM>.img
 
-so `rpi4-4GB-Dom0Zephyr-DomU-DomA-20260809-1750.img` is a 4 GiB Raspberry Pi 4
-image with a Zephyr Dom0 and both guests on it, built at 17:50 local time. A
+so `rpi4-4GB-Dom0Zephyr-DomA-20260809-1750.img` is a 4 GiB Raspberry Pi 4 image
+with a Zephyr Dom0 and DomA (no DomU -- on this SKU that pair is refused, see
+BOARD_RAM), built at 17:50 local time. A
 guest that was not built leaves its token out, so the name says what is on the
 card rather than what was asked for. The point is that a second build does not
 overwrite the first, and an image found later can still be identified — nothing
@@ -260,10 +322,13 @@ docker-worker instead, pass `AGL_DOCKER=<official-image> ./build.sh`.
 > (`HTTP_PROXY`/`HTTPS_PROXY` build-args and env are honoured as a starting
 > point; `build.sh` passes them through).
 >
-> **Proxy changes need `--rebuild-images`.** The proxy setting is baked into the
-> `sodev-builder` image at build time; `build.sh` reuses an existing image by tag
-> and will *not* rebuild it when the flag changes. After changing `--proxy` (or
-> the Dockerfile), pass `--rebuild-images` once so the new setting takes effect.
+> **Proxy changes do not need `--rebuild-images`.** The proxy is not stored in the
+> `sodev-builder` image: `Dockerfile.builder` declares no `ENV` for it -- a
+> defined-but-empty `http_proxy` makes the AOSP `repo` launcher proxy through nothing
+> and fail every fetch -- and `build.sh` passes the variables that have a value per
+> run with the bare `-e VAR` form. A **Dockerfile** change still needs
+> `--rebuild-images` once, because `build.sh` reuses an existing image by tag and
+> will *not* rebuild it otherwise.
 >
 > On a **restricted / proxy network**, two more site settings are commonly
 > needed beyond the proxy itself:
@@ -364,7 +429,7 @@ usage: moulin rpi5-sodev.yaml [--DOM0_OS {zephyr,linux}]
                               [--BOARD_RAM {16g,8g}] [--ENABLE_DOMU {no,yes}]
                               [--ENABLE_ANDROID {no,yes}]
 
-Config file description: Raspberry Pi 5 + Xen 4.21 — AGL SoDeV disaggregated
+Config file description: Raspberry Pi 5 + Xen 4.22 — AGL SoDeV disaggregated
 cockpit (Zephyr or thin-Linux Dom0)
 
 options:
@@ -428,7 +493,7 @@ instead; see *AAOS build modes* below.)
 | Artifact | Produced by | Consumed as |
 |---|---|---|
 | six p4 images (`super`, `userdata`, `boot`, `init_boot`, `vendor_boot`, `vbmeta`) | the `doma` moulin component (AOSP `m`) | SD p4 nested GPT, assembled by rouge |
-| DomA guest kernel | the `doma_kernel` component (bazel, GKI 6.1.118 + `xen-virtual-device`) | SD p1 `aaos-android-kernel` |
+| DomA guest kernel | the `doma_kernel` component (bazel, GKI 6.18.32 + `xen-virtual-device`) | SD p1 `aaos-android-kernel` |
 | DomA vendor-boot ramdisk | derived from `vendor_boot.img` by `aaos-guest-binaries` | SD p1 `aaos-vendor-boot-ramdisk` |
 | `vehicle_hal_grpc_server`, `dumpstate_grpc_server`, `garage_mode_helper` | built from source by `google-trout-agl-services` | DomD rootfs `/usr/bin` |
 
@@ -515,13 +580,27 @@ yet, `do_compile` then aborts with the paths it could not find.
 
 `build.sh` handles this: in `source` mode it runs
 
-    ninja doma_kernel doma && ninja image-full
+    ninja fetch-doma_kernel fetch-doma
+      && meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-aosp-device.sh "$PWD/<aosp>" <board>
+      && ninja doma_kernel
+      && meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-doma-kernel.sh \
+             "$PWD/<kernel>/<deploy dir>" "$PWD/<aosp>" <stage dir>
+      && ninja doma
+      && ninja image-full
+
+The two staging steps are why this is not a plain `ninja doma_kernel doma`: moulin has no
+hook between `repo sync` and the AOSP build, so the board's AAOS product variant
+(a no-op on rpi5) and the guest kernel copy Soong insists on have to be inserted between
+the goals. The directory names come from the board yaml, which is why the command above
+shows them as placeholders; run `build.sh` and it prints the exact line it uses.
 
 Ordering costs nothing here. Every moulin builder rule (yocto, android, bazel, zephyr)
 declares ninja's `console` pool, whose depth is 1, so the components are serialised
 either way — this only fixes *which* order.
 
-If you drive ninja by hand, build those two goals first. This also applies to
+If you drive ninja by hand, run that whole sequence, not just the two goals: skipping
+`stage-doma-kernel.sh` builds the AOSP images against a stale kernel copy. See
+*Keep the guest kernel and the p4 images coherent*. This also applies to
 `--domains-only`: it still builds DomD, and moulin's default ninja target does *not*
 include `doma`/`doma_kernel`.
 
@@ -531,9 +610,27 @@ The guest kernel, its modules and `super.img`'s `vendor_dlkm` must come from one
 consistent pair, or ~97 guest modules fail `disagrees about version of symbol
 module_layout` and AAOS never reaches SurfaceFlinger — `sys.boot_completed` still goes
 to 1 and `screencap` still returns a real UI, so the only visible symptom is a black
-panel. The build wires this up automatically: `doma` consumes `doma_kernel`'s output
-via `TARGET_PREBUILT_KERNEL` / `TARGET_PREBUILT_MODULES_DIR`, so the modules baked into
-`vendor_dlkm` and the kernel deployed to p1 are from the same tree.
+panel.
+
+`doma` consumes `doma_kernel`'s output via `TARGET_PREBUILT_KERNEL` /
+`TARGET_PREBUILT_MODULES_DIR`, but since Android 16 it cannot read it where bazel left
+it: Soong rejects a source path outside its own tree, so `stage-doma-kernel.sh` copies
+the dist into the AOSP checkout and those two variables name the copy
+(see *How the DomA artifacts are produced*). **That copy is not a ninja edge** — moulin
+owns the ninja file — so the graph cannot keep it fresh, and the two halves can drift
+apart: p4's `vendor_dlkm` comes from the copy, p1's kernel from the dist.
+
+Three things hold it together, and only the third one catches drift:
+
+| | catches |
+|---|---|
+| `build.sh` runs the staging on every invocation, between `ninja doma_kernel` and `ninja doma` | the normal path — the copy is never stale if you use `build.sh` |
+| `doma`'s `additional_deps` names both the dist Image and the staged Image | a rebuilt kernel re-runs the AOSP build; a checkout where the staging never ran fails loudly |
+| `aaos-guest-binaries` compares the staged copy against the dist byte for byte before shipping either | a copy that exists but is **stale** — the only case the other two miss |
+
+So driving ninja by hand is not enough on its own: `ninja doma_kernel doma` builds the
+AOSP images against whatever copy is lying around. If you do it anyway, the recipe stops
+the build rather than shipping the mismatch, and names the fix.
 
 **Judge coherence by the ABI, not by md5.** The GKI bazel build is not reproducible —
 three builds of the same source produced three different `Image` md5s — but all
@@ -611,7 +708,7 @@ A **prebuilt bundle** is a directory (`--aaos-prebuilt=<dir>`, default probe
 `<workspace>/aaos-prebuilt`) with:
 
 - `<dir>/images/` — the six p4 images, and
-- `<dir>/files/` — `aaos-android-kernel-xenbuilt-6.1.118` and
+- `<dir>/files/` — `aaos-android-kernel-xenbuilt-6.18.32` and
   `aaos-vendor-boot-ramdisk-xenbuilt-padded`,
 - optionally `<dir>/MANIFEST.md5`.
 
@@ -643,11 +740,17 @@ the build (see above) and the gRPC backends are fetched from public git.
 and `doma_kernel` components run their own `repo init` + `repo sync` into
 `<workspace>/android` and `<workspace>/android_kernel`.
 
-Measured on one from-scratch run (32-core host, warm Yocto sstate, DomA + DomU, Zephyr
-Dom0): **5 h 11 min** end to end and **272 GiB** of workspace — `android/` 231 GiB (of
-which `out/` 106 GiB), `android_kernel/` 18 GiB, `yocto/` 9 GiB. Budget more than that:
-those figures are one host's, the AOSP build dominates and scales with core count, and a
-cold Yocto sstate adds to the Yocto share. Everything after the first run is incremental.
+Measured on Android 17 (24-core host capped to 16 with `--cpuset-cpus`, `--memory=48g`,
+warm Yocto sstate, DomA + DomU, Zephyr Dom0): **336 GiB** of workspace — `android/`
+277 GiB (of which `out/` 138 GiB), `android_kernel/` 35 GiB, `agl/` 11 GiB, `yocto/`
+11 GiB — plus a 27 GiB SD image. The AOSP step alone is **1 h** once its `out/` is warm;
+a cold one is several hours and dominates the total.
+
+The Android 15 equivalent was 272 GiB and 5 h 11 min end to end on a 32-core host, so
+17 costs about 90 GiB more. Budget more than either figure: these are one host's, the
+AOSP build scales with core count, and a cold Yocto sstate adds to the Yocto share (the
+11 GiB above is with a warm one; 15 measured 31 GiB cold). Everything after the first run
+is incremental.
 
 **Case B — a repo object mirror.** If your site keeps a mirror (an exported
 `*-project-objects` tree, or another repo client), point `--aaos-ref` and
@@ -704,17 +807,58 @@ A cold AOSP build can OOM-kill the container regardless of `--memory`. `soong_ui
 many-core host the job count — not the memory cap — decides the peak. Cap the CPUs the
 container can see; `docker --cpus` does **not** help, because it leaves `nproc` unchanged:
 
-    XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh -u --aaos=source ... --memory=44g
+    XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh -u --aaos=source ... --memory=48g
 
-Measured on a 32-core host with a 44 GiB cap: killed at `nproc`=32, peak ~19 GiB at
-`nproc`=16. A warm `--aaos-src` tree does not reproduce it (its `m` finishes in minutes),
+Measured on a 32-core host: on **Android 17** `soong_build` alone peaks at 42.6 GiB, so
+the cap has to be 48g and the host wants 64 GiB (see *Check the host* at the top of this
+document, which is the current figure). The Android 15 measurement this section was first
+written from — killed at `nproc`=32, peak ~19 GiB at `nproc`=16 with a 44 GiB cap — is
+kept only to show that the CPU count, not the cap, is what moves the peak. A warm `--aaos-src` tree does not reproduce it (its `m` finishes in minutes),
 so verify on a cold build. `build.sh` recognises the kill and stops instead of spending its
 retries on it — see *`ninja failed with: signal: killed`* (`docs/TROUBLESHOOTING.md`).
 
-⚠ The AOSP target is `aosp_xenvm_trout_arm64-trunk_staging-userdebug`, provided by
+⚠ The AOSP target is board-specific since the Android 17 move:
+`aosp_xenvm_trout_rpi5_arm64-trunk_staging-userdebug` on a Pi 5 and
+`aosp_xenvm_trout_rpi4_arm64-trunk_staging-userdebug` on a Pi 4 (ANDROID_LUNCH_TARGET
+in the product yaml). The upstream product they derive from is
 `xen-troops/android_device_epam_xenvm-trout` (Google's own AOSP tree stops at
-`aosp_trout_arm64`). The manifest is `yhamamachi/android_manifest`, which pins stock
-public AOSP plus that device layer, mesa and `xen-troops/lisot`. The upstream Google
+`aosp_trout_arm64`).
+
+Each board gets a product of its own, but they arrive differently. The **Pi 4** product
+is a repo project: the AOSP manifest names
+`automotive-grade-linux/Android_device_sodev_xenvm-cf` at `device/sodev/xenvm-cf` in the
+`notdefault,rpi4` group, and `XT_DOMA_SOURCE_GROUP: "default,rpi4"` in
+`rpi4-sodev.yaml` makes `repo init` ask for it (repo *replaces* the group set, so
+`default` has to be named too). It exists because the Cortex-A72 is not the CPU the
+upstream board config assumes, and it needs its own `PRODUCT_DEVICE`. The **Pi 5**
+product is still staged into the checkout by `meta-xt-doma/stage-aosp-device.sh`, for
+one line -- the `PRODUCT_COPY_FILES` that installs `init.xenvm-buried-eth0.rc`, without
+which minradio retries `setupDataCall` at 7-13 Hz. That rc is destined for the upstream
+device tree (`device/epam/aosp-xenvm-trout`) in a gated, opt-in form once the maintainer
+agrees; until then it is carried here in the exact form the hardware verification ran,
+and a copy of it travels with the Pi 4 device for the same reason. `stage-aosp-device.sh`
+runs for both boards either way: it stages for the Pi 5 and, for the Pi 4, checks that
+the manifest actually delivered the project, because a forgotten group flag otherwise
+surfaces as `lunch` reporting "Can't find a product spec".
+
+The two manifests are `yhamamachi/android_manifest` (the AOSP tree: stock public AOSP
+`android-17.0.0_r1` plus that device layer and mesa) and
+`yhamamachi/android_kernel_manifest` (the GKI guest kernel), both on branch
+`android-17-xenvm-sh-main` and both pinned by commit in the product yamls -- the same
+arrangement V4H uses for its own two manifests. Three changes are needed on top of those
+branches, and they are not all in the same state: Mesa pinned at 25.3.6, which the
+Android 17 toolchain needs, is **merged upstream** (it was squashed, so the commit id
+differs from the one submitted, but the resulting tree is identical); the pinned kernel
+manifest added alongside the branch-tracking one (the kernel component selects it with
+`manifest:`) has **an open pull request**; and the Pi 4 device project described above is
+**not submitted upstream, deliberately** — it is one `<project>` line naming an
+AGL-hosted repository in the `notdefault` group, of no use to anyone not building this
+board, so it is carried on a fork rather than asked of the upstream manifest.
+
+Both `url:` values name the upstream repositories, pinned by commit. The two commits at
+the end of this series move each of them to a fork that carries the change missing from
+the upstream branch; read those two for which is which, and revert them to come back
+here. The upstream Google
 copy of the trout Yocto layer points at `partner-android.googlesource.com` and
 `sso://googleplex-android/`, neither of which is anonymously reachable — the EPAM fork
 is what makes a clean build possible.

@@ -23,6 +23,7 @@ DOM0_OS="${DOM0_OS:-zephyr}"                       # --dom0=zephyr|linux
 BOARD_RAM="${BOARD_RAM:-}"                         # --ram=<sku> : board SKU. rpi5: 16g(default)|8g. rpi4: 8g(default)|4g. Resolved after --board, below.
 ENABLE_DOMU="${ENABLE_DOMU:-no}"                   # -u/--domu    : add DomU (AGL cluster: p1 kernel + p3 rootfs)
 ENABLE_ANDROID="${ENABLE_ANDROID:-no}"             # -a/--android : add DomA (AAOS p4 nested GPT; heavy)
+ENABLE_DOMZ="${ENABLE_DOMZ:-no}"                   # -z/--domz    : add DomZ (Zephyr guest / RTOS domain: p1 zephyr-domz.bin)
 NINJA_TARGET="${NINJA_TARGET-image-full}"          # --domains-only => "" (build domains, skip SD assembly)
 AAOS_SRC_DIR="${AAOS_SRC_DIR:-}"                    # --aaos-src=<dir>       (reuse an AOSP checkout, source mode)
 AAOS_MODE="${AAOS_MODE:-}"                          # --aaos=off|auto|source|prebuilt (empty: derived from -a — off, or auto when -a given)
@@ -50,7 +51,7 @@ Usage() {
   cat <<'EOF'
 Usage: ./build.sh [options]
 
-  Raspberry Pi + Xen 4.21 AGL SoDeV disaggregated cockpit builder.
+  Raspberry Pi + Xen 4.22 AGL SoDeV disaggregated cockpit builder.
   Default build = Raspberry Pi 5, Dom0(Zephyr) + DomD only; guests are opt-in
   (upstream sodev-demo-workspace f3f0f8f7 "disable Android/Flatcar by default").
 
@@ -66,6 +67,11 @@ Domain options:
   -u, --domu             Build DomU (AGL instrument cluster: p1 kernel + p3 AGL rootfs)
   -a, --android          Include DomA (AAOS, p4 nested GPT). Alias for --aaos=auto
                          (how DomA is produced is chosen by --aaos).
+  -z, --domz             Build DomZ (Zephyr as an unprivileged DomU: the RTOS
+                         domain). 16 MiB / 1 vCPU, no rootfs -- the image is
+                         staged on p1 as zephyr-domz.bin and started by the xl
+                         toolstack from /etc/xen/domz.cfg. Console:
+                         `xl console DomZ` from the toolstack domain.
       --dom0=<os>        Dom0 OS: zephyr (default) | linux
       --ram=<sku>        Board SKU. Valid values and the default depend on --board.
                          rpi5: 16g (default) = full 4-domain map (Dom0 512 +
@@ -130,6 +136,7 @@ Environment (no flag):
 Examples:
   ./build.sh                                        # Dom0(zephyr)+DomD only (fast; DomU/DomA-less SD)
   ./build.sh -u                                     # + DomU (AGL cluster)
+  ./build.sh -z                                     # + DomZ (Zephyr RTOS domain)
   ./build.sh -u --aaos=prebuilt --aaos-prebuilt=$HOME/aaos-bundle   # + DomU + DomA from prebuilt (no AOSP build)
   ./build.sh -u --aaos=source   --aaos-src=$HOME/aosp    # + DomU + DomA built from AOSP source
   ./build.sh -u --aaos=source --aaos-ref=/mirror/aosp --aaos-kernel-ref=/mirror/aosp-kernel
@@ -149,6 +156,7 @@ while [ $# -gt 0 ]; do
     -a|--android)       ENABLE_ANDROID=yes ;;   # "want DomA"; required-ness is derived below (only when no explicit --aaos)
     --board)            needval $# "$1"; BOARD="$2"; shift ;;
     --board=*)          BOARD="${1#*=}" ;;
+    -z|--domz)          ENABLE_DOMZ=yes ;;
     --dom0)             needval $# "$1"; DOM0_OS="$2"; shift ;;
     --dom0=*)           DOM0_OS="${1#*=}" ;;
     --ram)              needval $# "$1"; BOARD_RAM="$2"; shift ;;
@@ -188,7 +196,10 @@ case "$DOM0_OS" in zephyr|linux) ;; *) echo "ERROR: --dom0 must be 'zephyr' or '
 # so a stray value would silently mean "no" yet still pass through — validate it.
 # (ENABLE_ANDROID is not validated here: it is derived from the resolved --aaos mode.)
 case "$ENABLE_DOMU" in no|yes) ;; *) echo "ERROR: ENABLE_DOMU must be 'no' or 'yes' (got '$ENABLE_DOMU'); use -u/--domu" >&2; exit 1 ;; esac
-
+# Same reasoning for the DomZ pair: both reach moulin verbatim and the yaml
+# variants are exactly "yes"/"no", so a stray value would pass through and then
+# silently mean "no".
+case "$ENABLE_DOMZ" in no|yes) ;; *) echo "ERROR: ENABLE_DOMZ must be 'no' or 'yes' (got '$ENABLE_DOMZ'); use -z/--domz" >&2; exit 1 ;; esac
 # --- Board selection (which product yaml) --------------------------------------
 # One yaml per board, named <board>-sodev.yaml. They are siblings, not variants of one
 # file: the SoC, the machine, the Zephyr Dom0 board, the passthrough set and the whole
@@ -310,42 +321,58 @@ echo ">> AAOS mode: $AAOS_MODE  (ENABLE_ANDROID=$ENABLE_ANDROID)"
 # 16 GB board's total_memory=16372 -- no 8 GB Pi 5 has been measured here -- so if
 # `xl create doma.cfg` ever fails to allocate, this is the first line to come back
 # to. See the BOARD_RAM parameter in the yaml.
-# DomA (p4) requires DomU (p3), on both boards. The SD partition order is fixed by the
-# yaml's definition order: the ENABLE_DOMU=yes `domu` partition is defined BEFORE the
-# ENABLE_ANDROID=yes `android` one. Without -u there is no p3 DomU rootfs, so rouge
-# assembles Android as p3 -- while the DomA guest config is hard-wired to p4 (doma.cfg
-# backs qemu's disk from /dev/mmcblk0p4 directly). The image then boots to a DomA-less
-# state and the build still exits 0. Refuse loudly instead.
+# --- SD p3 when DomA is built without DomU -------------------------------------
+# The SD partition order is fixed by the yaml's definition order and the guest configs
+# address the SD by fixed device node: doma.cfg backs qemu's disk from /dev/mmcblk0p4,
+# xl-attach-disks maps p4 to xvdc. So `-a` without `-u` used to put the DomA nested GPT
+# at p3, where nothing looks for it, and the build still exited 0 -- which is why this
+# combination was refused outright and a 4 GiB board had to ship BOTH guests and pick
+# one with `systemctl disable` at run time.
 #
-# Scoped to a full SD-image build (NINJA_TARGET non-empty): the mismatch can only ship
-# in an assembled image, and --domains-only is already covered by the NG-2 guard below.
-# Distinct from NG-2: NG-2 = "DomA never assembled"; this = "DomA assembled at the
-# wrong partition number".
-if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ] && [ -n "$NINJA_TARGET" ]; then
-  echo "ERROR: DomA (-a/--android or --aaos=source|prebuilt) requires DomU (-u/--domu)." >&2
-  echo "       Without -u there is no DomU rootfs at SD p3, so rouge assembles Android at" >&2
-  echo "       p3, but the DomA guest config is hard-wired to p4 (doma.cfg reads" >&2
-  echo "       /dev/mmcblk0p4) -> DomA cannot boot. Add -u/--domu, or drop DomA." >&2
+# It is now buildable: ENABLE_DOMU_RESERVED=yes makes the yaml insert an empty 8 MiB
+# partition where DomU's rootfs would be, so DomA keeps p4 (proven with `rouge --dump`
+# on both boards: boot / domd / reserved / android). That is what lets --ram=4g refuse
+# DomU+DomA below instead of shipping a pair that cannot both start.
+# Resolved from the two flags, never set by the user: reserve an empty p3 exactly when
+# DomA is built without DomU. Both "yes" would push the DomA nested GPT to p5, so the
+# contradiction is rejected rather than silently preferred one way.
+ENABLE_DOMU_RESERVED=no
+if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ]; then
+  ENABLE_DOMU_RESERVED=yes
+fi
+if [ "$ENABLE_DOMU_RESERVED" = yes ] && [ "$ENABLE_DOMU" = yes ]; then
+  echo "ERROR: internal: ENABLE_DOMU_RESERVED and ENABLE_DOMU are both yes." >&2
   exit 1
 fi
+if [ "$ENABLE_DOMU_RESERVED" = yes ] && [ -n "$NINJA_TARGET" ]; then
+  echo ">> NOTE: DomU-less DomA build: SD p3 is an empty 8 MiB reserved partition so the" >&2
+  echo ">>   DomA nested GPT stays at p4, which is what doma.cfg's qemu opens." >&2
+fi
 
-# --- 4 GiB Raspberry Pi 4: DomA fits, but not AT THE SAME TIME as DomU ---------
-# A notice, not a refusal. On the 4 GiB SKU Dom0 (256) + DomD (1024) + DomA (2560) has
-# been booted on hardware with 158 MiB of Xen free memory left; DomU alone fits too.
-# What does not fit is DomU and DomA together. Since DomA's p4 requires DomU's p3 (the
-# guard just above), both have to be BUILT into the image regardless -- the constraint
-# is purely at run time, and refusing here would block the only 4 GiB configuration
-# that can run DomA at all.
+# --- 4 GiB Raspberry Pi 4: DomU and DomA cannot both run -> refuse -------------
+# On the 4 GiB SKU Dom0 (256) + DomD (1024) + DomA (2560) has been booted on hardware
+# with 158 MiB of Xen free memory left; DomU alone fits too. What does not fit is DomU
+# and DomA together, so an image carrying both is an image whose two guests cannot both
+# start. This used to be only a NOTE, because DomA's p4 needed DomU's p3 to exist and
+# refusing would have blocked the only 4 GiB configuration that can run DomA at all.
+# ENABLE_DOMU_RESERVED (above) removed that dependency, so the over-commit is now a
+# hard error with three ways out.
 #
 # No arithmetic is restated here on purpose: the sizes live in
 # boot.cmd.xen.*-dom0.in (the 4 GiB DomD override and dom0_mem) and in the DomU/DomA
 # guest configs plus the meta-xt-rpi4 bbappends that override them.
-if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
-  echo ">> NOTE: on a 4 GiB Raspberry Pi 4, DomA and DomU cannot RUN at the same time." >&2
-  echo ">>   Each fits alone; together they exceed the free pool. Both are on the SD" >&2
-  echo ">>   anyway (DomA's p4 needs DomU's p3), so pick one at run time:" >&2
-  echo ">>     systemctl disable --now xl-create-domu   # then start DomA" >&2
-  echo ">>   Use --ram=8g if you need all four domains up together." >&2
+if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] \
+   && [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" = "yes" ]; then
+  echo "ERROR: a 4 GiB Raspberry Pi 4 cannot run DomU and DomA at the same time." >&2
+  echo "       Dom0 + DomD leave one guest's worth of free pool: DomA alone has booted" >&2
+  echo "       on hardware with 158 MiB of Xen free memory left, and DomU alone fits" >&2
+  echo "       too, but together they exceed it. Refusing to build an image whose two" >&2
+  echo "       guests cannot both start." >&2
+  echo "       Pick one:  drop -u/--domu  (DomA image; p3 becomes an empty reserved" >&2
+  echo "                  partition so DomA keeps p4)" >&2
+  echo "                  drop -a/--android/--aaos  (DomU image)" >&2
+  echo "                  --ram=8g  (all four domains together)" >&2
+  exit 1
 fi
 
 if [ "$BOARD" = "rpi5" ] && [ "$BOARD_RAM" = "8g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
@@ -381,21 +408,20 @@ if [ -z "$NINJA_TARGET" ] && [ "$AAOS_MODE" != "off" ]; then
   echo ">>   the DomA kernel/ramdisk from their outputs -- so this is not a short build." >&2
 fi
 
-# C2 guard: DomA (p4) requires DomU (p3). The SD partition order is fixed by
-# rpi5-sodev.yaml definition order (the ENABLE_DOMU=yes p3 partition is defined BEFORE
-# the ENABLE_ANDROID=yes p4). Without -u there is no p3 DomU rootfs, so rouge assembles
-# Android as p3 -- but the DomA guest config is hard-wired to p4 (doma.cfg backs the disk
-# from /dev/mmcblk0p4; xl-attach-disks p4->xvdc), so the image boots to a broken/DomA-less
-# state yet the build exits 0. Refuse loudly (mirrors the "fail loudly for -a" policy).
-# Scoped to a full SD-image build ($NINJA_TARGET non-empty): the mismatch can only ship in
-# an assembled image; --domains-only builds no image and is already covered by NG-2 above
-# (which also lets a legitimate --aaos=source --domains-only artifact-only build proceed).
-# DISTINCT from NG-2: NG-2 = "DomA never assembled"; C2 = "DomA assembled at the wrong p#".
-if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ] && [ -n "$NINJA_TARGET" ]; then
-  echo "ERROR: DomA (-a/--android or --aaos=source|prebuilt) requires DomU (-u/--domu)." >&2
-  echo "       Without -u there is no DomU rootfs at SD p3, so rouge assembles Android at" >&2
-  echo "       p3, but the DomA guest config is hard-wired to p4 (doma.cfg /dev/mmcblk0p4," >&2
-  echo "       xl-attach-disks p4->xvdc) -> DomA cannot boot. Add -u/--domu, or drop DomA." >&2
+# C2 guard (defensive): with ENABLE_DOMU_RESERVED derived above, "DomA without DomU"
+# reserves p3 and DomA stays at p4, so the old refusal is gone. What must never happen
+# is DomA being assembled with NEITHER a DomU rootfs nor the reservation at p3 -- that
+# is the original failure (DomA lands at p3, doma.cfg opens p4, the build exits 0). The
+# derivation makes it unreachable; this check keeps a future edit of it from shipping
+# a broken image silently. Scoped to a full SD-image build ($NINJA_TARGET non-empty):
+# the mismatch can only ship in an assembled image, and --domains-only is covered by
+# NG-2 above. DISTINCT from NG-2: NG-2 = "DomA never assembled"; C2 = "DomA assembled
+# at the wrong partition number".
+if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ] \
+   && [ "$ENABLE_DOMU_RESERVED" != "yes" ] && [ -n "$NINJA_TARGET" ]; then
+  echo "ERROR: internal: DomA without DomU and without the p3 reservation." >&2
+  echo "       rouge would assemble the DomA nested GPT at p3 while doma.cfg opens p4." >&2
+  echo "       ENABLE_DOMU_RESERVED must be yes whenever DomA is built without DomU." >&2
   exit 1
 fi
 
@@ -513,9 +539,17 @@ check_repo_mirror() {  # $1=dir $2=flag name
   # "object directory ... does not exist; check .git/objects/info/alternates" -- for every
   # project, from a step that has already started. Catch it here and name the root instead.
   local alt chain
-  alt="$(find "$d" -path '*/objects/info/alternates' -print -quit 2>/dev/null)"
+  # `|| true` is load-bearing, and only on these two: a bare command substitution in an
+  # ASSIGNMENT propagates its exit status, and `set -e` then kills the script with no
+  # message at all -- the stderr that would explain it is already discarded above. The
+  # three substitutions in this function that sit inside `[ ... ]` are protected by the
+  # test's own status and need nothing. find really does fail here: a mirror that has
+  # been built in leaves bazel's own out/bazel/.../sandbox/inaccessibleHelperDir behind,
+  # which is mode 000 by design, so find exits 1 after having searched everything it
+  # could read. The VALUE is what this check wants; the status is noise.
+  alt="$(find "$d" -path '*/objects/info/alternates' -print -quit 2>/dev/null || true)"
   if [ -n "$alt" ]; then
-    chain="$(head -1 "$alt" 2>/dev/null)"
+    chain="$(head -1 "$alt" 2>/dev/null || true)"
     case "${chain%/}/" in
       "$d"/*|"$workdir"/*) ;;   # self-contained, or reachable via the workspace mount
       *)
@@ -788,7 +822,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
       # requiring them would reject a correctly formed bundle for carrying only what is
       # still used.
       for req in \
-        files/aaos-android-kernel-xenbuilt-6.1.118 files/aaos-vendor-boot-ramdisk-xenbuilt-padded \
+        files/aaos-android-kernel-xenbuilt-6.18.32 files/aaos-vendor-boot-ramdisk-xenbuilt-padded \
         images/boot.img images/init_boot.img images/vendor_boot.img images/vbmeta.img \
         images/super.img images/userdata.img ; do
         grep -q " ${req}\$" "$AAOS_PREBUILT_DIR/MANIFEST.md5" \
@@ -814,7 +848,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     # required: without them prebuilt mode fails in the recipe with an actionable message.
     fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
     staged=0
-    for f in aaos-android-kernel-xenbuilt-6.1.118 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
+    for f in aaos-android-kernel-xenbuilt-6.18.32 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
       if [ -f "$AAOS_PREBUILT_DIR/files/$f" ]; then
         mkdir -p "$fdir"
         cp -f "$AAOS_PREBUILT_DIR/files/$f" "$fdir/$f"   # unconditional: never keep a stale copy
@@ -825,7 +859,10 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
       echo ">> AAOS prebuilt guest kernel + ramdisk staged into meta-xt-doma (derivation will be skipped)."
     else
       echo ">> ERROR: --aaos=prebuilt needs both boot artifacts in '$AAOS_PREBUILT_DIR/files/':" >&2
-      echo ">>   aaos-android-kernel-xenbuilt-6.1.118 and aaos-vendor-boot-ramdisk-xenbuilt-padded." >&2
+      echo ">>   aaos-android-kernel-xenbuilt-6.18.32 and aaos-vendor-boot-ramdisk-xenbuilt-padded." >&2
+      echo ">>   A bundle whose kernel is still named ...-6.1.118 is from the Android 15 guest" >&2
+      echo ">>   and is NOT usable here: pairing that kernel with a 17 vendor_dlkm mismatches" >&2
+      echo ">>   module_layout and the guest never reaches SurfaceFlinger. Rebuild the bundle." >&2
       echo ">>   They cannot be derived here: deriving them needs the AOSP checkout" >&2
       echo ">>   (system/tools/mkbootimg) and the bazel guest kernel, which prebuilt mode" >&2
       echo ">>   deliberately does not have. Use --aaos=source --aaos-src=<AOSP checkout>," >&2
@@ -840,7 +877,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     # building a fresh p4 from source -- the exact kernel/vendor_dlkm ABI mismatch that
     # boots to a black panel with sys.boot_completed=1.
     fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
-    for f in aaos-android-kernel-xenbuilt-6.1.118 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
+    for f in aaos-android-kernel-xenbuilt-6.18.32 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
       if [ -e "$fdir/$f" ]; then
         rm -f "$fdir/$f"
         echo ">> removed a stale prebuilt-staged artifact ($f); --aaos=$AAOS_MODE derives it"
@@ -929,20 +966,44 @@ if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] &&
     mkdir -p "$dir"
     in_docker "$XT_DOCKER" "
       set -e
-      # single source of truth: take url/rev/manifest/depth from the yaml's repo source
+      # single source of truth: take url/rev/manifest/depth/groups from the yaml's repo
+      # source (groups is a moulin variable there, so it is expanded below)
       eval \"\$(python3 - '${MOULIN_YAML}' '${comp}' <<'PYEOF'
-import sys, yaml, shlex
+import re, sys, yaml, shlex
 d = yaml.safe_load(open(sys.argv[1]))
 s = [x for x in d['components'][sys.argv[2]]['sources'] if x.get('type') == 'repo'][0]
+# groups is the one key here whose value is a moulin variable rather than a literal
+# (rpi4 has groups: "%{XT_DOMA_SOURCE_GROUP}"), and yaml.safe_load hands back the
+# placeholder. Expand it against the yaml's own variables: block -- the substitution
+# moulin itself would do -- rather than passing the literal '%{...}' to repo -g.
+# Bounded loop because a variable may be written in terms of another.
+V = d.get('variables') or {}
+def expand(v):
+    v = str(v)
+    for _ in range(8):
+        # Character classes, not backslash escapes: this source passes through a
+        # double-quoted bash string on its way to python, where a backslash is one
+        # unescaping away from meaning something else. [{] and [}] need none.
+        n = re.sub(r'%[{]([A-Za-z_][A-Za-z0-9_]*)[}]',
+                   lambda m: str(V.get(m.group(1), '')), v)
+        if n == v:
+            break
+        v = n
+    return v
 for k, v in (('R_URL', s['url']), ('R_REV', s['rev']),
              ('R_MANIFEST', s.get('manifest', 'default.xml')),
-             ('R_DEPTH', str(s.get('depth', '')))):
-    print('%s=%s' % (k, shlex.quote(v)))
+             ('R_DEPTH', str(s.get('depth', ''))),
+             ('R_GROUPS', s.get('groups', '') or '')):
+    print('%s=%s' % (k, shlex.quote(expand(v))))
 PYEOF
 )\"
       cd '$dir'
       if [ ! -d .repo ]; then
-        repo init --reference='$ref' --no-clone-bundle -u \"\$R_URL\" -m \"\$R_MANIFEST\" -b \"\$R_REV\" \${R_DEPTH:+--depth=\$R_DEPTH}
+        # -g matters as much as -u: repo REPLACES the group set, and the Pi 4 device tree
+        # is an opt-in project (groups="notdefault,rpi4"). moulin's own repo init does
+        # carry -g, but it does not re-run once this seeding has populated the checkout,
+        # so omitting it here is never recovered -- the tree is quietly missing a project.
+        repo init --reference='$ref' --no-clone-bundle -u \"\$R_URL\" -m \"\$R_MANIFEST\" -b \"\$R_REV\" \${R_DEPTH:+--depth=\$R_DEPTH} \${R_GROUPS:+-g \"\$R_GROUPS\"}
       fi
       jobs=${AAOS_SYNC_JOBS}
       tries=0
@@ -1018,6 +1079,7 @@ fi
 #    input not built here. --domains-only (NINJA_TARGET="") => domains only.
 APPLY_ZEPHYR="meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/apply-zephyr-patches.sh"
 STAGE_AOSP_DEVICE="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-aosp-device.sh"
+STAGE_DOMA_KERNEL="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-doma-kernel.sh"
 # In-container build step. prebuilt mode never invokes doma/doma_kernel: it builds the
 # domains (dom0/domd[/domu]) then assembles full.img with rouge directly from the staged
 # android/out images -> no AOSP (m) / bazel / repo sync runs. Other modes use the normal
@@ -1027,14 +1089,41 @@ STAGE_AOSP_DEVICE="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-aosp-device.
 # ROUGE_CMD (prebuilt mode's direct p4 assembly, else a ':' no-op) runs once after.
 if [ "$AAOS_MODE" = prebuilt ]; then
   dom_targets="dom0 domd"; [ "$ENABLE_DOMU" = yes ] && dom_targets="$dom_targets domu"
+  # DomZ is a separate moulin component (its own west workspace), so in prebuilt
+  # mode -- where the domains are built by name instead of via image-full -- it has
+  # to be named explicitly, or rouge would look for a zephyr-domz.bin that was
+  # never built.
+  [ "$ENABLE_DOMZ" = yes ] && dom_targets="$dom_targets domz"
   NINJA_CMD="ninja $dom_targets"
   if [ "$NINJA_TARGET" = "image-full" ]; then
-    ROUGE_CMD="rouge '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID yes --ENABLE_DOMU '${ENABLE_DOMU}' --BOARD_RAM '${BOARD_RAM}' -fi full -o full.img"
+    ROUGE_CMD="rouge '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID yes --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' -fi full -o full.img"
   else
     ROUGE_CMD=":"
   fi
 else
-  NINJA_CMD="ninja ${NINJA_TARGET}"; ROUGE_CMD=":"
+  if [ -z "$NINJA_TARGET" ]; then
+    # --domains-only: name the domains explicitly instead of relying on ninja's
+    # default target. The default target is the set of components marked
+    # `default: true` in the product yaml, and for the zephyr flavour that is dom0
+    # ALONE -- so `ninja` with no goal would build a 230 KB zephyr.bin and stop,
+    # despite --domains-only being documented as building "the domains".
+    #
+    # It used to work by accident: the zephyr dom0 component carried an
+    # additional_deps edge on DomD's Image.gz, which pulled the DomD bitbake into
+    # the default target. That edge was removed because it is not a real dependency
+    # (CONFIG_DOM_CFG_BUILTIN_IMAGES is off, DomD is dom0less, and p1 carries the
+    # uncompressed Image), and with it went the only thing that built DomD here.
+    # Naming the targets restores the contract without reinstating a false edge, and
+    # makes --domains-only mean the same thing for both Dom0 flavours -- the linux
+    # dom0 has a genuine dep on the DomD kernel and so was never affected.
+    #
+    # Same list as the prebuilt branch above.
+    dom_targets="dom0 domd"; [ "$ENABLE_DOMU" = yes ] && dom_targets="$dom_targets domu"
+    NINJA_CMD="ninja $dom_targets"
+  else
+    NINJA_CMD="ninja ${NINJA_TARGET}"
+  fi
+  ROUGE_CMD=":"
   # source mode: the AOSP components MUST finish before the DomD bitbake, because
   # aaos-guest-binaries derives the DomA kernel/ramdisk from their outputs
   # (android/out/.../vendor_boot.img and the bazel Image). ninja does not know that --
@@ -1050,19 +1139,66 @@ else
   # `ninja image-full` by hand; that case is covered by the recipe's do_compile bb.fatal,
   # which names the build.sh invocation to use.
   #
-  # Not gated on NINJA_TARGET: --domains-only (NINJA_TARGET="") still builds DomD, and
-  # moulin's default ninja target does NOT include doma/doma_kernel, so without this the
-  # AOSP outputs would be missing there too. See the NG-2 guard above.
+  # Not gated on NINJA_TARGET: --domains-only still builds DomD (it now names the
+  # targets explicitly, see above), and moulin's default ninja target does NOT include
+  # doma/doma_kernel, so without this the AOSP outputs would be missing there too.
+  # See the NG-2 guard above.
   if [ "$ENABLE_ANDROID" = yes ]; then
-    # NINJA_TARGET may be empty (--domains-only); `ninja` with no goal builds the
-    # default target, which is what the un-prefixed command did, so keep it unquoted
-    # and unguarded rather than dropping the second invocation.
+    # Where the guest kernel's bazel dist lands, and the name of the copy of it that has to
+    # exist INSIDE the AOSP checkout for Soong to accept it as a source path (Android 16+
+    # assembles the filesystem images in Soong, which rejects "../" and absolute paths --
+    # meta-xt-doma/stage-doma-kernel.sh has the full reasoning). Both come from the yaml, for
+    # the same reason the directory names near the top of this file do: one source of truth,
+    # and they are per-board.
+    #
+    # Read HERE, not up there with the others: only this branch uses them. `--aaos=off` and
+    # `--aaos=prebuilt` never run bazel or the AOSP build, so requiring the keys up front
+    # would make a DomA-less build of an older yaml fail before it starts.
+    AAOS_KERNEL_DEPLOY_DIR=$(sed -n 's/^[[:space:]]*ANDROID_KERNEL_DEPLOY_DIR:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$MOULIN_YAML" | head -1)
+    AAOS_KERNEL_STAGE_DIR=$(sed -n 's/^[[:space:]]*ANDROID_KERNEL_STAGE_DIR:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$MOULIN_YAML" | head -1)
+    [ -n "$AAOS_KERNEL_DEPLOY_DIR" ] || { echo "ERROR: could not read ANDROID_KERNEL_DEPLOY_DIR from $MOULIN_YAML" >&2; exit 1; }
+    [ -n "$AAOS_KERNEL_STAGE_DIR" ] || { echo "ERROR: could not read ANDROID_KERNEL_STAGE_DIR from $MOULIN_YAML" >&2; exit 1; }
+    # The stage name reaches a `rm -rf` inside stage-doma-kernel.sh, and it is interpolated
+    # into the shell string below, so validate it on this side too -- the same way BOARD is
+    # validated rather than trusted. The script checks it again; this catches it earlier and
+    # keeps a quote out of the command it builds.
+    case "$AAOS_KERNEL_STAGE_DIR" in
+      *[!A-Za-z0-9._-]*|-*|.|..)
+        echo "ERROR: ANDROID_KERNEL_STAGE_DIR in $MOULIN_YAML must be a single path" >&2
+        echo "       component of [A-Za-z0-9._-]; got '$AAOS_KERNEL_STAGE_DIR'." >&2
+        exit 1 ;;
+    esac
     # moulin has no hook between `repo sync` and the AOSP build, so split it: the
-    # fetch-only pass populates the checkout, stage-aosp-device.sh adds this board's
-    # AAOS product variant (a no-op on rpi5), THEN the AOSP build runs. Without the
-    # staging the rpi4 lunch target does not exist and `m` fails immediately, so the
-    # order is load-bearing rather than an optimisation.
-    NINJA_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel doma && ninja ${NINJA_TARGET}"
+    # fetch-only pass populates the checkout, stage-aosp-device.sh then puts this board's
+    # AAOS product variant in place, THEN the AOSP build runs. The order is load-bearing
+    # rather than an optimisation: on rpi5 the product is staged by that script and the
+    # lunch target does not exist until it has run; on rpi4 the product comes from the
+    # manifest instead and the script only verifies it, but a verification after `m` has
+    # already failed is worth nothing.
+    #
+    # doma_kernel and doma are likewise split, for the same reason one step further on:
+    # Soong will only read the guest kernel from INSIDE the AOSP checkout (it rejects the
+    # "../<kernel checkout>" form the yaml used through Android 15 -- see
+    # meta-xt-doma/stage-doma-kernel.sh), and the copy can only be made once bazel has
+    # produced the dist. So the kernel is built, staged into the checkout, and only then
+    # does the AOSP build run. Splitting the two ninja goals costs nothing: every moulin
+    # builder rule declares ninja's `console` pool (depth 1), so they were already
+    # serialised.
+    #
+    # The tail is ${NINJA_CMD}, not `ninja ${NINJA_TARGET}`: the variable already holds
+    # the goal list resolved above (the explicit domain list for --domains-only,
+    # ${NINJA_TARGET} otherwise), and re-deriving it here would drop back to ninja's
+    # default target under --domains-only -- which for the zephyr flavour is dom0 alone.
+    NINJA_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma && ${NINJA_CMD}"
+  fi
+  # NG-2 class hole, DomZ edition. --domains-only leaves NINJA_TARGET empty, so the
+  # bare `ninja` builds moulin's DEFAULT target -- and the domz component is not in
+  # it (nothing depends on DomZ except the p1 boot item, which only image-full pulls
+  # in). Without naming it here, `./build.sh --domz --domains-only` would build
+  # Dom0+DomD, exit 0, and produce no DomZ at all. Named after the default goal so a
+  # failure order matches the image build's.
+  if [ "$ENABLE_DOMZ" = yes ] && [ -z "$NINJA_TARGET" ]; then
+    NINJA_CMD="$NINJA_CMD && ninja domz"
   fi
 fi
 # ---------------------------------------------------------------------------
@@ -1088,6 +1224,10 @@ if [ "$NINJA_TARGET" = "image-full" ]; then
   IMG_NAME="${BOARD}-${BOARD_RAM%g}GB-${img_dom0}"
   [ "$ENABLE_DOMU" = yes ]    && IMG_NAME="${IMG_NAME}-DomU"
   [ "$ENABLE_ANDROID" = yes ] && IMG_NAME="${IMG_NAME}-DomA"
+  # DomZ changes what is on p1, so it belongs in the name for the same reason
+  # DomU/DomA do: two images that differ only by -z are otherwise
+  # indistinguishable once written.
+  [ "$ENABLE_DOMZ" = yes ]    && IMG_NAME="${IMG_NAME}-DomZ"
   IMG_NAME="${IMG_NAME}-$(date +%Y%m%d-%H%M).img"
   echo ">> SD image will be ${IMG_NAME} (full.img -> it)"
   # A leftover symlink from an earlier build has to go BEFORE rouge runs: rouge
@@ -1102,7 +1242,7 @@ if [ "$NINJA_TARGET" = "image-full" ]; then
   if [ -L full.img ]; then rm -f full.img; fi
 fi
 
-echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
+echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
 in_docker "$XT_DOCKER" "
   set -e
   # Regenerate the moulin build dirs' conf from scratch (V4H build.sh parity): a
@@ -1110,24 +1250,45 @@ in_docker "$XT_DOCKER" "
   # ENABLE_ANDROID=yes run) would otherwise be reused, so a later --dom0/-a/-u
   # change would build against the wrong bblayers.conf.
   rm -rf yocto/build-dom*/conf
-  moulin '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID '${ENABLE_ANDROID}' --ENABLE_DOMU '${ENABLE_DOMU}' --BOARD_RAM '${BOARD_RAM}'
+  moulin '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID '${ENABLE_ANDROID}' --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}'
+  # Zephyr source cache (Yocto DL_DIR analogue): when XT_WEST_CACHE_DIR points at a
+  # pre-populated west reference workspace, pull the manifest+projects from it so the
+  # west fetches run offline (past a blocking proxy). 'west update' projects come via
+  # update.path-cache; the manifest repo that 'west init -m URL' clones is not
+  # path-cache-covered, so redirect that URL to the reference workspace via git
+  # insteadOf. The URL is the zephyr-dom0-xt manifest pinned in rpi5-sodev.yaml.
+  #
+  # Deliberately OUTSIDE the DOM0_OS=zephyr branch: there are two west workspaces
+  # now (zephyr/ for Dom0, zephyr-domz/ for DomZ), DomZ is built in the linux-Dom0
+  # flavour too, and both are initialised from the same manifest repository -- so
+  # these two --global settings serve whichever of them the build needs.
+  if [ -n \"\$XT_WEST_CACHE_DIR\" ] && { [ '${DOM0_OS}' = zephyr ] || [ '${ENABLE_DOMZ}' = yes ]; }; then
+    west config --global update.path-cache \"\$XT_WEST_CACHE_DIR\"
+    git config --global url.\"\$XT_WEST_CACHE_DIR/zephyr-dom0-xt\".insteadOf https://github.com/xen-troops/zephyr-dom0-xt.git
+  fi
   if [ '${DOM0_OS}' = zephyr ]; then
-    # Zephyr Dom0 source cache (Yocto DL_DIR analogue): when XT_WEST_CACHE_DIR points
-    # at a pre-populated west reference workspace, pull the manifest+projects from it
-    # so fetch-dom0 runs offline (past a blocking proxy). 'west update' projects come
-    # via update.path-cache; the manifest repo that 'west init -m URL' clones is not
-    # path-cache-covered, so redirect that URL to the reference workspace via git
-    # insteadOf. The URL is the dom0-zephyr manifest pinned in rpi5-sodev.yaml.
-    if [ -n \"\$XT_WEST_CACHE_DIR\" ]; then
-      west config --global update.path-cache \"\$XT_WEST_CACHE_DIR\"
-      git config --global url.\"\$XT_WEST_CACHE_DIR/zephyr-dom0-xt\".insteadOf https://github.com/xen-troops/zephyr-dom0-xt.git
-    fi
     # moulin has no patch hook for west sources: fetch-only pass ('fetch-dom0' =
     # west init+update) populates the workspace, apply the Zephyr Dom0 patch
-    # series (idempotent), THEN build. Without 0001 guest create fails rc=-3,
-    # so this must precede the zephyr.bin build.
+    # series (idempotent), THEN build. Without the ABI patches
+    # (0018 zeroes the createdomain hypercall argument, 0024 drops Zephyr's
+    # vendored Xen public headers, and 0027/0029 point zephyr-dom0-xt and
+    # zephyr-xrun at zephyr-xenlib's copy) guest create fails rc=-3, so this
+    # must precede the zephyr.bin build.
     ninja fetch-dom0
     '${APPLY_ZEPHYR}' \"\$PWD/zephyr\"
+  fi
+  # DomZ needs the manifest half of the same treatment, and only that half. Its
+  # application carries no Zephyr source patches of its own, so none of the Dom0
+  # source patches apply to it -- but
+  # its workspace is initialised from the SAME manifest repository, which pins Zephyr
+  # 3.6. That pin wants Zephyr SDK 0.16.5, while the builder image ships 1.0.1 for
+  # Dom0's 4.4.1, so an unpatched DomZ workspace dies in
+  # FindZephyr-sdk.cmake:57 (find_package) before compiling a line. Applying 0021
+  # (--manifest-only) builds DomZ against the same Zephyr 4.4.1 as Dom0: one Zephyr
+  # and one SDK in the tree instead of two.
+  if [ '${ENABLE_DOMZ}' = yes ]; then
+    ninja fetch-domz
+    '${APPLY_ZEPHYR}' --manifest-only \"\$PWD/zephyr-domz\"
   fi
   # moulin's generated doma/doma_kernel repo-sync has no built-in retry, so a single
   # transient proxy/network abort can fail the whole ninja run. ninja is incremental
@@ -1163,9 +1324,31 @@ in_docker "$XT_DOCKER" "
       echo \">>   fetch: retrying cannot help. Confirm on the host with\" >&2
       echo \">>   'dmesg -T | grep -i oom-kill' (constraint=CONSTRAINT_MEMCG => the container).\" >&2
       echo \">>   Cap build parallelism and re-run; the build resumes incrementally:\" >&2
-      echo \">>     XT_DOCKER_RUN_OPTS=\\\"--cpuset-cpus=0-15\\\" ./build.sh ...\" >&2
+      echo \">>     XT_DOCKER_RUN_OPTS=\\\"--cpuset-cpus=0-15\\\" ./build.sh --memory=48g ...\" >&2
       echo \">>   (--cpus does NOT help: it leaves nproc, and therefore ninja -j, unchanged.)\" >&2
+      echo \">>   Both matter: --cpuset-cpus bounds the compile phase, --memory bounds\" >&2
+      echo \">>   soong_build, which is one process and ignores the job count entirely.\" >&2
       echo \">>   See 'Bounding a cold AOSP build' in docs/BUILD.md.\" >&2
+      exit 1
+    fi
+    # nsjail: also NOT transient, and it lands hours in. Android 17 builds
+    # trusty_security_vm_arm64.bin with a genrule that runs prebuilts/build-tools/nsjail,
+    # and Docker's default sandbox blocks the three things nsjail needs. They fail one at a
+    # time, so match any of the three signatures rather than only the last one. Android 15
+    # had no nsjail-invoking target, which is why this is new.
+    if grep -qE 'initCloneNs\\(\\)|pivot_root\\(.*(Operation not permitted|Permission denied)|clone\\(flags=CLONE_NEW.*Operation not permitted' \"\$ninja_out\"; then
+      echo \">> ninja failed inside nsjail. This is the Docker sandbox, not a transient\" >&2
+      echo \">>   error: retrying cannot help. AOSP 17 runs one genrule under nsjail, which\" >&2
+      echo \">>   needs to create namespaces, change mount propagation and pivot_root.\" >&2
+      echo \">>   Grant all three and re-run; the build resumes incrementally:\" >&2
+      echo \">>     XT_DOCKER_RUN_OPTS=\\\"--cpuset-cpus=0-15 \\\\\" >&2
+      echo \">>       --security-opt seccomp=unconfined \\\\\" >&2
+      echo \">>       --security-opt apparmor=unconfined \\\\\" >&2
+      echo \">>       --security-opt systempaths=unconfined\\\" ./build.sh ...\" >&2
+      echo \">>   All three are needed: seccomp covers clone and pivot_root, and apparmor\" >&2
+      echo \">>   and systempaths each block the mount on their own. No capability works\" >&2
+      echo \">>   (--cap-add=SYS_ADMIN gets past clone but not pivot_root).\" >&2
+      echo \">>   See '### 0. Check the host' in docs/BUILD.md.\" >&2
       exit 1
     fi
     tries=\$((tries+1))
@@ -1178,6 +1361,10 @@ in_docker "$XT_DOCKER" "
 
 echo "Build complete."
 [ "${ENABLE_DOMU}" = "yes" ] && echo "  AGL DomU image : agl/build/tmp/deploy/images/${AGL_MACHINE}/"
+if [ "${ENABLE_DOMZ}" = "yes" ]; then
+  echo "  DomZ (Zephyr)  : zephyr-domz/build-domz-${BOARD}/zephyr/zephyr.bin -> p1 as zephyr-domz.bin"
+  echo "                   console: xl console DomZ  (from the toolstack domain)"
+fi
 if [ "${ENABLE_ANDROID}" = "yes" ]; then
   echo "  moulin output  : artifacts/ , yocto/ , android/"
 else

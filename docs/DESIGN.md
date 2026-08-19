@@ -24,10 +24,24 @@ from the R-Car V4H AGL SoDeV reference it came from.
 | DomD | 2 | 0–1 | dom0less, direct-mapped; GPU + RP1 (+ SDHCI with zephyr Dom0); qemu virtio backends; toolstack (zephyr flavour) |
 | DomU | 1 | 1 | AGL cluster guest (virtio-pci, grant DMA) |
 | DomA | 2 | 2–3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
+| DomZ | 1 | 3 | Zephyr RTOS guest (`xenvm` board); no virtio at all — PV console only |
 
 BCM2712 has **no IOMMU**, so DomD is direct-mapped (`xen,static-mem` + libxl
 direct-map). DomU virtio uses grant-based DMA; DomA virtio uses foreign mapping
 (`grant_usage=0` in `doma.cfg`).
+
+**DomZ runs on pCPU 0**, alongside Dom0 (an xenstore server and nothing else) and
+DomD's first vCPU. It deliberately does not share a core with DomA: while the AAOS
+guest boots it wants 1.6-2.3 cores and the board reaches 370-380% busy (measured
+2026-08-19), and DomZ -- which needs 0.1 s of CPU per session -- should not sit
+behind that. `domz.cfg` records what to change if DomZ ever needs a core of its own.
+It is the one domain with no device model: `domz.cfg` leaves `virtio`, `disk` and `vif`
+empty, so libxl starts no qemu for it, and it has no passthrough at all: its only
+interface is the Xen PV console.
+
+DomZ is also the one domain that is **not RPi5-specific**: `xenvm` is Zephyr's generic
+ARMv8 Xen-guest board, so the same image is a valid guest under Xen on an RPi4 —
+verified on both boards, in both Dom0 flavours.
 
 ## Board RAM size
 
@@ -40,7 +54,14 @@ Raspberry Pi 5 ships as an 8 GB and a 16 GB SKU. `--ram=16g|8g` (moulin
 | DomD | 4096 MiB | **3072 MiB** | `xen,static-mem` |
 | DomU | 1024 MiB | 1024 MiB | heap, `domu.cfg` |
 | DomA | 4096 MiB | **3072 MiB** | heap, `doma.cfg` (substituted from `BOARD_RAM`) |
-| total | 9728 MiB | 7680 MiB | + Xen ~64 MiB |
+| DomZ | 16 MiB | 16 MiB | heap, `domz.cfg` (fixed by the `xenvm` board's RAM bank) |
+| total | 9744 MiB | 7696 MiB | + Xen ~64 MiB |
+
+DomZ is board-independent and rounds to nothing: 16 MiB is what Zephyr's `xenvm`
+board links against, so it is not a tunable — raising `memory` in `domz.cfg` alone
+would leave the extra unused, lowering it would put the RAM bank below what the
+image expects. It is a heap allocation, so no `xen,static-mem` bank moves and
+`tools/check-memory-map.py` is unaffected.
 
 **`8g` splits the reduction between DomD and DomA.** DomD's static-mem banks reach
 `0x1c0000000` (7 GiB), so on an 8 GB board every address in the map still exists —
@@ -202,12 +223,16 @@ process*. It is built from:
   @ `rpi5-v0.4.0`, fetched by moulin as a `west` source; zephyr builder,
   board `rpi_5`.
 - **Patch series**: `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`
-  (0001-0018 + its own README with the per-patch rationale and required
-  `west build` flags). Highlights:
-  0001 aligns the domctl ABI with Xen 4.21 (load-bearing — guest creation
-  fails with rc=-3 without it), 0004 adds the SoDeV DomU/DomA `dom_cfg`
-  entries, 0006/0007 move the toolstack role to DomD, 0012/0014-0016 harden the
-  xenstore server against ring wedges (0013 is a regions null-init-ptr fix), and
+  (0002-0033, with 0001/0010/0013 retired — its own README carries the per-patch
+  rationale, the retirement reasons and the required `west build` flags).
+  Highlights: 0021 moves the west manifest to Zephyr 4.4.1 and takes
+  `zephyr-xenlib` from zephyrproject-rtos (so the Xen ABI headers come from
+  there, which is what retired 0001), 0033 raises the domctl interface version to
+  0x18 for Xen 4.22 (load-bearing, and silent if missed: out of the Kconfig range
+  kconfiglib discards the value and falls back to 0x17), 0004 adds the SoDeV
+  DomU/DomA `dom_cfg` entries, 0006/0007 move the toolstack role to DomD,
+  0012/0014-0016 harden the xenstore server against ring wedges, 0018 zeroes the
+  `createdomain` hypercall argument (without it guest creation failed rc=-3), and
   0017 guards `xu console` against toolstack-introduced domains whose console
   ring Dom0 never mapped (was crashing Dom0).
 - **Applying the patches**: moulin has no patch hook for west sources, so run
@@ -241,6 +266,14 @@ process*. It is built from:
 4. DomD weston (kiosk-shell) routes the qemu windows by app-id:
    DomU -> HDMI-A-1, DomA -> HDMI-A-2. weston's start is gated on the DRM mode lists
    having settled (`96-wait-drm-modes.conf` -> `weston-wait-drm-modes`); see below.
+5. `-z`: **DomZ** is created last, by the same toolstack, from
+   `zephyr-domz.bin` on p1. Deliberately last and ordering-only (`After=`, no
+   `Requires=`, and no weston gate — it has no device model and no display), so a
+   slow or failing RTOS domain can never hold up the cockpit's screens, and DomZ
+   still starts in builds that have no DomU/DomA at all. It is an `xl`-created
+   domain rather than a dom0less one specifically to keep this step out of
+   `boot.scr` and out of the static-mem map: the Xen PV console it gets in exchange
+   is also what makes `xl console DomZ` work.
 
 ## Differences vs the V4H AGL SoDeV (`sodev-demo-workspace`)
 
@@ -252,7 +285,7 @@ identical and what this port changes:
 | DomU/DomA sources | `sodev-demo-workspace` | **identical** — consumed via the same repo as a pinned submodule (`external/sodev-demo-workspace`); guest virtio contract (virtio-pci BDF addr1-7, virtio-gpu-gl) unchanged, so V4H-built guest images boot unmodified |
 | Build flow | `build.sh` + moulin + docker | **mirrored** — this repo's `build.sh`/`docker/` reproduce the same flow on the RPi5 yaml |
 | Board / BSP | R-Car V4H (Spider/Sparrow Hawk) | Raspberry Pi 5 (BCM2712 + RP1), via `xen-troops/meta-xt-prod-devel-rpi5` + `meta-rpi-sodev/meta-xt-rpi5` |
-| Xen | xen-troops fork | **stock meta-virtualization Xen 4.21** + bbappend patch series (a bbappend patch series over the stock recipes; no forked Xen repo) |
+| Xen | xen-troops fork | **Xen 4.22** via an interim local version recipe in `meta-xt-common/meta-xt-domx` (meta-virtualization master stops at 4.21) + bbappend patch series over pristine xenbits; no forked Xen repo |
 | IOMMU | IPMMU present | **none on BCM2712** → DomD is direct-mapped (`xen,static-mem`); DomU virtio = grant DMA, DomA virtio = foreign mapping (`grant_usage=0`) |
 | Dom0 | Linux Dom0 | selectable: **Zephyr xenstore-only Dom0 (default)** or thin Linux Dom0 (`DOM0_OS`) |
 | Boot | Dom0 creates domains | **dom0less**: Xen brings up Dom0 + DomD from the DTB; the toolstack domain then creates DomU/DomA |
@@ -264,9 +297,10 @@ identical and what this port changes:
   patch series in bbappends. No forked xen repo is used by the build:
   `rpi5-sodev.yaml` fetches meta-virtualization at a pinned revision and the
   whole RPi5/virtio delta is reconstructed as `file://` patch series on top of
-  the pristine xenbits `stable-4.21` tree (see the headers of
-  `meta-xt-rpi5/recipes-extended/xen/xen_4.21.bbappend` and
-  `meta-xt-dom0-linux/recipes-extended/xen-tools/xen-tools_4.21.bbappend`).
+  the pristine xenbits `stable-4.22` tree (see the headers of
+  `meta-xt-rpi5/recipes-extended/xen/xen_4.22.bbappend`,
+  `meta-xt-rpi4/recipes-extended/xen/xen_4.22.bbappend` and
+  `meta-xt-dom0-linux/recipes-extended/xen-tools/xen-tools_4.22.bbappend`).
   Rebasing to a newer Xen means bumping the pin and re-applying the series —
   no fork history to carry.
 - **No IOMMU** → direct-map DomD; DomU grant DMA / DomA foreign mapping (`grant_usage=0`). Guest disks per

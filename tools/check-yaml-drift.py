@@ -56,9 +56,18 @@ BASELINE = os.path.join(ROOT, "tools", "yaml-drift-baseline.txt")
 # Applied in order, longest/most specific first: raspberrypi4-64 has to be rewritten
 # before a bare raspberrypi4 would match part of it.
 NORMALISE = [
-    ("aosp_xenvm_trout_rpi4_arm64", "aosp_xenvm_trout_arm64"),
-    ("xenvm_trout_rpi4_arm64", "xenvm_trout_arm64"),
-    ("xenvm-trout-rpi4", "xenvm-trout"),
+    # Both boards now name their own AOSP product: rpi4 needs one for its CPU
+    # variant, rpi5 for the vendor init.rc that minradio's data call depends on. So
+    # the product NAME normalises rpi4 -> rpi5 like any other board token.
+    #
+    # The DEVICE deliberately does NOT normalise. rpi5's product keeps the upstream
+    # xenvm_trout_arm64 device while rpi4 needs a device of its own, and that is a
+    # real asymmetry rather than a board-token spelling: rewriting it here would hide
+    # it, so it is left to show up as drift and is recorded in the baseline instead.
+    ("aosp_xenvm_trout_rpi4_arm64", "aosp_xenvm_trout_rpi5_arm64"),
+    # No rule for the staged device DIRECTORY name: the Pi 4's device is a repo
+    # project now (device/sodev/xenvm-cf, from the AOSP manifest), so only the Pi 5
+    # still names a directory in this tree and there is nothing to pair it with.
     ("raspberrypi4-64", "raspberrypi5"),
     ("raspberrypi4", "raspberrypi5"),
     ("meta-xt-rpi4", "meta-xt-rpi5"),

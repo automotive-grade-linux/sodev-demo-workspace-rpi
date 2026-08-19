@@ -10,11 +10,17 @@
 /android_kernel-rpi4/
 /yocto/
 /zephyr/
+# DomZ's west workspace. A SECOND one is needed because /zephyr/ only exists in the
+# --dom0=zephyr flavour while DomZ is built in both (see the domz component in
+# rpi5-sodev.yaml). The DomZ application itself is committed, under domz/.
+/zephyr-domz/
 /artifacts/
 /out/
 /full.img
 /build.ninja
 /.moulin.config
+# moulin per-component ninja depfiles (.moulin_dom0.d, .moulin_domd.d, ...)
+/.moulin_*.d
 /.ninja_deps
 /.ninja_log
 /.stamps/
@@ -40,7 +46,7 @@ __pycache__/
 **/recipes-bsp/aaos-guest-binaries/files/aaos-vendor-boot-ramdisk-xenbuilt-*
 
 # Build outputs: SD images. build.sh names each one after the configuration it
-# holds -- <board>-<SKU>-Dom0<flavour>[-DomU][-DomA]-<date>-<time>.img -- and
+# holds -- <board>-<SKU>-Dom0<flavour>[-DomU][-DomA][-DomZ]-<date>-<time>.img -- and
 # points full.img at the newest, so both shapes have to be ignored. The pattern is
 # written out rather than a bare *.img so that an image someone deliberately adds
 # to the tree is still noticed.

@@ -39,11 +39,13 @@
 +    desc: "DomD rootfs only (RPi5)"
 +    desc: "Full RPi5(BCM2711)+Xen SD image (thin Linux or Zephyr Dom0 + dom0less DomD + DomU AGL + DomA AAOS)"
 +    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1024 MiB; DomU or DomA, one at a time)"
++  ANDROID_DEVICE: "xenvm_trout_rpi5_arm64"
 +  ANDROID_KERNEL_DIR: "android_kernel-rpi5"
 +  BOARD_RAM:
 +  DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}. On a new board bring the thin-Linux Dom0 up first: it is a relocatable arm64 Image, so it does not depend on the Zephyr SRAM relink being right.
 +  DOMA_DIR: "android-rpi5"
 +  MACHINE: "raspberrypi5"   # meta-raspberrypi machine (SOC_FAMILY=rpi, MACHINEOVERRIDES raspberrypi5, DEFAULTTUNE cortexa76-nocrypto)
++  XT_DOMA_SOURCE_GROUP: "default,rpi5"
 -                - [BOARD_RAM, "%{BOARD_RAM}"]
 -                - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
 -          "armstub8-2712.bin": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/armstub8-2712.bin"
@@ -65,6 +67,7 @@
 -    desc: "Full RPI image"
 -    desc: "Full RPi5+Xen SD image (Dom0 + DomD, optional DomU AGL / DomA AAOS)"
 -    desc: "Target Raspberry Pi 5 SKU: 16g (default; full 4-domain cockpit) or 8g (DomD and DomA 3072 MiB each; the four domains then total 7680 MiB and fit an 8 GB board -- see the comment above)"
+-  ANDROID_DEVICE: "xenvm_trout_arm64"
 -  ANDROID_KERNEL_DIR: "android_kernel"
 -  BOARD_RAM:
 -  BOARD_RAM: "16g"           # default 16g (16 GB board); overridable: --BOARD_RAM {16g|8g}
@@ -72,3 +75,4 @@
 -  DOMA_DIR: "android"
 -  MACHINE: "raspberrypi5"
 -  XEN_DT_SCMI_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen-scmi"
+-  XT_DOMA_SOURCE_GROUP: ""

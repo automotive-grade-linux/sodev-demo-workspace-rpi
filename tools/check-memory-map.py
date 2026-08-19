@@ -383,10 +383,15 @@ DOM0_BANK0_MEASURED = {
 def predict_dom0_bank0(banks, size_bytes, flavour):
     """Reproduce allocate_memory_11()'s bank[0] placement.
 
-    Xen cannot pin a direct-map Dom0 to a DT address (allocate_memory_11 ignores
-    xen,static-mem -- that is dom0less-domU only, Xen 4.21 domain_build.c:2033) and it
-    loads the arm64 Image at bank[0].start + text_offset (kernel.c:106), so dom0_mem
-    decides where the bank lands.
+    Xen cannot pin a direct-map Dom0 to a DT address (allocate_memory_11() in
+    xen/arch/arm/domain_build.c ignores xen,static-mem -- that property is parsed only
+    on the dom0less path, xen/common/device-tree/dom0less-bindings.c) and it loads the
+    arm64 Image at bank[0].start + text_offset (kernel_zimage_place() in
+    xen/arch/arm/kernel.c), so dom0_mem decides where the bank lands.
+    Re-checked against Xen 4.22: allocate_memory_11() still makes no reference to
+    static memory, and the text_offset placement is unchanged. Cited by function
+    rather than line number, because the previous citation named a line that did not
+    hold the code even on 4.21.
 
     The loop in allocate_memory_11 is `for (bits = order; bits <= lowmem_bitsize;
     bits++) alloc_domheap_pages(d, order, MEMF_bits(bits))`: it raises the address

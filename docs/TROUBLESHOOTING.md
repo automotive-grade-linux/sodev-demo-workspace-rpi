@@ -197,6 +197,42 @@ Nothing is auto-created any more, for any of the three cache flags. `--aaos-ref`
 hold at least one bare `*.git`, because an empty one would make `repo` fall back to
 full network fetches — the very thing those flags exist to avoid.
 
+## A Zephyr build cannot find Python 3.12
+
+```
+CMake Error at .../FindPackageHandleStandardArgs.cmake:230 (message):
+  Could NOT find Python3: Found unsuitable version "3.10.12", but required is
+  at least "3.12" (found /usr/bin/python3 ...)
+Call Stack ... zephyr/cmake/modules/python.cmake:41 (find_package)
+```
+
+**Cause.** A `sodev-builder` image built before this series. Zephyr 4.4 sets
+`PYTHON_MINIMUM_REQUIRED 3.12`; the distro python3 in the image is 3.10 and stays 3.10
+on purpose (Yocto and the AOSP host tools are validated against it). What the current
+`docker/Dockerfile.builder` does is install python3.12 alongside, put Zephyr's
+`requirements-base.txt` in `/opt/zephyr-venv`, and point `/usr/local/bin/west` at that
+interpreter -- `west build` then hands cmake the 3.12 it is running under. An old image
+has `west` on 3.10 instead, and cmake stops as above.
+
+**Fix.** `./build.sh --rebuild-images ...` once. To confirm which image you have:
+`docker run --rm sodev-builder head -1 /usr/local/bin/west` should print
+`#!/opt/zephyr-venv/bin/python3.12`. Note that `tools/check-domz.sh` uses the same
+`XT_DOCKER` default, so a stale image makes its DomZ build step fail the same way.
+
+## DomZ does not start
+
+DomZ (the Zephyr RTOS domain, `-z`) has one interface: its Xen PV
+console. Everything below is read there, with `xl console DomZ` from the toolstack
+domain (`ssh -tt root@192.168.10.10 'xl console DomZ'` over ssh, since `xenconsole`
+needs a tty). Exit with `Ctrl-]`.
+
+| Symptom | Cause | What to do |
+|---|---|---|
+| `xl create` fails, `rc=-19` in `xl dmesg` | The guest asked for a vGICv3. BCM2712 is a GIC-400 and Xen reports *"vGICv3 is not supported on this platform"* | `gic_version="v2"` in `/etc/xen/domz.cfg` (it is the shipped value) and a DomZ image built for the plain `xenvm` board, not `xenvm_gicv3` |
+| `xl create` hangs waiting for a device model | Something added a `virtio`/`disk`/`vif` entry to `domz.cfg`, so libxl spawns qemu for a guest that has no need of one | Keep all three lists empty — DomZ uses only the PV console |
+| `xl create` prints `Parsing config from …` and then hangs forever | **xenstore is not reachable.** libxl blocks on its first xenstore write, before it ever touches the guest image, so this looks like an image problem and is not one. Reproduced deliberately under QEMU: with `xenstored` failing, `xl create` hung exactly here and `xl list` showed no domains at all — not even Dom0 | Check the toolstack domain: `xl list` must show Dom0/DomD. In the zephyr flavour xenstore is served by Zephyr Dom0 (`domd-toolstack-prep` seeds the connection); in the linux flavour it is `xenstored.service`. `systemctl status xenstored` and `journalctl -u xenstored` name the cause — on a Linux Dom0 the usual one is a kernel without `CONFIG_XEN_GNTDEV`, which makes xenstored exit with *"Failed to open connection to gnttab"* |
+| Console silent, no `DomZ up:` line | The image is not what `kernel=` points at, or p1 was not mounted | `ls -l /mnt/zephyr-domz.bin` in the toolstack domain; `xl-create-domz.service` mounts `/dev/mmcblk0p1` at `/mnt` in its `ExecStartPre` |
+
 ## Health checks (xenstore / teardown regression sanity)
 Run from the toolstack domain after boot:
 
@@ -324,7 +360,7 @@ Run from the toolstack domain after boot:
   allocation — so V4H shares the identical four lines with the identical pairing
   (virtio-serial together with virtio-gpu on the top line). Three fixes in this
   workspace are *ahead* of that base:
-  - `4.21-0004-vgic-pci-irq-level-race-fix.patch` — the level-emulation array
+  - `4.22-0004-vgic-pci-irq-level-race-fix.patch` — the level-emulation array
     `d->arch.vgic.pci_irq_level[]` is written in `vgic_inject_irq()` while
     `gic_update_one_lr()` reads the same slot under the target vCPU's `vgic.lock`.
     The base writes it unlocked; the race loses a level update (missed interrupt)

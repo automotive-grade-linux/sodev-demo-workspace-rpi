@@ -1,5 +1,5 @@
 # ============================================================================
-# Raspberry Pi 4 / BCM2711 — SoDeV disaggregated cockpit on Xen 4.21
+# Raspberry Pi 4 / BCM2711 — SoDeV disaggregated cockpit on Xen 4.22
 # ============================================================================
 #
 # SIBLING FILE. There is one product yaml per board and moulin has no cross-file
@@ -31,7 +31,7 @@
 # below says "meta-xt-rpi5" it is describing upstream text or the sibling board; the
 # layer this yaml loads is meta-xt-rpi4, and the two are never loaded together.
 # ============================================================================
-desc: "Raspberry Pi 4 + Xen 4.21 — AGL SoDeV disaggregated cockpit (Zephyr or thin-Linux Dom0)"
+desc: "Raspberry Pi 4 + Xen 4.22 — AGL SoDeV disaggregated cockpit (Zephyr or thin-Linux Dom0)"
 
 # Combining model (moulin has NO cross-file include):
 #   Dom0/DomD : rpi5 base. Component bodies live in the external/meta-xt-prod-devel-rpi5
@@ -66,6 +66,26 @@ variables:
   ZEPHYR_DOM0_MACHINE: "rpi_4b"
   ZEPHYR_DOM0_TARGET: "zephyr-dom0-xt"
   ZEPHYR_DOM0_BUILD_DIR: "build-dom0"
+
+  # --- DomZ (Zephyr guest / DomU) ---------------------------------------------
+  # DomZ is a SECOND, independent west workspace: the Dom0 one (%{ZEPHYR_DOM0_DIR})
+  # only exists in the --DOM0_OS zephyr flavour, and DomZ must build in both. The
+  # manifest is the same repository as Dom0's (it is what pins xen-troops/zephyr,
+  # the tree that carries the xenvm board), but the application built out of it is
+  # this repo's domz/app, referenced by a workspace-relative path: moulin's zephyr
+  # builder runs `west build ... $target` from inside the component build-dir, so a
+  # target outside the workspace is simply a relative path. That keeps the DomZ
+  # application versioned here while the Zephyr checkout stays pristine.
+  ZEPHYR_DOMZ_DIR: "zephyr-domz"
+  ZEPHYR_DOMZ_MACHINE: "xenvm"      # Zephyr's Xen-guest board (GICv2, Xen PV console)
+  ZEPHYR_DOMZ_APP: "../domz/app"
+  # Named after the board even though the guest is board-independent (`xenvm`, so the
+  # two boards produce the same image): moulin's zephyr builder does not build pristine,
+  # and a shared directory would hand whichever board ran last its predecessor's CMake
+  # cache -- a cross-board switch then reconfigures in place instead of from scratch.
+  # One directory per board keeps `moulin rpi4-sodev.yaml && ninja domz` after an rpi5
+  # build honest, and keeps the two boards' artifacts separately inspectable.
+  ZEPHYR_DOMZ_BUILD_DIR: "build-domz-rpi4"
 
   # --- DomD / DomU build dirs + machines + image names (copied from rpi5.yaml) ---
   DOMU_MACHINE: "virtio-armv8-xt"
@@ -106,19 +126,39 @@ variables:
   # The Pi 5 keeps the historical names so an existing checkout is not re-synced.
   ANDROID_KERNEL_DIR: "android_kernel-rpi4"
   DOMA_DIR: "android-rpi4"
-  XT_DOMA_SOURCE_GROUP: ""
+  # repo group set for the AOSP/kernel `repo init` (-g). This board's AAOS device is a
+  # repo project, not a directory staged from this layer: the manifest names
+  # automotive-grade-linux/Android_device_sodev_xenvm-cf at device/sodev/xenvm-cf with
+  # groups="notdefault,rpi4", so it is fetched only when the group is asked for. repo
+  # REPLACES the group set rather than adding to it, so "default" has to be named too --
+  # -g rpi4 alone would sync one project and nothing else. Measured on the pinned
+  # revision: 1087 projects with this value, 1086 with the empty one rpi5 uses.
+  XT_DOMA_SOURCE_GROUP: "default,rpi4"
   ANDROID_KERNEL_BUILD_CONFIG: "//common-modules/xen-virtual-device:xen_virtual_device_aarch64_dist"
   ANDROID_KERNEL_DEPLOY_DIR: "out/deploy/common-modules/xen-virtual-device/xen_virtual_device_aarch64"
+  # Where stage-doma-kernel.sh copies that dist to, relative to the AOSP checkout root, and
+  # therefore the prefix the doma builder's TARGET_PREBUILT_* env below uses. It must be a
+  # tree-relative path: Android 16 moved filesystem assembly into Soong, which rejects a
+  # source path starting with "../" or "/" (build/soong/android/paths.go), so the pre-17
+  # "../%{ANDROID_KERNEL_DIR}/..." form now fails soong analysis. Not under device/: that is
+  # repo-managed and `repo sync` would delete the copy. The name needs no board suffix --
+  # it lives inside this board's own AOSP checkout (DOMA_DIR above).
+  ANDROID_KERNEL_STAGE_DIR: "xt-doma-kernel"
   # A Raspberry Pi 4 specific AAOS product, not the upstream one. The AAOS guest is
   # compiled for the ISA of the HOST cores it runs on -- a virtio guest still executes on
-  # the host's CPUs -- and BCM2711's Cortex-A72 lacks the ARMv8 crypto extensions that the
-  # upstream board config's cortex-a53 variant implies, so /init dies with SIGILL inside
-  # BoringSSL before first-stage mount. The variant is ADDED, not patched in:
-  # meta-xt-common/meta-xt-doma/aosp-device/agl/xenvm-trout-rpi4/ is staged into the repo
-  # checkout by stage-aosp-device.sh (build.sh runs it between `ninja fetch-doma` and
-  # `ninja doma`), and it only includes the upstream board config and overrides the ISA
-  # baseline. Its own PRODUCT_DEVICE also keeps the two boards' out/target/product trees
-  # apart, so switching --board cannot reuse objects compiled for the other CPU.
+  # the host's CPUs -- and the upstream board config resolves to cortex-a53, which is not
+  # the Cortex-A72 of a BCM2711. The variant is ADDED, not patched in: it includes the
+  # upstream board config and overrides the ISA baseline after it. Its own PRODUCT_DEVICE
+  # also keeps the two boards' out/target/product trees apart, so switching --board
+  # cannot reuse objects compiled for the other CPU.
+  #
+  # It arrives with `repo sync`, from the project the manifest carries in the
+  # notdefault,rpi4 group (device/sodev/xenvm-cf -- see XT_DOMA_SOURCE_GROUP above), so
+  # nothing is copied into the checkout for this board any more. stage-aosp-device.sh
+  # still runs between `ninja fetch-doma` and `ninja doma`, but for rpi4 it only checks
+  # that the project, its BoardConfig and the two files it installs are there: a
+  # forgotten group flag would otherwise surface as `lunch` reporting "Can't find a
+  # product spec" with nothing pointing at the flag.
   ANDROID_DEVICE: "xenvm_trout_rpi4_arm64"
   ANDROID_LUNCH_TARGET: "aosp_xenvm_trout_rpi4_arm64-trunk_staging-userdebug"
   # --- DomU (AGL) — informational; actual build is in build.sh ---
@@ -274,7 +314,7 @@ parameters:
   # one variant's disjoint body is merged in (moulin overrides append to sequences /
   # add-or-replace mapping keys, so an empty base + full-body variant is unambiguous).
   #   zephyr (DEFAULT) = upstream/main policy: west source + zephyr builder, board
-  #     rpi_5, XEN_DOMCTL_INTERFACE_VERSION 0x17 (our Xen 4.21 fork). Boot loads
+  #     rpi_5, XEN_DOMCTL_INTERFACE_VERSION 0x18 (our Xen 4.22). Boot loads
   #     zephyr.bin as dom0. Requires meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/apply-zephyr-patches.sh after
   #     `west update` (moulin has no apply_patch hook). See rpi5-sodev.yaml (--DOM0_OS zephyr).
   #   linux            = our verified thin control domain: git source + yocto builder,
@@ -298,7 +338,7 @@ parameters:
           # Zephyr Dom0 body (from rpi5-sodev.yaml (--DOM0_OS zephyr) dom0 component):
           # zephyr-dom0-xt @ rpi5-v0.4.0, board rpi_5 (bcm2712), west source +
           # zephyr builder. See rpi5-sodev.yaml (--DOM0_OS zephyr) for the full rationale
-          # (R1 0x17 ABI, hybrid dom_cfg, apply-zephyr-patches.sh).
+          # (R1 0x18 ABI, hybrid dom_cfg, apply-zephyr-patches.sh).
           dom0:
             build-dir: "%{ZEPHYR_DOM0_DIR}"
             sources:
@@ -311,16 +351,35 @@ parameters:
               target: "%{ZEPHYR_DOM0_TARGET}"
               work_dir: "%{ZEPHYR_DOM0_BUILD_DIR}"
               vars:
-                - "CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME=\"1\""
+                # Volume 0, not 1: on Zephyr 4.4 FF_VOLUMES comes from the number of
+                # status-okay devicetree disk nodes, and this Dom0 has exactly one
+                # (the inert ramdisk0 that 0019 adds so FatFs compiles at all —
+                # the SD belongs to DomD). "1:" would be out of range. 0028 also
+                # moves VolToPart[0] from {3, 2} to {0, 2} -- src/storage.c is shared by
+                # both boards, so the rpi5 patch fixes it for rpi_4b too: `pd` indexes
+                # zfs_diskio.c's
+                # pdrv_str[] = {FF_VOLUME_STRS}, which has one entry here, so 3 was an
+                # out-of-bounds read. Nothing is lost either way — storage_init() fails
+                # earlier, at disk_access_init("SD") with -ENODEV, because the SD
+                # controller is DomD's. Redundant with the Kconfig default ("0" if
+                # FS_FATFS_MULTI_PARTITION); kept here so the value is visible next to
+                # the other Dom0 build vars.
+                - "CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME=\"0\""
                 # NB: CONFIG_DOM_STORAGE_FATFS_DIR="" (guest kernels staged at the
                 # p1 FAT root, not dom0/) is set in the board .conf —
-                # meta-xt-dom0-zephyr/0018 for boards/rpi_4b.conf — NOT as a
+                # meta-xt-dom0-zephyr/0019 for boards/rpi_4b.conf — NOT as a
                 # builder var here, because moulin mangles an empty-string -D
                 # value in its `west build -- ...` cmd.
-                # [R1] match our Xen 4.21 fork ABI (0x17).
-                - "CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x00000017"
+                # [R1] match our Xen 4.22 ABI (0x18). NOTE: this only takes
+                # effect together with meta-xt-dom0-zephyr patch 0033, which
+                # widens the symbol's Kconfig range to 0x18 -- outside the range
+                # kconfiglib discards the value with only a warning and falls
+                # back to the default, so the build stays green at 0x17.
+                # Keep in sync with the board .conf set by patch 0008 (rpi_5)
+                # and patch 0019 (rpi_4b).
+                - "CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x00000018"
                 # Enable the SoDeV guests. On rpi_4b these are rpi_4b_sodev_domu /
-                # rpi_4b_sodev_doma, added by meta-xt-dom0-zephyr/0019 in
+                # rpi_4b_sodev_doma, added by meta-xt-dom0-zephyr/0020 in
                 # src/dom_cfg/rpi_4b.c (CMakeLists.txt selects
                 # src/dom_cfg/${BOARD}.c, and `board:` above is rpi_4b).
                 # Self-contained gate: the dom_cfg block compiles in only when
@@ -330,9 +389,13 @@ parameters:
                 - "CONFIG_DOM_CFG_SODEV=y"
               target_images:
                 - "%{ZEPHYR_DOM0_BUILD_DIR}/zephyr/zephyr.bin"
-              additional_deps:
-                # Zephyr Dom0 embeds/loads the DomD Linux kernel (GPU driver domain).
-                - "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/Image.gz"
+              # No additional_deps on the DomD kernel. An earlier version listed
+              # %{DOMD_BUILD_DIR}/.../Image.gz "because Zephyr Dom0 embeds/loads the
+              # DomD kernel", which is not true in this topology: BUILTIN_IMAGES is
+              # off so nothing is embedded, DomD is dom0less (U-Boot boot module), and
+              # p1 carries the uncompressed Image, not Image.gz. The file happens to
+              # exist so ninja did not fail — it just serialised a 230 KB Dom0 behind
+              # DomD's whole 6.5 GiB rootfs.
         images:
           full:
             partitions:
@@ -382,6 +445,14 @@ parameters:
                 # [ENABLE_DOMU gate] see rpi5-image-xt-dom0-thin.bbappend: install
                 # xt-xen-cfg-domu into the Dom0 rootfs only when a DomU is built.
                 - [XT_DOMU_CFG_INSTALL, "%{XT_DOMU_CFG_INSTALL}"]
+                # [ENABLE_DOMZ gate] In THIS flavour Dom0 owns the xl toolstack,
+                # so it is Dom0's rootfs that needs domz.cfg +
+                # xl-create-domz.service. Both this conf and the domd one set the
+                # two DomZ variables because meta-xt-domz is parsed by both
+                # builds; a variable read by a shared layer but set in only one
+                # component conf is the ExpansionError the DOMD_CAN_TYPE /
+                # XEN_DT_SCMI entries below document.
+                - [XT_DOMZ_CFG_INSTALL, "%{XT_DOMZ_CFG_INSTALL}"]
                 # [V4H-style DomA gate] meta-xt-doma is always in `layers` (like the
                 # V4H prod-devel-rcar4 yaml); ENABLE_ANDROID=no masks ALL its recipes
                 # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/"), the
@@ -405,12 +476,14 @@ parameters:
                 # entries to SRC_URI unconditionally, which made do_fetch look for
                 # bcm2711-raspberrypi4-64-domd-scmi.dtso and fail the parse. They are
                 # now scoped to :raspberrypi5 there.
-                # [Case-C] Select the STOCK meta-virtualization Xen 4.21 recipes
-                # (xen_4.21.bb / xen-tools_4.21.bb, SRCREV 1c72306b, branch stable-4.21)
+                # [Case-C] Select the Xen 4.22 recipes (xen_4.22.bb / xen-tools_4.22.bb,
+                # SRCREV d45d5687f1, branch stable-4.22). [4.22] These are INTERIM
+                # LOCAL recipes in meta-xt-common/meta-xt-domx (shared by both board
+                # products) -- meta-virtualization master stops at 4.21.
                 # instead of the xen-troops fork _git recipe. The RPi5 delta is carried
                 # as a file:// patch series in the project bbappends.
-                - [PREFERRED_VERSION_xen, "4.21.0+stable"]
-                - [PREFERRED_VERSION_xen-tools, "4.21+stable"]
+                - [PREFERRED_VERSION_xen, "4.22.0+stable"]
+                - [PREFERRED_VERSION_xen-tools, "4.22+stable"]
                 # [Case-C] fork-specific SRC_URI:remove:pn-xen-tools no longer needed.
                 - [PREFERRED_VERSION_u-boot, "2024.04"]
                 - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
@@ -466,7 +539,7 @@ parameters:
                 - "../meta-raspberrypi"
                 - "../meta-openembedded/meta-perl"
                 # [fullmetavirt] consolidated meta-xt-* layers (ws-vendored). meta-xt-rpi4
-                # carries the Xen 4.21 bbappend + patch series, the shared
+                # carries the Xen 4.22 bbappend + patch series, the shared
                 # linux-raspberrypi_6.18 DT/config bbappend, CMA/USB/DVFS rpi-config,
                 # and the Xen DT overlay (built in both dom0 and domd).
                 - "../../meta-rpi-sodev/meta-xt-common/meta-xt-dom0-linux"
@@ -477,6 +550,11 @@ parameters:
                 # DomU integration layer: provides xt-xen-cfg-domu installed into the
                 # Dom0 rootfs. DomU AGL guest recipes are BBMASK'd.
                 - "../../meta-rpi-sodev/meta-xt-common/meta-xt-domu"
+                # DomZ integration layer: xt-xen-cfg-domz (domz.cfg +
+                # xl-create-domz.service). Installed only when
+                # %{XT_DOMZ_CFG_INSTALL} is non-empty, so the layer is harmless in a
+                # DomZ-less build (it carries no other recipe).
+                - "../../meta-rpi-sodev/meta-xt-common/meta-xt-domz"
                 # DomA integration layer. Always in layers (V4H style); under
                 # ENABLE_ANDROID=no all its recipes are BBMASK'd via %{XT_DOMA_BBMASK}
                 # so a DomA-less build never parses the AAOS-prebuilt SRC_URI.
@@ -595,6 +673,53 @@ parameters:
                 resize: false   # raw dd; AGL ext4 also carries resize2fs-1.46.5-incompatible features
                 size: 2048 MiB
                 image_path: "agl/build/tmp/deploy/images/%{AGL_GUEST_MACHINE}/%{AGL_GUEST_IMAGE_IC}-%{AGL_GUEST_MACHINE}.rootfs.ext4"
+
+  # ---------------------------------------------------------------------------
+  # ENABLE_DOMU_RESERVED -- keep the DomA nested GPT at SD p4 when DomU is absent.
+  # ---------------------------------------------------------------------------
+  # The guest configs address the SD by fixed device node, not by partlabel
+  # (doma.cfg's qemu -drive opens /dev/mmcblk0p4, domd.cfg passes p3 and p4 to DomD
+  # as xvdb/xvdc), and rouge numbers partitions in YAML declaration order. So
+  # ENABLE_ANDROID=yes with ENABLE_DOMU=no used to put the DomA nested GPT at p3,
+  # where nothing looks for it -- which is why build.sh refused that combination
+  # outright and a 4 GiB board had to ship BOTH guests and pick one at run time.
+  #
+  # This parameter closes that hole from the layout side: "yes" inserts an EMPTY
+  # 8 MiB partition where DomU's rootfs would have been, so DomA keeps p4 without a
+  # DomU being built at all. Declared BETWEEN ENABLE_DOMU and ENABLE_ANDROID because
+  # moulin applies parameters in definition order: DomU's p3 (when present), then
+  # this filler (when DomU is absent), then DomA's p4.
+  #
+  # Never set both this and ENABLE_DOMU to "yes": that would push DomA to p5.
+  # build.sh derives the value (yes only when ENABLE_ANDROID=yes and ENABLE_DOMU=no)
+  # and rejects the contradiction; a direct moulin/rouge invocation bypasses that,
+  # exactly as it bypasses the other layout guards described at the partition list.
+  ENABLE_DOMU_RESERVED:
+    desc: "Reserve an empty SD p3 in place of the DomU rootfs so the DomA nested GPT stays at p4 in a DomU-less build. Derived by build.sh; do not set by hand."
+    "no":
+      default: true
+      overrides:
+        variables:
+          # No layout change. The variable exists so the parameter has a body and so
+          # the value is visible in the generated build.ninja for a DomU-less debug.
+          XT_SD_P3: "domu-rootfs-or-absent"
+    "yes":
+      overrides:
+        variables:
+          XT_SD_P3: "reserved-empty"
+        images:
+          full:
+            partitions:
+              # p3 -- placeholder only. Deliberately `empty` (zeroed, no filesystem)
+              # and tiny: it exists to hold the partition NUMBER, and anything that
+              # looked like a rootfs here would invite a boot attempt. domd.cfg's
+              # `phy:/dev/mmcblk0p3, xvdb, w` still attaches, harmlessly, to 8 MiB of
+              # zeros -- with no DomU there is no device model that opens xvdb.
+              reserved:
+                desc: "Reserved (empty): holds p3 so the DomA nested GPT stays p4 in a DomU-less image"
+                gpt_type: 8DA63339-0007-60C0-C436-083AC8230908
+                type: empty
+                size: 8 MiB
 
   # DomA (AAOS) is assembled directly by rouge as a nested GPT (true V4H
   # android_only style) from the doma component's AOSP outputs — there is no
@@ -722,6 +847,40 @@ parameters:
                     type: android_sparse
                     image_path: "%{DOMA_DIR}/out/target/product/%{ANDROID_DEVICE}/userdata.img"
 
+  # ---------------------------------------------------------------------------
+  # DomZ (Zephyr guest) gate — the RTOS domain.
+  # ---------------------------------------------------------------------------
+  # Same idiom as ENABLE_DOMU/ENABLE_ANDROID: yaml default "no" (the orchestrator
+  # decides), build.sh turns it on with --domz. "yes" adds
+  #   - the p1 boot item zephyr-domz.bin (which is also what pulls the `domz`
+  #     component into the ninja graph), and
+  #   - xt-xen-cfg-domz (domz.cfg + xl-create-domz.service) into the rootfs of
+  #     whichever domain runs the toolstack: DomD in the zephyr flavour, Dom0 in
+  #     the thin-Linux one. Both component confs read %{XT_DOMZ_CFG_INSTALL}, so a
+  #     guest-less build never ships the service (it would fail on every boot).
+  # NO new partition: DomZ runs entirely out of the 16 MiB Xen gives it, so the
+  # board-verified p2=DomD / p3=DomU / p4=DomA layout is untouched.
+  #
+  # Placed AFTER ENABLE_ANDROID so that, whatever the flag combination, the p3
+  # (DomU) and p4 (DomA) partitions are still appended in that order.
+  ENABLE_DOMZ:
+    desc: "Build DomZ (Zephyr as an unprivileged DomU) and add it to the SD image (p1 zephyr-domz.bin + the DomZ xl cfg). yaml default no; build.sh adds it with --domz."
+    "no":
+      default: true
+      overrides:
+        variables:
+          XT_DOMZ_CFG_INSTALL: ""
+    "yes":
+      overrides:
+        variables:
+          XT_DOMZ_CFG_INSTALL: "xt-xen-cfg-domz"
+        images:
+          full:
+            partitions:
+              boot:
+                items:
+                  "zephyr-domz.bin": "%{ZEPHYR_DOMZ_DIR}/%{ZEPHYR_DOMZ_BUILD_DIR}/zephyr/zephyr.bin"
+
 components:
   # =========================================================================
   # Dom0 / DomD — RPi5 base, copied verbatim from external/meta-xt-prod-devel-rpi5/rpi5.yaml.
@@ -790,14 +949,21 @@ components:
         # directory that does not exist (found by the clean-room cold build).
         - [AAOS_SRC_TREE, "${TOPDIR}/../../%{DOMA_DIR}"]
         - [AAOS_KERNEL_TREE, "${TOPDIR}/../../%{ANDROID_KERNEL_DIR}"]
-        # [Case-C] Select the STOCK meta-virtualization Xen 4.21 recipes; the
+        # The AOSP build reads the guest kernel from a copy inside its own checkout
+        # (Soong will not take a path outside the tree), and that copy is made by a
+        # script, not by a ninja edge, so it can go stale without the graph noticing.
+        # Pass the directory name so aaos-guest-binaries can compare that copy against
+        # the kernel it is about to put on p1 -- if they differ, p4's vendor_dlkm and
+        # p1's kernel come from different builds and module_layout disagrees.
+        - [AAOS_KERNEL_STAGE_DIR, "%{ANDROID_KERNEL_STAGE_DIR}"]
+        # [Case-C] Select the Xen 4.22 recipes (INTERIM LOCAL, in meta-xt-domx); the
         # RPi5 delta is carried as a file:// patch series in the project
-        # bbappends (meta-xt-rpi4/.../xen_4.21.bbappend +
-        # meta-xt-dom0-linux/.../xen-tools_4.21.bbappend).
-        - [PREFERRED_VERSION_xen,"4.21.0+stable"]
-        - [PREFERRED_VERSION_xen-tools, "4.21+stable"]
+        # bbappends (meta-xt-rpi4/.../xen_4.22.bbappend +
+        # meta-xt-dom0-linux/.../xen-tools_4.22.bbappend).
+        - [PREFERRED_VERSION_xen,"4.22.0+stable"]
+        - [PREFERRED_VERSION_xen-tools, "4.22+stable"]
         # [Case-C] fork-specific SRC_URI:remove:pn-xen-tools dropped (stock
-        # xen-tools_4.21.bb does not require the xen-source.inc chain that
+        # xen-tools_4.22.bb does not require the xen-source.inc chain that
         # appended those patches). See the dom0 component comment.
         - [PREFERRED_VERSION_u-boot, "2024.04"]
         # Not set on this board: [XEN_DT_SCMI, ...]. No SCMI on BCM2711.
@@ -917,8 +1083,11 @@ components:
         # DomU is built. ENABLE_DOMU=no => "" so a guest-less build never ships the
         # service (it would fail every boot). Consumed by rpi5-image-xt-domd-vc4-initramfs.
         - [XT_DOMU_CFG_INSTALL, "%{XT_DOMU_CFG_INSTALL}"]
-        # [V4H-style DomA gate] see the dom0-linux conf: ENABLE_ANDROID=no masks
-        # every meta-xt-doma recipe; =yes expands to "".
+        # [ENABLE_DOMZ gate] Same for DomZ (Zephyr guest): in the zephyr flavour
+        # DomD is the toolstack domain, so domz.cfg + xl-create-domz.service go
+        # into the DomD rootfs. Set in the dom0(linux) conf as well —
+        # meta-xt-domz is in both layer sets.
+        - [XT_DOMZ_CFG_INSTALL, "%{XT_DOMZ_CFG_INSTALL}"]
         - [BBMASK:append, "%{XT_DOMA_BBMASK}"]
       build_target: "%{XT_DOMD_IMAGE}"
       layers:
@@ -926,7 +1095,7 @@ components:
         - "../meta-raspberrypi"
         - "../meta-openembedded/meta-perl"
         # [fullmetavirt] consolidated meta-xt-* layers (ws-vendored single source).
-        # meta-xt-rpi4 carries the Xen 4.21 bbappend + patch series, the shared
+        # meta-xt-rpi4 carries the Xen 4.22 bbappend + patch series, the shared
         # linux-raspberrypi_6.18 DT/config bbappend, CMA/USB/DVFS rpi-config, and
         # the bcm2712-raspberrypi5-xen DT overlay. meta-xt-driver-domain carries
         # the DomD kernel body + V4H kernel/mesa/weston/qemu bbappends + all the
@@ -953,6 +1122,11 @@ components:
         # (DomD is the toolstack domain that runs xl create). The DomU AGL guest
         # recipes are BBMASK'd in conf (same mask as the dom0 build).
         - "../../meta-rpi-sodev/meta-xt-common/meta-xt-domu"
+        # DomZ integration layer: xt-xen-cfg-domz (domz.cfg +
+        # xl-create-domz.service), installed into the DomD rootfs because DomD is
+        # the toolstack domain in the zephyr flavour. Gated by
+        # %{XT_DOMZ_CFG_INSTALL}.
+        - "../../meta-rpi-sodev/meta-xt-common/meta-xt-domz"
         # DomA integration layer (meta-xt-doma): stacks the vhost_xen kernel bbappend
         # on the DomD linux-raspberrypi build and installs xt-aaos-host-services
         # (VHAL/dumpstate) + domd-vhost-xen-domid into the DomD image. Always in
@@ -1080,17 +1254,91 @@ components:
         - "tmp/deploy/images/%{DOMU_MACHINE}/Image"
 
   # =========================================================================
+  # DomZ — Zephyr as an unprivileged guest (DomU), the RTOS domain.
+  #
+  # Zephyr's own `xenvm` board is the Xen-guest board (GICv2 - which is what this
+  # board needs, the host has no usable vGICv3 - guest memory map at 0x40000000,
+  # ARM generic timer read at runtime, and the Xen PV console so `xl console DomZ`
+  # works). The image is a raw binary staged on SD p1 as zephyr-domz.bin and
+  # started by the xl toolstack from /etc/xen/domz.cfg (meta-xt-domz), exactly like
+  # DomU/DomA are - NOT a dom0less domain, so neither boot.cmd nor the static-mem
+  # map changes.
+  #
+  # There is no rootfs and no partition of its own: DomZ is 16 MiB of RAM and a
+  # single vCPU. It is a normal moulin component whose output becomes the
+  # ENABLE_DOMZ=yes p1 boot item, the same way `domu` is.
+  # =========================================================================
+  domz:
+    build-dir: "%{ZEPHYR_DOMZ_DIR}"
+    sources:
+      - type: west
+        url: "https://github.com/xen-troops/zephyr-dom0-xt.git"
+        rev: "rpi5-v0.4.0"
+    builder:
+      type: zephyr
+      board: "%{ZEPHYR_DOMZ_MACHINE}"
+      target: "%{ZEPHYR_DOMZ_APP}"
+      work_dir: "%{ZEPHYR_DOMZ_BUILD_DIR}"
+      target_images:
+        - "%{ZEPHYR_DOMZ_BUILD_DIR}/zephyr/zephyr.bin"
+
+  # =========================================================================
   # DomA — COPIED from V4H AGL SoDeV (prod-devel-rcar4_new.yaml). Kept in sync
   # via meta-rpi-sodev/scripts/sync-guest-pins.sh.  TARGET_BOARD_PLATFORM uses xenvm (VM), not
   # the host SoC, so it is NOT %{SOC_FAMILY} here (RPi5 deviation from V4H).
+  #
+  # AAOS version: Android 17 (AOSP tag android-17.0.0_r1) on the GKI android17-6.18
+  # guest kernel. Both manifests are xenvm-trout manifests WITHOUT a proprietary.xml,
+  # because the xen-troops "-ih-" branches for 17 pin Renesas X5H material from
+  # partnergitlab.renesas.solutions (a private GitLab) and select the PowerVR DDK for
+  # GPU. Neither is reachable nor useful here: this guest runs on a Raspberry Pi, whose
+  # GPU path is virgl/mesa3d, and the whole point of the four-domain demo is that it
+  # builds from anonymous HTTPS with no NDA (docs/BUILD.md "### 0. Check the host").
+  # The manifests used here therefore keep the 15-era arrangement -- upstream Mesa for
+  # the guest GPU, no vendor prebuilts -- at the 17 revisions.
+  #
+  # Where the manifests live. The same arrangement V4H uses: the two `type: repo`
+  # components point straight at manifest repositories, pinned by commit (V4H does this
+  # in meta-rcar-demo/prod-devel-rcar4_new.yaml with xen-troops/android_kernel_manifest
+  # and yhamamachi/android_manifest). AGL hosts no Android manifest repository, and
+  # nothing about the guest source is duplicated here.
+  #
+  # Three changes are needed for an Android 17 guest, and all three go UPSTREAM rather
+  # than being kept downstream, because RPi5 builds the same binary as V4H and a
+  # downstream-only manifest would break that:
+  #   Mesa pinned at 25.3.6 -- MERGED upstream. Android 17 needs the UNREACHABLE rename
+  #                            Mesa made in 25.3.0; the 24.3.0-devel revision the branch
+  #                            pinned before did not compile under -std=gnu++23
+  #   a pinned kernel manifest added ALONGSIDE the branch-tracking one, so a workspace
+  #                            revision resolves to one tree instead of whatever the
+  #                            tracked branches point at that day. The kernel component
+  #                            selects it by name below; `manifest:` is `repo init -m`.
+  #   the Raspberry Pi 4 device as a project in the notdefault,rpi4 group, pointing at
+  #                            automotive-grade-linux/Android_device_sodev_xenvm-cf.
+  #                            Only a board that asks for the group fetches it: measured
+  #                            on the pinned revision, 1087 projects with -g default,rpi4
+  #                            and 1086 without, the device being the difference. See
+  #                            XT_DOMA_SOURCE_GROUP at the top of this file.
+  #
+  # Both components point at the upstream manifest repositories, pinned by commit.
+  # This is the end state; the two commits after this one move each url to a fork of
+  # it, because one change per manifest is not in the upstream branch. Read those
+  # commits for which is which and why, and revert them to come back here.
+  #
+  #   git ls-remote https://github.com/yhamamachi/android_manifest        android-17-xenvm-sh-main
+  #   git ls-remote https://github.com/yhamamachi/android_kernel_manifest android-17-xenvm-sh-main
+  #
+  # Move BOTH boards' yaml in the same change -- if one board went to upstream while
+  # the other stayed on a fork they would stop sharing one revision, which is the
+  # asymmetry a single pinned rev exists to avoid.
   # =========================================================================
   doma_kernel:
     build-dir: "%{ANDROID_KERNEL_DIR}"
     sources:
       - type: repo
-        url: https://github.com/xen-troops/android_kernel_manifest.git
-        rev: 23e08b76317bfb41d4ec4f68a891fb00bf591b0b
-        manifest: default.xml
+        url: https://github.com/yhamamachi/android_kernel_manifest.git
+        rev: ac2ea7005b35c3151af33fa6a7ddac3a775688c6
+        manifest: pinned-common-android17-6.18.xml
         depth: 1
         groups: "%{XT_DOMA_SOURCE_GROUP}"
         dir: "."
@@ -1103,7 +1351,20 @@ components:
         - "--sandbox_debug"
       target: "%{ANDROID_KERNEL_BUILD_CONFIG}"
       target-patterns:
-        - "--dist_dir=%{ANDROID_KERNEL_DEPLOY_DIR}"
+        # The dist rule changed between the 6.1 and 6.18 kernel trees, and with it the
+        # flag that names the output directory. 6.1 ended in
+        #     copy_to_dist_dir(dist_dir = ...) + exec(name = ..._dist)
+        # whose generated script takes --dist_dir. 6.18 ends in rules_pkg:
+        #     pkg_files(strip_prefix = strip_prefix.files_only()) + pkg_install(...)
+        # and that pkg_install declares NO destdir attribute, so rules_pkg requires
+        # --destdir (or DESTDIR in the environment) at `bazel run` time -- see
+        # external/bazelbuild-rules_pkg pkg/install.bzl. moulin's bazel builder puts
+        # target-patterns after `--`, i.e. they reach the generated installer as program
+        # arguments, which is exactly where both flags belong. A relative path resolves
+        # against BUILD_WORKSPACE_DIRECTORY (the android_kernel checkout root), the same
+        # place the old relative dist_dir landed, so ANDROID_KERNEL_DEPLOY_DIR and the
+        # aaos-guest-binaries recipe that reads it are unaffected.
+        - "--destdir=%{ANDROID_KERNEL_DEPLOY_DIR}"
       target_images:
         - "%{ANDROID_KERNEL_DEPLOY_DIR}/Image"
 
@@ -1112,7 +1373,7 @@ components:
     sources:
       - type: repo
         url: https://github.com/yhamamachi/android_manifest.git
-        rev: aff3224d1515e0fa63effcb37d629edd16ce6c46
+        rev: 97bc72216187c83f6fb02a33607d31feab442162
         manifest: default.xml
         depth: 1
         groups: "%{XT_DOMA_SOURCE_GROUP}"
@@ -1121,8 +1382,15 @@ components:
       type: android
       env:
         - "TARGET_BOARD_PLATFORM=xenvm"
-        - "TARGET_PREBUILT_KERNEL=../%{ANDROID_KERNEL_DIR}/%{ANDROID_KERNEL_DEPLOY_DIR}/Image"
-        - "TARGET_PREBUILT_MODULES_DIR=../%{ANDROID_KERNEL_DIR}/%{ANDROID_KERNEL_DEPLOY_DIR}/"
+        # Both paths are relative to the AOSP checkout root and point at the staged copy of
+        # the doma_kernel dist that stage-doma-kernel.sh makes there (build.sh runs it
+        # between `ninja doma_kernel` and `ninja doma`). They CANNOT name the kernel
+        # checkout directly any more: Android 16 moved filesystem assembly into Soong, and
+        # Soong rejects a source path that starts with "../" or "/", so the pre-17 form
+        # failed analysis with "Path is outside directory" once per artefact. See
+        # meta-xt-doma/stage-doma-kernel.sh for where each variable ends up.
+        - "TARGET_PREBUILT_KERNEL=%{ANDROID_KERNEL_STAGE_DIR}/Image"
+        - "TARGET_PREBUILT_MODULES_DIR=%{ANDROID_KERNEL_STAGE_DIR}/"
       lunch_target: "%{ANDROID_LUNCH_TARGET}"
       target_images:
         - "out/target/product/%{ANDROID_DEVICE}/boot.img"
@@ -1132,7 +1400,16 @@ components:
         - "out/target/product/%{ANDROID_DEVICE}/super.img"
         - "out/target/product/%{ANDROID_DEVICE}/userdata.img"
       additional_deps:
+        # Two edges for one input, because the AOSP build reads a COPY of the kernel that
+        # this graph cannot produce (stage-doma-kernel.sh makes it; moulin owns the ninja
+        # file, so the script cannot be an edge). The dist Image is what a rebuilt kernel
+        # changes, so it is what re-runs this component; the staged Image is named too so a
+        # checkout where the staging never ran fails with "missing and no known rule to
+        # make it" instead of building against whatever is there. Neither edge can see a
+        # copy that is merely STALE -- aaos-guest-binaries compares the two byte for byte
+        # before shipping either, which is the check that actually closes the hole.
         - "../%{ANDROID_KERNEL_DIR}/%{ANDROID_KERNEL_DEPLOY_DIR}/Image"
+        - "%{ANDROID_KERNEL_STAGE_DIR}/Image"
 
 # =========================================================================
 # images — full + rootfs copied verbatim from external/meta-xt-prod-devel-rpi5/rpi5.yaml,
@@ -1227,11 +1504,11 @@ images:
       # doma component's AOSP outputs. No prebuilt combined-disk input. With
       # ENABLE_ANDROID=no the SD image has no p4 (DomA-less).
       #
-      # !! ENABLE_ANDROID=yes REQUIRES ENABLE_DOMU=yes !!
-      # The two parameters add their partitions INDEPENDENTLY and rouge numbers
-      # partitions in declaration order, so `--ENABLE_ANDROID yes --ENABLE_DOMU no`
-      # produces an image where the DomA nested GPT is the THIRD partition. All four
-      # combinations parse and rouge lists three images for each, so nothing fails at
+      # !! ENABLE_ANDROID=yes REQUIRES p3 TO EXIST -- DomU's OR the reservation !!
+      # The parameters add their partitions INDEPENDENTLY and rouge numbers partitions
+      # in declaration order, so `--ENABLE_ANDROID yes --ENABLE_DOMU no` on its own
+      # produces an image where the DomA nested GPT is the THIRD partition. All the
+      # combinations parse and rouge lists its images for each, so nothing fails at
       # build time — it fails at run time, because the guest configs address the
       # partitions by fixed device node, not by partlabel:
       #   doma.cfg:126           -drive file=/dev/mmcblk0p4      (AAOS super.img)
@@ -1240,12 +1517,16 @@ images:
       # With DomU absent, DomA's data lands on p3 while qemu still opens p4, which
       # does not exist -> DomA would fail to start with an I/O error, not a clear
       # message.
-      # This IS already enforced: build.sh's "C2 guard" refuses
-      # ENABLE_ANDROID=yes + ENABLE_DOMU!=yes for a full SD-image build (and NG-2
-      # covers the --domains-only case, deliberately still allowing an
-      # `--aaos=source --domains-only` artifact-only build). The note is kept here
-      # because the constraint lives in the PARTITION ORDER defined above, not in
-      # build.sh, and a direct `moulin`/`rouge` invocation bypasses that guard.
+      # ENABLE_DOMU_RESERVED=yes (parameter above) covers the DomU-less case by
+      # inserting an empty 8 MiB partition at p3, so DomA keeps p4. build.sh DERIVES
+      # that value (yes exactly when ENABLE_ANDROID=yes and ENABLE_DOMU=no) and its
+      # C2 guard refuses the remaining hole -- DomA with neither a DomU rootfs nor the
+      # reservation at p3 -- for a full SD-image build; NG-2 covers --domains-only,
+      # deliberately still allowing an `--aaos=source --domains-only` artifact-only
+      # build. The note is kept here because the constraint lives in the PARTITION
+      # ORDER defined above, not in build.sh: a direct `moulin`/`rouge` invocation
+      # bypasses the derivation, so it has to pass --ENABLE_DOMU_RESERVED yes itself
+      # whenever it asks for DomA without DomU.
       # The permanent fix would be to address these partitions by
       # /dev/disk/by-partlabel/<name> in doma.cfg / domd.cfg / xl-create-doma.service.
 
