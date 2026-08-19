@@ -9,17 +9,21 @@ Reviewed-by: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
 Reviewed-by: Andrii Anisov <andrii_anisov@epam.com>
 Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
 Local-Modifications: parse_vgsx_list() hardened -- NULL guard on the strdup() and free(buf) at the end of each loop iteration; without them a failed allocation is dereferenced and every entry after the first leaks its copy
+ [4.22] Regenerated against xenbits stable-4.22 (d45d5687f1) by Yuichi
+ Kusakabe <yuichi_kusakabe@jp.honda>: context only. On the 4.21-era context hunk
+ #1 needed fuzz 1 and landed +30 lines out, hunk #2 +55; the emitted code is
+ byte-for-byte the 4.21 version (same 61 insertions, same diffstat).
 Origin: https://github.com/xen-troops/xen commit 290e2ef7e07ecd58b1d924d89ed854f9a7650f26
 ---
  tools/xl/xl_parse.c | 61 +++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 61 insertions(+)
 
 diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
-index 1cc41f1bff..0c95111354 100644
+index 01783731b5..2e840852e6 100644
 --- a/tools/xl/xl_parse.c
 +++ b/tools/xl/xl_parse.c
-@@ -1314,6 +1314,66 @@ out:
-     return ret;
+@@ -1344,6 +1344,66 @@ int parse_xsquota_item(const char *buf, struct libxl_xs_quota_item *item)
+     return 0;
  }
  
 +static int parse_vgsx_config(libxl_device_vgsx *vgsx, char *token)
@@ -85,7 +89,7 @@ index 1cc41f1bff..0c95111354 100644
  void parse_config_data(const char *config_source,
                         const char *config_data,
                         int config_len,
-@@ -3033,6 +3091,7 @@ skip_usbdev:
+@@ -3088,6 +3148,7 @@ skip_usbdev:
      }
  
      parse_vkb_list(config, d_config);

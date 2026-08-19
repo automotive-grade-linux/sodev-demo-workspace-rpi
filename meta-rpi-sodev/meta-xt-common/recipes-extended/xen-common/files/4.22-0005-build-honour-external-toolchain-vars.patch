@@ -24,6 +24,10 @@ every configuration this is built in.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Origin: https://github.com/xen-troops/xen branch rpi5_dev -- split out of the
+ squashed working delta carried as 4.22-0001. Original authors of that delta:
+ Volodymyr Babchuk <volodymyr_babchuk@epam.com> and Ihor Usyk
+ <ihor_usyk@epam.com> (EPAM Systems, GPL-2.0-only).
 Upstream-Status: Pending [not submitted yet; generic cross-build fix, no RPi5 dependency]
 ---
  config/StdGNU.mk        | 12 ++++++------

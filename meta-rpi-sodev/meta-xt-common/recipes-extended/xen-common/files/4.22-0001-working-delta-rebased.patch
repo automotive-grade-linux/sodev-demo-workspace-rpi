@@ -1,12 +1,15 @@
 From 5b2632a74cb975e3a5654f12d3bfdfafc88ba267 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Thu, 18 Jun 2026 23:35:01 +0900
-Subject: xen-troops working delta, rebased onto xen-4.21-xt-gen5
+Subject: xen-troops working delta, rebased onto Xen 4.22
 
-Reapply the EPAM rpi5_dev working delta on top of xen-troops
-xen-4.21-xt-gen5 (Xen 4.21.0). The delta is the difference the rpi5_dev branch
-carries over its own 4.19 base; it is squashed here because the individual
-commits do not rebase onto 4.21 independently (see the conflict notes below).
+Reapply the EPAM rpi5_dev working delta on top of pristine xenbits stable-4.22
+(d45d5687f1). The delta is the difference the rpi5_dev branch carries over its
+own 4.19 base; it is squashed here because the individual commits do not rebase
+independently (see the conflict notes below). It was first rebased onto
+xen-troops xen-4.21-xt-gen5 (Xen 4.21.0) -- the 4.19 -> 4.21 notes below are
+from that step and are kept because they explain the current shape -- and then
+carried to 4.22, see the [4.22] note further down.
 
 Conflict resolution highlights (4.19 -> 4.21):
 - public/domctl.h: renumber to coexist with upstreamed 4.21 ops/flags
@@ -41,7 +44,22 @@ floor in place each is equivalent to the upstream code it replaced, and the
 release_guest_irq() rewrite additionally rejects the extended SPI range that
 vgic_is_valid_line() accepts under CONFIG_GICV3_ESPI.
 
-Builds clean (arm64, Xen 4.21.0); the base switch is verified by compile+link.
+[4.22] Carried from 4.21.0 to 4.22.0. Of the 20 hunks across 13 files, 19 apply
+to stable-4.22 with only offsets; one needed rebasing. Upstream e263eeaf71
+("domctl: handle XEN_DOMCTL_{,un}bind_pt_irq without acquiring domctl lock") and
+329edc090d ("domain: locking for irq_caps accesses") rewrote
+arch_do_domctl()'s XEN_DOMCTL_bind_pt_irq from a chain of early returns into an
+`rc = ...` if/else chain evaluated under read_lock(&currd->caps_lock), and
+introduced a `currd` local for current->domain. The two diagnostic printks this
+delta adds on the EPERM and EBUSY paths were moved into that shape; the only
+textual change to the emitted code in the whole patch is
+current->domain->domain_id -> currd->domain_id, which is the same value. Every
+other added line across all 13 files is byte-identical to the 4.21 version, and
+the six Kconfig options, their default-n/0 + UNSUPPORTED gating, and the three
+un-ported relaxations described above are therefore unchanged. Applies to
+stable-4.22 with zero fuzz, and builds clean (arm64): do_patch and do_compile both
+succeed in the Yocto build for both Dom0 flavours (zephyr and thin-Linux), with
+patch-fuzz left at ERROR.
 
 Origin: https://github.com/xen-troops/xen branch rpi5_dev (tip 2214507e72),
  squashed and rebased onto branch xen-4.21-xt-gen5 (tip d4823d5ef9).
@@ -68,10 +86,10 @@ Upstream-Status: Inappropriate [downstream RPi5/BCM2712 working delta; local wor
  13 files changed, 412 insertions(+), 12 deletions(-)
 
 diff --git a/xen/arch/arm/Kconfig b/xen/arch/arm/Kconfig
-index cf6af68299..718c4bd7f4 100644
+index 5fa89fcb24..224a7e286b 100644
 --- a/xen/arch/arm/Kconfig
 +++ b/xen/arch/arm/Kconfig
-@@ -274,6 +274,89 @@ config PCI_PASSTHROUGH
+@@ -275,6 +275,89 @@ config PCI_PASSTHROUGH
  	help
  	  This option enables PCI device passthrough
  
@@ -162,10 +180,10 @@ index cf6af68299..718c4bd7f4 100644
  
  menu "ARM errata workaround via the alternative framework"
 diff --git a/xen/arch/arm/device.c b/xen/arch/arm/device.c
-index 3cdfa7686c..d160b3736d 100644
+index 3497650b5f..8223190524 100644
 --- a/xen/arch/arm/device.c
 +++ b/xen/arch/arm/device.c
-@@ -24,7 +24,7 @@ int map_irq_to_domain(struct domain *d, unsigned int irq,
+@@ -25,7 +25,7 @@ int __overlay_init map_irq_to_domain(struct domain *d, unsigned int irq,
      res = irq_permit_access(d, irq);
      if ( res )
      {
@@ -175,10 +193,10 @@ index 3cdfa7686c..d160b3736d 100644
      }
  
 diff --git a/xen/arch/arm/domain.c b/xen/arch/arm/domain.c
-index e36719bce4..c191e44e9f 100644
+index baa3a5d708..0cd0aa95e6 100644
 --- a/xen/arch/arm/domain.c
 +++ b/xen/arch/arm/domain.c
-@@ -612,9 +612,16 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+@@ -561,9 +561,16 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
  {
      unsigned int max_vcpus;
      unsigned int flags_required = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap);
@@ -196,7 +214,7 @@ index e36719bce4..c191e44e9f 100644
      unsigned int sve_vl_bits = sve_decode_vl(config->arch.sve_vl);
  
      if ( (config->flags & ~flags_optional) != flags_required )
-@@ -795,6 +802,20 @@ int arch_domain_create(struct domain *d,
+@@ -762,6 +769,20 @@ int arch_domain_create(struct domain *d,
      if ( (rc = sci_domain_init(d, config)) != 0 )
          goto fail;
  
@@ -218,10 +236,10 @@ index e36719bce4..c191e44e9f 100644
  
  fail:
 diff --git a/xen/arch/arm/domain_build.c b/xen/arch/arm/domain_build.c
-index fb8fbb1650..e2ee2d5b4f 100644
+index 72d5316180..71026c0396 100644
 --- a/xen/arch/arm/domain_build.c
 +++ b/xen/arch/arm/domain_build.c
-@@ -1774,7 +1774,22 @@ static int __init handle_node(struct domain *d, struct kernel_info *kinfo,
+@@ -1674,7 +1674,22 @@ static int __init handle_node(struct domain *d, struct kernel_info *kinfo,
  
  static int __init prepare_dtb_hwdom(struct domain *d, struct kernel_info *kinfo)
  {
@@ -245,7 +263,7 @@ index fb8fbb1650..e2ee2d5b4f 100644
      const void *fdt;
      int new_size;
      int ret;
-@@ -2028,6 +2043,56 @@ int __init construct_hwdom(struct kernel_info *kinfo,
+@@ -1926,6 +1941,56 @@ int __init construct_hwdom(struct kernel_info *kinfo,
      if ( rc < 0 )
          return rc;
  
@@ -303,29 +321,28 @@ index fb8fbb1650..e2ee2d5b4f 100644
      {
          rc = prepare_dtb_hwdom(d, kinfo);
 diff --git a/xen/arch/arm/domctl.c b/xen/arch/arm/domctl.c
-index ad914c915f..3bcfe9f7f3 100644
+index 6c9a3f9920..8566f31e93 100644
 --- a/xen/arch/arm/domctl.c
 +++ b/xen/arch/arm/domctl.c
-@@ -108,10 +108,18 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
-             return rc;
+@@ -111,9 +111,17 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
+         read_lock(&currd->caps_lock);
  
-         if ( !irq_access_permitted(current->domain, irq) )
+         if ( !irq_access_permitted(currd, irq) )
 +        {
 +            printk(XENLOG_WARNING "bind_pt_irq -> EPERM (caller d%d lacks capability)\n",
-+                   current->domain->domain_id);
-             return -EPERM;
++                   currd->domain_id);
+             rc = -EPERM;
 +        }
- 
-         if ( !vgic_reserve_virq(d, virq) )
+         else if ( !vgic_reserve_virq(d, virq) )
 +        {
 +            printk(XENLOG_WARNING "bind_pt_irq -> EBUSY (vgic_reserve_virq(d%d, vIRQ%u) failed; already allocated?)\n",
 +                   d->domain_id, virq);
-             return -EBUSY;
+             rc = -EBUSY;
 +        }
- 
-         rc = route_irq_to_guest(d, virq, irq, "routed IRQ");
-         if ( rc )
-@@ -179,6 +187,82 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
+         else
+         {
+             rc = route_irq_to_guest(d, virq, irq, "routed IRQ");
+@@ -184,6 +192,82 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
      }
      case XEN_DOMCTL_dt_overlay:
          return dt_overlay_domctl(d, &domctl->u.dt_overlay);
@@ -462,7 +479,7 @@ index 63ed1b74f0..649e4c9f45 100644
      {
          printk(XENLOG_G_ERR "Unable to map MFN %#"PRI_mfn" in %pd\n",
 diff --git a/xen/arch/arm/vgic.c b/xen/arch/arm/vgic.c
-index e966162efe..88a5875323 100644
+index c2949400ed..a1a7721469 100644
 --- a/xen/arch/arm/vgic.c
 +++ b/xen/arch/arm/vgic.c
 @@ -253,6 +253,30 @@ int domain_vgic_init(struct domain *d, unsigned int nr_spis)
@@ -497,10 +514,10 @@ index e966162efe..88a5875323 100644
      if ( nr_spis > (1020 - NR_LOCAL_IRQS) )
  #ifndef CONFIG_GICV3_ESPI
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index d488f08aff..f95fea334d 100644
+index ba7244ccc5..a186f5fa21 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -627,6 +627,18 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+@@ -599,6 +599,18 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
      unsigned int altp2m_mode = MASK_EXTR(config->altp2m.opts,
                                           XEN_DOMCTL_ALTP2M_mode_mask);
  
@@ -520,10 +537,10 @@ index d488f08aff..f95fea334d 100644
      {
          dprintk(XENLOG_INFO, "%s support not available\n", hvm ? "HVM" : "PV");
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index 75c7da16e2..aa791a57c5 100644
+index 9289f78bd1..b92004b19d 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -756,7 +756,13 @@ static int sanitise_domain_config(struct xen_domctl_createdomain *config)
+@@ -807,7 +807,13 @@ static int sanitise_domain_config(struct xen_domctl_createdomain *config)
             XEN_DOMCTL_CDF_s3_integrity | XEN_DOMCTL_CDF_oos_off |
             XEN_DOMCTL_CDF_xs_domain | XEN_DOMCTL_CDF_iommu |
             XEN_DOMCTL_CDF_nested_virt | XEN_DOMCTL_CDF_vpmu |
@@ -539,10 +556,10 @@ index 75c7da16e2..aa791a57c5 100644
          dprintk(XENLOG_INFO, "Unknown CDF flags %#x\n", config->flags);
          return -EINVAL;
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 579924048b..f5e6b0e031 100644
+index 8924fe406c..5842c81d16 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -418,7 +418,38 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -683,7 +683,38 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
              break;
          }
  
@@ -582,10 +599,10 @@ index 579924048b..f5e6b0e031 100644
          {
              ret = PTR_ERR(d);
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 588b5b99cb..dd796c5e51 100644
+index 40b0f73563..689db447d6 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
-@@ -3030,11 +3030,16 @@ static bool prepare_staticmem_pages(struct page_info *pg, unsigned long nr_mfns,
+@@ -3058,11 +3058,16 @@ static bool prepare_staticmem_pages(struct page_info *pg, unsigned long nr_mfns,
  /*
   * Acquire nr_mfns contiguous reserved pages, starting at #smfn, of
   * static memory.
@@ -606,7 +623,7 @@ index 588b5b99cb..dd796c5e51 100644
  {
      unsigned long i;
      struct page_info *pg;
-@@ -3080,9 +3085,12 @@ static int assign_domstatic_pages(struct domain *d, struct page_info *pg,
+@@ -3108,9 +3113,12 @@ static int assign_domstatic_pages(struct domain *d, struct page_info *pg,
  /*
   * Acquire nr_mfns contiguous pages, starting at #smfn, of static memory,
   * then assign them to one specific domain #d.
@@ -622,7 +639,7 @@ index 588b5b99cb..dd796c5e51 100644
      struct page_info *pg;
  
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 5aef5e3ece..b2769aefd7 100644
+index c8379bbf3b..1b23aff430 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
 @@ -68,9 +68,22 @@ struct xen_domctl_createdomain {
@@ -649,7 +666,7 @@ index 5aef5e3ece..b2769aefd7 100644
  
      uint32_t flags;
  
-@@ -992,6 +1005,20 @@ struct xen_domctl_paging_mempool {
+@@ -995,6 +1008,20 @@ struct xen_domctl_paging_mempool {
      uint64_aligned_t size; /* Size in bytes. */
  };
  
@@ -670,7 +687,7 @@ index 5aef5e3ece..b2769aefd7 100644
  #if defined(__i386__) || defined(__x86_64__)
  struct xen_domctl_vcpu_msr {
      uint32_t         index;
-@@ -1370,6 +1397,15 @@ struct xen_domctl {
+@@ -1373,6 +1400,15 @@ struct xen_domctl {
  #define XEN_DOMCTL_gsi_permission                88
  #define XEN_DOMCTL_set_llc_colors                89
  #define XEN_DOMCTL_get_domain_state              90 /* stable interface */
@@ -686,7 +703,7 @@ index 5aef5e3ece..b2769aefd7 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1435,6 +1471,7 @@ struct xen_domctl {
+@@ -1438,6 +1474,7 @@ struct xen_domctl {
          struct xen_domctl_paging_mempool    paging_mempool;
  #if defined(__arm__) || defined(__aarch64__)
          struct xen_domctl_dt_overlay        dt_overlay;

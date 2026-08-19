@@ -18,11 +18,14 @@ map_irq_to_domain() (-> the non-hwdom route_irq_to_guest relaxation already in
 this tree).  No-op for nodes without msi-ranges, so safe for every passthrough
 node.  dom0less-only; needs no toolstack (avoids the 4.19/4.21 xl ABI mismatch).
 
-Builds clean (arm64, Xen 4.21.0).
+Builds clean (arm64). [4.22] Applies to stable-4.22 with zero fuzz and compiles in
+the Yocto build for both Dom0 flavours; the hunks moved by offsets only, no rebase.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [rework needed before submission: relies on the
+ non-hwdom route_irq_to_guest relaxation (XT_GUEST_MIN_NR_SPIS) that
+ 4.22-0001 adds, which is downstream-only]
 ---
  xen/arch/arm/dom0less-build.c | 83 +++++++++++++++++++++++++++++++++++++++++-
  1 file changed, 82 insertions(+), 1 deletion(-)

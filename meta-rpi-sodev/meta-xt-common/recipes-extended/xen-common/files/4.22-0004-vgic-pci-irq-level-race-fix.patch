@@ -19,7 +19,9 @@ falling-edge early return and the injection path are untouched).
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on the downstream legacy-PCI
+ level-emulation series (0013/0019): d->arch.vgic.pci_irq_level[] does not
+ exist upstream, so this cannot be submitted as-is]
 ---
 --- a/xen/arch/arm/vgic.c
 +++ b/xen/arch/arm/vgic.c
