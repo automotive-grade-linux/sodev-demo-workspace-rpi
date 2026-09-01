@@ -71,7 +71,7 @@ XEN_REL ?= "4.22.0"
 XEN_BRANCH ?= "stable-4.22"
 
 SRC_URI = " \
-    git://xenbits.xen.org/xen.git;branch=${XEN_BRANCH} \
+    git://xenbits.xen.org/git-http/xen.git;protocol=https;branch=${XEN_BRANCH} \
     file://0001-menuconfig-mconf-cfg-Allow-specification-of-ncurses-location.patch \
     file://0001-libxl_nocpuid-fix-build-error.patch \
     "

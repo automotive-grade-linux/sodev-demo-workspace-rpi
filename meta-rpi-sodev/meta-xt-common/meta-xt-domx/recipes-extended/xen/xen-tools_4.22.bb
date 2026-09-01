@@ -59,7 +59,7 @@ XEN_REL ?= "4.22"
 XEN_BRANCH ?= "stable-4.22"
 
 SRC_URI = " \
-    git://xenbits.xen.org/xen.git;branch=${XEN_BRANCH} \
+    git://xenbits.xen.org/git-http/xen.git;protocol=https;branch=${XEN_BRANCH} \
     file://0001-python-pygrub-pass-DISTUTILS-xen-4.19.patch \
     file://0001-libxl_nocpuid-fix-build-error.patch \
     file://0001-tests-vpci-drop-explicit-g-use-refreshed-4.22.patch \
