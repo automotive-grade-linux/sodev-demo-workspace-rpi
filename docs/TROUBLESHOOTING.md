@@ -53,6 +53,64 @@ timeout every boot.
 This is intermittent: if the EDID happens to land before weston enumerates, nothing goes
 wrong, which is why it was not caught earlier.
 
+## DomD panics in `brcmstb_l2_intc` during boot
+
+Measured on a Raspberry Pi 4, 2026-09-02, after swapping the HDMI display. DomD died
+0.53 s into its own boot, before init:
+
+```
+Unable to handle kernel NULL pointer dereference at virtual address 0000000000000008
+pc : brcmstb_l2_intc_irq_handle+0x40/0x1a0
+Call trace:
+  brcmstb_l2_intc_irq_handle
+  ...
+  _raw_spin_unlock_irqrestore                (P)
+  irq_set_chained_handler_and_data+0x98/0xe0
+  brcmstb_l2_intc_probe.isra.0+0x150/0x298
+  platform_irqchip_probe
+Kernel panic - not syncing: Oops: Fatal exception in interrupt
+```
+
+This is an upstream race, not a configuration problem, and **it is already fixed in this
+workspace** by `0013-irqchip-brcmstb-l2-set-up-the-generic-chip-before-ch.patch`
+(`meta-xt-common/meta-xt-driver-domain/recipes-kernel/linux/files/`). If the panic shows
+up, the DomD kernel in the image predates that patch — rebuild it.
+
+Why it happens: `brcmstb_l2_intc_probe()` installs the chained parent handler before
+assigning `data->gc`, and `irq_set_chained_handler_and_data()` unmasks the parent line and
+re-sends anything pending on it. A parent that is already asserted therefore runs the
+handler from inside that call, where `data->gc` is still NULL. On BCM2711 the display L2
+controller (`aon_intr`, `interrupt-controller@7ef00100`, GIC SPI 96) is the SoC's only
+edge-triggered GIC line, so its parent latches pending state from the HDMI work the
+firmware does before Linux starts — which is why a display swap can surface it while the
+software is unchanged. BCM2712 has the same window on `disp_intr` (SPI 97) and `aon_intr`
+(SPI 239), so the patch is applied to both boards.
+
+The interrupt type matters too, and it was wrong here until 2026-09-02. The DomD partial
+device tree declared `interrupts = <0x0 96 0x1>` (EDGE_RISING) for `aon_intr`, copied from
+the `bcm2711-rpi-4-b.dtb` that `raspberrypi/firmware` distributes. **That prebuilt is
+stale**: EDGE_RISING is what raspberrypi/linux carried up to `rpi-5.15.y`, while mainline
+(since at least v5.19) and every rpi tree from `rpi-6.1.y` onwards — including the 6.18
+pinned here — say `IRQ_TYPE_LEVEL_HIGH`. It is now `<0x0 96 0x4>`.
+
+Why the type decides whether the race above is reachable: brcmstb-l2 masks all 32 child
+sources and clears their status at the top of its probe, so the controller's output line is
+already low when it chains the parent. With a **level** type there is no pending parent and
+the probe finishes quietly. With an **edge** type, a rising edge latched earlier — during
+the firmware's HDMI/EDID work, before Linux runs — stays pending regardless of the line and
+is re-sent the instant the parent is started, which is exactly what walked into the window.
+Measured on hardware: switching the partial DT to LEVEL_HIGH stops the panic.
+
+⚠ Open item: the `bcm2711-rpi-4-b.dtb` shipped on p1 is still the firmware prebuilt, so the
+**host** DT Xen reads and the **guest** partial DT now disagree for SPI 96. The partial DT
+governs what DomD's own probe sees, which is why fixing it was sufficient. Making the host
+DT agree means shipping the kernel-built dtb instead of the prebuilt, which has not been
+done. See `meta-xt-rpi4/BCM2711-DT-TRUTH.md` §4.
+
+🚨 `0013` must be **deleted** once upstream carries the fix — see the note at the end of
+the patch itself and the comment above its `SRC_URI` line in
+`linux-raspberrypi_6.18.bbappend`. Check it on every kernel SRCREV bump.
+
 ## DomD-side toolstack units are masked in the thin-Linux flavour
 
 `domd-toolstack-prep.service`, `xl-create-domu.service` and `xl-create-doma.service` ship

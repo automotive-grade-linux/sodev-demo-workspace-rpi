@@ -1,0 +1,136 @@
+From 042162a6e0438f354f7db1f7a8f505ed5b66458b Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 2 Sep 2026 14:02:31 +0900
+Subject: [PATCH] irqchip/brcmstb-l2: set up the generic chip before chaining
+ the parent
+
+brcmstb_l2_intc_probe() installs the chained parent handler before it fills in
+the data structure that handler dereferences:
+
+	irq_set_chained_handler_and_data(parent_irq,
+					 brcmstb_l2_intc_irq_handle, data);
+
+	data->gc = irq_get_domain_generic_chip(data->domain, 0);
+	data->gc->reg_base = base;
+	...
+	data->status_offset = init_params->cpu_status;
+	data->mask_offset = init_params->cpu_mask_status;
+
+irq_set_chained_handler_and_data() does more than record the handler. On the
+is_chained path it calls irq_activate_and_startup(desc, IRQ_RESEND), which
+unmasks the parent line and re-sends whatever is already pending on it. If the
+parent is pending at that moment the handler runs immediately, from inside that
+call, and its very first statement is
+
+	status = irq_reg_readl(b->gc, b->status_offset) & ...
+
+with b->gc still NULL. That is an unhandled NULL dereference in interrupt
+context during an initcall, i.e. the machine dies before init runs:
+
+  Unable to handle kernel NULL pointer dereference at virtual address 8
+  pc : brcmstb_l2_intc_irq_handle+0x40/0x1a0
+  Call trace:
+    brcmstb_l2_intc_irq_handle
+    handle_irq_desc
+    generic_handle_domain_irq
+    gic_handle_irq
+    ...
+    _raw_spin_unlock_irqrestore          (irq_set_chained_handler_and_data's own
+    irq_set_chained_handler_and_data      unlock -- the handler ran inside it)
+    brcmstb_l2_intc_probe.isra.0
+    platform_irqchip_probe
+  Kernel panic - not syncing: Oops: Fatal exception in interrupt
+
+Observed on a Raspberry Pi 4 where the display L2 controller (aon_intr,
+interrupt-controller@7ef00100) is the sole edge-triggered GIC line on the SoC,
+so its parent SPI latches a pending state from the HDMI activity the firmware
+performs before Linux starts. Whether the parent happens to be pending is
+outside the driver's control, so the window is real on any board whose parent
+line can arrive asserted.
+
+Note that no extra masking is needed to fix this: the probe already writes
+0xffffffff to cpu_mask_set (and to cpu_clear unless brcm,irq-can-wake) right
+after mapping the registers, long before this point. An early spurious parent
+therefore finds status == 0 and takes the existing handle_bad_irq() path
+harmlessly -- provided b->gc is readable. The only defect is the ordering.
+
+Move the chaining call down so it runs once everything the handler and the
+generic chip's callbacks touch is in place. It has to stay ahead of the
+enable_irq_wake() in the can_wake branch, which needs the parent started, so
+just before that branch is the correct spot.
+
+No functional change other than the ordering: the diff moves three lines and
+adds a comment.
+
+--- NOTE FOR THE INTEGRATOR (downstream, not part of the upstream submission) ---
+
+THIS PATCH MUST BE REVERTED (deleted) ONCE UPSTREAM CARRIES THE FIX. It is a
+local carry of a fix to upstream code, not a downstream feature, so keeping it
+after upstream lands an equivalent change would either fail to apply or apply
+twice. Check it on every kernel SRCREV bump:
+
+    grep -n -B6 'Set the IRQ chaining logic' drivers/irqchip/irq-brcmstb-l2.c
+
+  - if irq_set_chained_handler_and_data() still appears BEFORE the
+    "data->gc = irq_get_domain_generic_chip(...)" assignment, upstream is still
+    broken and this patch is still needed;
+  - if it appears AFTER that assignment (or the file no longer matches this
+    hunk at all), upstream has fixed it: delete this file and drop its
+    file://0013-... line from
+    meta-xt-common/meta-xt-driver-domain/recipes-kernel/linux/linux-raspberrypi_6.18.bbappend.
+
+The change is a pure move, so reverting it restores the pinned upstream file
+byte-for-byte.
+
+Assisted-by: Claude Code:claude-opus-5[1m]
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/irqchip/irq-brcmstb-l2.c | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/irqchip/irq-brcmstb-l2.c b/drivers/irqchip/irq-brcmstb-l2.c
+index 38de9d0..27b879e 100644
+--- a/drivers/irqchip/irq-brcmstb-l2.c
++++ b/drivers/irqchip/irq-brcmstb-l2.c
+@@ -212,10 +212,6 @@ static int brcmstb_l2_intc_probe(struct platform_device *pdev, struct device_nod
+ 		goto out_free_domain;
+ 	}
+ 
+-	/* Set the IRQ chaining logic */
+-	irq_set_chained_handler_and_data(parent_irq,
+-					 brcmstb_l2_intc_irq_handle, data);
+-
+ 	data->gc = irq_get_domain_generic_chip(data->domain, 0);
+ 	data->gc->reg_base = base;
+ 	data->gc->private = data;
+@@ -244,6 +240,26 @@ static int brcmstb_l2_intc_probe(struct platform_device *pdev, struct device_nod
+ 	ct->chip.irq_resume = brcmstb_l2_intc_resume;
+ 	ct->chip.irq_pm_shutdown = brcmstb_l2_intc_shutdown;
+ 
++	/*
++	 * Set the IRQ chaining logic only now that everything
++	 * brcmstb_l2_intc_irq_handle() and the generic chip's callbacks touch is
++	 * in place: data->gc, its reg_base, the status/mask offsets and the
++	 * chip_types ack/mask/unmask ops.
++	 *
++	 * irq_set_chained_handler_and_data() does not merely record the handler;
++	 * for a chained handler it also calls irq_activate_and_startup() with
++	 * IRQ_RESEND, which unmasks the parent line and re-sends anything already
++	 * pending on it. If the parent fires there, the handler runs immediately,
++	 * inside this call. Doing that before data->gc is assigned dereferences
++	 * NULL in the handler's first statement and takes the machine down with
++	 * "Fatal exception in interrupt" during an initcall.
++	 *
++	 * enable_irq_wake() below needs the parent started, so this has to stay
++	 * ahead of it.
++	 */
++	irq_set_chained_handler_and_data(parent_irq,
++					 brcmstb_l2_intc_irq_handle, data);
++
+ 	if (data->can_wake) {
+ 		/* This IRQ chip can wake the system, set all child interrupts
+ 		 * in wake_enabled mask
+-- 
+2.43.0
+

@@ -23,6 +23,37 @@ SRC_URI:append = " \
     file://0012-drm-v3d-pin-runtime-active-under-xen-domd-xen-troops.patch \
 "
 
+# 0013 is NOT board-specific, which is why it has its own block: brcmstb-l2 backs
+# BCM2711's aon_intr (the HDMI/display L2 controller, GIC SPI 96) and BCM2712's
+# disp_intr (SPI 97) and aon_intr (SPI 239) alike, so both boards' DomD needs it.
+#
+# It fixes an UPSTREAM race: brcmstb_l2_intc_probe() calls
+# irq_set_chained_handler_and_data() -- which unmasks the parent line and re-sends
+# anything pending on it -- before assigning data->gc, and the handler dereferences
+# data->gc in its first statement. A parent that is already pending therefore takes
+# the machine down during an initcall. Measured on a Raspberry Pi 4, 2026-09-02,
+# after an HDMI display swap: DomD panicked 0.53 s into boot with
+#   "Unable to handle kernel NULL pointer dereference at virtual address 8"
+#   "pc : brcmstb_l2_intc_irq_handle+0x40" / "Fatal exception in interrupt"
+# BCM2711's aon_intr is the sole edge-triggered GIC line on that SoC, so its parent
+# latches pending state from the firmware's pre-Linux HDMI activity. See
+# docs/TROUBLESHOOTING.md, "DomD panics in brcmstb_l2_intc during boot".
+#
+# 🚨 DELETE THIS WHEN UPSTREAM CARRIES THE FIX. It is a local carry of a fix to
+# upstream code, so once the pinned raspberrypi/linux gains an equivalent change
+# this patch either stops applying or applies twice. Check on every SRCREV bump:
+#
+#     grep -n -B6 'Set the IRQ chaining logic' drivers/irqchip/irq-brcmstb-l2.c
+#
+# If irq_set_chained_handler_and_data() still comes BEFORE the
+# "data->gc = irq_get_domain_generic_chip(...)" assignment, upstream is still broken
+# and the patch is still needed. If it comes after it, remove the patch file and the
+# SRC_URI line below. The patch is a pure move, so dropping it restores the pinned
+# upstream file byte-for-byte.
+SRC_URI:append = " \
+    file://0013-irqchip-brcmstb-l2-set-up-the-generic-chip-before-ch.patch \
+"
+
 # rpi5-0004: V4H Xen patchset for the Dom0/DomD kernel. The base meta-xt-rpi5
 # linux-raspberrypi_6.12.bbappend (pristine) does NOT carry these; they were
 # being applied by editing the base bbappend directly. Moved here so meta-xt-rpi5
