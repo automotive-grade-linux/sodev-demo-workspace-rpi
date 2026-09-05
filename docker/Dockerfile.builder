@@ -3,7 +3,7 @@
 #
 #   docker build -f docker/Dockerfile.builder docker/ \
 #     --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
-#     -t sodev-builder
+#     -t sodev-builder-rpi
 #
 # A single image for the whole workspace. It reconstructs the EPAM/xen-troops
 # moulin/ninja build environment and folds in the AOSP host toolchain and the

@@ -131,20 +131,22 @@ configuration (`rpi4-sodev.yaml` instead of `rpi5-sodev.yaml`, `meta-xt-rpi4` in
 `8g`/`4g` there, `16g`/`8g` on the Pi 5. Nothing else in this walkthrough differs. What
 is verified on that board is listed in `meta-rpi-sodev/meta-xt-rpi4/README.md`.
 
-> **This series needs `--rebuild-images` once.** The builder image gains Zephyr SDK
-> 1.0.1 and a python3.12 virtualenv here, because Zephyr 4.4 sets
-> `PYTHON_MINIMUM_REQUIRED 3.12` and Ubuntu 22.04 ships 3.10. An image built before
-> that change fails in cmake with `Could NOT find Python3: Found unsuitable version
-> "3.10.12", but required is at least "3.12"` -- see *A Zephyr build cannot find
-> Python 3.12* (`docs/TROUBLESHOOTING.md`).
+> **The builder image needs Zephyr SDK 1.0.1 and a python3.12 virtualenv**, because
+> Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12` and Ubuntu 22.04 ships 3.10. You do
+> not need `--rebuild-images` for that: this series also renames the tag, so
+> `sodev-builder-rpi` does not exist yet on your host and the first build creates it
+> with both. `--rebuild-images` is for the case where `XT_DOCKER` names an image built
+> before that change, which fails in cmake with `Could NOT find Python3: Found
+> unsuitable version "3.10.12", but required is at least "3.12"` -- see *A Zephyr build
+> cannot find Python 3.12* (`docs/TROUBLESHOOTING.md`).
 
 ### 4. Build the container image
 
-Nothing to do -- `build.sh` builds `sodev-builder` from `docker/Dockerfile.builder` on
+Nothing to do -- `build.sh` builds `sodev-builder-rpi` from `docker/Dockerfile.builder` on
 first use and reuses it afterwards. The first run prints:
 
 ```
->> docker build sodev-builder  (-f docker/Dockerfile.builder)
+>> docker build sodev-builder-rpi  (-f docker/Dockerfile.builder)
 ```
 
 and later runs print nothing, because `build_img` skips a tag that already exists.
@@ -152,8 +154,8 @@ and later runs print nothing, because `build_img` skips a tag that already exist
 To see whether it is there already:
 
 ```sh
-docker image inspect sodev-builder >/dev/null 2>&1 && echo present || echo absent
-docker images sodev-builder
+docker image inspect sodev-builder-rpi >/dev/null 2>&1 && echo present || echo absent
+docker images sodev-builder-rpi
 ```
 
 To build it yourself -- the same command `build.sh` runs, so the result is
@@ -162,7 +164,7 @@ interchangeable with it:
 ```sh
 docker build -f docker/Dockerfile.builder docker/ \
   --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
-  -t sodev-builder
+  -t sodev-builder-rpi
 ```
 
 Behind a proxy, add the same build args `build.sh` would pass. Pass **only the ones you
@@ -176,7 +178,7 @@ docker build -f docker/Dockerfile.builder docker/ \
   --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
   --build-arg https_proxy="$HTTPS_PROXY" --build-arg http_proxy="$HTTPS_PROXY" \
   --network=host \
-  -t sodev-builder
+  -t sodev-builder-rpi
 ```
 
 `--network=host` is only needed when the proxy or a mirror listens on the **host's**
@@ -189,13 +191,13 @@ proxy reaches the `RUN` layers as a build arg and is never stored in the image:
 ```sh
 ./build.sh --rebuild-images -u --aaos=source      # via build.sh
 REBUILD_IMAGES=1 ./build.sh -u --aaos=source      # same thing, env form
-docker build --no-cache -f docker/Dockerfile.builder docker/ -t sodev-builder   # by hand
+docker build --no-cache -f docker/Dockerfile.builder docker/ -t sodev-builder-rpi   # by hand
 ```
 
 To look inside without building anything:
 
 ```sh
-docker run --rm -it -v "$PWD":"$PWD" -w "$PWD" sodev-builder
+docker run --rm -it -v "$PWD":"$PWD" -w "$PWD" sodev-builder-rpi
 ```
 
 Inside, the build drivers are on `PATH`:
@@ -236,8 +238,8 @@ dominates either way.
 
 | Phase | Log line to look for |
 |---|---|
-| container image built (first run only) | `>> docker build sodev-builder` |
-| DomU (AGL) bitbake, if `-u` | `>> DomU(AGL) in sodev-builder:` |
+| container image built (first run only) | `>> docker build sodev-builder-rpi` |
+| DomU (AGL) bitbake, if `-u` | `>> DomU(AGL) in sodev-builder-rpi:` |
 | AOSP `repo init` + `repo sync`, ~1379 projects | `[N/M] Initialize repo directory` |
 | AAOS guest kernel (bazel) and the AOSP build | `Invoke Android build system` |
 | DomD / Dom0 Yocto builds | `Yocto Build: domd`, `Invoke Zephyr build system` |
@@ -309,7 +311,12 @@ A single build image is provided under `docker/`:
 
 | Image | Dockerfile | Used for |
 |---|---|---|
-| `sodev-builder` | `docker/Dockerfile.builder` | everything: moulin + ninja (Yocto/Xen/Zephyr; pinned moulin revision), the AOSP/AAOS (DomA) build, and the DomU AGL bitbake |
+| `sodev-builder-rpi` (`XT_DOCKER`) | `docker/Dockerfile.builder` | everything: moulin + ninja (Yocto/Xen/Zephyr; pinned moulin revision), the AOSP/AAOS (DomA) build, and the DomU AGL bitbake |
+
+The tag is `sodev-builder-rpi`, not `sodev-builder`: the V4H `sodev-demo-workspace` builds
+a different image under that name, and a host that builds both must not have one
+workspace's `--rebuild-images` replace the other's image. Override with `XT_DOCKER`;
+`AGL_DOCKER` follows it.
 
 The DomU AGL build uses the same image by default; to use the AGL-official
 docker-worker instead, pass `AGL_DOCKER=<official-image> ./build.sh`.
@@ -323,7 +330,7 @@ docker-worker instead, pass `AGL_DOCKER=<official-image> ./build.sh`.
 > point; `build.sh` passes them through).
 >
 > **Proxy changes do not need `--rebuild-images`.** The proxy is not stored in the
-> `sodev-builder` image: `Dockerfile.builder` declares no `ENV` for it -- a
+> `sodev-builder-rpi` image: `Dockerfile.builder` declares no `ENV` for it -- a
 > defined-but-empty `http_proxy` makes the AOSP `repo` launcher proxy through nothing
 > and fail every fetch -- and `build.sh` passes the variables that have a value per
 > run with the bare `-e VAR` form. A **Dockerfile** change still needs
@@ -360,8 +367,8 @@ Build and enter the builder manually:
 
 ```sh
 docker build -f docker/Dockerfile.builder docker/ \
-  --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" -t sodev-builder
-docker run --rm -it -v "$PWD":"$PWD" -w "$PWD" sodev-builder
+  --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" -t sodev-builder-rpi
+docker run --rm -it -v "$PWD":"$PWD" -w "$PWD" sodev-builder-rpi
 #   add --network=host only if the build has to reach a proxy or mirror on the
 #   host's loopback (build.sh does this via XT_DOCKER_NETWORK=host)
 # inside the container, proceed with the manual build below:
@@ -376,7 +383,7 @@ through into both `docker build` and the build containers, and
 `XT_SSTATE_DIR`/`XT_DL_DIR` point bitbake at an existing sstate/downloads
 cache (absolute paths) for much faster rebuilds — e.g. reuse another
 workspace's `yocto/common_data/sstate`. This shared cache is used by **both**
-the moulin/sodev-builder build (Dom0/DomD/DomU-kernel/DomA) **and** the DomU AGL
+the moulin/sodev-builder-rpi build (Dom0/DomD/DomU-kernel/DomA) **and** the DomU AGL
 bitbake — `build.sh` points the AGL build's `DL_DIR`/`SSTATE_DIR` at the same
 cache (`XT_DL_DIR`/`XT_SSTATE_DIR` when set, else the in-workspace
 `yocto/common_data/{downloads,sstate}`), so AGL source downloads are

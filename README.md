@@ -139,11 +139,13 @@ disables the heavy Android/Flatcar guests by default).
 | `--aaos-src=<dir>` (`AAOS_SRC_DIR`) | — | Reuse an existing AOSP checkout for `source` mode (skip the repo sync; still builds AOSP from it) |
 | `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from `rpi5-sodev.yaml`, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
-| `--rebuild-images` | off | Force-rebuild `docker/sodev-builder`. **Required once for this series**: it moves the image to Zephyr SDK 1.0.1 and adds the python3.12 virtualenv that Zephyr 4.4 needs (`PYTHON_MINIMUM_REQUIRED 3.12`). An image built before that change fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` |
+| `--rebuild-images` | off | Force-rebuild the `XT_DOCKER` image (`sodev-builder-rpi`). It never touches the V4H workspace's `sodev-builder` -- the two workspaces use different Dockerfiles and, since this series, different tags. Not needed for the Zephyr SDK 1.0.1 / python3.12 move that this series makes: the new tag has no pre-existing image, so the first build creates it already up to date. You need it only when `XT_DOCKER` points at an older image (a pre-rename `sodev-builder`, say), which fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` (Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12`) |
 | `--west-cache=<dir>` (`XT_WEST_CACHE_DIR`) | — | Point the Zephyr west fetches at a pre-populated reference workspace, so `west update` runs offline (the AAOS analogue is `--aaos-ref`). Used for both west workspaces: Dom0's and DomZ's |
 | `--memory=<size>` (`XT_DOCKER_MEMORY`) | — (unlimited) | Cap each build container's RAM via docker `--memory` **and** `--memory-swap` (equal ⇒ no host-swap spill, so an unbounded moulin/AOSP/Yocto build cannot OOM the host), e.g. `24g` |
 | (`XT_DOCKER_NETWORK`) | — (Docker bridge) | `--network` value for the build containers, e.g. `host`. Needed when the build has to reach a proxy or package mirror bound to the **host's** loopback: a bridged container's `127.0.0.1` is its own, not the host's. Applies to `docker run` and `docker build` |
 | (`XT_DOCKER_RUN_OPTS`) | — | Extra `docker run` options applied verbatim to every builder, for anything `--memory` does not cover (e.g. `--cpus 8`) |
+| (`XT_DOCKER`) | `sodev-builder-rpi` | Tag of the unified build image. Deliberately not `sodev-builder`, the tag the V4H `sodev-demo-workspace` uses: on a host that builds both, one shared name would let `--rebuild-images` here replace the V4H image |
+| (`AGL_DOCKER`) | `$XT_DOCKER` | Image for the DomU AGL bitbake. Follows `XT_DOCKER`; set it to the AGL-official `docker-worker` to use that instead (then `docker pull` it yourself -- `build.sh` builds only its own tag) |
 | `--sstate=<dir>` (`XT_SSTATE_DIR`) | — | Reuse an external Yocto sstate cache; bind-mounted into the builders Must name an **existing** directory (a typo would otherwise rebuild everything against an empty cache); an existing but empty one is accepted with a note. |
 | `--dl=<dir>` (`XT_DL_DIR`) | — | Reuse an external Yocto downloads dir; bind-mounted into the builders Must name an existing directory, as `--sstate`. |
 | (`XT_DISABLE_SPDX`) | — (SBOM on) | Set to any non-empty value to drop `create-spdx` from `INHERIT` for the Yocto components. SBOM generation is **on by default** — the images ship SPDX documents — so this is only an escape hatch for a faster iteration cycle or for working around an SPDX-tool problem, never for a release build |
@@ -232,7 +234,7 @@ See also:
 ├── build.sh                 # orchestrator (Docker; mirror of AGL sodev-demo-workspace/build.sh)
 ├── rpi5-sodev.yaml          # moulin entry (Raspberry Pi 5): Dom0/DomD/DomU/DomA/DomZ build + SD-image wiring
 ├── rpi4-sodev.yaml          # moulin entry (Raspberry Pi 4 / BCM2711), same domain set; ./build.sh --board=rpi4
-├── docker/                  # unified sodev-builder build image (built on demand)
+├── docker/                  # unified sodev-builder-rpi build image (built on demand)
 ├── docs/                    # BUILD.md (build detail) / DESIGN.md (why) / TROUBLESHOOTING.md
 ├── domz/                    # DomZ = the Zephyr RTOS guest (-z)
 │   ├── app/                 #   Zephyr application for the `xenvm` board
@@ -306,7 +308,7 @@ See also:
 - [Health checks (xenstore / teardown regression sanity)](docs/TROUBLESHOOTING.md) — quick checks to run after a change.
 ## Build & hardware verification (RPi5)
 **Both Dom0 flavours build end-to-end** from a clean checkout to a complete,
-loopback-verified 4-domain SD image: the single `sodev-builder` image produces
+loopback-verified 4-domain SD image: the single `sodev-builder-rpi` image produces
 `full.img` with the four-partition GPT (p1 boot carrying the flavour's Dom0
 payload — `zephyr.bin` or the thin-Linux Dom0 initramfs, p2/p3 ext4 domain
 rootfs, p4 the AAOS 12-partition nested GPT), verified for both `--dom0=zephyr`

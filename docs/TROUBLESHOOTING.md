@@ -264,7 +264,8 @@ CMake Error at .../FindPackageHandleStandardArgs.cmake:230 (message):
 Call Stack ... zephyr/cmake/modules/python.cmake:41 (find_package)
 ```
 
-**Cause.** A `sodev-builder` image built before this series. Zephyr 4.4 sets
+**Cause.** An image built from a `Dockerfile.builder` older than the Zephyr 4.4 move --
+in practice an image `XT_DOCKER` points at, such as a pre-rename `sodev-builder`. Zephyr 4.4 sets
 `PYTHON_MINIMUM_REQUIRED 3.12`; the distro python3 in the image is 3.10 and stays 3.10
 on purpose (Yocto and the AOSP host tools are validated against it). What the current
 `docker/Dockerfile.builder` does is install python3.12 alongside, put Zephyr's
@@ -273,7 +274,7 @@ interpreter -- `west build` then hands cmake the 3.12 it is running under. An ol
 has `west` on 3.10 instead, and cmake stops as above.
 
 **Fix.** `./build.sh --rebuild-images ...` once. To confirm which image you have:
-`docker run --rm sodev-builder head -1 /usr/local/bin/west` should print
+`docker run --rm sodev-builder-rpi head -1 /usr/local/bin/west` should print
 `#!/opt/zephyr-venv/bin/python3.12`. Note that `tools/check-domz.sh` uses the same
 `XT_DOCKER` default, so a stale image makes its DomZ build step fail the same way.
 

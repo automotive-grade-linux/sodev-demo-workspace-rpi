@@ -44,7 +44,7 @@ VERDICTS
     ONLY-IN-REF / ONLY-IN-NEW  present on one side only
 
 Run inside the build container (it needs mtools, debugfs, dtc):
-    docker run --rm -v $PWD:/work -w /work sodev-builder \\
+    docker run --rm -v $PWD:/work -w /work sodev-builder-rpi \\
         python3 tools/compare-sd-image.py <reference.img> <candidate.img>
 """
 import argparse

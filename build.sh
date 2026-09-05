@@ -6,7 +6,7 @@
 #   - DomA (AAOS): built from AOSP source (--aaos=source; heavy) OR consumed from a
 #     prebuilt bundle (--aaos=prebuilt; no AOSP build). rouge assembles the p4 nested
 #     GPT either way (V4H android_only style). See --aaos / README "AAOS build modes".
-#   - Dom0/DomD (rpi5 base) + final SD image: moulin + ninja in sodev-builder.
+#   - Dom0/DomD (rpi5 base) + final SD image: moulin + ninja in sodev-builder-rpi.
 # The default build is Dom0(Zephyr)+DomD only; the DomU and DomA guests are opt-in
 # (-u / -a), matching upstream sodev-demo-workspace (commit f3f0f8f7 "Disable
 # Android and Flatcar guests by default"). All heavy build steps run in Docker (per
@@ -43,8 +43,14 @@ PROXY="${HTTPS_PROXY:-}"                            # --proxy=<url>
 MOULIN_YAML=""
 AGL_IMAGE="${AGL_IMAGE:-agl-cluster-demo-flutter-guest}"
 AGL_MACHINE="${AGL_MACHINE:-virtio-aarch64}"
-XT_DOCKER="${XT_DOCKER:-sodev-builder}"                # unified build image: moulin/ninja (Yocto/Xen/Zephyr) + AOSP + AGL bitbake (docker/Dockerfile.builder)
-AGL_DOCKER="${AGL_DOCKER:-sodev-builder}"  # DomU AGL bitbake image (defaults to the unified image; set to the AGL-official docker-worker to use it instead)
+# Image tags. The V4H workspace (sodev-demo-workspace) builds its own image under the
+# plain "sodev-builder" tag; this one is a different Dockerfile (Zephyr SDK, python
+# venv, AOSP 17 toolchain), so it gets its own tag -- sharing the name would make
+# --rebuild-images here silently replace the V4H image on a host that builds both,
+# and the V4H build would then fail for no visible reason. AGL_DOCKER follows
+# XT_DOCKER: overriding one name must not leave the DomU stage on the old one.
+XT_DOCKER="${XT_DOCKER:-sodev-builder-rpi}"          # unified build image: moulin/ninja (Yocto/Xen/Zephyr) + AOSP + AGL bitbake (docker/Dockerfile.builder)
+AGL_DOCKER="${AGL_DOCKER:-$XT_DOCKER}"              # DomU AGL bitbake image (defaults to the unified image; set to the AGL-official docker-worker to use it instead)
 XT_DOCKER_MEMORY="${XT_DOCKER_MEMORY:-}"           # --memory=<size> : cap build-container RAM (docker --memory + --memory-swap, e.g. 24g). Empty => unlimited (current behavior)
 
 Usage() {
@@ -119,8 +125,9 @@ Build environment:
       --west-cache=<dir> Reuse a west reference workspace (Zephyr Dom0 manifest+projects)
                          (the AAOS equivalents are --aaos-ref / --aaos-kernel-ref above)
       --proxy=<url>      HTTP(S) proxy for docker builds + fetches
-      --rebuild-images   Force-rebuild the docker/ build image (REQUIRED after changing
-                         --proxy: the value is baked into the image)
+      --rebuild-images   Force-rebuild the docker/ build image (needed after a Dockerfile
+                         change; a proxy change does NOT need it -- the proxy is passed
+                         per run and is not stored in the image)
       --memory=<size>    Cap build-container RAM (docker --memory + --memory-swap,
                          e.g. 24g). Default: unlimited.
   -h, --help             Show this usage
@@ -132,6 +139,10 @@ Environment (no flag):
                          host's loopback. Default: Docker's bridge.
       XT_DOCKER_RUN_OPTS Extra `docker run` opts applied verbatim to every build
                          container, e.g. "--cpus 12" (empty = none).
+      XT_DOCKER          Tag of the unified build image (default: sodev-builder-rpi).
+                         Distinct from the V4H workspace's "sodev-builder" on purpose:
+                         --rebuild-images rebuilds THIS tag only.
+      AGL_DOCKER         Image for the DomU AGL bitbake (default: $XT_DOCKER).
 
 Examples:
   ./build.sh                                        # Dom0(zephyr)+DomD only (fast; DomU/DomA-less SD)
@@ -617,7 +628,7 @@ add_cache_mount "$XT_AAOS_REF"
 add_cache_mount "$XT_AAOS_KERNEL_REF"
 
 # When --aaos-src points OUTSIDE the workspace, the ninja doma/doma_kernel
-# components (run in the sodev-builder container) reach the AOSP tree via the
+# components (run in the sodev-builder-rpi container) reach the AOSP tree via the
 # android/ symlink (-> AAOS_SRC_DIR) and ../android_kernel. in_docker only mounts
 # $workdir + the cache dirs, so those symlinks dangle in-container and
 # `mkdir -p android/.` fails. Mount the external tree (and android_kernel's real
@@ -889,16 +900,18 @@ fi
 # Build the unified build image if missing (moulin/ninja + AOSP + AGL bitbake host).
 # The DomA (AAOS) moulin build (step 2) runs inside this same image via ninja.
 build_img "$XT_DOCKER"  docker/Dockerfile.builder
-# The DomU AGL build uses the same unified image by default. build_img is idempotent
-# (skips when present), so this is a no-op when AGL_DOCKER == the image just built.
-# If AGL_DOCKER points at a pre-built image (e.g. the AGL-official docker-worker),
-# it is not our default tag, so it is left for the user to `docker pull`.
-if [ "$ENABLE_DOMU" = "yes" ] && [ "$AGL_DOCKER" = "sodev-builder" ]; then
-  build_img "$AGL_DOCKER" docker/Dockerfile.builder
+# The DomU AGL build uses the same unified image by default, so there is nothing more
+# to build when AGL_DOCKER names the image just built. If AGL_DOCKER points at another
+# image (e.g. the AGL-official docker-worker) it is not ours to build: it is left for
+# the user to `docker pull`. Compared against $XT_DOCKER, not a literal: with a literal
+# an XT_DOCKER override left this branch building (and with --rebuild-images,
+# replacing) an image under the OLD default name.
+if [ "$ENABLE_DOMU" = "yes" ] && [ "$AGL_DOCKER" != "$XT_DOCKER" ]; then
+  echo ">> DomU(AGL) image '$AGL_DOCKER' is not the unified image; not building it (docker pull it if missing)"
 fi
 
 # 0a) DomA (AAOS). `ninja image-full` (step 2) builds the doma_kernel (bazel) + doma
-#     (android) moulin components inside sodev-builder and rouge assembles their outputs
+#     (android) moulin components inside sodev-builder-rpi and rouge assembles their outputs
 #     into the SD image p4 as a nested GPT (V4H android_only style; see rpi5-sodev.yaml
 #     ENABLE_ANDROID). There is no prebuilt combined-disk and no separate warm step: the
 #     moulin `android` builder runs the full repo sync + lunch + build itself in step 2
@@ -1039,7 +1052,7 @@ fi
 #    kernel (linux-virtio-armv8). Omitting -u skips both (DomU-less SD).
 if [ "${ENABLE_DOMU}" = "yes" ]; then
   AGL_BRANCH="$(meta-rpi-sodev/scripts/sync-guest-pins.sh --print agl-branch)"
-  # Reuse the shared Yocto DL_DIR/SSTATE_DIR (the same cache the moulin/sodev-builder
+  # Reuse the shared Yocto DL_DIR/SSTATE_DIR (the same cache the moulin/sodev-builder-rpi
   # build uses) for the AGL bitbake, so it dedupes source downloads and reuses
   # sstate across rebuilds — and the cache persists beyond the disposable agl/
   # checkout. External --dl/--sstate win; otherwise the in-workspace common_data.
@@ -1071,7 +1084,7 @@ else
   echo ">> DomU(AGL) SKIPPED (no -u/--domu). SD image omits DomU kernel(p1)+AGL rootfs(p3)."
 fi
 
-# 2) Dom0/DomD (rpi5 base) + final image assembly — moulin + ninja in sodev-builder.
+# 2) Dom0/DomD (rpi5 base) + final image assembly — moulin + ninja in sodev-builder-rpi.
 #    `ninja image-full` assembles full.img (the flashable SD image) in one step, the same
 #    one-command flow as the V4H AGL SoDeV build. The image builder (rouge) is userspace
 #    (mkfs.vfat/mkfs.ext4/mtools/simg2img/dd) — no root/loop. With -a it builds the

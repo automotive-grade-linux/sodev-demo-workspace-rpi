@@ -15,10 +15,10 @@
 #   2. checkpatch                 - Zephyr coding style on the DomZ sources.
 #      Needs the west workspace (for scripts/checkpatch.pl) and perl.
 #   3. moulin graph               - every flag combination resolves, on BOTH boards,
-#      and `ninja` has a rule for the domz target. Needs Docker + sodev-builder.
+#      and `ninja` has a rule for the domz target. Needs Docker + sodev-builder-rpi.
 #   4. DomZ build                 - the xenvm image builds. The guest is
 #      board-independent (it never sees the SoC), so one build covers both boards.
-#      Needs Docker + sodev-builder.
+#      Needs Docker + sodev-builder-rpi.
 #
 # What is NOT covered, and cannot be: booting the domain (`xl create domz.cfg`) and
 # the Xen PV console. See domz/README.md for the bring-up order and for how to iterate
@@ -35,7 +35,7 @@ cd "$workdir"
 QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 
-XT_DOCKER="${XT_DOCKER:-sodev-builder}"
+XT_DOCKER="${XT_DOCKER:-sodev-builder-rpi}"
 WEST_WS="${WEST_WS:-zephyr-domz}"
 
 # Zephyr's xenvm board links against a RAM bank at 0x40000000 whose size is in
