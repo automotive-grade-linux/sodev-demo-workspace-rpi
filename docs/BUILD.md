@@ -329,6 +329,26 @@ docker-worker instead, pass `AGL_DOCKER=<official-image> ./build.sh`.
 > (`HTTP_PROXY`/`HTTPS_PROXY` build-args and env are honoured as a starting
 > point; `build.sh` passes them through).
 >
+> **Where the proxy is configured matters, and there are three places.** `build.sh`
+> forwards `HTTPS_PROXY`/`HTTP_PROXY` (or `--proxy`) as Docker's predefined build args and
+> as `-e` to every container. Docker has two proxy settings of its own that this does
+> *not* replace: the **client** config `~/.docker/config.json` (`proxies.default` --
+> injected into containers and builds *only when the caller passes no proxy variables*;
+> an explicit value from `build.sh` overrides it), and the **daemon** config
+> (`/etc/systemd/system/docker.service.d/http-proxy.conf`, `Environment=HTTPS_PROXY=...`),
+> which is what `docker pull` of a base image uses and which `build.sh` cannot set for you.
+> Behind a proxy, `FROM ubuntu:22.04` in `docker build` fails until the daemon one is set.
+>
+> **A proxy bound to the host's loopback** (`127.0.0.1:3128`, `localhost:3128`) is a
+> special case: a bridged container's `127.0.0.1` is the container, so the forwarded value
+> is unreachable and the symptom is not a proxy error -- `docker build` dies in the first
+> `apt-get` with dozens of `Unable to locate package` lines, because `apt-get update`
+> fetched nothing. `build.sh` now refuses such a value before starting (unless
+> `XT_DOCKER_NETWORK=host`) and prints the ways out: `--proxy=http://<bridge gateway>:<port>`
+> (`docker network inspect bridge`, typically `172.17.0.1`; the proxy has to listen on that
+> address too -- `ss -lntp`), `XT_DOCKER_NETWORK=host`, or unsetting the variables so the
+> client config above applies.
+>
 > **Proxy changes do not need `--rebuild-images`.** The proxy is not stored in the
 > `sodev-builder-rpi` image: `Dockerfile.builder` declares no `ENV` for it -- a
 > defined-but-empty `http_proxy` makes the AOSP `repo` launcher proxy through nothing

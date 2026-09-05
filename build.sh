@@ -14,7 +14,14 @@
 # Options are V4H build.sh-style flags; the matching env vars are the fallback.
 set -euo pipefail
 
-workdir="$(cd "$(dirname "$0")" && pwd)"
+# Physical path (-P): the cache/tree flags below are canonicalised with readlink -f and
+# compared against $workdir to decide whether a path is inside the workspace, so the two
+# have to be resolved the same way -- a workspace reached through a symlink would
+# otherwise never compare equal to its own subdirectories.
+# Note for a workspace that was previously built through a symlinked path: the physical
+# path becomes the new TMPDIR base, and bitbake's sanity check reports "TMPDIR has changed
+# location" once -- invoke build.sh via the physical path, or move yocto/build-*/tmp.
+workdir="$(cd "$(dirname "$0")" && pwd -P)"
 cd "$workdir"
 
 # --- knobs (flag defaults; each is overridable by env or by the flags below) ---
@@ -29,6 +36,7 @@ AAOS_SRC_DIR="${AAOS_SRC_DIR:-}"                    # --aaos-src=<dir>       (re
 AAOS_MODE="${AAOS_MODE:-}"                          # --aaos=off|auto|source|prebuilt (empty: derived from -a — off, or auto when -a given)
 AAOS_PREBUILT_DIR="${AAOS_PREBUILT_DIR:-}"          # --aaos-prebuilt=<dir>  (prebuilt AAOS bundle: files/ + images/)
 AAOS_REQUIRED=""                                    # set by -a/--android: DomA is required, so auto must NOT silently fall back to off
+ANDROID_FLAG=""                                     # -a/--android given on the command line (as opposed to ENABLE_ANDROID=yes from the environment)
 XT_SSTATE_DIR="${XT_SSTATE_DIR:-}"                  # --sstate=<dir>
 XT_DL_DIR="${XT_DL_DIR:-}"                          # --dl=<dir>
 XT_WEST_CACHE_DIR="${XT_WEST_CACHE_DIR:-}"          # --west-cache=<dir> (west reference workspace: Zephyr Dom0 manifest+projects; DL_DIR analogue)
@@ -96,7 +104,8 @@ Domain options:
 DomA (AAOS) options:
       --aaos=<mode>      off | auto | source | prebuilt   (default: off; -a => auto)
                            off      : DomA-less SD (no p4 Android)
-                           source   : build AAOS from AOSP source (heavy: ~250GiB, 1-3h)
+                           source   : build AAOS from AOSP source (heavy: ~360 GiB of disk
+                                      incl. the SD image, hours; see docs/BUILD.md '0. Check the host')
                            prebuilt : consume a prebuilt AAOS bundle; NO AOSP build (fast)
                            auto     : prebuilt if a bundle is found, else source if an
                                       AOSP checkout is found, else off
@@ -143,6 +152,19 @@ Environment (no flag):
                          Distinct from the V4H workspace's "sodev-builder" on purpose:
                          --rebuild-images rebuilds THIS tag only.
       AGL_DOCKER         Image for the DomU AGL bitbake (default: $XT_DOCKER).
+      BB_HASHSERVE       Hash-equivalence server for every bitbake in this build (the
+                         moulin Yocto domains AND the DomU AGL bitbake), e.g.
+                         "unix:///path/hashserve.sock" (mount it via XT_CACHE_MOUNTS)
+                         or "host:port". Default: bitbake's per-build "auto" server.
+      XT_CACHE_MOUNTS    Extra `docker -v HOST:CONTAINER` specs (space-separated) for a
+                         pre-populated cache; tracked against --sstate/--dl/--west-cache/--aaos-*.
+      XT_AAOS_SYNC_JOBS  Parallelism of the reference-mirror pre-sync (default 4; only
+                         with --aaos-ref/--aaos-kernel-ref). The plain source-mode sync is
+                         moulin's own repo fetch and is not affected.
+      REPO_SKIP_SELF_UPDATE=1  Stop `repo` updating itself (hangs behind some proxies).
+      CONNECTIVITY_CHECK_URIS="" Skip bitbake's network probe (proxied/offline sites).
+      AAOS_PREBUILT_ASSUME_BOARD  Accept a prebuilt bundle that has no BUNDLE-INFO,
+                         asserting it was built for this --board.
 
 Examples:
   ./build.sh                                        # Dom0(zephyr)+DomD only (fast; DomU/DomA-less SD)
@@ -164,7 +186,7 @@ needval() { [ "$1" -ge 2 ] || { echo "ERROR: option '$2' requires a value" >&2; 
 while [ $# -gt 0 ]; do
   case "$1" in
     -u|--domu)          ENABLE_DOMU=yes ;;
-    -a|--android)       ENABLE_ANDROID=yes ;;   # "want DomA"; required-ness is derived below (only when no explicit --aaos)
+    -a|--android)       ENABLE_ANDROID=yes; ANDROID_FLAG=yes ;;   # "want DomA"; required-ness is derived below
     --board)            needval $# "$1"; BOARD="$2"; shift ;;
     --board=*)          BOARD="${1#*=}" ;;
     -z|--domz)          ENABLE_DOMZ=yes ;;
@@ -199,6 +221,17 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# The cache and tree paths below end up as `docker -v HOST:CONTAINER` specs and as
+# symlink targets under yocto/common_data, and both need an absolute path: `[ -d rel ]`
+# accepts a relative one, docker then rejects `-v rel:rel` ("invalid mount config ...
+# must be absolute") and `ln -s rel` leaves a link that dangles from anywhere but here.
+# Canonicalise what exists. A path that does not exist is left as typed, so the
+# existence checks below can name it the way the user wrote it.
+for _v in XT_SSTATE_DIR XT_DL_DIR XT_WEST_CACHE_DIR XT_AAOS_REF XT_AAOS_KERNEL_REF AAOS_SRC_DIR AAOS_PREBUILT_DIR; do
+  if [ -n "${!_v}" ] && [ -e "${!_v}" ]; then printf -v "$_v" '%s' "$(readlink -f "${!_v}")"; fi
+done
+unset _v
 
 # Dom0 OS is a moulin parameter of rpi5-sodev.yaml: --DOM0_OS {zephyr,linux}
 # selects the whole dom0 component (Zephyr west/zephyr build vs Linux yocto).
@@ -268,8 +301,25 @@ esac
 # -a/--android sets ENABLE_ANDROID=yes; with no explicit --aaos that means "include
 # DomA, auto-pick how". ENABLE_ANDROID is then DERIVED from the resolved mode below.
 if [ -z "$AAOS_MODE" ]; then
-  # -a/--android OR env ENABLE_ANDROID=yes both mean "I want DomA" => auto + required.
-  if [ "$ENABLE_ANDROID" = "yes" ]; then AAOS_MODE=auto; AAOS_REQUIRED=yes; else AAOS_MODE=off; fi
+  # -a/--android OR env ENABLE_ANDROID=yes both mean "I want DomA" => auto.
+  if [ "$ENABLE_ANDROID" = "yes" ]; then AAOS_MODE=auto; else AAOS_MODE=off; fi
+fi
+# -a means "DomA is required" whether or not --aaos also said HOW to get it. This used to
+# be set only in the no---aaos branch above, so `-a --aaos=source` left AAOS_REQUIRED
+# empty and the "-a with --domains-only" refusal below degraded to a warning -- a build
+# that was explicitly asked for DomA exited 0 without one. `-a --aaos=off` is the one
+# combination that contradicts itself, so the FLAG form is refused. ENABLE_ANDROID=yes from
+# the environment is documented as the fallback for -a, and a flag beats a fallback: with
+# --aaos=off it simply yields a DomA-less build, as it always did.
+if [ "$ENABLE_ANDROID" = "yes" ]; then
+  if [ "$AAOS_MODE" = off ]; then
+    if [ "$ANDROID_FLAG" = yes ]; then
+      echo "ERROR: -a/--android asks for DomA, but --aaos=off builds none. Drop one of them." >&2
+      exit 1
+    fi
+  else
+    AAOS_REQUIRED=yes
+  fi
 fi
 case "$AAOS_MODE" in off|auto|source|prebuilt) ;; *) echo "ERROR: --aaos must be off|auto|source|prebuilt (got '$AAOS_MODE')" >&2; exit 1 ;; esac
 # Default bundle probe: prefer a board-tagged bundle, then the untagged legacy path.
@@ -456,6 +506,62 @@ cmdcheck() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required tool not
 cmdcheck docker
 cmdcheck git
 
+# Disk. Nothing checked free space, so a workspace short of the ~360 GiB an
+# --aaos=source build needs (334 GiB measured on Android 17 plus the SD image) failed
+# with ENOSPC hours in. Warn -- not stop: the figure is one host's measurement, sparse
+# files and a warm cache change it, and a user who knows may proceed. Thresholds:
+# source mode 360 GiB; anything else 60 GiB (yocto/ + agl/ + the image, with margin).
+_need_gib=60; [ "$AAOS_MODE" = source ] && _need_gib=360
+# `|| true`: a bare command substitution in an ASSIGNMENT propagates its exit status,
+# and set -e would then kill the build with no message at all.
+_free_kib=$(df -Pk "$workdir" 2>/dev/null | awk 'NR==2 {print $4}' || true)
+case "$_free_kib" in ''|*[!0-9]*) _free_kib="" ;; esac   # some filesystems report "-": no figure, no warning
+if [ -n "$_free_kib" ] && [ "$((_free_kib / 1048576))" -lt "$_need_gib" ]; then
+  echo ">> WARNING: $((_free_kib / 1048576)) GiB free on the filesystem holding '$workdir';" >&2
+  echo ">>   this build (--aaos=$AAOS_MODE) is expected to need ~${_need_gib} GiB. It will run" >&2
+  echo ">>   until the disk fills. Free space, or move the workspace (docs/BUILD.md '0. Check the host')." >&2
+fi
+unset _need_gib _free_kib
+
+# A proxy on the HOST's loopback is unreachable from a bridged container: 127.0.0.1 in the
+# container is the container. Passed on verbatim (build args, -e), it fails in a way that
+# does not name the proxy at all -- `docker build` dies in the first apt-get with sixty
+# lines of "Unable to locate package", because apt-get update fetched nothing. Worse, an
+# explicit value here OVERRIDES the proxy Docker itself would have supplied: the client's
+# ~/.docker/config.json `proxies.default` is rewritten by many sites to the bridge gateway
+# (e.g. http://172.17.0.1:3128) precisely so containers can reach a loopback-bound proxy,
+# and build.sh's explicit --build-arg/-e take precedence over it. So refuse up front,
+# with the three ways out, unless the container shares the host's network namespace.
+# Host networking may also have been requested through the raw run options.
+_hostnet=no
+case " ${XT_DOCKER_RUN_OPTS:-} " in *" --network=host "*|*" --network host "*|*" --net=host "*|*" --net host "*) _hostnet=yes ;; esac
+if [ "${XT_DOCKER_NETWORK:-}" != host ] && [ "$_hostnet" != yes ]; then
+  for v in HTTPS_PROXY HTTP_PROXY https_proxy http_proxy; do
+    _p="${!v:-}"; [ -n "$_p" ] || continue
+    _hp="${_p#*://}"; _hp="${_hp%%/*}"; _hp="${_hp##*@}"   # host[:port]: strip scheme, path, userinfo
+    case "$_hp" in \[*\]*) _h="${_hp%%\]*}]" ;; *) _h="${_hp%:*}" ;; esac   # host ([v6] kept whole)
+    _port="${_hp#"$_h"}"; _port="${_port#:}"                # what followed the host, if anything
+    _h="${_h,,}"                                            # host names are case-insensitive
+    case "$_h" in
+      127.*|localhost|localhost.localdomain|\[::1\]|\[0:0:0:0:0:0:0:1\]|\[::ffff:127.*|0.0.0.0)
+        _gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
+        _shown="$_hp"; case "$_p" in *://*) _shown="${_p%%://*}://$_hp" ;; esac   # never echo userinfo
+        echo "ERROR: $v=$_shown points at the host's loopback, which a bridged build container" >&2
+        echo "       cannot reach (its 127.0.0.1 is itself). The failure it would cause is not a" >&2
+        echo "       proxy error but 'apt-get: Unable to locate package ...' in docker build, or" >&2
+        echo "       silent fetch failures in the build. Pick one:" >&2
+        echo "         --proxy=http://${_gw:-<docker bridge gateway>}:${_port:-<port>}   # reach the proxy via the bridge gateway" >&2
+        echo "             (works if the proxy also listens on that address: ss -lntp | grep ':${_port:-<port>}')" >&2
+        echo "         XT_DOCKER_NETWORK=host ./build.sh ...            # container shares the host's loopback" >&2
+        echo "         unset $v (and the other proxy variables) so Docker's own client-side" >&2
+        echo "             proxy config (~/.docker/config.json 'proxies.default') applies instead;" >&2
+        echo "             an explicit value here overrides that config." >&2
+        exit 1 ;;
+    esac
+  done
+  unset _p _hp _h _port _gw _shown
+fi
+
 # Optional extra Docker mounts for a pre-populated cache (DL_DIR / sstate mirror).
 # A clean clone needs NONE: the workspace (with its submodules) is mounted at
 # $workdir and the cache is repo-relative. To reuse a site cache, export
@@ -477,6 +583,14 @@ DOCKER_RUN_OPTS=()
 # `docker run` and `docker build` (fetches happen in both).
 NET_OPTS=()
 [ -n "$XT_DOCKER_NETWORK" ] && NET_OPTS+=( "--network=$XT_DOCKER_NETWORK" )
+# `docker build` fetches too, and the raw run options do not reach it: host networking
+# asked for through XT_DOCKER_RUN_OPTS -- the case the loopback-proxy check above lets
+# through -- has to be repeated for the image build, and ONLY there. Putting it in
+# NET_OPTS would hand `docker run` the flag twice (once from here, once from the raw
+# options), which docker refuses outright: `network "host" is specified multiple times`.
+BUILD_NET_OPTS=( ${NET_OPTS[@]+"${NET_OPTS[@]}"} )
+if [ -z "$XT_DOCKER_NETWORK" ] && [ "$_hostnet" = yes ]; then BUILD_NET_OPTS+=( --network=host ); fi
+unset _hostnet
 [ -n "$XT_DOCKER_MEMORY" ] && DOCKER_RUN_OPTS+=( --memory "$XT_DOCKER_MEMORY" --memory-swap "$XT_DOCKER_MEMORY" )
 DOCKER_RUN_OPTS+=( ${XT_DOCKER_RUN_OPTS:-} )
 # Reuse an external Yocto sstate/downloads cache for faster rebuilds: mount it into
@@ -488,12 +602,85 @@ DOCKER_RUN_OPTS+=( ${XT_DOCKER_RUN_OPTS:-} )
 # android_kernel sibling mount derived from --aaos-src below can land on the same path a
 # --aaos-kernel-ref already claimed. So record every container path that has been mounted
 # and skip repeats instead of letting `docker run` fail after the build has already started.
-MOUNTED_AT=()
+#
+# The same container path from the same host path is the harmless repeat described
+# above. The same container path from a DIFFERENT host path is a real conflict -- docker
+# would refuse it, and silently keeping whichever came first would mount the wrong
+# directory -- so that one is an error here, before anything has been built.
+MOUNTED_AT=()    # container paths, parallel to MOUNTED_HOST and MOUNTED_OPT
+MOUNTED_HOST=()  # canonical host paths
+MOUNTED_OPT=()   # mount options the user gave ("" for the flags' own mounts)
+# Container paths are compared after the same cleaning docker applies to a mount
+# destination (filepath.Clean: collapse '//', drop a trailing '/'), so `/x/` and `/x`
+# are one mount point here as they are to docker.
+_clean_path() { local p="$1"; while [ "${p#*//}" != "$p" ]; do p="${p//\/\//\/}"; done; [ "$p" != / ] && p="${p%/}"; printf '%s' "$p"; }
 mount_at() {  # $1=host path  $2=container path
-  local h="$1" c="$2" m
-  for m in ${MOUNTED_AT[@]+"${MOUNTED_AT[@]}"}; do [ "$m" = "$c" ] && return 0; done
-  MOUNTED_AT+=( "$c" ); CACHE_MOUNTS+=( -v "$h":"$c" )
+  local h="$1" c i; c="$(_clean_path "$2")"
+  [ -e "$h" ] && h="$(readlink -f "$h")"   # compare canonical with canonical (the specs above are)
+  for i in ${MOUNTED_AT[@]+"${!MOUNTED_AT[@]}"}; do
+    [ "${MOUNTED_AT[$i]}" = "$c" ] || continue
+    if [ "${MOUNTED_HOST[$i]}" != "$h" ]; then
+      echo "ERROR: two different host directories are mounted at the same container path '$c':" >&2
+      echo "         '${MOUNTED_HOST[$i]}'  (mounted first)" >&2
+      echo "         '$h'" >&2
+      echo "       docker would reject this as a duplicate mount point once the build had" >&2
+      echo "       started. Check XT_CACHE_MOUNTS against --sstate/--dl/--west-cache/--aaos-*." >&2
+      exit 1
+    fi
+    case ",${MOUNTED_OPT[$i]}," in
+      *,ro,*|*,readonly,*)
+        echo ">> WARNING: '$c' was mounted READ-ONLY by XT_CACHE_MOUNTS ('${MOUNTED_OPT[$i]}'), and a" >&2
+        echo ">>   flag now names the same directory as a cache the build WRITES to. Drop the" >&2
+        echo ">>   read-only spec, or the build will fail late with permission errors." >&2 ;;
+      *) echo ">> NOTE: '$c' is already mounted (same host path); not mounting it twice." ;;
+    esac
+    return 0
+  done
+  MOUNTED_AT+=( "$c" ); MOUNTED_HOST+=( "$h" ); MOUNTED_OPT+=( "" ); CACHE_MOUNTS+=( -v "$h":"$c" )
 }
+# XT_CACHE_MOUNTS was copied into CACHE_MOUNTS above, BEFORE this bookkeeping existed, so
+# its container paths were invisible to mount_at: `XT_CACHE_MOUNTS="-v /x:/x" --sstate=/x`
+# (the README's recommended way to share a site cache, plus the flag for the same dir)
+# produced two -v /x:/x and a "Duplicate mount point" from the first docker run -- after
+# the image build, i.e. exactly the late failure the skip logic is there to prevent.
+# Register what the user's specs mount so the flags below see them. Recognised forms:
+#   -v HOST:CONTAINER[:opts]   --volume HOST:CONTAINER[:opts]   (also the -v=/--volume= form)
+#   --mount type=bind,src=HOST,dst=CONTAINER[,...]              (src|source, dst|destination|target)
+# Anything else is passed to docker untouched and simply not tracked.
+_reg_spec() {  # $1=HOST:CONTAINER[:opts]
+  local host="${1%%:*}" rest="${1#*:}" cont
+  [ "$rest" != "$1" ] || return 0            # no ':' -- an anonymous volume, nothing to track
+  cont="${rest%%:*}"; local opts=""; [ "${rest#*:}" != "$rest" ] && opts="${rest#*:}"
+  [ -n "$cont" ] || return 0                 # "HOST:" -- malformed; leave it to docker's own error
+  [ -e "$host" ] && host="$(readlink -f "$host")"   # the flags are canonicalised above; compare like with like
+  MOUNTED_AT+=( "$(_clean_path "$cont")" ); MOUNTED_HOST+=( "$host" ); MOUNTED_OPT+=( "$opts" )
+}
+_reg_mount() {  # $1=type=bind,src=...,dst=...
+  local kv host="" cont="" opts="" IFS=,
+  for kv in $1; do
+    case "$kv" in
+      src=*|source=*)                  host="${kv#*=}" ;;
+      dst=*|destination=*|target=*)    cont="${kv#*=}" ;;
+      ro|readonly|readonly=true)       opts="ro" ;;
+    esac
+  done
+  [ -n "$cont" ] || return 0                 # no dst= (tmpfs, or malformed) -- nothing to track
+  [ -e "$host" ] && host="$(readlink -f "$host")"
+  MOUNTED_AT+=( "$(_clean_path "$cont")" ); MOUNTED_HOST+=( "$host" ); MOUNTED_OPT+=( "$opts" )
+}
+_prev=""
+for _tok in ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}; do
+  case "$_prev" in
+    -v|--volume) _reg_spec "$_tok" ;;
+    --mount)     _reg_mount "$_tok" ;;
+  esac
+  case "$_tok" in
+    -v=*|--volume=*) _reg_spec "${_tok#*=}" ;;
+    --mount=*)       _reg_mount "${_tok#*=}" ;;
+  esac
+  _prev="$_tok"
+done
+unset _prev _tok
 add_cache_mount() { local d="$1"; [ -n "$d" ] || return 0; mkdir -p "$d"; case "$d/" in "$workdir"/*) return 0;; esac; mount_at "$d" "$d"; }
 # A cache path that does not exist is, in practice, a typo. add_cache_mount's `mkdir -p`
 # used to create it silently, and nothing later in the run said so: the build simply
@@ -634,6 +821,10 @@ add_cache_mount "$XT_AAOS_KERNEL_REF"
 # `mkdir -p android/.` fails. Mount the external tree (and android_kernel's real
 # target) so they resolve. (--aaos-src of an in-workspace dir is a no-op here.)
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "$AAOS_SRC_DIR" ]; then
+  # Validate first, as every other cache flag does: add_cache_mount's `mkdir -p` would turn
+  # a mistyped --aaos-src into an empty directory, and an empty AOSP checkout is not an
+  # error to anything downstream -- repo simply syncs ~1400 projects into it for hours.
+  check_cache_dir "$AAOS_SRC_DIR" --aaos-src "AOSP checkout"
   add_cache_mount "$AAOS_SRC_DIR"
   akdir="$(readlink -f "$workdir/$AAOS_KERNEL_DIR_NAME" 2>/dev/null || true)"
   [ -n "$akdir" ] && [ -d "$akdir" ] && add_cache_mount "$akdir"
@@ -698,7 +889,19 @@ fi
 # passes the variable only when it is actually set, so "unset" (keep bitbake's default
 # probe) stays distinct from "set to empty" (disable the probe). `-e VAR="${VAR-}"`
 # would define it unconditionally and silently disable the probe for everyone.
-export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE_DIR XT_DL_DIR AAOS_KERNEL_MD5 AAOS_RAMDISK_MD5 CONNECTIVITY_CHECK_URIS"
+#
+# The rule, for every variable a yaml `conf` line reads with os.getenv(): it has to be in
+# BOTH places. `-e` puts it in the container's environment; this list is what lets it
+# survive bitbake's startup, which deletes every environment variable not named in
+# BB_ENV_PASSTHROUGH(_ADDITIONS) (bb.utils.filter_environment) before the yaml's
+# `${@os.getenv(...)}` is ever evaluated. The variables that reach a yaml line this way
+# today are XT_SSTATE_DIR and XT_DL_DIR; one that is missing from either place is
+# silently ignored inside the container, however carefully it was exported on the host.
+# BB_HASHSERVE is bitbake's own variable (bitbake.conf: `BB_HASHSERVE ??= "auto"`, i.e.
+# a private hash-equivalence server per build), so passing it through is all it takes to
+# point every Yocto domain at a shared server -- no yaml line needed, and it is already in
+# BB_BASEHASH_IGNORE_VARS so the value does not enter any task hash.
+export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE_DIR XT_DL_DIR BB_HASHSERVE AAOS_KERNEL_MD5 AAOS_RAMDISK_MD5 CONNECTIVITY_CHECK_URIS"
 
 # Run a command inside a Docker image, mounting the workspace at the same path.
 in_docker() {  # $1=image, rest=command
@@ -709,6 +912,7 @@ in_docker() {  # $1=image, rest=command
     -e HTTPS_PROXY -e HTTP_PROXY -e https_proxy -e http_proxy \
     -e NO_PROXY -e no_proxy \
     -e REPO_SKIP_SELF_UPDATE \
+    -e BB_HASHSERVE \
     -e CONNECTIVITY_CHECK_URIS \
     -e AAOS_KERNEL_MD5="${AAOS_KERNEL_MD5:-}" -e AAOS_RAMDISK_MD5="${AAOS_RAMDISK_MD5:-}" \
     -e XT_SSTATE_DIR="$XT_SSTATE_DIR" -e XT_DL_DIR="$XT_DL_DIR" \
@@ -728,7 +932,7 @@ build_img() {  # $1=image tag, $2=dockerfile path relative to workdir
   for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
     if [ -n "${!v:-}" ]; then pargs+=(--build-arg "$v=${!v}"); fi
   done
-  docker build "${NET_OPTS[@]}" -f "$workdir/$2" \
+  docker build ${BUILD_NET_OPTS[@]+"${BUILD_NET_OPTS[@]}"} -f "$workdir/$2" \
     --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
     "${pargs[@]}" \
     -t "$1" "$workdir/docker"
@@ -737,7 +941,16 @@ build_img() {  # $1=image tag, $2=dockerfile path relative to workdir
 # 0) Fetch submodules (base + AGL SoDeV) — only when something is uninitialized, so
 #    rebuilds don't re-hit the network or reset a locally-checked-out submodule.
 #    Force a refresh by running `git submodule update --init --recursive` by hand.
-if git submodule status --recursive 2>/dev/null | grep -q '^-'; then
+#    The status is captured first: piped straight into `grep -q '^-'`, a git that FAILED
+#    (no output) was indistinguishable from "nothing uninitialised", its stderr was
+#    discarded, and the build reported "already initialized" and went on to fail later
+#    where the submodule content is first needed.
+if ! sub_status=$(git submodule status --recursive 2>&1); then
+  echo "ERROR: 'git submodule status --recursive' failed:" >&2
+  printf '%s\n' "$sub_status" | sed 's/^/       /' >&2
+  exit 1
+fi
+if printf '%s\n' "$sub_status" | grep -q '^-'; then
   git submodule update --init --recursive
 else
   echo ">> submodules already initialized; skipping update"
@@ -914,8 +1127,10 @@ fi
 #     into the SD image p4 as a nested GPT (V4H android_only style; see rpi5-sodev.yaml
 #     ENABLE_ANDROID). There is no prebuilt combined-disk and no separate warm step: the
 #     moulin `android` builder runs the full repo sync + lunch + build itself in step 2
-#     (the AOSP toolchain is baked into Dockerfile.builder). Budget ~300 GiB free; one
-#     measured from-scratch run took 5 h 11 min. --aaos-src reuses an existing checkout
+#     (the AOSP toolchain is baked into Dockerfile.builder). Budget ~360 GiB free (334 GiB
+#     of workspace + the SD image, measured on Android 17 -- docs/BUILD.md "0. Check the
+#     host"); the Android 15 from-scratch run took 5 h 11 min and 17 is longer cold.
+#     --aaos-src reuses an existing checkout
 #     (skips the sync); --aaos-ref seeds it from a repo object mirror; omit -a for a
 #     DomA-less SD.
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "${AAOS_SRC_DIR}" ] && [ "${AAOS_SRC_DIR}" != "$workdir/$AAOS_DIR_NAME" ]; then

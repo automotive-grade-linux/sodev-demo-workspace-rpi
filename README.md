@@ -96,8 +96,15 @@ Before you build:
 - **Behind an HTTP(S) proxy / restricted network?** Set `HTTPS_PROXY` (that is the
   variable `build.sh` reads; `--proxy=<url>` does the same) and you will usually also
   need `CONNECTIVITY_CHECK_URIS=""` and `REPO_SKIP_SELF_UPDATE=1` (see *Docker
-  usage*). If the proxy listens on the **host's** loopback, also set
-  `XT_DOCKER_NETWORK=host` — a bridged container cannot reach it otherwise.
+  usage*).
+- **Proxy on the host's loopback (`127.0.0.1:3128`, `localhost`)?** A bridged container
+  cannot reach it (its `127.0.0.1` is itself), and `build.sh` refuses to start rather than
+  let `docker build` fail on `apt-get` with no mention of the proxy. Either point
+  `--proxy` at the Docker bridge gateway (`docker network inspect bridge`, usually
+  `http://172.17.0.1:3128`, if your proxy listens there too), set `XT_DOCKER_NETWORK=host`,
+  or leave the proxy variables unset and let Docker's own client config
+  (`~/.docker/config.json` → `proxies.default`) supply it -- an explicit value in the
+  environment overrides that config. Details in *Docker usage* (`docs/BUILD.md`).
 - To vary the build, run moulin/ninja by hand, or share an sstate cache, see
   *Build configuration*, *Docker usage* (`docs/BUILD.md`) and *Manual build* (`docs/BUILD.md`).
 
@@ -138,6 +145,7 @@ disables the heavy Android/Flatcar guests by default).
 | `--aaos-prebuilt=<dir>` (`AAOS_PREBUILT_DIR`) | `<ws>/aaos-prebuilt` | Prebuilt AAOS bundle (`files/` + `images/` + `MANIFEST.md5`); consumed by `prebuilt`/`auto`. **Skips the AOSP source build entirely.** See *AAOS build modes* |
 | `--aaos-src=<dir>` (`AAOS_SRC_DIR`) | — | Reuse an existing AOSP checkout for `source` mode (skip the repo sync; still builds AOSP from it) |
 | `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from `rpi5-sodev.yaml`, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
+| (`XT_AAOS_SYNC_JOBS`) | 4 | Parallelism of the **reference-mirror pre-sync** (only with `--aaos-ref`/`--aaos-kernel-ref`); raise it on a fast link, lower it behind a rate-limited proxy. The plain `source`-mode sync is moulin's own `repo` fetch and is not affected |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
 | `--rebuild-images` | off | Force-rebuild the `XT_DOCKER` image (`sodev-builder-rpi`). It never touches the V4H workspace's `sodev-builder` -- the two workspaces use different Dockerfiles and, since this series, different tags. Not needed for the Zephyr SDK 1.0.1 / python3.12 move that this series makes: the new tag has no pre-existing image, so the first build creates it already up to date. You need it only when `XT_DOCKER` points at an older image (a pre-rename `sodev-builder`, say), which fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` (Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12`) |
 | `--west-cache=<dir>` (`XT_WEST_CACHE_DIR`) | — | Point the Zephyr west fetches at a pre-populated reference workspace, so `west update` runs offline (the AAOS analogue is `--aaos-ref`). Used for both west workspaces: Dom0's and DomZ's |
@@ -148,6 +156,7 @@ disables the heavy Android/Flatcar guests by default).
 | (`AGL_DOCKER`) | `$XT_DOCKER` | Image for the DomU AGL bitbake. Follows `XT_DOCKER`; set it to the AGL-official `docker-worker` to use that instead (then `docker pull` it yourself -- `build.sh` builds only its own tag) |
 | `--sstate=<dir>` (`XT_SSTATE_DIR`) | — | Reuse an external Yocto sstate cache; bind-mounted into the builders Must name an **existing** directory (a typo would otherwise rebuild everything against an empty cache); an existing but empty one is accepted with a note. |
 | `--dl=<dir>` (`XT_DL_DIR`) | — | Reuse an external Yocto downloads dir; bind-mounted into the builders Must name an existing directory, as `--sstate`. |
+| (`BB_HASHSERVE`) | — (bitbake `auto`: a private server per build) | Hash-equivalence server for **every** bitbake in this build -- the moulin Yocto domains and the DomU AGL bitbake alike (both containers get the variable) -- so equivalent tasks are reused across workspaces and machines: `unix:///path/to/hashserve.sock` (bind-mount the socket's directory with `XT_CACHE_MOUNTS`) or `host:port` (reachable from the container's network). Passed through to bitbake as-is; bitbake already excludes it from task hashes |
 
 DomU / DomA gating follows the V4H `prod-devel-rcar4_new.yaml` idiom: the
 `meta-xt-doma` layer is always in `bblayers`, and `ENABLE_ANDROID=no` masks all
