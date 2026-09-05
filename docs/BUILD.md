@@ -63,12 +63,19 @@ build (see *How the DomA artifacts are produced*).
 >     [E] initCloneNs():432 pivot_root('/tmp/nsjail.1000.root', ...): Operation not permitted
 >
 > Three `--security-opt`s are needed, and each one covers a different step (measured
-> separately -- dropping any of them moves the failure rather than removing it):
+> separately -- dropping any of them moves the failure rather than removing it). They go
+> in `XT_DOCKER_RUN_OPTS_AOSP`, which only the container running the AOSP build gets;
+> `XT_DOCKER_RUN_OPTS` still carries the limits that apply to every container:
 >
->     XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15 \
->       --security-opt seccomp=unconfined \
+>     XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" \
+>     XT_DOCKER_RUN_OPTS_AOSP="--security-opt seccomp=unconfined \
 >       --security-opt apparmor=unconfined \
 >       --security-opt systempaths=unconfined" ./build.sh --memory=48g ...
+>
+> On a host with `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 24.04 and
+> later) `build.sh` refuses `apparmor=unconfined` even in `XT_DOCKER_RUN_OPTS_AOSP`:
+> read *Ubuntu 24.04 hosts* below first and use the confining `docker-nsjail-build`
+> profile in its place.
 >
 > | | blocks |
 > |---|---|
@@ -86,6 +93,88 @@ build (see *How the DomA artifacts are produced*).
 > because AOSP's default goal check-builds every module, so there is nothing to gain by
 > excluding it from the product -- and moulin's android builder always runs a plain
 > `m -j`, so the goal is not ours to change.
+
+> **Ubuntu 24.04 hosts: `apparmor=unconfined` and BitBake do not mix.** Ubuntu 24.04 ships
+> `kernel.apparmor_restrict_unprivileged_userns = 1`, which forbids user-namespace
+> creation to any process that is *not* confined by an AppArmor profile. BitBake's sanity
+> check (`sanity.bbclass`) creates one to prove it can isolate tasks from the network, so
+> in an unconfined container every Yocto domain dies at startup with
+>
+>     ERROR: User namespaces are not usable by BitBake, possibly due to AppArmor.
+>
+> Measured on such a host (Ubuntu 24.04, kernel 7.0, `sodev-builder-rpi`, wrynose poky).
+> The probe column does what `sanity.bbclass` `check_userns()` does --
+> `unshare(CLONE_NEWNET|CLONE_NEWUSER)`, then write `/proc/self/uid_map`; the BitBake
+> column is a real `bitbake -p` in the DomD build directory with the sanity cache cleared
+> (the check runs once per build directory, so a passed cache hides it):
+>
+> | `docker run` options | probe | BitBake |
+> |---|---|---|
+> | (none) | `unshare` itself fails, EPERM (default seccomp) | **passes** (`bitbake -p` rc=0) -- "cannot unshare" is treated as "no isolation available" |
+> | `seccomp=unconfined` | succeeds, uid unchanged | passes (probe; the check's success condition) |
+> | `seccomp=unconfined` + `apparmor=unconfined` + `systempaths=unconfined` | **EPERM, uid becomes nobody** | **fails** (`bitbake -p`: "User namespaces are not usable by BitBake", rc=1) |
+> | `--privileged` | **EPERM, uid becomes nobody** | fails (probe; privileged implies unconfined) |
+>
+> Hence the split above: the relaxation goes in `XT_DOCKER_RUN_OPTS_AOSP` and reaches only
+> the AOSP container, and `build.sh` refuses `apparmor=unconfined`/`--privileged` in the
+> global `XT_DOCKER_RUN_OPTS` on such a host before starting (it used to fail at the DomU
+> bitbake, thirty minutes in after the AOSP `repo sync`).
+>
+> **But `apparmor=unconfined` does not rescue nsjail on such a host either.** nsjail creates
+> its own user namespace (its parent writes the child's `uid_map`, which is allowed), and
+> with the sysctl at 1 a user namespace created by an *unconfined* process has no
+> capabilities -- so nsjail's very next step, `mount('/', '/', MS_REC|MS_PRIVATE)`, is
+> denied. Measured with the AOSP prebuilt `nsjail` (`prebuilts/build-tools/linux-x86/bin`)
+> in the build container, `--chroot` + bind mounts, on this kernel:
+>
+> | sysctl | `docker run` AppArmor option | nsjail | BitBake probe |
+> |---|---|---|---|
+> | 1 | (docker-default), `seccomp=unconfined` | fails: `mount('/','/',MS_REC\|MS_PRIVATE): Permission denied` | passes |
+> | 1 | `apparmor=unconfined` (+ seccomp/systempaths unconfined) | **fails, same mount denied** | fails |
+> | **0** | `apparmor=unconfined` (+ seccomp/systempaths unconfined) | **passes** | **passes** |
+> | **1** | **confining profile below** (+ seccomp/systempaths unconfined) | **passes** | **passes** |
+>
+> So on Ubuntu 24.04 there are exactly two working setups, and `build.sh` refuses the
+> unconfined form in `XT_DOCKER_RUN_OPTS_AOSP` when the AOSP build is going to run:
+>
+> 1. **Keep the hardening, confine the AOSP container with a profile that allows what
+>    nsjail needs** (least privilege; the same idea as the host-side nsjail profile that
+>    Ubuntu bug 2063976 and community write-ups use). Load it once on the host:
+>
+>        sudo tee /etc/apparmor.d/docker-nsjail-build >/dev/null <<'EOF'
+>        #include <tunables/global>
+>        profile docker-nsjail-build flags=(attach_disconnected,mediate_deleted) {
+>          #include <abstractions/base>
+>          network,
+>          capability,
+>          file,
+>          umount,
+>          mount,
+>          pivot_root,
+>          userns,
+>          signal,
+>          ptrace,
+>          unix,
+>        }
+>        EOF
+>        sudo apparmor_parser -r /etc/apparmor.d/docker-nsjail-build
+>
+>    and select it for the AOSP container:
+>
+>        XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" \
+>        XT_DOCKER_RUN_OPTS_AOSP="--security-opt seccomp=unconfined \
+>          --security-opt apparmor=docker-nsjail-build \
+>          --security-opt systempaths=unconfined" ./build.sh --memory=48g ...
+>
+>    The profile is broad (it is a build sandbox's sandbox, not a security boundary), but
+>    the container stays *confined*, which is what the userns restriction keys on. Since
+>    BitBake's probe passes under it too, it would even work as the global option; keeping
+>    it in `_AOSP` limits the relaxation to the one container that needs it.
+>
+> 2. **Lower the sysctl for the duration of the build** (Ubuntu's documented workaround; it
+>    does not survive a reboot), and use `apparmor=unconfined` as before:
+>
+>        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
 ### 1. Install Docker
 

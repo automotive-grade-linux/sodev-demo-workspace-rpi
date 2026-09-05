@@ -52,6 +52,7 @@ XT_AAOS_KERNEL_REF="${XT_AAOS_KERNEL_REF:-}"        # --aaos-kernel-ref=<dir> (r
 REBUILD_IMAGES="${REBUILD_IMAGES:-0}"              # --rebuild-images
 XT_DOCKER_NETWORK="${XT_DOCKER_NETWORK:-}"         # --network for the build containers, e.g. "host"
 XT_DOCKER_RUN_OPTS="${XT_DOCKER_RUN_OPTS:-}"       # extra `docker run` opts for the build containers, e.g. "--memory=48g --cpus=12" (recommended on shared hosts to bound the heavy AOSP/Yocto steps; empty = no limit)
+XT_DOCKER_RUN_OPTS_AOSP="${XT_DOCKER_RUN_OPTS_AOSP:-}"  # extra `docker run` opts for the AOSP (DomA source) container ONLY, on top of XT_DOCKER_RUN_OPTS -- where the nsjail --security-opt relaxations go
 PROXY="${HTTPS_PROXY:-}"                            # --proxy=<url>
 # Set from BOARD once the flags are parsed (see "Board selection" below). Assigning it
 # here would freeze the rpi5 yaml before --board is read.
@@ -158,6 +159,12 @@ Environment (no flag):
                          host's loopback. Default: Docker's bridge.
       XT_DOCKER_RUN_OPTS Extra `docker run` opts applied verbatim to every build
                          container, e.g. "--cpus 12" (empty = none).
+      XT_DOCKER_RUN_OPTS_AOSP  Extra `docker run` opts for the AOSP (DomA source) container
+                         ONLY, on top of XT_DOCKER_RUN_OPTS: the place for the nsjail
+                         --security-opt relaxations. Keep them out of XT_DOCKER_RUN_OPTS --
+                         an unconfined container breaks bitbake on Ubuntu 24.04 hosts, and
+                         there apparmor=unconfined does not help nsjail either: use the
+                         confining profile from docs/BUILD.md ('0. Check the host').
       XT_DOCKER          Tag of the unified build image (default: sodev-builder-rpi).
                          Distinct from the V4H workspace's "sodev-builder" on purpose:
                          --rebuild-images rebuilds THIS tag only.
@@ -606,6 +613,70 @@ if [ -z "$XT_DOCKER_NETWORK" ] && [ "$_hostnet" = yes ]; then BUILD_NET_OPTS+=( 
 unset _hostnet
 [ -n "$XT_DOCKER_MEMORY" ] && DOCKER_RUN_OPTS+=( --memory "$XT_DOCKER_MEMORY" --memory-swap "$XT_DOCKER_MEMORY" )
 DOCKER_RUN_OPTS+=( ${XT_DOCKER_RUN_OPTS:-} )
+# Per-stage additions (in_docker appends them after DOCKER_RUN_OPTS). Set around one
+# in_docker call and cleared again; only the AOSP stage uses it, see moulin_stage below.
+STAGE_RUN_OPTS=()
+
+# Ubuntu 24.04 (and any kernel with kernel.apparmor_restrict_unprivileged_userns=1)
+# forbids user-namespace creation to processes that are NOT confined by AppArmor. Two
+# things in this build collide with that:
+#   - bitbake's sanity check (poky sanity.bbclass, "User namespaces are not usable by
+#     BitBake, possibly due to AppArmor") creates a user namespace and fails when it comes
+#     up half-working (unshare succeeds, the uid_map write is refused, the uid turns into
+#     nobody) -- a hard EPERM on unshare itself, as under docker's default seccomp, is
+#     tolerated as "no isolation available". The half-working case is exactly what an
+#     UNCONFINED process gets on such a kernel, so the container must stay confined;
+#   - AOSP 17's nsjail genrule needs mount/pivot_root inside a user namespace it creates
+#     itself (docs/BUILD.md "0. Check the host").
+# Measured on this kernel with the build image and the AOSP prebuilt nsjail:
+#   - apparmor=unconfined (the documented nsjail relaxation): bitbake's probe fails (uid_map
+#     write EPERM, uid becomes nobody) AND nsjail fails too -- its user namespace is created
+#     but is capability-less, so mount('/','/',MS_REC|MS_PRIVATE) is denied. With the sysctl
+#     at 1 the unconfined route works for NOTHING; only lowering the sysctl to 0 makes both
+#     pass in an unconfined container.
+#   - a CONFINING profile that grants `userns, mount, pivot_root, capability` (docs/BUILD.md
+#     has one) with the sysctl left at 1: nsjail passes and bitbake's probe passes.
+# So: a global apparmor=unconfined at sysctl=1 breaks every Yocto domain, and in the AOSP
+# container it breaks nsjail as well. Refuse the global form up front instead of failing
+# 30 minutes in at the DomU bitbake; refuse the _AOSP form when the AOSP build will
+# actually run, since the genrule would fail hours in.
+_userns_restricted=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)
+if [ "$_userns_restricted" = 1 ]; then
+  case " ${XT_DOCKER_RUN_OPTS:-} " in
+    *apparmor[=:]unconfined*|*" --privileged "*|*" --privileged="*)
+      echo "ERROR: XT_DOCKER_RUN_OPTS relaxes AppArmor for EVERY build container, and this host has" >&2
+      echo "       kernel.apparmor_restrict_unprivileged_userns=1: an unconfined container cannot" >&2
+      echo "       create user namespaces, so bitbake's sanity check fails in every Yocto domain" >&2
+      echo "       ('User namespaces are not usable by BitBake, possibly due to AppArmor')." >&2
+      echo "       Only the AOSP (DomA source) build needs a relaxation, for its nsjail genrule, and on" >&2
+      echo "       this host apparmor=unconfined does not help nsjail either. Give the AOSP container a" >&2
+      echo "       CONFINING profile that allows userns/mount/pivot_root (docs/BUILD.md '0. Check the host'):" >&2
+      echo "         XT_DOCKER_RUN_OPTS_AOSP=\"--security-opt seccomp=unconfined \\" >&2
+      echo "           --security-opt apparmor=docker-nsjail-build --security-opt systempaths=unconfined\"" >&2
+      echo "       and keep XT_DOCKER_RUN_OPTS for the limits that apply everywhere (--cpuset-cpus)." >&2
+      echo "       Alternatively lower the sysctl for the build (not reboot-safe) and keep unconfined:" >&2
+      echo "         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2
+      exit 1 ;;
+  esac
+  if [ "$AAOS_MODE" = source ]; then
+    case " ${XT_DOCKER_RUN_OPTS_AOSP:-} " in
+      *apparmor[=:]unconfined*|*" --privileged "*|*" --privileged="*)
+        echo "ERROR: XT_DOCKER_RUN_OPTS_AOSP makes the AOSP container unconfined, and this host has" >&2
+        echo "       kernel.apparmor_restrict_unprivileged_userns=1: a user namespace created by an" >&2
+        echo "       unconfined process gets no capabilities, so nsjail's mount('/','/',MS_REC|MS_PRIVATE)" >&2
+        echo "       is denied and the trusty_security_vm genrule fails hours into the AOSP build" >&2
+        echo "       (measured with the AOSP prebuilt nsjail on this kernel). Either" >&2
+        echo "         - keep the sysctl and confine the container with a profile that grants" >&2
+        echo "           userns/mount/pivot_root (docs/BUILD.md '0. Check the host', Ubuntu 24.04):" >&2
+        echo "             XT_DOCKER_RUN_OPTS_AOSP=\"--security-opt seccomp=unconfined \\" >&2
+        echo "               --security-opt apparmor=docker-nsjail-build --security-opt systempaths=unconfined\"" >&2
+        echo "         - or lower the sysctl for the duration of the build (not reboot-safe):" >&2
+        echo "             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2
+        exit 1 ;;
+    esac
+  fi
+fi
+unset _userns_restricted
 # Reuse an external Yocto sstate/downloads cache for faster rebuilds: mount it into
 # the containers and let bitbake pick it up via XT_SSTATE_DIR/XT_DL_DIR (rpi5-sodev.yaml
 # reads them with os.getenv; passed through below). A dir already under $workdir is
@@ -921,7 +992,7 @@ export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE
 in_docker() {  # $1=image, rest=command
   local img="$1"; shift
   docker run --rm "${NET_OPTS[@]}" \
-    "${DOCKER_RUN_OPTS[@]}" \
+    "${DOCKER_RUN_OPTS[@]}" ${STAGE_RUN_OPTS[@]+"${STAGE_RUN_OPTS[@]}"} \
     -v "$workdir":"$workdir" "${CACHE_MOUNTS[@]}" -w "$workdir" \
     -e HTTPS_PROXY -e HTTP_PROXY -e https_proxy -e http_proxy \
     -e NO_PROXY -e no_proxy \
@@ -1370,6 +1441,7 @@ STAGE_DOMA_KERNEL="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-doma-kernel.
 # Split the build into the (retriable) ninja part and the one-shot rouge assembly:
 # NINJA_CMD is wrapped in a bounded retry loop below (transient repo-sync aborts),
 # ROUGE_CMD (prebuilt mode's direct p4 assembly, else a ':' no-op) runs once after.
+AOSP_CMD=""   # set in source mode below: the AOSP components, run in their own container first
 if [ "$AAOS_MODE" = prebuilt ]; then
   dom_targets="dom0 domd"; [ "$ENABLE_DOMU" = yes ] && dom_targets="$dom_targets domu"
   # DomZ is a separate moulin component (its own west workspace), so in prebuilt
@@ -1472,7 +1544,13 @@ else
     # the goal list resolved above (the explicit domain list for --domains-only,
     # ${NINJA_TARGET} otherwise), and re-deriving it here would drop back to ninja's
     # default target under --domains-only -- which for the zephyr flavour is dom0 alone.
-    NINJA_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma && ${NINJA_CMD}"
+    #
+    # The AOSP steps are a separate command, run in their OWN container (moulin_stage
+    # below), because that container may need `docker run` options the Yocto/Zephyr one
+    # must not have (XT_DOCKER_RUN_OPTS_AOSP: the nsjail relaxations, which on an Ubuntu
+    # 24.04 host break bitbake's user-namespace check). They were one ${NINJA_CMD} before;
+    # the ordering argument above holds either way, the AOSP container simply runs first.
+    AOSP_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma"
   fi
   # NG-2 class hole, DomZ edition. --domains-only leaves NINJA_TARGET empty, so the
   # bare `ninja` builds moulin's DEFAULT target -- and the domz component is not in
@@ -1525,7 +1603,17 @@ if [ "$NINJA_TARGET" = "image-full" ]; then
   if [ -L full.img ]; then rm -f full.img; fi
 fi
 
-echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} AAOS_MODE=${AAOS_MODE} ninja='${NINJA_CMD}'${ROUGE_CMD:+ +rouge} in ${XT_DOCKER}"
+# ROUGE_CMD is ":" (a no-op), never empty, when rouge does not run, so "is rouge part of
+# this build" is a comparison, not an emptiness test.
+rouge_note=""; [ "$ROUGE_CMD" != ":" ] && rouge_note=" + rouge"
+# One moulin build container. The whole build used to be a single container running
+# moulin + west + one ninja command; it is now this function, called once or twice:
+# once for the AOSP components in source mode (their own container, with
+# XT_DOCKER_RUN_OPTS_AOSP added), then once for everything else. Both calls regenerate the
+# moulin conf and share the retry loop and its OOM/nsjail diagnosis; only the second runs
+# the west fetch/patch prelude and rouge.
+moulin_stage() {  # $1=ninja command (text)  $2=rouge command (text, ":" for none)  $3=yes: run the west prelude
+  local ninja_cmd="$1" rouge_cmd="$2" do_west="$3"
 in_docker "$XT_DOCKER" "
   set -e
   # Regenerate the moulin build dirs' conf from scratch (V4H build.sh parity): a
@@ -1545,11 +1633,11 @@ in_docker "$XT_DOCKER" "
   # now (zephyr/ for Dom0, zephyr-domz/ for DomZ), DomZ is built in the linux-Dom0
   # flavour too, and both are initialised from the same manifest repository -- so
   # these two --global settings serve whichever of them the build needs.
-  if [ -n \"\$XT_WEST_CACHE_DIR\" ] && { [ '${DOM0_OS}' = zephyr ] || [ '${ENABLE_DOMZ}' = yes ]; }; then
+  if [ '${do_west}' = yes ] && [ -n \"\$XT_WEST_CACHE_DIR\" ] && { [ '${DOM0_OS}' = zephyr ] || [ '${ENABLE_DOMZ}' = yes ]; }; then
     west config --global update.path-cache \"\$XT_WEST_CACHE_DIR\"
     git config --global url.\"\$XT_WEST_CACHE_DIR/zephyr-dom0-xt\".insteadOf https://github.com/xen-troops/zephyr-dom0-xt.git
   fi
-  if [ '${DOM0_OS}' = zephyr ]; then
+  if [ '${do_west}' = yes ] && [ '${DOM0_OS}' = zephyr ]; then
     # moulin has no patch hook for west sources: fetch-only pass ('fetch-dom0' =
     # west init+update) populates the workspace, apply the Zephyr Dom0 patch
     # series (idempotent), THEN build. Without the ABI patches
@@ -1569,7 +1657,7 @@ in_docker "$XT_DOCKER" "
   # FindZephyr-sdk.cmake:57 (find_package) before compiling a line. Applying 0021
   # (--manifest-only) builds DomZ against the same Zephyr 4.4.1 as Dom0: one Zephyr
   # and one SDK in the tree instead of two.
-  if [ '${ENABLE_DOMZ}' = yes ]; then
+  if [ '${do_west}' = yes ] && [ '${ENABLE_DOMZ}' = yes ]; then
     ninja fetch-domz
     '${APPLY_ZEPHYR}' --manifest-only \"\$PWD/zephyr-domz\"
   fi
@@ -1598,7 +1686,7 @@ in_docker "$XT_DOCKER" "
   # step where the OOM actually happens, so the detector below would never fire for it and
   # the loop would spend all five attempts blaming the network. Verified over the three
   # failure positions (first fails / second fails / both succeed).
-  run_ninja() { { ${NINJA_CMD}; } 2>&1 | tee \"\$ninja_out\"; return \${PIPESTATUS[0]}; }
+  run_ninja() { { ${ninja_cmd}; } 2>&1 | tee \"\$ninja_out\"; return \${PIPESTATUS[0]}; }
   tries=0
   until run_ninja; do
     rc=\$?
@@ -1624,13 +1712,17 @@ in_docker "$XT_DOCKER" "
       echo \">>   error: retrying cannot help. AOSP 17 runs one genrule under nsjail, which\" >&2
       echo \">>   needs to create namespaces, change mount propagation and pivot_root.\" >&2
       echo \">>   Grant all three and re-run; the build resumes incrementally:\" >&2
-      echo \">>     XT_DOCKER_RUN_OPTS=\\\"--cpuset-cpus=0-15 \\\\\" >&2
-      echo \">>       --security-opt seccomp=unconfined \\\\\" >&2
+      echo \">>     XT_DOCKER_RUN_OPTS_AOSP=\\\"--security-opt seccomp=unconfined \\\\\" >&2
       echo \">>       --security-opt apparmor=unconfined \\\\\" >&2
       echo \">>       --security-opt systempaths=unconfined\\\" ./build.sh ...\" >&2
       echo \">>   All three are needed: seccomp covers clone and pivot_root, and apparmor\" >&2
       echo \">>   and systempaths each block the mount on their own. No capability works\" >&2
-      echo \">>   (--cap-add=SYS_ADMIN gets past clone but not pivot_root).\" >&2
+      echo \">>   (--cap-add=SYS_ADMIN gets past clone but not pivot_root). Use the _AOSP\" >&2
+      echo \">>   variable, not XT_DOCKER_RUN_OPTS: an unconfined container breaks bitbake's\" >&2
+      echo \">>   user-namespace check on hosts with apparmor_restrict_unprivileged_userns=1 --\" >&2
+      echo \">>   and on such a host (Ubuntu 24.04) apparmor=unconfined does not help nsjail\" >&2
+      echo \">>   either: use apparmor=docker-nsjail-build (a confining profile, see the docs)\" >&2
+      echo \">>   or lower that sysctl for the build.\" >&2
       echo \">>   See '### 0. Check the host' in docs/BUILD.md.\" >&2
       exit 1
     fi
@@ -1639,8 +1731,19 @@ in_docker "$XT_DOCKER" "
     echo \">> ninja attempt \$tries failed; retrying in 15s (incremental resume; transient fetch/repo-sync abort?)\" >&2
     sleep 15
   done
-  ${ROUGE_CMD}
+  ${rouge_cmd}
 "
+}
+
+echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} AAOS_MODE=${AAOS_MODE} ninja='${AOSP_CMD:+$AOSP_CMD ; }${NINJA_CMD}'${rouge_note} in ${XT_DOCKER}"
+if [ -n "$AOSP_CMD" ]; then
+  echo ">> [1/2] AOSP components (DomA source build) in ${XT_DOCKER}${XT_DOCKER_RUN_OPTS_AOSP:+, extra docker run opts: $XT_DOCKER_RUN_OPTS_AOSP}"
+  STAGE_RUN_OPTS=( ${XT_DOCKER_RUN_OPTS_AOSP:-} )
+  moulin_stage "$AOSP_CMD" ":" no
+  STAGE_RUN_OPTS=()
+  echo ">> [2/2] Yocto/Zephyr domains${rouge_note} in ${XT_DOCKER}"
+fi
+moulin_stage "$NINJA_CMD" "$ROUGE_CMD" yes
 
 echo "Build complete."
 [ "${ENABLE_DOMU}" = "yes" ] && echo "  AGL DomU image : agl/build/tmp/deploy/images/${AGL_MACHINE}/"
