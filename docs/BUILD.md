@@ -701,23 +701,40 @@ the guest dies in `/init` with SIGILL on the first boot. Yocto has no equivalent
 because `PACKAGE_ARCH` is part of every sstate key and `DEPLOY_DIR_IMAGE` is per MACHINE;
 a bundle of images has neither.
 
+The board is not the only thing a bundle is specific to. The guest **generation** is the
+other. An Android 15 bundle for the *same* device name (the V4H workspace produced those
+for `xenvm_trout_arm64`, which is also rpi5's device) passes a board/device check. This
+tree stages and verifies Android 17 / GKI 6.18.32 guests only, and the measured failure
+in this family is a *mixed* set: a guest kernel and a `vendor_dlkm` from different builds
+share no `module_layout`, and the guest boots to a black panel. Until this check existed,
+only the staged kernel's file name (`...-6.1.118` vs `...-6.18.32`) happened to catch a
+15 bundle.
+
 So a bundle declares what it is, in a `BUNDLE-INFO` file beside `MANIFEST.md5`:
 
 ```
 board=rpi4
 device=xenvm_trout_rpi4_arm64
+android=17                      # Android major version of the guest
+guest_kernel=6.18.32            # GKI kernel version its kernel/vendor_dlkm were built from
 cpu_variant=cortex-a72          # optional, informational
 ```
 
-`build.sh` refuses a bundle whose `board=` (or `device=`) disagrees with `--board`. The
-default probe prefers `<workspace>/aaos-prebuilt-<board>/` over the untagged
-`<workspace>/aaos-prebuilt/`, so the two can coexist.
+`build.sh` refuses a bundle whose `board=` (or `device=`) disagrees with `--board`, and one
+whose `android=` / `guest_kernel=` disagree with the generation this tree builds
+(`AAOS_GUEST_ANDROID`, default 17; `AAOS_GUEST_KERNEL`, default 6.18.32 -- both
+overridable in the environment, and the kernel version also names the staged kernel
+artifact the recipe consumes). A `BUNDLE-INFO` written before those two lines existed is
+accepted with a note, assuming this tree's generation. The default probe prefers
+`<workspace>/aaos-prebuilt-<board>/` over the untagged `<workspace>/aaos-prebuilt/`, so
+the two can coexist.
 
-Bundles produced before this check exist and have no `BUNDLE-INFO`. Every one of them
-predates a second board, i.e. was built for rpi5, so an untagged bundle is accepted for
-`--board=rpi5` with a note and refused for anything else. If you know an untagged bundle
-was built for the board you are building, `AAOS_PREBUILT_ASSUME_BOARD=<board>` proceeds
-without the check.
+A bundle with **no** `BUNDLE-INFO` is refused. It used to be accepted for `--board=rpi5`
+on the reasoning that every untagged bundle predated the second board; that was true of
+the bundles this tree had produced and false of the world (the V4H bundles above are
+untagged too). Add the file -- it travels with the bundle -- or, for one run, assert what
+the bundle is with `AAOS_PREBUILT_ASSUME_BOARD=<board>`; that asserts board, device and
+generation alike, unverified.
 
 ### AAOS build modes (`--aaos`)
 
@@ -735,8 +752,10 @@ A **prebuilt bundle** is a directory (`--aaos-prebuilt=<dir>`, default probe
 `<workspace>/aaos-prebuilt`) with:
 
 - `<dir>/images/` — the six p4 images, and
-- `<dir>/files/` — `aaos-android-kernel-xenbuilt-6.18.32` and
+- `<dir>/files/` — `aaos-android-kernel-xenbuilt-6.18.32` (the version is `AAOS_GUEST_KERNEL`) and
   `aaos-vendor-boot-ramdisk-xenbuilt-padded`,
+- `<dir>/BUNDLE-INFO` -- required; declares board, device and guest generation (see *Prebuilt
+  bundles are board-specific* above), and
 - optionally `<dir>/MANIFEST.md5`.
 
 The two `files/` artifacts are needed because **`prebuilt` cannot derive them**: deriving

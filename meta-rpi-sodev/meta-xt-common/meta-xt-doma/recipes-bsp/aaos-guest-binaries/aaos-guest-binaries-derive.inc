@@ -76,7 +76,11 @@ AAOS_STAGED_KERNEL_IN_TREE ??= "${AAOS_SRC_TREE}/${AAOS_KERNEL_STAGE_DIR}/Image"
 # stages the bundle's two boot artifacts here and the derivation is skipped. Present =>
 # use verbatim; absent => derive. Deliberately NOT in SRC_URI: a file:// entry must
 # exist at do_fetch, which would make every source-mode build require them again.
-AAOS_STAGED_KERNEL ??= "${THISDIR}/files/aaos-android-kernel-xenbuilt-6.18.32"
+# The kernel version in the staged name comes from the same variable build.sh uses to
+# stage the file (and to check the bundle), so the two cannot disagree; the yaml sets it
+# from the environment with this tree's default.
+AAOS_GUEST_KERNEL ??= "6.18.32"
+AAOS_STAGED_KERNEL ??= "${THISDIR}/files/aaos-android-kernel-xenbuilt-${AAOS_GUEST_KERNEL}"
 AAOS_STAGED_RAMDISK ??= "${THISDIR}/files/aaos-vendor-boot-ramdisk-xenbuilt-padded"
 
 DEPENDS += "lz4-native cpio-native"

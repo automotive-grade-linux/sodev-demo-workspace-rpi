@@ -34,7 +34,14 @@ ENABLE_DOMZ="${ENABLE_DOMZ:-no}"                   # -z/--domz    : add DomZ (Ze
 NINJA_TARGET="${NINJA_TARGET-image-full}"          # --domains-only => "" (build domains, skip SD assembly)
 AAOS_SRC_DIR="${AAOS_SRC_DIR:-}"                    # --aaos-src=<dir>       (reuse an AOSP checkout, source mode)
 AAOS_MODE="${AAOS_MODE:-}"                          # --aaos=off|auto|source|prebuilt (empty: derived from -a — off, or auto when -a given)
-AAOS_PREBUILT_DIR="${AAOS_PREBUILT_DIR:-}"          # --aaos-prebuilt=<dir>  (prebuilt AAOS bundle: files/ + images/)
+AAOS_PREBUILT_DIR="${AAOS_PREBUILT_DIR:-}"          # --aaos-prebuilt=<dir>  (bundle: files/ + images/ + BUNDLE-INFO)
+# The DomA guest generation this tree builds: Android major version and the GKI kernel
+# version. The bundle's guest kernel is staged under a name that carries the kernel
+# version (aaos-guest-binaries-derive.inc composes the same name from the same variable,
+# passed through to bitbake below), and a prebuilt bundle is checked against both before
+# anything is staged. Overridable from the environment; the defaults are this tree's.
+AAOS_GUEST_ANDROID="${AAOS_GUEST_ANDROID:-17}"      # Android major version of the DomA guest
+AAOS_GUEST_KERNEL="${AAOS_GUEST_KERNEL:-6.18.32}"   # GKI kernel version of the DomA guest
 AAOS_REQUIRED=""                                    # set by -a/--android: DomA is required, so auto must NOT silently fall back to off
 ANDROID_FLAG=""                                     # -a/--android given on the command line (as opposed to ENABLE_ANDROID=yes from the environment)
 XT_SSTATE_DIR="${XT_SSTATE_DIR:-}"                  # --sstate=<dir>
@@ -109,18 +116,21 @@ DomA (AAOS) options:
                            prebuilt : consume a prebuilt AAOS bundle; NO AOSP build (fast)
                            auto     : prebuilt if a bundle is found, else source if an
                                       AOSP checkout is found, else off
-      --aaos-prebuilt=<dir>  Prebuilt AAOS bundle (layout: files/ + images/, plus an
-                             optional MANIFEST.md5 and BUNDLE-INFO). Used by
+      --aaos-prebuilt=<dir>  Prebuilt AAOS bundle (layout: files/ + images/ + BUNDLE-INFO,
+                             plus an optional MANIFEST.md5). Used by
                              prebuilt/auto. Default probe:
                              <workspace>/aaos-prebuilt-<board>, then
                              <workspace>/aaos-prebuilt.
-                             A bundle is BOARD-SPECIFIC (the guest is compiled for the
-                             host CPU), so it should declare itself in BUNDLE-INFO:
+                             A bundle is BOARD- and GENERATION-SPECIFIC (the guest is
+                             compiled for the host CPU; kernel and vendor_dlkm must be
+                             one build), so it declares itself in BUNDLE-INFO:
                                  board=rpi4
                                  device=xenvm_trout_rpi4_arm64
-                             A mismatch against --board is refused. An untagged bundle
-                             is accepted for rpi5 only (they all predate multi-board
-                             support); AAOS_PREBUILT_ASSUME_BOARD=<board> overrides.
+                                 android=17
+                                 guest_kernel=6.18.32
+                             A mismatch against --board / this tree's generation is
+                             refused. A bundle with NO BUNDLE-INFO is refused unless
+                             AAOS_PREBUILT_ASSUME_BOARD=<board> asserts what it is.
       --aaos-src=<dir>       Reuse an existing AOSP checkout for source mode (skip repo sync)
       --aaos-ref=<dir>       Repo OBJECT MIRROR for the AOSP tree: seed the checkout with
                              'repo init --reference=<dir>' so the sync is local. Accepts a
@@ -164,7 +174,10 @@ Environment (no flag):
       REPO_SKIP_SELF_UPDATE=1  Stop `repo` updating itself (hangs behind some proxies).
       CONNECTIVITY_CHECK_URIS="" Skip bitbake's network probe (proxied/offline sites).
       AAOS_PREBUILT_ASSUME_BOARD  Accept a prebuilt bundle that has no BUNDLE-INFO,
-                         asserting it was built for this --board.
+                         asserting it was built by this tree for this --board (unverified).
+      AAOS_GUEST_ANDROID Android major version of the DomA guest (default: 17).
+      AAOS_GUEST_KERNEL  GKI kernel version of the DomA guest (default: 6.18.32); names
+                         the staged kernel artifact and is checked against the bundle.
 
 Examples:
   ./build.sh                                        # Dom0(zephyr)+DomD only (fast; DomU/DomA-less SD)
@@ -360,7 +373,7 @@ if [ "$AAOS_MODE" = auto ]; then
     # NOT silently ship a DomA-less image and exit 0 — a CI/user asked for DomA).
     echo "ERROR: -a/--android requested DomA, but found neither a prebuilt bundle" >&2
     echo "       (6 images at '$AAOS_PREBUILT_DIR/images/') nor an AOSP source checkout." >&2
-    echo "       Pass --aaos-prebuilt=<dir> (files/ + images/), --aaos=source --aaos-src=<dir>," >&2
+    echo "       Pass --aaos-prebuilt=<dir> (files/ + images/ + BUNDLE-INFO), --aaos=source --aaos-src=<dir>," >&2
     echo "       or --aaos-ref=<repo object mirror> (build.sh seeds a checkout from it)," >&2
     echo "       or drop -a for a DomA-less image (use --aaos=auto to allow the silent fall-back)." >&2
     exit 1
@@ -895,13 +908,14 @@ fi
 # survive bitbake's startup, which deletes every environment variable not named in
 # BB_ENV_PASSTHROUGH(_ADDITIONS) (bb.utils.filter_environment) before the yaml's
 # `${@os.getenv(...)}` is ever evaluated. The variables that reach a yaml line this way
-# today are XT_SSTATE_DIR and XT_DL_DIR; one that is missing from either place is
-# silently ignored inside the container, however carefully it was exported on the host.
+# today are XT_SSTATE_DIR, XT_DL_DIR and AAOS_GUEST_KERNEL; one that is missing from
+# either place is silently ignored inside the container, however carefully it was
+# exported on the host.
 # BB_HASHSERVE is bitbake's own variable (bitbake.conf: `BB_HASHSERVE ??= "auto"`, i.e.
 # a private hash-equivalence server per build), so passing it through is all it takes to
 # point every Yocto domain at a shared server -- no yaml line needed, and it is already in
 # BB_BASEHASH_IGNORE_VARS so the value does not enter any task hash.
-export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE_DIR XT_DL_DIR BB_HASHSERVE AAOS_KERNEL_MD5 AAOS_RAMDISK_MD5 CONNECTIVITY_CHECK_URIS"
+export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE_DIR XT_DL_DIR BB_HASHSERVE AAOS_GUEST_KERNEL AAOS_KERNEL_MD5 AAOS_RAMDISK_MD5 CONNECTIVITY_CHECK_URIS"
 
 # Run a command inside a Docker image, mounting the workspace at the same path.
 in_docker() {  # $1=image, rest=command
@@ -913,6 +927,7 @@ in_docker() {  # $1=image, rest=command
     -e NO_PROXY -e no_proxy \
     -e REPO_SKIP_SELF_UPDATE \
     -e BB_HASHSERVE \
+    -e AAOS_GUEST_KERNEL="$AAOS_GUEST_KERNEL" \
     -e CONNECTIVITY_CHECK_URIS \
     -e AAOS_KERNEL_MD5="${AAOS_KERNEL_MD5:-}" -e AAOS_RAMDISK_MD5="${AAOS_RAMDISK_MD5:-}" \
     -e XT_SSTATE_DIR="$XT_SSTATE_DIR" -e XT_DL_DIR="$XT_DL_DIR" \
@@ -979,15 +994,30 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     # guest dies in /init with SIGILL on the first boot because its userspace was
     # compiled for a CPU variant this host does not implement.
     #
+    # A second axis is the guest GENERATION. An Android 15 bundle for the same device name
+    # (V4H produced untagged ones for xenvm_trout_arm64 -- rpi5's device) passes the board
+    # and device checks. This tree stages and verifies Android 17 / GKI 6.18.32 guests only;
+    # a bundle of another generation is unverified here, and the one failure of this kind
+    # that IS measured -- a guest kernel and a vendor_dlkm from different builds -- boots to
+    # a black panel (no shared module_layout). Until now only the staged kernel's file name
+    # (...-6.1.118 vs ...-6.18.32) happened to catch a 15 bundle. So the bundle declares its
+    # generation too.
+    #
     # A bundle therefore declares what it is, in a BUNDLE-INFO file next to MANIFEST.md5:
     #     board=rpi4
     #     device=xenvm_trout_rpi4_arm64
+    #     android=17                       # Android major version of the guest
+    #     guest_kernel=6.18.32             # GKI kernel version the bundle's kernel/vendor_dlkm are
     #     cpu_variant=cortex-a72          # optional, informational
-    # Lines starting with # and blank lines are ignored.
+    # Lines starting with # and blank lines are ignored. android= and guest_kernel= are
+    # compared against AAOS_GUEST_ANDROID / AAOS_GUEST_KERNEL; a bundle that omits them
+    # (written before they existed) is assumed to match, with a NOTE.
     binfo="$AAOS_PREBUILT_DIR/BUNDLE-INFO"
     if [ -f "$binfo" ]; then
       b_board=$(sed -n 's/^board=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$binfo" | head -1)
       b_device=$(sed -n 's/^device=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$binfo" | head -1)
+      b_android=$(sed -n 's/^android=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$binfo" | head -1)
+      b_kernel=$(sed -n 's/^guest_kernel=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$binfo" | head -1)
       [ -n "$b_board" ] || { echo "ERROR: $binfo has no 'board=' line." >&2; exit 1; }
       if [ "$b_board" != "$BOARD" ]; then
         echo "ERROR: prebuilt bundle is for board '$b_board', this build is --board=$BOARD." >&2
@@ -1001,31 +1031,56 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
         echo "       '$AAOS_PREBUILT_DIR'" >&2
         exit 1
       fi
-      echo ">> prebuilt bundle provenance OK (board=$b_board device=${b_device:-unset})"
+      if [ -n "$b_android" ] && [ "$b_android" != "$AAOS_GUEST_ANDROID" ]; then
+        echo "ERROR: prebuilt bundle is an Android $b_android guest; this tree builds DomA for Android $AAOS_GUEST_ANDROID." >&2
+        echo "       '$AAOS_PREBUILT_DIR'" >&2
+        echo "       This tree stages and verifies Android $AAOS_GUEST_ANDROID guests only. Its kernel, vendor_dlkm" >&2
+        echo "       and p4 images must be one generation (a mixed set shares no module_layout and boots" >&2
+        echo "       to a black panel). Use a bundle built from this tree, or --aaos=source." >&2
+        exit 1
+      fi
+      if [ -n "$b_kernel" ] && [ "$b_kernel" != "$AAOS_GUEST_KERNEL" ]; then
+        echo "ERROR: prebuilt bundle's guest kernel is $b_kernel; this tree stages $AAOS_GUEST_KERNEL." >&2
+        echo "       '$AAOS_PREBUILT_DIR'" >&2
+        echo "       (AAOS_GUEST_KERNEL=$b_kernel would accept it -- only if the p4 images were built" >&2
+        echo "       against that kernel too.)" >&2
+        exit 1
+      fi
+      if [ -z "$b_android" ] || [ -z "$b_kernel" ]; then
+        echo ">> NOTE: BUNDLE-INFO has no android=/guest_kernel= line; assuming Android $AAOS_GUEST_ANDROID /"
+        echo ">>   kernel $AAOS_GUEST_KERNEL (this tree's). Add both lines to make the bundle self-describing."
+      fi
+      echo ">> prebuilt bundle provenance OK (board=$b_board device=${b_device:-unset} android=${b_android:-assumed $AAOS_GUEST_ANDROID} guest_kernel=${b_kernel:-assumed $AAOS_GUEST_KERNEL})"
     else
-      # Legacy bundle with no provenance. Bundles predate this check, and every one of
-      # them was built before a second board existed -- i.e. for rpi5. Accept that for
-      # rpi5 so existing workflows keep working, and refuse it for any other board rather
-      # than stage a guest that cannot run. AAOS_PREBUILT_ASSUME_BOARD is the escape hatch
-      # for someone who knows their untagged bundle was built for this board.
+      # Bundle with no provenance at all. This used to be accepted for rpi5 on the
+      # reasoning that every untagged bundle predated the second board -- which was true
+      # of the bundles this tree had produced, and false of the world: the V4H workspace
+      # produced untagged Android 15 bundles for the same device name, and one of those
+      # passes every check here except the accidental file-name one. So an untagged bundle
+      # is no longer assumed to be anything. Whoever knows what it is says so, either by
+      # adding a BUNDLE-INFO (preferred, it travels with the bundle) or, for this one run,
+      # with AAOS_PREBUILT_ASSUME_BOARD=<board> -- which asserts board, device and
+      # generation alike, unverified.
       if [ -n "${AAOS_PREBUILT_ASSUME_BOARD:-}" ]; then
         if [ "$AAOS_PREBUILT_ASSUME_BOARD" != "$BOARD" ]; then
           echo "ERROR: AAOS_PREBUILT_ASSUME_BOARD=$AAOS_PREBUILT_ASSUME_BOARD but --board=$BOARD." >&2
           exit 1
         fi
-        echo ">> NOTE: bundle has no BUNDLE-INFO; proceeding on AAOS_PREBUILT_ASSUME_BOARD=$BOARD (unverified)."
-      elif [ "$BOARD" = rpi5 ]; then
-        echo ">> NOTE: bundle has no BUNDLE-INFO ('$AAOS_PREBUILT_DIR'). Treating it as rpi5,"
-        echo ">>   which is what every bundle predating this check was built for. Add a"
-        echo ">>   BUNDLE-INFO with 'board=rpi5' to make that explicit."
+        echo ">> NOTE: bundle has no BUNDLE-INFO; proceeding on AAOS_PREBUILT_ASSUME_BOARD=$BOARD"
+        echo ">>   (board, device and Android $AAOS_GUEST_ANDROID / kernel $AAOS_GUEST_KERNEL generation all UNVERIFIED)."
       else
-        echo "ERROR: prebuilt bundle has no BUNDLE-INFO and --board=$BOARD is not rpi5." >&2
-        echo "       '$AAOS_PREBUILT_DIR'" >&2
-        echo "       Untagged bundles predate multi-board support and were built for rpi5;" >&2
-        echo "       staging one here would produce a guest that dies in /init with SIGILL." >&2
-        echo "       Add a BUNDLE-INFO file with 'board=$BOARD' (and optionally" >&2
-        echo "       'device=$AAOS_PRODUCT_DEVICE'), or set AAOS_PREBUILT_ASSUME_BOARD=$BOARD" >&2
-        echo "       if you built it for this board, or use --aaos=source." >&2
+        echo "ERROR: prebuilt bundle has no BUNDLE-INFO: '$AAOS_PREBUILT_DIR'" >&2
+        echo "       Nothing in a bundle's images says which board or which Android generation" >&2
+        echo "       it was built for, and a wrong one stages, assembles and exits 0 -- then the" >&2
+        echo "       guest dies in /init (other board) or is a generation this tree does not stage" >&2
+        echo "       or verify (black panel if kernel and vendor_dlkm disagree). Add a BUNDLE-INFO" >&2
+        echo "       file next to MANIFEST.md5:" >&2
+        echo "           board=$BOARD" >&2
+        echo "           device=$AAOS_PRODUCT_DEVICE" >&2
+        echo "           android=$AAOS_GUEST_ANDROID" >&2
+        echo "           guest_kernel=$AAOS_GUEST_KERNEL" >&2
+        echo "       or, if you know this bundle was built by this tree for this board, set" >&2
+        echo "       AAOS_PREBUILT_ASSUME_BOARD=$BOARD for this run; or use --aaos=source." >&2
         exit 1
       fi
     fi
@@ -1045,10 +1100,10 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
       # requiring them would reject a correctly formed bundle for carrying only what is
       # still used.
       for req in \
-        files/aaos-android-kernel-xenbuilt-6.18.32 files/aaos-vendor-boot-ramdisk-xenbuilt-padded \
+        files/aaos-android-kernel-xenbuilt-${AAOS_GUEST_KERNEL} files/aaos-vendor-boot-ramdisk-xenbuilt-padded \
         images/boot.img images/init_boot.img images/vendor_boot.img images/vbmeta.img \
         images/super.img images/userdata.img ; do
-        grep -q " ${req}\$" "$AAOS_PREBUILT_DIR/MANIFEST.md5" \
+        grep -q "[ *]${req}\$" "$AAOS_PREBUILT_DIR/MANIFEST.md5" \
           || { echo "ERROR: MANIFEST.md5 does not cover '$req' (incomplete manifest)" >&2; exit 1; }
       done
     else
@@ -1071,7 +1126,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     # required: without them prebuilt mode fails in the recipe with an actionable message.
     fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
     staged=0
-    for f in aaos-android-kernel-xenbuilt-6.18.32 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
+    for f in "aaos-android-kernel-xenbuilt-${AAOS_GUEST_KERNEL}" aaos-vendor-boot-ramdisk-xenbuilt-padded; do
       if [ -f "$AAOS_PREBUILT_DIR/files/$f" ]; then
         mkdir -p "$fdir"
         cp -f "$AAOS_PREBUILT_DIR/files/$f" "$fdir/$f"   # unconditional: never keep a stale copy
@@ -1082,10 +1137,11 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
       echo ">> AAOS prebuilt guest kernel + ramdisk staged into meta-xt-doma (derivation will be skipped)."
     else
       echo ">> ERROR: --aaos=prebuilt needs both boot artifacts in '$AAOS_PREBUILT_DIR/files/':" >&2
-      echo ">>   aaos-android-kernel-xenbuilt-6.18.32 and aaos-vendor-boot-ramdisk-xenbuilt-padded." >&2
-      echo ">>   A bundle whose kernel is still named ...-6.1.118 is from the Android 15 guest" >&2
-      echo ">>   and is NOT usable here: pairing that kernel with a 17 vendor_dlkm mismatches" >&2
-      echo ">>   module_layout and the guest never reaches SurfaceFlinger. Rebuild the bundle." >&2
+      echo ">>   aaos-android-kernel-xenbuilt-${AAOS_GUEST_KERNEL} and aaos-vendor-boot-ramdisk-xenbuilt-padded." >&2
+      echo ">>   A bundle whose kernel carries another version (e.g. ...-6.1.118, the Android 15" >&2
+      echo ">>   guest's) is from another guest generation and is NOT usable here: pairing that" >&2
+      echo ">>   kernel with an Android ${AAOS_GUEST_ANDROID} vendor_dlkm mismatches module_layout and the" >&2
+      echo ">>   guest never reaches SurfaceFlinger. Rebuild the bundle for this generation." >&2
       echo ">>   They cannot be derived here: deriving them needs the AOSP checkout" >&2
       echo ">>   (system/tools/mkbootimg) and the bazel guest kernel, which prebuilt mode" >&2
       echo ">>   deliberately does not have. Use --aaos=source --aaos-src=<AOSP checkout>," >&2
@@ -1100,7 +1156,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     # building a fresh p4 from source -- the exact kernel/vendor_dlkm ABI mismatch that
     # boots to a black panel with sys.boot_completed=1.
     fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
-    for f in aaos-android-kernel-xenbuilt-6.18.32 aaos-vendor-boot-ramdisk-xenbuilt-padded; do
+    for f in "aaos-android-kernel-xenbuilt-${AAOS_GUEST_KERNEL}" aaos-vendor-boot-ramdisk-xenbuilt-padded; do
       if [ -e "$fdir/$f" ]; then
         rm -f "$fdir/$f"
         echo ">> removed a stale prebuilt-staged artifact ($f); --aaos=$AAOS_MODE derives it"

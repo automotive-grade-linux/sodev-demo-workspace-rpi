@@ -868,6 +868,11 @@ components:
         # the kernel it is about to put on p1 -- if they differ, p4's vendor_dlkm and
         # p1's kernel come from different builds and module_layout disagrees.
         - [AAOS_KERNEL_STAGE_DIR, "%{ANDROID_KERNEL_STAGE_DIR}"]
+        # Guest kernel version: names the prebuilt-staged kernel artifact the recipe looks
+        # for (aaos-guest-binaries-derive.inc). build.sh passes AAOS_GUEST_KERNEL through
+        # (BB_ENV_PASSTHROUGH_ADDITIONS) so an override there and the recipe agree; unset
+        # => this tree's default.
+        - [AAOS_GUEST_KERNEL, "${@os.getenv('AAOS_GUEST_KERNEL') or '6.18.32'}"]
         # Select the Xen 4.22 recipes (INTERIM LOCAL, in meta-xt-domx); the
         # RPi5 delta is carried as a file:// patch series in the project
         # bbappends (meta-xt-rpi5/.../xen_4.22.bbappend +
