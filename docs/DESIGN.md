@@ -24,7 +24,7 @@ from the R-Car V4H AGL SoDeV reference it came from.
 | DomD | 2 | 0–1 | dom0less, direct-mapped; GPU + RP1 (+ SDHCI with zephyr Dom0); qemu virtio backends; toolstack (zephyr flavour) |
 | DomU | 1 | 1 | AGL cluster guest (virtio-pci, grant DMA) |
 | DomA | 2 | 2–3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
-| DomZ | 1 | 3 | Zephyr RTOS guest (`xenvm` board); no virtio at all — PV console only |
+| DomZ | 1 | 0 | Zephyr RTOS guest (`xenvm` board); no virtio at all — PV console only |
 
 BCM2712 has **no IOMMU**, so DomD is direct-mapped (`xen,static-mem` + libxl
 direct-map). DomU virtio uses grant-based DMA; DomA virtio uses foreign mapping
@@ -55,7 +55,8 @@ Raspberry Pi 5 ships as an 8 GB and a 16 GB SKU. `--ram=16g|8g` (moulin
 | DomU | 1024 MiB | 1024 MiB | heap, `domu.cfg` |
 | DomA | 4096 MiB | **3072 MiB** | heap, `doma.cfg` (substituted from `BOARD_RAM`) |
 | DomZ | 16 MiB | 16 MiB | heap, `domz.cfg` (fixed by the `xenvm` board's RAM bank) |
-| total | 9744 MiB | 7696 MiB | + Xen ~64 MiB |
+| total, four domains | 9728 MiB | 7680 MiB | Dom0 + DomD + DomU + DomA: the figure `build.sh`, the yaml and `tools/check-memory-map.py` use |
+| total, with DomZ | 9744 MiB | 7696 MiB | + Xen ~64 MiB. DomZ is not in the checker's arithmetic (see below) |
 
 DomZ is board-independent and rounds to nothing: 16 MiB is what Zephyr's `xenvm`
 board links against, so it is not a tunable — raising `memory` in `domz.cfg` alone
@@ -147,16 +148,16 @@ The interesting part is what was *not* wrong: DomD still had 1.3 GiB free, nothi
 OOM-killed, `xendriverdomain` was alive, and DomD's `swiotlb`/CMA state was byte-identical
 to the working 16g boot. So the binding limit is not DomD's RAM but what its device model
 can map of a 4 GiB guest. Giving DomA the other 1024 MiB fixes it: **DomD 3072 + DomA
-3072** keeps the same 7680 MiB total and boots all four domains cleanly — 0 binder
+3072** keeps the same 7680 MiB four-domain total and boots all four domains cleanly — 0 binder
 errors, `sys.boot_completed=1`, both panels lit (verified on hardware).
 
 The mechanism behind the mapping limit is not pinned down. `DomD 2048 + DomA 4096` fails
 and `DomD 3072 + DomA 3072` works; which of the two changes carries the fix has not been
 isolated.
 
-**All four domains fit an 8 GB board** by the arithmetic, but not by much: 7680 + Xen ~64 = 7744 MiB
+**All four domains fit an 8 GB board** by the arithmetic, but not by much: 7680 (four domains; 7696 with DomZ's 16 MiB) + Xen ~64 = 7744 MiB
 against roughly 8180 MiB usable (extrapolated from the 16 GB board's
-`total_memory=16372` = 16384 − 12), i.e. ~436 MiB of headroom. That margin exists
+`total_memory=16372` = 16384 − 12), i.e. ~436 MiB of headroom (7760 and ~420 MiB with DomZ). That margin exists
 *only* because Dom0 is 512M — at 1024M the same four domains came to 8256 MiB and
 over-committed the board. `build.sh` prints the arithmetic when `--ram=8g` is combined
 with `-a/--android`, because the 8180 figure is extrapolated rather than measured.
@@ -282,7 +283,7 @@ identical and what this port changes:
 
 | Area | V4H AGL SoDeV (upstream) | This RPi5 port |
 |---|---|---|
-| DomU/DomA sources | `sodev-demo-workspace` | **identical** — consumed via the same repo as a pinned submodule (`external/sodev-demo-workspace`); guest virtio contract (virtio-pci BDF addr1-7, virtio-gpu-gl) unchanged, so V4H-built guest images boot unmodified |
+| DomU/DomA sources | `sodev-demo-workspace` | **identical** — consumed via the same repo as a pinned submodule (`external/sodev-demo-workspace`); guest virtio contract (virtio-pci BDF addr1-7, virtio-gpu-gl) unchanged, so V4H-built guest images boot unmodified (measured with a complete V4H Android 17 set on the then-Android-15 stack). `build.sh` still requires a prebuilt bundle to declare this tree's generation (Android 17 / GKI 6.18.32): a guest kernel and a `vendor_dlkm` from different builds share no `module_layout`, and a bundle of another generation is not what this tree verifies |
 | Build flow | `build.sh` + moulin + docker | **mirrored** — this repo's `build.sh`/`docker/` reproduce the same flow on the RPi5 yaml |
 | Board / BSP | R-Car V4H (Spider/Sparrow Hawk) | Raspberry Pi 5 (BCM2712 + RP1), via `xen-troops/meta-xt-prod-devel-rpi5` + `meta-rpi-sodev/meta-xt-rpi5` |
 | Xen | xen-troops fork | **Xen 4.22** via an interim local version recipe in `meta-xt-common/meta-xt-domx` (meta-virtualization master stops at 4.21) + bbappend patch series over pristine xenbits; no forked Xen repo |

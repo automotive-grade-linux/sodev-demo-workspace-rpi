@@ -27,7 +27,7 @@ build (see *How the DomA artifacts are produced*).
 
 | | Needed | Why |
 |---|---|---|
-| Disk | **~400 GiB free** for a build including DomA | Measured on Android 17: 336 GiB of workspace — `android/` 277 GiB (of which `out/` 138 GiB), `android_kernel/` 35 GiB, `agl/` 11 GiB, `yocto/` 11 GiB — plus the 27 GiB SD image, so 363 GiB in total; ~400 is that rounded up for headroom (a cold Yocto sstate alone was 31 GiB on 15 against the 11 GiB measured here with a warm one). The Android 15 figure was 272 GiB, so add ~90 GiB if you are following older notes |
+| Disk | **~400 GiB free** for a build including DomA | Measured on Android 17: 334 GiB of workspace — `android/` 277 GiB (of which `out/` 138 GiB), `android_kernel/` 35 GiB, `agl/` 11 GiB, `yocto/` 11 GiB — plus the SD image, ~26 GiB (25.8 GiB = 27.7 GB; its p4 varies with the AOSP output), so ~360 GiB in total; ~400 is that rounded up for headroom. `build.sh` warns before starting when the workspace's filesystem has less than 360 GiB free (60 GiB without `--aaos=source`) (a cold Yocto sstate alone was 31 GiB on 15 against the 11 GiB measured here with a warm one). The Android 15 figure was 272 GiB, so add ~90 GiB if you are following older notes |
 | RAM | **64 GiB**, capped at `--memory=48g` (below); the AOSP step is the peak | On Android 17 `soong_build` alone peaked at **42.6 GiB** doing analysis, before any compiling, so the cap has to sit above that and the host has to have room for the cap plus whatever else it runs. (The Android 15 figure was ~19 GiB with `nproc`=16 — the analysis got much heavier, and it is a single process, so `--cpuset-cpus` does not bound it.) Measured on a 64 GiB host: 48g cap left ~14 GiB, which was enough but not generous — a 48 GiB host cannot both grant the cap and stay alive |
 | Cores | more is faster, but see the warning below | `soong_ui` sizes its job count from `nproc`, not from any memory cap |
 | Docker | engine, usable as a non-root user, **and able to relax its sandbox** (below) | every heavy step runs in a container, and one Android 17 build step runs its own sandbox inside it |
@@ -347,7 +347,7 @@ failures each have an entry in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 `build.sh` names the image after the configuration that produced it and points
 `full.img` at the newest one:
 
-    <board>-<SKU>-Dom0<Zephyr|Linux>[-DomU][-DomA]-<YYYYmmdd-HHMM>.img
+    <board>-<SKU>-Dom0<Zephyr|Linux>[-DomU][-DomA][-DomZ]-<YYYYmmdd-HHMM>.img
 
 so `rpi4-4GB-Dom0Zephyr-DomA-20260809-1750.img` is a 4 GiB Raspberry Pi 4 image
 with a Zephyr Dom0 and DomA (no DomU -- on this SKU that pair is refused, see
@@ -365,10 +365,10 @@ A complete image has four partitions:
 
 | # | Name | Size | Contents |
 |---|---|---|---|
-| 1 | `boot` | 512 MiB | FAT: firmware, U-Boot, `xen`, `zephyr.bin`, the DomD kernel and DTBs, `boot.scr`, `linux-domu`, and the two DomA boot artifacts |
+| 1 | `boot` | 512 MiB | FAT, populated by rouge from the yaml: RPi firmware (`bootcode.bin`, `start*.elf`, `fixup*.dat`, `config.txt`, `cmdline.txt`; rpi5 adds `armstub8-2712.bin`, rpi4 `bl31.bin`), `u-boot`, `xen`, the DomD kernel `Image` and DTBs (board DTB, the Xen DTBO, `*-domd-vc4.dtb`; rpi5 `overlays/bcm2712d0.dtbo`, rpi4 `overlays/disable-bt.dtbo`), `boot.scr`; then per option: `zephyr.bin` (Zephyr Dom0) or `initramfs-xt-dom0-thin.cpio.gz` (Linux Dom0), `linux-domu` (`-u`), the two DomA boot artifacts `aaos-android-kernel` + `aaos-vendor-boot-ramdisk` (`-a`), `zephyr-domz.bin` (`-z`) |
 | 2 | `domd` | 9216 MiB | DomD (driver domain) rootfs |
 | 3 | `domu` | 2048 MiB | DomU AGL instrument-cluster rootfs (present with `-u`) |
-| 4 | `android` | 14662 MiB | DomA as a nested GPT (present with DomA) |
+| 4 | `android` | ~14662 MiB (measured) | DomA as a nested GPT (present with DomA). Not a fixed size: the six explicitly sized members (`*_b` slots, `misc`, `metadata`) total 172 MiB, the four `_a` slots take their image's size, and `super` / `userdata` follow the AOSP output (the yaml omits `size:` for them on purpose) -- so it changes with every AOSP build |
 
 **Checkpoint** -- the build should not have left anything staged in the tree:
 
@@ -491,7 +491,15 @@ docker run --rm -it -v "$PWD":"$PWD" -w "$PWD" sodev-builder-rpi
 through into both `docker build` and the build containers, and
 `XT_SSTATE_DIR`/`XT_DL_DIR` point bitbake at an existing sstate/downloads
 cache (absolute paths) for much faster rebuilds — e.g. reuse another
-workspace's `yocto/common_data/sstate`. This shared cache is used by **both**
+workspace's `yocto/common_data/sstate`. Note how they take effect: `build.sh` replaces
+`yocto/common_data/downloads` and `yocto/common_data/sstate` with **symlinks** to the
+directories you name (an empty existing directory is removed first). If either is a
+**non-empty real directory** -- a workspace that has already built once without the
+flags -- `build.sh` stops with an error rather than hide that content behind a link; move
+it away, or point the flag at that directory itself. `XT_CACHE_MOUNTS` (a list of extra
+`docker -v HOST:CONTAINER` specs) is the general-purpose way to make some other host
+directory visible inside the containers; the flags above already mount what they name.
+This shared cache is used by **both**
 the moulin/sodev-builder-rpi build (Dom0/DomD/DomU-kernel/DomA) **and** the DomU AGL
 bitbake — `build.sh` points the AGL build's `DL_DIR`/`SSTATE_DIR` at the same
 cache (`XT_DL_DIR`/`XT_SSTATE_DIR` when set, else the in-workspace
@@ -851,8 +859,11 @@ The two `files/` artifacts are needed because **`prebuilt` cannot derive them**:
 needs the AOSP checkout (`system/tools/mkbootimg/unpack_bootimg.py`) and the bazel guest
 kernel, and skipping the AOSP build is the entire point of the mode. `build.sh` copies
 them into `meta-xt-doma/recipes-bsp/aaos-guest-binaries/files/` (`.gitignore`d — build
-inputs, never committed) and the recipe then uses them verbatim instead of deriving. All
-four artifacts in a bundle must come from **one** build, for the ABI reason above.
+inputs, never committed) and the recipe then uses them verbatim instead of deriving.
+Everything in a bundle -- the two `files/` artifacts and the six `images/` -- must come
+from **one** build, for the ABI reason above. (Bundles used to carry two gRPC server
+binaries and a NOTICE in `files/` as well; those are built from source and committed now,
+so a current bundle has two `files/`, not five.)
 
 There is **no public download of such a bundle**; it is something a colleague or a CI
 produces. A third party with nothing uses `--aaos=source`, which needs only anonymously
@@ -876,9 +887,9 @@ and `doma_kernel` components run their own `repo init` + `repo sync` into
 `<workspace>/android` and `<workspace>/android_kernel`.
 
 Measured on Android 17 (24-core host capped to 16 with `--cpuset-cpus`, `--memory=48g`,
-warm Yocto sstate, DomA + DomU, Zephyr Dom0): **336 GiB** of workspace — `android/`
+warm Yocto sstate, DomA + DomU, Zephyr Dom0): **334 GiB** of workspace — `android/`
 277 GiB (of which `out/` 138 GiB), `android_kernel/` 35 GiB, `agl/` 11 GiB, `yocto/`
-11 GiB — plus a 27 GiB SD image. The AOSP step alone is **1 h** once its `out/` is warm;
+11 GiB — plus a ~26 GiB (27.7 GB) SD image, ~360 GiB in all. The AOSP step alone is **1 h** once its `out/` is warm;
 a cold one is several hours and dominates the total.
 
 The Android 15 equivalent was 272 GiB and 5 h 11 min end to end on a 32-core host, so

@@ -116,8 +116,8 @@ Before you build:
 - **git** and **bash** on the host — `build.sh` checks for git, initialises the
   `external/` submodules, and runs `meta-rpi-sodev/scripts/sync-guest-pins.sh`
   before entering any container.
-- **Disk**: ~400 GiB free for a full `-a` (AAOS) build — one measured Android 17 run used 336 GiB
-  of workspace and AOSP dominates it; the
+- **Disk**: ~400 GiB free for a full `-a` (AAOS) build — one measured Android 17 run used 334 GiB
+  of workspace plus a ~26 GiB SD image (~360 GiB), and AOSP dominates it; the
   guest-less default build (no AOSP) needs far less. Do not build on a
   filesystem with filename-length limits (e.g. ecryptfs).
 - **RAM**: an AOSP/Yocto build is memory-hungry — for `-a` on Android 17, `soong_build`
@@ -243,7 +243,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | DomD graphics | Mesa 26.0.5, weston 15.0.0 (kiosk-shell), libdrm 2.4.131 |
 | DomD device-model | QEMU 7.0.0 (Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock) |
 | DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch, plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
-| DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). A V4H-built AAOS image boots unmodified (portability proof) |
+| DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). The virtio contract is the V4H one: a complete V4H-built AAOS image (kernel, ramdisk and p4 from one build) boots unmodified -- measured in 2026-07 with a V4H Android 17 image on this stack while it was still Android 15. `build.sh` nevertheless accepts only prebuilt bundles that declare this tree's own generation (Android 17 / GKI 6.18.32, `BUNDLE-INFO`): the failure it guards against is a *mixed* set, a guest kernel and a `vendor_dlkm` from different builds, which share no `module_layout` and boot to a black panel |
 | DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`domz/`](domz/README.md) |
 
 
@@ -359,8 +359,15 @@ RPi5 guest**, and touch input was not exercised. The per-item list:
   fixed in-tree (legacy Dom0 qdisk unit masked; prebuilt dumpstate backend not
   auto-enabled until rebuilt against wrynose libxml2).
 
-As a portability proof, the **V4H-built DomA image boots unmodified**
-on this stack (guest kernel/ramdisk/super swapped as binaries — no rebuild).
+As a portability proof, the **V4H-built DomA image boots unmodified** on this stack
+(guest kernel/ramdisk/super swapped as binaries — no rebuild). Measured in 2026-07 with a
+complete V4H Android 17 set on this stack while it was still Android 15, so the virtio
+contract (virtio-pci, virtio-gpu-gl) carries across guest generations. What does not is a
+*mixed* set: a guest kernel and a `vendor_dlkm` from different builds share no
+`module_layout`, and the guest never reaches SurfaceFlinger. `build.sh` therefore
+accepts only prebuilt bundles that declare this tree's generation (`BUNDLE-INFO`
+`android=` / `guest_kernel=`: Android 17 / GKI 6.18.32); a coherent image of another
+generation is outside what this tree verifies, not something it has been shown to break.
 
 **DomZ (`-z`) is verified on hardware in all four verification patterns** (RPi4 and
 RPi5, Zephyr-Dom0 and thin-Linux-Dom0): `xl list` shows the domain at 16 MiB / 1 vCPU,

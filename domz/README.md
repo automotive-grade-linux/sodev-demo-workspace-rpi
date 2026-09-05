@@ -155,8 +155,8 @@ DomD, the boot script).
 
 ## Memory and CPU
 
-16 MiB and one vCPU, pinned to pCPU 3 (idle in the default DomA-less build; shared
-with the Android guest when `-a` is used). The 16 MiB is not a tunable: Zephyr's
+16 MiB and one vCPU, pinned to pCPU 0 (alongside Dom0 and DomD's first vCPU; it used
+to be pCPU 3, one of DomA's cores, and was moved off them -- `domz.cfg` explains why). The 16 MiB is not a tunable: Zephyr's
 `xenvm` board links against a 16 MiB RAM bank at `0x40000000`, so `memory = 16` in
 `domz.cfg` has to match it — `tools/check-domz.sh` checks that pair. Nothing
 static-mem changes, so the memory map checked by `tools/check-memory-map.py` is

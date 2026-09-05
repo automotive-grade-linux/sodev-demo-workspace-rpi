@@ -134,6 +134,10 @@ BUDGET = {
 #     of a 4 GiB guest rather than DomD's own RAM.
 # The 8g map therefore splits the reduction: DomD 3072 + DomA 3072, verified to boot
 # all four domains.
+#
+# "Four domains" throughout means Dom0/DomD/DomU/DomA. DomZ (16 MiB, heap-allocated by
+# the toolstack, no static-mem bank) is deliberately not in this arithmetic; the totals
+# here are 16 MiB below the with-DomZ totals in docs/DESIGN.md.
 DOMD_KNOWN_OOM_MiB = 2048
 
 # Where Zephyr's sram0 is relinked to, in
@@ -615,7 +619,7 @@ def report_budget(ram, strict):
           % (ram, detail, total, XEN_OVERHEAD_MiB, usable, src))
     if total + XEN_OVERHEAD_MiB > usable:
         short = total + XEN_OVERHEAD_MiB - usable
-        msg = ("%s: OVER-COMMIT by %d MiB with all four domains -- "
+        msg = ("%s: OVER-COMMIT by %d MiB with all four domains (DomZ's 16 MiB not counted) -- "
                "`xl create doma.cfg` is expected to fail to allocate at run time"
                % (ram, short))
         if strict:
@@ -626,7 +630,7 @@ def report_budget(ram, strict):
         print("  ----  %s without DomA: %d MiB of %d MiB usable -- fits"
               % (ram, without_doma, usable))
     else:
-        ok("%s: all four domains fit (%d MiB headroom)"
+        ok("%s: all four domains fit (%d MiB headroom; DomZ's 16 MiB heap allocation not counted)"
            % (ram, usable - total - XEN_OVERHEAD_MiB))
 
 

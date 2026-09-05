@@ -299,7 +299,7 @@ AAOS_KERNEL_DIR_NAME=$(sed -n 's/^[[:space:]]*ANDROID_KERNEL_DIR:[[:space:]]*"\(
 # The SKUs are per-board and so are the domain sizes; see the BOARD_RAM parameter in
 # the corresponding yaml for the full rationale.
 #
-# rpi5: 16g (default) or 8g. The default map wants 10240 MiB with all four domains,
+# rpi5: 16g (default) or 8g. The default map wants 9728 MiB with all four domains,
 #   which needs the 16 GB board; 8g takes DomD from 4096 to 3072 MiB and DomA likewise.
 #   The split is measured: DomD 2048 alone left the DomA device model unable to serve a
 #   4 GiB guest and AAOS crash-looped in binder (hardware, 2026-08-03).
@@ -421,6 +421,8 @@ ENABLE_DOMU_RESERVED=no
 if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ]; then
   ENABLE_DOMU_RESERVED=yes
 fi
+# Unreachable by construction (the derivation above sets it only when ENABLE_DOMU is not
+# yes); kept as a guard against a future edit of that derivation, not as a live check.
 if [ "$ENABLE_DOMU_RESERVED" = yes ] && [ "$ENABLE_DOMU" = yes ]; then
   echo "ERROR: internal: ENABLE_DOMU_RESERVED and ENABLE_DOMU are both yes." >&2
   exit 1
@@ -494,7 +496,8 @@ fi
 # is DomA being assembled with NEITHER a DomU rootfs nor the reservation at p3 -- that
 # is the original failure (DomA lands at p3, doma.cfg opens p4, the build exits 0). The
 # derivation makes it unreachable; this check keeps a future edit of it from shipping
-# a broken image silently. Scoped to a full SD-image build ($NINJA_TARGET non-empty):
+# a broken image silently -- it is a guard, not a live check, and should not be counted
+# as one. Scoped to a full SD-image build ($NINJA_TARGET non-empty):
 # the mismatch can only ship in an assembled image, and --domains-only is covered by
 # NG-2 above. DISTINCT from NG-2: NG-2 = "DomA never assembled"; C2 = "DomA assembled
 # at the wrong partition number".
@@ -1193,8 +1196,9 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
     # the AOSP checkout itself (system/tools/mkbootimg/unpack_bootimg.py) and the bazel
     # kernel Image -- neither of which exists in prebuilt mode, which is the whole point
     # of the mode. So stage the bundle's two boot artifacts and let the recipe use them
-    # verbatim instead of deriving (see aaos-guest-binaries-derive.inc). Staged, not
-    # required: without them prebuilt mode fails in the recipe with an actionable message.
+    # verbatim instead of deriving (see aaos-guest-binaries-derive.inc). Both are
+    # required: the loop below stops the build if either is missing, because the recipe
+    # cannot derive them in prebuilt mode and would only fail later, inside bitbake.
     fdir="$workdir/meta-rpi-sodev/meta-xt-common/meta-xt-doma/recipes-bsp/aaos-guest-binaries/files"
     staged=0
     for f in "aaos-android-kernel-xenbuilt-${AAOS_GUEST_KERNEL}" aaos-vendor-boot-ramdisk-xenbuilt-padded; do
