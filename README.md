@@ -148,7 +148,6 @@ disables the heavy Android/Flatcar guests by default).
 | (`AGL_DOCKER`) | `$XT_DOCKER` | Image for the DomU AGL bitbake. Follows `XT_DOCKER`; set it to the AGL-official `docker-worker` to use that instead (then `docker pull` it yourself -- `build.sh` builds only its own tag) |
 | `--sstate=<dir>` (`XT_SSTATE_DIR`) | — | Reuse an external Yocto sstate cache; bind-mounted into the builders Must name an **existing** directory (a typo would otherwise rebuild everything against an empty cache); an existing but empty one is accepted with a note. |
 | `--dl=<dir>` (`XT_DL_DIR`) | — | Reuse an external Yocto downloads dir; bind-mounted into the builders Must name an existing directory, as `--sstate`. |
-| (`XT_DISABLE_SPDX`) | — (SBOM on) | Set to any non-empty value to drop `create-spdx` from `INHERIT` for the Yocto components. SBOM generation is **on by default** — the images ship SPDX documents — so this is only an escape hatch for a faster iteration cycle or for working around an SPDX-tool problem, never for a release build |
 
 DomU / DomA gating follows the V4H `prod-devel-rcar4_new.yaml` idiom: the
 `meta-xt-doma` layer is always in `bblayers`, and `ENABLE_ANDROID=no` masks all
@@ -161,6 +160,17 @@ The *Quick start* above is the happy path (`./build.sh` → `full.img`); *Build
 configuration* lists the flags/flavours. This section covers the Docker build
 environment, running moulin + ninja by hand, and staging the AAOS prebuilts for
 `-a`.
+
+The Yocto domains — DomD, the thin Linux Dom0 flavour and the DomU kernel — generate an SPDX 3.0.1
+SBOM: poky enables `create-spdx` by default (`INHERIT_DISTRO` in `defaultsetup.conf`) and this
+workspace keeps it on. Each domain writes its documents to `tmp/deploy/spdx/3.0.1/` in that build
+directory, plus a per-image SBOM beside the image. They are deploy artifacts and are never part of a
+rootfs. The DomU AGL rootfs is a separate bitbake with its own poky and emits SPDX 2.2. If a local
+build ever needs the SBOM off, add `INHERIT:remove = "create-spdx"` to that build's `conf/local.conf`
+and run bitbake inside the builder. Note the two builds differ in how long that edit lives: `build.sh`
+deletes and regenerates `yocto/build-dom*/conf` on every run, so an edit there is gone next run, while
+`agl/build/conf/local.conf` keeps it: `aglsetup.sh` skips configuration generation altogether once a
+`conf/local.conf` is there, and only `-f` overwrites it.
 
 
 See also:

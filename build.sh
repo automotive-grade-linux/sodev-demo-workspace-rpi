@@ -709,7 +709,6 @@ in_docker() {  # $1=image, rest=command
     -e HTTPS_PROXY -e HTTP_PROXY -e https_proxy -e http_proxy \
     -e NO_PROXY -e no_proxy \
     -e REPO_SKIP_SELF_UPDATE \
-    -e XT_DISABLE_SPDX="${XT_DISABLE_SPDX:-}" \
     -e CONNECTIVITY_CHECK_URIS \
     -e AAOS_KERNEL_MD5="${AAOS_KERNEL_MD5:-}" -e AAOS_RAMDISK_MD5="${AAOS_RAMDISK_MD5:-}" \
     -e XT_SSTATE_DIR="$XT_SSTATE_DIR" -e XT_DL_DIR="$XT_DL_DIR" \

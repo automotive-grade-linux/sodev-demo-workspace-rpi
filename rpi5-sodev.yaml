@@ -241,17 +241,6 @@ common_data:
     # PROVIDES virtual/(nativesdk-)egl for the SDK/native qemu host task.
     - [DISTRO_FEATURES_FILTER_NATIVESDK:append, " glvnd"]
     - [DISTRO_FEATURES_FILTER_NATIVE:append, " glvnd"]
-    # SBOM/SPDX generation stays ENABLED by default -- an automotive-grade
-    # deliverable should ship one. It can be turned off for a single build with
-    #     XT_DISABLE_SPDX=1 ./build.sh ...
-    # which is occasionally necessary: on a build root whose qemu sstate predates
-    # the qemu package split, poky's create-spdx aborts image do_rootfs with
-    # "Unable to find package 'qemu-system-aarch64' in SPDX file" because the
-    # cached SPDX document does not contain the split package. A clean build root
-    # (or `bitbake -c cleansstate qemu`) fixes that properly; the switch is only an
-    # escape hatch. The SBOM itself is a deploy artifact (tmp/deploy/spdx/*.json)
-    # and is not part of the rootfs either way.
-    - [INHERIT:remove, "${@'create-spdx' if os.getenv('XT_DISABLE_SPDX') else ''}"]
     # [wrynose] BB_DANGLINGAPPENDS_WARNONLY removed in wrynose 5.2. The dangling
     # appends it previously suppressed (shared DomU/DomA image .bbappends in
     # configs lacking the base recipe) resolve cleanly with the full layer set; no

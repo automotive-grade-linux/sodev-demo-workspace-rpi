@@ -10,17 +10,11 @@ land in both, and the failure is silent: the board whose copy was not updated si
 keeps the older behaviour.
 
 That is not hypothetical. rpi4-sodev.yaml was created from an older revision of
-rpi5-sodev.yaml and arrived carrying
-
-    - [INHERIT:remove, "create-spdx"]
-
-where the current shared text is
-
-    - [INHERIT:remove, "${@'create-spdx' if os.getenv('XT_DISABLE_SPDX') else ''}"]
-
-i.e. SBOM generation was off for that board while being on for the other. It was found
-by noticing that the two boards' `bitbake -n` task counts differed by ~1,400, not by any
-check. This is that check.
+rpi5-sodev.yaml and arrived carrying an older `- [INHERIT:remove, "create-spdx"]` entry
+while the shared text had already moved on, i.e. SBOM generation was off for that board while
+being on for the other. It was found by noticing that the two boards' `bitbake -n` task
+counts differed by ~1,400, not by any check. (Both lines are gone now -- the SBOM is
+unconditional -- but the failure mode is not.) This is that check.
 
 HOW IT WORKS
 ------------
