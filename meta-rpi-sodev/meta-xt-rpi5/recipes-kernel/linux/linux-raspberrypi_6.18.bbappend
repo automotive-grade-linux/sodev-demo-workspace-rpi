@@ -138,3 +138,28 @@ SRC_URI:append = " file://xen-config-a4b-frontend.cfg"
 # from meta-xt-common for both boards. See files/bcm2712-domd-nat.cfg for the
 # measurements that pinned it down.
 SRC_URI:append = " file://bcm2712-domd-nat.cfg"
+
+# USB-C Dom0 management Ethernet gadget. The RP1 USB controllers remain host
+# mode for the USB-A ports; this enables the separate BCM2712 DWC2 gadget path.
+SRC_URI:append = " file://usb-gadget-config.cfg"
+
+# Patch the boot DTB that firmware hands to Xen so Linux Dom0 sees the Pi 5
+# USB-C OTG controller as a usable UDC. Hardware testing showed that the shipped
+# boot partition does not include overlays/dwc2.dtbo, and merely adding
+# dtoverlay=dwc2 left /axi/usb@480000 disabled. Enabling the node was not enough:
+# under Xen the bcm2835-power provider remains deferred, so the USB node's
+# power-domains reference also has to be removed or dwc2 probe defers forever.
+DEPENDS:append = " dtc-native"
+
+do_deploy:append:raspberrypi5() {
+    for dtb in \
+        ${DEPLOYDIR}/bcm2712-rpi-5-b.dtb \
+        ${DEPLOYDIR}/broadcom/bcm2712-rpi-5-b.dtb
+    do
+        if [ -f "$dtb" ]; then
+            fdtput -t s "$dtb" /axi/usb@480000 status okay
+            fdtput -t s "$dtb" /axi/usb@480000 dr_mode peripheral
+            fdtput -d "$dtb" /axi/usb@480000 power-domains || true
+        fi
+    done
+}

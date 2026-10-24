@@ -1,0 +1,13 @@
+[Unit]
+Description=Dom0 USB-C Ethernet gadget management interface
+After=systemd-modules-load.service systemd-udevd.service systemd-resolved.service dom0-domd-vif.service
+Wants=systemd-resolved.service dom0-domd-vif.service
+Before=sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/dom0-usb-gadget-up
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,130 @@
+#!/bin/sh
+set -eu
+
+GADGET="usb-gadget"
+UDC="1000480000.usb"
+HOSTNAME="@SODEV_MANAGEMENT_HOSTNAME@"
+DEV_ADDR="02:00:00:00:77:02"
+HOST_ADDR="02:00:00:00:77:01"
+USB_ADDR="192.168.77.2/24"
+USB_NET="192.168.77.0/24"
+DOM0_VIF_ADDR="192.168.0.1"
+DOMD_VIF_ADDR="192.168.0.11"
+DOMD_VIF="vif1.0"
+DHCP_CONF="/etc/udhcpd/usb0.conf"
+DHCP_PID="/run/udhcpd-usb0.pid"
+CONFIGFS="/sys/kernel/config"
+GADGETS="${CONFIGFS}/usb_gadget"
+GADGET_DIR="${GADGETS}/${GADGET}"
+
+hostname "${HOSTNAME}" || true
+
+mkdir -p "${CONFIGFS}"
+if ! grep -q " ${CONFIGFS} configfs " /proc/mounts; then
+    mount -t configfs none "${CONFIGFS}"
+fi
+
+for _ in $(seq 1 60); do
+    if [ -e "/sys/class/udc/${UDC}" ]; then
+        break
+    fi
+    sleep 0.5
+done
+
+if [ ! -e "/sys/class/udc/${UDC}" ]; then
+    echo "USB device controller ${UDC} did not appear" >&2
+    exit 1
+fi
+
+# Use ConfigFS CDC ECM. On hardware, legacy g_ether failed to bind to this UDC,
+# while ConfigFS ECM bound cleanly and is usable by macOS/Linux hosts.
+modprobe libcomposite
+modprobe usb_f_ecm
+
+if [ -d "${GADGET_DIR}" ]; then
+    echo "" > "${GADGET_DIR}/UDC" 2>/dev/null || true
+    rm -f "${GADGET_DIR}"/configs/c.1/*.usb0 2>/dev/null || true
+    rmdir "${GADGET_DIR}"/functions/*.usb0 2>/dev/null || true
+    rmdir "${GADGET_DIR}/configs/c.1/strings/0x409" 2>/dev/null || true
+    rmdir "${GADGET_DIR}/configs/c.1" 2>/dev/null || true
+    rmdir "${GADGET_DIR}/strings/0x409" 2>/dev/null || true
+    rmdir "${GADGET_DIR}" 2>/dev/null || true
+fi
+
+mkdir -p "${GADGET_DIR}"
+cd "${GADGET_DIR}"
+
+printf '0x1d6b\n' > idVendor
+printf '0x0104\n' > idProduct
+mkdir -p strings/0x409
+printf '0001\n' > strings/0x409/serialnumber
+printf 'SoDeV\n' > strings/0x409/manufacturer
+printf 'USB Ethernet\n' > strings/0x409/product
+
+mkdir -p configs/c.1/strings/0x409
+printf 'CDC ECM\n' > configs/c.1/strings/0x409/configuration
+
+mkdir -p functions/ecm.usb0
+printf '%s\n' "${DEV_ADDR}" > functions/ecm.usb0/dev_addr
+printf '%s\n' "${HOST_ADDR}" > functions/ecm.usb0/host_addr
+ln -s functions/ecm.usb0 configs/c.1/
+printf '%s\n' "${UDC}" > UDC
+
+for _ in $(seq 1 60); do
+    if [ -e /sys/class/net/usb0 ]; then
+        break
+    fi
+    sleep 0.5
+done
+
+if [ ! -e /sys/class/net/usb0 ]; then
+    echo "usb0 did not appear after binding ${GADGET}; UDC state: $(cat /sys/class/udc/${UDC}/state 2>/dev/null || true)" >&2
+    exit 1
+fi
+
+ip addr replace "${USB_ADDR}" dev usb0
+ip link set usb0 up
+
+resolvectl mdns usb0 yes 2>/dev/null || true
+resolvectl llmnr usb0 yes 2>/dev/null || true
+
+if command -v udhcpd >/dev/null 2>&1 && [ -f "${DHCP_CONF}" ]; then
+    if [ -f "${DHCP_PID}" ] && kill -0 "$(cat "${DHCP_PID}")" 2>/dev/null; then
+        :
+    else
+        rm -f "${DHCP_PID}"
+        udhcpd -S "${DHCP_CONF}"
+    fi
+fi
+
+# USB gadget hardware is owned by Dom0, but externally visible TCP services
+# should behave like Ethernet and land in DomD. Forward every inbound TCP port
+# from the USB host to DomD's existing point-to-point vif address. Leave UDP on
+# Dom0 so DHCP and mDNS/LLMNR for the USB link keep working locally.
+if command -v iptables >/dev/null 2>&1; then
+    sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+    modprobe ip_tables 2>/dev/null || true
+    modprobe iptable_filter 2>/dev/null || true
+    modprobe iptable_nat 2>/dev/null || true
+    modprobe nf_conntrack 2>/dev/null || true
+    modprobe nf_nat 2>/dev/null || true
+    modprobe xt_nat 2>/dev/null || true
+    modprobe xt_tcpudp 2>/dev/null || true
+
+    ipt_add() {
+        _t=""
+        if [ "$1" = "-t" ]; then _t="-t $2"; shift 2; fi
+        _op="$1"; shift
+        # shellcheck disable=SC2086
+        iptables $_t -C "$@" 2>/dev/null && return 0
+        # shellcheck disable=SC2086
+        iptables $_t "$_op" "$@" 2>/dev/null || true
+    }
+
+    ipt_add -t nat -A PREROUTING -i usb0 -p tcp \
+        -j DNAT --to-destination "${DOMD_VIF_ADDR}"
+    ipt_add -t nat -A POSTROUTING -s "${USB_NET}" -d "${DOMD_VIF_ADDR}/32" -p tcp \
+        -j SNAT --to-source "${DOM0_VIF_ADDR}"
+    ipt_add -A FORWARD -i usb0 -o "${DOMD_VIF}" -p tcp -d "${DOMD_VIF_ADDR}" -j ACCEPT
+    ipt_add -A FORWARD -i "${DOMD_VIF}" -o usb0 -p tcp -s "${DOMD_VIF_ADDR}" -j ACCEPT
+fi

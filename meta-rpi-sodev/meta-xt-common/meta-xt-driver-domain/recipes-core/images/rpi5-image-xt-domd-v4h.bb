@@ -34,6 +34,22 @@ IMAGE_INSTALL:append = " \
 
 # xt-rpi5-domain (boot-time vCPU pinning) already comes from the vc4 base above.
 
+# Advertised name for external management discovery.
+SODEV_MANAGEMENT_HOSTNAME ??= "basecamp"
+
+ROOTFS_POSTPROCESS_COMMAND += "set_domd_management_identity; "
+set_domd_management_identity() {
+    echo "${SODEV_MANAGEMENT_HOSTNAME}" > ${IMAGE_ROOTFS}${sysconfdir}/hostname
+    sed -i 's|@SODEV_MANAGEMENT_HOSTNAME@|${SODEV_MANAGEMENT_HOSTNAME}|g' \
+        ${IMAGE_ROOTFS}${bindir}/domd-flatbridge-up
+    install -d ${IMAGE_ROOTFS}${sysconfdir}/systemd/resolved.conf.d
+    cat > ${IMAGE_ROOTFS}${sysconfdir}/systemd/resolved.conf.d/management-name.conf <<'EOF'
+[Resolve]
+MulticastDNS=yes
+LLMNR=yes
+EOF
+}
+
 # Exclude the licence-restricted Wi-Fi firmware packages. A board whose radio
 # needs one of them takes it back out of both lists in its bbappend.
 BAD_RECOMMENDATIONS += "linux-firmware-rpidistro-bcm43455 linux-firmware-rpidistro-bcm43456 linux-firmware-rpidistro-bcm43430"

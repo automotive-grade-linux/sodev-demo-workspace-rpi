@@ -1,5 +1,5 @@
 # xenbr0: bring the bridge up with NO address. The late flat-bridge unit
-# (domd-flatbridge.service) assigns 192.168.10.10 once the guest vifs exist.
+# (domd-flatbridge.service) starts DHCP on it once the guest vifs exist.
 #
 # Do NOT put 192.168.0.1 here (it is a tempting NAT default): 192.168.0.1 is Dom0's
 # end of the Dom0<->DomD point-to-point vif (dom0-domd-vif-up), and a local
@@ -13,3 +13,5 @@ Name=xenbr0
 [Network]
 ConfigureWithoutCarrier=yes
 LinkLocalAddressing=no
+MulticastDNS=yes
+LLMNR=yes

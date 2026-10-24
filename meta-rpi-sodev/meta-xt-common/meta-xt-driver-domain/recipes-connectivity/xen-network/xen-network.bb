@@ -16,15 +16,15 @@ LIC_FILES_CHKSUM = "file://${COREBASE}/meta/COPYING.MIT;md5=3da9cfbcb788c80a0384
 #   - 20-domd-vif.network    : Dom0-link xen-netfront static .0.11 (NOT bridged).
 #   - 21-domd-emu-vif.network : qemu device-model taps (vif-emu*) -> xenbr0, so a
 #                              DomA/DomU recreated after boot gets bridged too.
-#   - 50-xenbr0.network      : xenbr0 up, addressless (flatbridge assigns .10.10
+#   - 50-xenbr0.network      : xenbr0 up, addressless (flatbridge starts DHCP
 #                              late; .0.1 here would shadow Dom0's vif .0.1).
 #   - bridge.conf            : modules-load bridge.ko (CONFIG_BRIDGE=m).
 #   - systemd-networkd-wait-online.conf : --any --timeout=15 (no end0 block).
 #   - domd-sshd-fix.service  : /run/sshd + ssh-keygen -A + restart sshd.socket
 #                              (host keys generated on first boot; none committed).
 #   - domd-flatbridge-up/.service : LATE (post-graphical.target) flat L2 bridge:
-#                              xenbr0=.10.10, enslave eth0 + DomU/DomA qemu taps,
-#                              serve DomA eth1 DHCP lease .10.13 (dnsmasq). Kept
+#                              enslave eth0 + DomU/DomA qemu taps, then run
+#                              udhcpc on xenbr0. Kept
 #                              off the xenstore-critical window (doing it at boot
 #                              wedged xenbus).
 SRC_URI = " \
@@ -92,14 +92,16 @@ RDEPENDS:${PN} = " \
     xen-tools-xenstore \
 "
 
-# DomD-only runtime deps: dnsmasq (DomA eth1 DHCP lease on the flat bridge),
-# haveged (entropy for the first-boot ssh-keygen in domd-sshd-fix) and iptables
+# DomD-only runtime deps: dnsmasq (existing DomA/guest support), haveged
+# (entropy for the first-boot ssh-keygen in domd-sshd-fix), busybox-udhcpc
+# (DHCP client for xenbr0) and iptables
 # (the source NAT domd-flatbridge-up installs so guests can reach the internet
 # through DomD's Wi-Fi -- without it the script logs a warning and the guests
 # have no route out).
 RDEPENDS:${PN}-flatbridge = " \
     ${PN} \
     dnsmasq \
+    busybox-udhcpc \
     haveged \
     iptables \
 "
@@ -143,16 +145,9 @@ do_install() {
     install -m 0755 ${S}/domd-flatbridge-up ${D}${bindir}/domd-flatbridge-up
 }
 
-# [C2 single source] Enforce the DomD static addresses from sodev-net.inc so the
-# topology lives in exactly one place. Only DomD eth0 (flat L2) and the
-# Dom0<->DomD vif (xen-netfront) carry a static Address here. xenbr0 stays
-# ADDRESSLESS on purpose (50-xenbr0.network) — .10.10 is assigned LATE by
-# domd-flatbridge-up, never via a .network Address= — so 50-xenbr0.network is not
-# rewritten; the address itself is substituted into domd-flatbridge-up instead,
-# together with the uplink gateway it sets the default route to.
-# The former end0.network (DHCP uplink) was dropped: RP1 is now
-# pinned to eth0 (00-rp1-eth0.link) so no "end0" ever appears on DomD, and the
-# thin Dom0 image already rm'd it (rpi5-image-xt-dom0-thin.bb flatten_dom0_network).
+# [C2 single source] Keep the boot-time DomD eth0 address and Dom0<->DomD vif
+# static. The final external wired address is obtained by udhcpc on xenbr0 in
+# domd-flatbridge-up, not assigned as a baked-in 192.168.10.x address.
 do_install:append() {
     sed -i \
         -e 's|^Address=.*|Address=${XT_DOMD_ETH0_IP}/24|' \
@@ -160,12 +155,4 @@ do_install:append() {
         ${D}${sysconfdir}/systemd/network/10-eth0.network
     sed -i 's|^Address=.*|Address=${XT_DOMD_VIF_IP}/24|' \
         ${D}${sysconfdir}/systemd/network/20-domd-vif.network
-    sed -i \
-        -e 's|^XENBR0_ADDR=.*|XENBR0_ADDR=${XT_DOMD_XENBR0_IP}/24|' \
-        -e 's|^UPLINK_GW=.*|UPLINK_GW=${XT_PC_UPLINK_GW_IP}|' \
-        ${D}${bindir}/domd-flatbridge-up
-    grep -q '^XENBR0_ADDR=${XT_DOMD_XENBR0_IP}/24$' ${D}${bindir}/domd-flatbridge-up || \
-        bbfatal "domd-flatbridge-up: XENBR0_ADDR substitution did not take"
-    grep -q '^UPLINK_GW=${XT_PC_UPLINK_GW_IP}$' ${D}${bindir}/domd-flatbridge-up || \
-        bbfatal "domd-flatbridge-up: UPLINK_GW substitution did not take"
 }

@@ -21,3 +21,18 @@ IMAGE_INSTALL:append = " ${XT_DOMU_CFG_INSTALL}"
 # when DomZ is built (--domz), else "".
 XT_DOMZ_CFG_INSTALL ??= ""
 IMAGE_INSTALL:append = " ${XT_DOMZ_CFG_INSTALL}"
+
+# Dedicated USB-C point-to-point management network into Linux Dom0:
+#   host side: DHCP from 192.168.77.10-192.168.77.20/24
+#   Dom0 side: 192.168.77.2/24 (usb0)
+IMAGE_INSTALL:append = " dom0-usb-gadget"
+
+# Advertised name for USB management discovery.
+SODEV_MANAGEMENT_HOSTNAME ??= "basecamp"
+
+ROOTFS_POSTPROCESS_COMMAND += "set_usb_gadget_hostname; "
+set_usb_gadget_hostname() {
+    echo "${SODEV_MANAGEMENT_HOSTNAME}" > ${IMAGE_ROOTFS}${sysconfdir}/hostname
+    sed -i 's|@SODEV_MANAGEMENT_HOSTNAME@|${SODEV_MANAGEMENT_HOSTNAME}|g' \
+        ${IMAGE_ROOTFS}${bindir}/dom0-usb-gadget-up
+}
