@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 22 Oct 2026 07:51:12 +0900
+Subject: [PATCH] virtio-media: hold an event when the guest has no buffer
+ posted
+
+virtio_media_send_event() dropped an event when the guest had no event
+buffer posted, and never sent it again. A comment in the event
+code said an empty queue meant the guest had stopped consuming. It
+does not: the driver handles events in a workqueue and reposts each
+buffer after the event, so its 16 buffers can run out for a moment when
+that work does not run soon enough.
+
+A dropped event is enough to stop playback. The guest's v4l2_codec2
+decoder completes its works in output order, and a work is done once
+its input buffer is back and its output has arrived. When the
+OUTPUT-done of one bitstream buffer is lost, that work never completes;
+every later work waits behind it, holding its output buffer, until the
+decoder has no output buffer left to queue, and decoding stalls too.
+Measured on a Raspberry Pi 5 (2026-10-21), H.264 1080p60 played full
+screen in a WebView with WebViewSurfaceControl, 10 minutes at a time:
+playback stopped in 8 of 15 runs. In 3 of those runs a build logged
+every drop: the only event dropped was the OUTPUT-done of one
+bitstream buffer, in the one run that stopped, and the decoder's last
+successful output-buffer dequeue came about 0.14 s later.
+
+The device now holds an event the guest has no buffer for, in order,
+and a new event waits behind the held ones, so an event can be late but
+is never reordered. This layer's guest driver does not kick the event
+queue when it reposts a buffer (its patch 0011), so the held events go
+out with the next event the device sends, before the response to the
+next command the guest sends, or from a timer: 1 ms after holding one;
+each time the timer finds the guest has taken none the delay doubles,
+up to 100 ms, and once it takes one it is back to 1 ms.
+virtio_media_handle_event(), empty until now, sends them at once for a
+driver that kicks when it reposts a buffer, as upstream's does.
+
+A held event must not arrive after the command that took its buffer
+back: STREAMOFF and REQBUFS(0) drop the held DQBUF events of that queue,
+and CLOSE every held event of the session, before the held events that
+remain are sent. Nothing is held before DRIVER_OK; an event then is for
+a session of a driver that went away, and is sent if there is a buffer
+and dropped if not, as before. A device reset, which the device now
+handles, drops the held events and owed errors.
+
+Held events live in a fixed array of 64, four times the buffers the
+driver posts, so a guest that really stops consuming costs no more
+memory and ten timer wake-ups a second. Past 64 an event is dropped
+and reported (the first and every 100th), and its session, up to 8 of
+them, is sent VIRTIO_MEDIA_EVT_ERROR once the held events have gone
+out, so that it fails instead of waiting for the lost event; this
+layer's guest keeps a session it got an error for until it is closed
+(its patch 0015). At most every 30 s, when events waited since the last
+report, the device reports how many did and how many were held at once.
+
+With this change, the same test stopped in none of 6 runs, 3 with the
+ioreq thread off and 3 with it on. At least 10 and 1 events waited
+(the 30 s reports leave out the last seconds of a run), at most 8 at
+once, and none was dropped.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
+---
+ hw/virtio/virtio-media.c         | 279 +++++++++++++++++++++++++++++--
+ include/hw/virtio/virtio-media.h |  19 +++
+ 2 files changed, 283 insertions(+), 15 deletions(-)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 40caf7455..4726b93c0 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -504,16 +504,9 @@ bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
+ /* events                                                                    */
+ /* ------------------------------------------------------------------------- */
+ 
+-/*
+- * Push one event onto the event queue.
+- *
+- * If the guest has no buffer posted the event is DROPPED, with a warning, and
+- * not retried. Buffering it here instead would grow without bound while the
+- * guest is wedged, and the driver keeps several buffers posted at all times
+- * (virtio_media_send_event_buffer is called for each one at probe and again
+- * after each event), so an empty queue means the guest has stopped consuming.
+- */
+-void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
++/* Put one event into a buffer the guest has posted; false if it has none. */
++static bool virtio_media_push_event(VirtIOMedia *vm, const void *evt,
++                                    size_t len)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(vm);
+     VirtQueueElement *elem;
+@@ -521,13 +514,226 @@ void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
+ 
+     elem = virtqueue_pop(vm->event_vq, sizeof(VirtQueueElement));
+     if (!elem) {
+-        warn_report_once("virtio-media: event queue empty, dropping event");
+-        return;
++        return false;
+     }
+     written = iov_from_buf(elem->in_sg, elem->in_num, 0, evt, len);
+     virtqueue_push(vm->event_vq, elem, written);
+     virtio_notify(vdev, vm->event_vq);
+     g_free(elem);
++    return true;
++}
++
++/*
++ * Tell a session whose event had to be dropped (the held queue was full) that
++ * it lost one, once the guest can take it, so that it fails rather than waits
++ * forever for that event. This layer's guest keeps a session it got an error
++ * for until it is closed (aosp-kernel-patches .../virtio-media/0015).
++ */
++static void virtio_media_send_drop_errors(VirtIOMedia *vm)
++{
++    struct virtio_media_event_error evt = {
++        .hdr = { .event = VIRTIO_MEDIA_EVT_ERROR },
++        .err = EIO,
++    };
++
++    while (vm->evt_err_count) {
++        evt.hdr.session_id = vm->evt_err_sid[0];
++        if (!virtio_media_push_event(vm, &evt, sizeof(evt))) {
++            return;
++        }
++        vm->evt_err_count--;
++        memmove(vm->evt_err_sid, vm->evt_err_sid + 1,
++                vm->evt_err_count * sizeof(vm->evt_err_sid[0]));
++    }
++}
++
++/*
++ * Send the held events the guest has buffers for, oldest first, then any
++ * error owed for a dropped one, and retry the rest from a timer.
++ *
++ * WHEN. This layer's guest driver does not kick the event queue when it
++ * reposts a buffer (aosp-kernel-patches .../virtio-media/0011), only for the
++ * 16 it posts at probe, so the held events go out with the next event this
++ * device sends, before the response to the next command the guest sends, or
++ * from the timer: 1 ms after holding one; each time the timer finds that the
++ * guest has taken none, the delay doubles, up to 100 ms; once it takes one,
++ * back to 1 ms. A guest that has stopped consuming costs ten wake-ups a
++ * second, not a thousand.
++ */
++static void virtio_media_send_held_events(VirtIOMedia *vm, bool from_timer)
++{
++    VirtIOMediaHeldEvent *e;
++    uint32_t before = vm->evt_held_count + vm->evt_err_count;
++
++    while (vm->evt_held_count) {
++        e = &vm->evt_held[vm->evt_held_head];
++        if (!virtio_media_push_event(vm, e->buf, e->len)) {
++            break;
++        }
++        vm->evt_held_head = (vm->evt_held_head + 1) % VIRTIO_MEDIA_EVT_HELD_MAX;
++        vm->evt_held_count--;
++    }
++    if (!vm->evt_held_count) {
++        virtio_media_send_drop_errors(vm);
++    }
++    if (!vm->evt_held_count && !vm->evt_err_count) {
++        timer_del(vm->evt_held_timer);
++        vm->evt_held_retry_us = 1000;
++        return;
++    }
++    if (vm->evt_held_count + vm->evt_err_count < before) {
++        vm->evt_held_retry_us = 1000;
++    } else if (from_timer) {
++        vm->evt_held_retry_us = MIN(vm->evt_held_retry_us * 2, 100000);
++    } else if (timer_pending(vm->evt_held_timer)) {
++        return;         /* no progress: leave the timer where it is */
++    }
++    timer_mod(vm->evt_held_timer,
++              qemu_clock_get_us(QEMU_CLOCK_REALTIME) + vm->evt_held_retry_us);
++}
++
++static void virtio_media_evt_held_timer_cb(void *opaque)
++{
++    virtio_media_send_held_events(opaque, true);
++}
++
++/*
++ * Drop the held events that must not reach the guest any more: after
++ * STREAMOFF or REQBUFS(0) on a queue (|type| != 0), the DQBUF events of that
++ * queue, whose buffers the guest owns again; after CLOSE (|type| == 0), every
++ * event of the session. The device already sends no event for such a buffer
++ * (see virtio_media_host_readable() and the decoder's STREAMOFF); this keeps
++ * one queued before the command from arriving after it.
++ */
++static void virtio_media_drop_held_events(VirtIOMedia *vm, uint32_t session_id,
++                                          uint32_t type)
++{
++    uint32_t i, kept = 0, n = vm->evt_held_count;
++
++    for (i = 0; i < n; i++) {
++        VirtIOMediaHeldEvent *e =
++            &vm->evt_held[(vm->evt_held_head + i) % VIRTIO_MEDIA_EVT_HELD_MAX];
++        const struct virtio_media_event_header *h = (const void *)e->buf;
++        const struct virtio_media_event_dqbuf *d = (const void *)e->buf;
++
++        if (h->session_id == session_id &&
++            (!type || (h->event == VIRTIO_MEDIA_EVT_DQBUF &&
++                       d->buffer.type == type))) {
++            continue;
++        }
++        if (kept != i) {
++            vm->evt_held[(vm->evt_held_head + kept) %
++                         VIRTIO_MEDIA_EVT_HELD_MAX] = *e;
++        }
++        kept++;
++    }
++    vm->evt_held_count = kept;
++    if (!type) {
++        for (i = 0; i < vm->evt_err_count; i++) {
++            if (vm->evt_err_sid[i] == session_id) {
++                vm->evt_err_count--;
++                memmove(vm->evt_err_sid + i, vm->evt_err_sid + i + 1,
++                        (vm->evt_err_count - i) * sizeof(vm->evt_err_sid[0]));
++                break;
++            }
++        }
++    }
++    if (!vm->evt_held_count && !vm->evt_err_count) {
++        timer_del(vm->evt_held_timer);
++        vm->evt_held_retry_us = 1000;
++    }
++}
++
++/*
++ * Send one event, or hold it until the guest has a buffer for it.
++ *
++ * WHY HOLD. An event dropped here is never sent again, and the guest waits
++ * for it forever. A dropped OUTPUT-done is enough to stop playback: the
++ * guest's decoder completes its works in output order, and one whose input
++ * buffer never comes back blocks every later one, which keeps its output
++ * buffer; the decoder then has no output buffer left to queue, and decoding
++ * stalls too. Measured on RPi5 (2026-10-21), H.264 1080p60 in a WebView with
++ * WebViewSurfaceControl: in three runs with a build that logged every drop,
++ * the only event dropped was the OUTPUT-done of one bitstream buffer, in the
++ * one run that stopped, and the decoder's last successful output-buffer
++ * dequeue came about 0.14 s later. The guest had not stopped consuming: it
++ * handles events in a workqueue and reposts each buffer after the event, so
++ * its 16 buffers can run out for a moment when that work does not run soon
++ * enough.
++ *
++ * Held events keep their order, a new event waits behind them, and an event
++ * is only late, never reordered. They live in a fixed array of
++ * VIRTIO_MEDIA_EVT_HELD_MAX, so a guest that really stops consuming costs no
++ * more memory; past that an event is dropped and reported, and its session
++ * (up to 8 of them) is sent VIRTIO_MEDIA_EVT_ERROR once the held events have
++ * gone out. Before the driver is ready (after a reset, until DRIVER_OK)
++ * nothing is held: an event then is for a session of the driver that went
++ * away, and is sent if there is a buffer and dropped if not, as before.
++ */
++void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(vm);
++    const struct virtio_media_event_header *h = evt;
++    VirtIOMediaHeldEvent *e;
++    uint32_t i;
++    int64_t now;
++
++    assert(len <= sizeof(e->buf));
++    if (vm->evt_held_count || vm->evt_err_count) {
++        virtio_media_send_held_events(vm, false);
++    }
++    if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        virtio_media_push_event(vm, evt, len);
++    } else if (vm->evt_held_count || vm->evt_err_count ||
++               !virtio_media_push_event(vm, evt, len)) {
++        if (vm->evt_held_count == VIRTIO_MEDIA_EVT_HELD_MAX) {
++            vm->evt_held_dropped++;
++            for (i = 0; i < vm->evt_err_count; i++) {
++                if (vm->evt_err_sid[i] == h->session_id) {
++                    break;
++                }
++            }
++            if (i == vm->evt_err_count &&
++                vm->evt_err_count < ARRAY_SIZE(vm->evt_err_sid)) {
++                vm->evt_err_sid[vm->evt_err_count++] = h->session_id;
++            }
++            /* The first drop and every 100th after it. */
++            if (vm->evt_held_dropped % 100 == 1) {
++                warn_report("virtio-media: event dropped, the guest has taken "
++                            "none of %u held events (%" PRIu64 " dropped)",
++                            vm->evt_held_count, vm->evt_held_dropped);
++            }
++        } else {
++            e = &vm->evt_held[(vm->evt_held_head + vm->evt_held_count) %
++                              VIRTIO_MEDIA_EVT_HELD_MAX];
++            memcpy(e->buf, evt, len);
++            e->len = len;
++            vm->evt_held_count++;
++            vm->evt_held_total++;
++            vm->evt_held_depth_max = MAX(vm->evt_held_depth_max,
++                                         vm->evt_held_count);
++            if (!timer_pending(vm->evt_held_timer)) {
++                vm->evt_held_retry_us = 1000;
++                timer_mod(vm->evt_held_timer,
++                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 1000);
++            }
++        }
++    }
++
++    /* Every 30 s at most, and only when events waited since the last report. */
++    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    if (vm->evt_held_total != vm->evt_held_reported &&
++        now - vm->evt_held_stats_ms >= 30000) {
++        info_report("virtio-media: %" PRIu64 " events waited for a guest event "
++                    "buffer (%" PRIu64 " in all), at most %u at once; %" PRIu64
++                    " dropped in all",
++                    vm->evt_held_total - vm->evt_held_reported,
++                    vm->evt_held_total, vm->evt_held_depth_max,
++                    vm->evt_held_dropped);
++        vm->evt_held_reported = vm->evt_held_total;
++        vm->evt_held_depth_max = 0;
++        vm->evt_held_stats_ms = now;
++    }
+ }
+ 
+ void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
+@@ -2100,6 +2306,7 @@ static int virtio_media_do_close(VirtIOMedia *vm, uint32_t session_id)
+     if (!s) {
+         return EINVAL;
+     }
++    virtio_media_drop_held_events(vm, session_id, 0);
+     QLIST_REMOVE(s, next);
+     virtio_media_session_free(s);
+     return 0;
+@@ -3018,6 +3225,16 @@ static void virtio_media_command_bh(void *opaque)
+                 status = virtio_media_passthrough(s, desc->code, payload,
+                                                   work_len);
+             }
++            if (!status && desc->code == VIDIOC_STREAMOFF &&
++                payload_len >= sizeof(uint32_t)) {
++                virtio_media_drop_held_events(vm, s->id,
++                                              *(uint32_t *)payload);
++            } else if (!status && desc->code == VIDIOC_REQBUFS &&
++                       payload_len >= sizeof(struct v4l2_requestbuffers) &&
++                       !((struct v4l2_requestbuffers *)payload)->count) {
++                virtio_media_drop_held_events(
++                    vm, s->id, ((struct v4l2_requestbuffers *)payload)->type);
++            }
+ 
+             /*
+              * The response payload exists only for _IOR / _IOWR. Its size comes
+@@ -3067,6 +3284,15 @@ static void virtio_media_command_bh(void *opaque)
+         if (resp_len) {
+             iov_from_buf(elem->in_sg, elem->in_num, 0, resp, resp_len);
+         }
++        /*
++         * The guest is at work: send what it has buffers for, after this
++         * command has dropped the events it took back (STREAMOFF,
++         * REQBUFS(0), CLOSE) and before its response, so that an event the
++         * guest has a buffer for still comes before the response.
++         */
++        if (vm->evt_held_count || vm->evt_err_count) {
++            virtio_media_send_held_events(vm, false);
++        }
+         virtqueue_push(vq, elem, resp_len);
+         g_free(elem);
+     }
+@@ -3090,12 +3316,13 @@ static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
+ }
+ 
+ /*
+- * The event queue only ever carries device-to-driver traffic. The driver posts
+- * empty buffers on it and this handler does nothing with the kick: buffers are
+- * consumed by virtio_media_send_event() when there is something to report.
++ * The event queue only ever carries device-to-driver traffic. A driver that
++ * kicks it when it reposts a buffer, as upstream's does, gets the held events
++ * at once. This layer's driver kicks only at probe, when nothing is held.
+  */
+ static void virtio_media_handle_event(VirtIODevice *vdev, VirtQueue *vq)
+ {
++    virtio_media_send_held_events(VIRTIO_MEDIA(vdev), false);
+ }
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -3219,6 +3446,10 @@ init_common:
+     vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
+     vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
+     vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
++    vm->evt_held_timer = timer_new_us(QEMU_CLOCK_REALTIME,
++                                      virtio_media_evt_held_timer_cb, vm);
++    vm->evt_held_retry_us = 1000;
++    vm->evt_held_stats_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+     virtio_media_gpu_set_fence_fd(vm->gpu_fence_fd);
+ 
+     /*
+@@ -3238,6 +3469,22 @@ init_common:
+     }
+ }
+ 
++/*
++ * A device reset drops the held events and owed errors: the driver they were
++ * for is gone.
++ */
++static void virtio_media_reset(VirtIODevice *vdev)
++{
++    VirtIOMedia *vm = VIRTIO_MEDIA(vdev);
++
++    vm->evt_held_head = 0;
++    vm->evt_held_count = 0;
++    vm->evt_err_count = 0;
++    if (vm->evt_held_timer) {
++        timer_del(vm->evt_held_timer);
++    }
++}
++
+ static void virtio_media_unrealize(DeviceState *dev)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+@@ -3249,6 +3496,7 @@ static void virtio_media_unrealize(DeviceState *dev)
+         virtio_media_session_free(s);
+     }
+     g_clear_pointer(&vm->command_bh, qemu_bh_delete);
++    g_clear_pointer(&vm->evt_held_timer, timer_free);
+     g_free(vm->cmd_buf);
+     vm->cmd_buf = NULL;
+     virtio_delete_queue(vm->command_vq);
+@@ -3295,6 +3543,7 @@ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+     vdc->realize = virtio_media_realize;
+     vdc->unrealize = virtio_media_unrealize;
++    vdc->reset = virtio_media_reset;
+     vdc->get_config = virtio_media_get_config;
+     vdc->get_features = virtio_media_get_features;
+ }
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index c4a78ce14..e7ef9ac3a 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -142,6 +142,16 @@ struct virtio_media_event_event {
+  */
+ #define VIRTIO_MEDIA_EVENT_MAX_SIZE sizeof(struct virtio_media_event_dqbuf)
+ 
++/*
++ * An event the guest had no buffer for yet; see virtio_media_send_event().
++ * 64 is four times the buffers the guest driver posts.
++ */
++#define VIRTIO_MEDIA_EVT_HELD_MAX 64
++typedef struct VirtIOMediaHeldEvent {
++    uint8_t buf[VIRTIO_MEDIA_EVENT_MAX_SIZE];
++    uint32_t len;
++} VirtIOMediaHeldEvent;
++
+ /*
+  * Enough for any single V4L2 ioctl payload plus the arrays that follow it: a
+  * v4l2_buffer with VIDEO_MAX_PLANES planes and one SG list per plane. A 4 KiB
+@@ -481,6 +491,15 @@ struct VirtIOMedia {
+      * allocation out of the path.
+      */
+     uint8_t *cmd_buf;
++    VirtIOMediaHeldEvent evt_held[VIRTIO_MEDIA_EVT_HELD_MAX];
++    uint32_t evt_held_head, evt_held_count, evt_held_depth_max;
++    QEMUTimer *evt_held_timer;
++    int64_t evt_held_retry_us;
++    uint64_t evt_held_total, evt_held_reported, evt_held_dropped;
++    int64_t evt_held_stats_ms;
++    /* sessions owed an error for an event dropped with the held queue full */
++    uint32_t evt_err_sid[8];
++    uint32_t evt_err_count;
+ };
+ 
+ /* ------------------------------------------------------------------------- */

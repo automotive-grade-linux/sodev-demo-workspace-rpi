@@ -100,7 +100,8 @@ PACKAGECONFIG[glusterfs] = ""
 
 # The q11 patches apply in the order listed here, which is not their numbers' order: they
 # are grouped by the series that brings them (qemu 11.1.2 itself, the display path,
-# HEVC, H.264, 4K60), and the numbers follow the order they were written in.
+# HEVC, H.264, 4K60, then the groups listed after 4K60), and the numbers follow the
+# order they were written in up to q11-085; any later number follows the order listed.
 #
 # qemu 11.1.2 itself.
 # q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one).
@@ -242,3 +243,15 @@ SRC_URI:append:class-target = " file://q11-080-virtio-media-decoder-mode-decode-
 #   loop (the thread q11-074 added for H.264).
 SRC_URI:append:class-target = " file://q11-082-virtio-media-decoder-mode-offer-scaled-frames-keep-more-of-them.patch"
 SRC_URI:append:class-target = " file://q11-083-virtio-media-decoder-mode-decode-the-hwaccel-on-the-decode-thread.patch"
+#
+# With the ioreq thread on by default (the DomD image creates /etc/qemu-ioreq-thread).
+# q11-084: decoder mode converts a frame on the CPU and tries the GPU again with the next
+#   one while the guest's resource for the buffer does not exist yet, instead of
+#   converting the rest of the stream on the CPU.
+SRC_URI:append:class-target = " file://q11-084-virtio-media-decoder-mode-retry-a-guest-resource-not-created-yet.patch"
+#
+# The event queue.
+# q11-085: virtio-media holds an event the guest has no buffer posted for and sends it
+#   later (with the next event or command, or from a timer) instead of dropping it; a
+#   dropped OUTPUT-done stopped playback in a test.
+SRC_URI:append:class-target = " file://q11-085-virtio-media-hold-an-event-when-the-guest-has-no-buffer-posted.patch"

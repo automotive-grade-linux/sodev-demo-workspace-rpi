@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 20 Oct 2026 16:16:53 +0900
+Subject: [PATCH] virtio-media: decoder mode: retry a guest resource not
+ created yet
+
+The decoder mode writes a frame on the GPU into the virgl resource the
+guest's v4l2_codec2 HAL names for the capture buffer (QBUF's reserved2).
+The guest creates that resource through virtio-gpu, and the two devices'
+queues are served separately: nothing makes the guest wait for
+virtio-gpu to have created the resource before it queues the buffer to
+virtio-media. A resource that did not exist yet made
+virtio_media_gpu_blit() return -EINVAL, as for a buffer of another size,
+and the host-sand path (q11-069), the software-frame path (q11-073) and
+the zero-copy path (q11-080) took that to mean the GPU cannot take the
+stream: the stream was converted on the CPU to its end.
+
+virtio_media_gpu_blit() now returns -ESRCH while res_id is not a
+resource with a texture. The three paths convert that frame on the CPU
+and try the GPU again with the next one; a resource of another size or
+format still turns the path off for the stream. The host-sand path warns
+once the guest's resource has been missing for 120 frames.
+
+With q11-052's ordering this is not expected to happen: in 30 starts of
+a 4K HEVC stream on a Raspberry Pi 5 (2026-10-20) the -ESRCH path was
+not taken. It was written against the version of q11-052 that drained
+its FIFO from a bottom half of the default AioContext, with which one
+start in 30 lost its first frame's resource, and is kept for a guest
+that queues a buffer while virtio-gpu has not got to its resource yet
+for another reason (its renderer blocked, for one).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
+---
+ hw/virtio/virtio-media-decoder.c       | 14 +++++++++++---
+ hw/virtio/virtio-media-virgl.c         |  2 +-
+ include/hw/virtio/virtio-media-virgl.h |  6 ++++++
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index e7fcc05f6..0bb221e37 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -477,6 +477,7 @@ struct VirtIOMediaDec {
+     bool gpu_off;
+     bool gpu_logged;
+     unsigned gpu_again;
++    unsigned gpu_nores;     /* frames whose guest resource did not exist yet */
+     AVBufferRef *gpu_fctx; /* the hw_frames_ctx the imports came from */
+     DecGpuEntry gpu[DEC_GPU_CACHE];
+     unsigned gpu_n;
+@@ -800,6 +801,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+     d->gpu_off = false;
+     d->sw_off = false;
+     d->gpu_again = 0;
++    d->gpu_nores = 0;
+     /*
+      * q11-dec-zero-copy: the imports go and the GPU path gets another try.
+      * The pool stays: a stream of the same size (after a seek, say) takes it
+@@ -2146,7 +2148,7 @@ static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         }
+     }
+     r = virtio_media_gpu_blit(d->zc_gpu[idx], gb->virgl_res);
+-    if (r == -EINVAL) {
++    if (r == -EINVAL || r == -ESRCH) {
+         return -ERANGE;   /* this guest buffer (its size, or no resource) */
+     }
+     if (r) {
+@@ -2218,7 +2220,13 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+             *bytesused = need;
+             return true;
+         }
+-        if (r != -EAGAIN) {
++        if (r == -ESRCH) {
++            /* this frame only: the next one finds the resource */
++            if (++d->gpu_nores == DEC_GPU_AGAIN_WARN) {
++                warn_report("virtio-media/dec: host-sand: no guest resource for "
++                            "%u frames; converting them on the CPU", d->gpu_nores);
++            }
++        } else if (r != -EAGAIN) {
+             d->gpu_off = true;
+             dec_gpu_clear(d);
+             warn_report("virtio-media/dec: host-sand: the GPU cannot take this "
+@@ -2274,7 +2282,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+             *bytesused = need;
+             return true;
+         }
+-        if (r != -EAGAIN && r != -ERANGE) {
++        if (r != -EAGAIN && r != -ERANGE && r != -ESRCH) {
+             d->sw_off = true;
+             dec_sw_clear(d);
+             warn_report("virtio-media/dec: sw-gpu: the GPU cannot take this "
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 3fe379ccb..0aab9f155 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -1078,7 +1078,7 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+     }
+     memset(&info, 0, sizeof(info));
+     if (virgl_renderer_resource_get_info(res_id, &info) != 0 || !info.tex_id) {
+-        return -EINVAL;
++        return -ESRCH;  /* not (yet) a resource of virtio-gpu: retry later */
+     }
+     /*
+      * The TFU path in Mesa v3d needs a full-surface copy between identical
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 4776cd0ab..77fb1b242 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -100,6 +100,12 @@ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
+                                           uint32_t dst_width, uint32_t dst_height,
+                                           float scale, uint32_t len, int matrix,
+                                           int *err);
++/*
++ * Copy the import into virgl resource res_id: 0, -EAGAIN without virtio-gpu's GL
++ * yet, -ESRCH while res_id is no resource with a texture (the guest may have
++ * created it after queueing the buffer), -EINVAL for a resource of another size
++ * or format, or a GL error.
++ */
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id);
+ /* q11-isp-scanout: the GL texture of virgl resource res_id (0: none) */
+ uint32_t virtio_media_gpu_res_tex(uint32_t res_id);
