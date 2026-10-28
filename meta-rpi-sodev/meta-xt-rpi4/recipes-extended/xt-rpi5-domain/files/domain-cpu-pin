@@ -1,20 +1,42 @@
 #!/bin/sh
-# Pin Dom0 and the dom0less DomD to the boot-time CPU map.
+# Pin Dom0 and the dom0less DomD to the boot-time CPU map, and give DomD its
+# credit2 weight.
 #
-#   CPU map:  Dom0 -> pcpu 0    DomD(domid 1) -> pcpu 0-1
-#             DomU -> pcpu 1     DomA -> pcpu 2-3
+#   Dom0 -> pcpu 0    DomD (domid 1) vcpu 0 -> pcpu 0, vcpu 1 -> pcpu 1
 #
-# DomU/DomA pin themselves at create via `cpus=` in their xl cfgs. Dom0 (the
-# control domain) and the dom0less DomD (domid 1, built by Xen with no xl cfg)
-# cannot, so pin them here once the toolstack + DomD are up. Reducing the
-# cross-domain CPU contention during the parallel guest boot is the goal.
-xl vcpu-pin 0 all 0 2>/dev/null || true
+# The guests pin themselves at create through `cpus=` in their xl cfgs (doma.cfg,
+# domu.cfg, domz.cfg); docs/DESIGN.md has the whole map. Dom0 (the control
+# domain) and the dom0less DomD (built by Xen with no xl cfg) cannot, so they are
+# pinned here once the toolstack and DomD are up, before DomA and DomU are created
+# (the unit's Before=; it took 0.5 s on a Raspberry Pi 5 with the Zephyr Dom0,
+# 2026-10-24). With the Linux Dom0 the toolstack is Dom0's: this copy in DomD then
+# waits the 60 s of the loop below and logs four failures at every boot.
+#
+# One pcpu per DomD vcpu: DomD's vcpu 0 shares pcpu 0 only with Dom0 and DomZ (nearly
+# idle with the Zephyr Dom0, an xenstore server; the Linux Dom0, which is the SD block
+# backend too, was not measured), so a thread kept on it is not left waiting while Xen
+# runs another domain's vcpu. Measured on a Raspberry Pi 5 (2026-10-24, Zephyr Dom0,
+# H.264 1080p60 in a WebView beside the HMI, 10 minutes, virtio-snd's tx-no-bql on):
+# with DomD's vcpus on pcpu 0-1, DomA's device-model main loop held the BQL over 50 ms
+# 194 times, using 3-5 ms of CPU in each: Xen had taken its vcpu away, and DomA's
+# sound buffers waited behind the BQL. Pinning alone, with the main loop free to run
+# on either vcpu, left it at 196; it takes the DomD qemu wrapper keeping DomA's device
+# model on vcpu 0 as well (its comment has those numbers), which it does on the
+# Raspberry Pi 5 only. The Raspberry Pi 4 has not been measured.
+#
+# Weight 512 (the default is 256 for every domain): when DomD's vcpu 1 and another
+# domain's vcpu both want pcpu 1, credit2 gives DomD twice that domain's share of
+# it. Its effect was not measured on its own.
+xl vcpu-pin 0 all 0 || echo "domain-cpu-pin: xl vcpu-pin 0 all 0 failed" >&2
 
-# Wait for the dom0less DomD (domid 1) to exist, then pin it to cpu 0-1.
+# Wait for the dom0less DomD (domid 1) to exist, then pin and weigh it.
 i=0
 while [ "$i" -lt 60 ]; do
     xl list 1 >/dev/null 2>&1 && break
     i=$((i + 1)); sleep 1
 done
-xl vcpu-pin 1 all 0-1 2>/dev/null || true
+# A failure goes to the journal (the unit's stderr) and the boot goes on.
+xl vcpu-pin 1 0 0 || echo "domain-cpu-pin: xl vcpu-pin 1 0 0 failed" >&2
+xl vcpu-pin 1 1 1 || echo "domain-cpu-pin: xl vcpu-pin 1 1 1 failed" >&2
+xl sched-credit2 -d 1 -w 512 || echo "domain-cpu-pin: xl sched-credit2 -d 1 -w 512 failed" >&2
 exit 0

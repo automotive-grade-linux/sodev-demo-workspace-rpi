@@ -30,9 +30,11 @@ DESCRIPTION = "\
 # the alternative is a rename touching a dozen unrelated files.
 #
 # domain-cpu-pin and its unit are byte-identical to the meta-xt-rpi5 ones on purpose:
-# the script is board-agnostic (it only issues `xl vcpu-pin`) and the CPU map it encodes
-# -- Dom0 -> pcpu 0, dom0less DomD -> pcpu 0-1, DomU -> 1, DomA -> 2-3 -- applies
-# unchanged to BCM2711, which is also a 4-core part (Cortex-A72 x4 instead of A76 x4).
+# the script is board-agnostic (it only issues `xl vcpu-pin` and `xl sched-credit2`) and
+# the part of the CPU map it sets -- Dom0 -> pcpu 0, dom0less DomD vcpu 0 -> pcpu 0 and
+# vcpu 1 -> pcpu 1, DomD weight 512 -- applies unchanged to BCM2711, which is also a
+# 4-core part (Cortex-A72 x4 instead of A76 x4). DomU's pcpus differ by board, but
+# those come from domu.cfg (this layer's xt-xen-cfg-domu append), not from here.
 # If the Raspberry Pi 4 map ever diverges, change files/domain-cpu-pin HERE; the
 # meta-xt-rpi5 copy is a different file in a layer that is never loaded with this one.
 

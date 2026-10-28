@@ -197,12 +197,26 @@ rpi4_doma_output_swap() {
 
 # Machine gating (required now that both boards live in one layer)
 #
-# The two postfuncs above encode a fact about THIS RPi4 bench -- only micro-HDMI 1 has a
-# panel attached -- so they must not run on any other machine. RPi5 has a panel on both
-# ports, where upstream weston.ini's assignment (DomU=HDMI-A-1 / DomA=HDMI-A-2) and its
-# modeline are already correct.
+# The two postfuncs of sections 2 and 3 encode a fact about THIS RPi4 bench -- only
+# micro-HDMI 1 has a panel attached -- so they must not run on any other machine. RPi5
+# has a panel on both ports, where upstream weston.ini's assignment (DomU=HDMI-A-1 /
+# DomA=HDMI-A-2) and its modeline are already correct.
 #
 # do_install[postfuncs] is a varflag and awkward to add or remove per machine, so the
 # functions themselves are defined as `name:raspberrypi4-64()` with a same-named no-op as
 # the default; bitbake resolves the override and runs the board-specific body on RPi4 and
 # the no-op elsewhere.
+
+# 4. weston's priority and CPU, as on the Raspberry Pi 5: nice -19 on DomD's CPU 0.
+# Measured here with the device models left on both CPUs (2026-10-28, the note at
+# XT_QEMU_IOREQ_FIFO in the DomD image recipe): nothing got better, and nothing worse by
+# more than two runs of one setting differed, so the two boards are kept alike. A
+# systemd drop-in rather than a renice of the running process, so that Mesa's shader
+# disk-cache thread (weston:disk$0) keeps the nice 19 / SCHED_BATCH that Mesa gives it.
+SRC_URI += "file://99-rpi4-priority.conf"
+do_install:append() {
+    install -d ${D}${systemd_system_unitdir}/weston.service.d
+    install -m 0644 ${UNPACKDIR}/99-rpi4-priority.conf \
+        ${D}${systemd_system_unitdir}/weston.service.d/99-rpi4-priority.conf
+}
+FILES:${PN} += "${systemd_system_unitdir}/weston.service.d/99-rpi4-priority.conf"
