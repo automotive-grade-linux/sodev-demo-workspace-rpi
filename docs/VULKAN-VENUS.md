@@ -25,7 +25,7 @@ This is the authoritative list of what that means:
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
 | DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in qemu 10.0.2 |
 
-Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.2 in both
+Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.4 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from
 (section 7e), so splitting the host GL/Vulkan driver by lane would mean shipping two
 of them for no gain. And **DomA's AOSP-side Vulkan settings do not follow the
@@ -97,7 +97,7 @@ and one was a hard blocker; the table is written from that starting point, and t
 
 | Component | Version | State | Why |
 |---|---|---|---|
-| mesa | 26.0.5 in oe-core; **this series pins DomD's to 26.2.2** (ungated, so both lanes) -- section 7e | **V3DV already built AND already installed** | meta-raspberrypi `mesa.bbappend` appends `vulkan broadcom` for `rpi`, so `VULKAN_DRIVERS` gains `broadcom` → `libvulkan_broadcom.so` in `mesa-vulkan-drivers`. And it is already in the shipping rootfs: weston's `vulkan-renderer.so` links `libvulkan.so.1`, so weston RDEPENDS on vulkan-loader, whose `RRECOMMENDS virtual-vulkan-icd` resolves to `mesa-vulkan-drivers` |
+| mesa | 26.0.5 in oe-core; **this series pins DomD's to 26.2.4** (ungated, so both lanes) -- section 7e | **V3DV already built AND already installed** | meta-raspberrypi `mesa.bbappend` appends `vulkan broadcom` for `rpi`, so `VULKAN_DRIVERS` gains `broadcom` → `libvulkan_broadcom.so` in `mesa-vulkan-drivers`. And it is already in the shipping rootfs: weston's `vulkan-renderer.so` links `libvulkan.so.1`, so weston RDEPENDS on vulkan-loader, whose `RRECOMMENDS virtual-vulkan-icd` resolves to `mesa-vulkan-drivers` |
 | weston | 15.0.0 (oe-core); a 16.0.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_weston` selects it (both board yamls pin `15.%`, and both boards' `vulkan` lanes select `16.%`) | **Vulkan renderer already built** | `PACKAGECONFIG` filters `vulkan` from `DISTRO_FEATURES` → `-Drenderer-vulkan=true` |
 | virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off |
 | qemu | **10.0.2** (xen-troops fork, `meta-xt-qemu`) by default; **7.0.0** with `--gpu=gl` | was the blocker | `virtio-gpu-gl` grew `venus=` in QEMU **9.2.0**, so the 7.0.0 the tree used to ship has no such property. Raising the device model is what this work turned into the default |
@@ -154,7 +154,7 @@ container, wrynose oe-core, `MACHINE=raspberrypi5`), with `GPU=vulkan`:
 - the built rootfs contains `/usr/lib/libvulkan_broadcom.so` (V3DV) with its
   `/usr/share/vulkan/icd.d/broadcom_icd.json` manifest, `libvulkan.so.1` and
   `/usr/bin/vulkaninfo`; the manifest records `mesa-vulkan-drivers 26.0.5`
-  (that build predates the 26.2.2 pin of section 7e; both lanes resolve 26.2.2
+  (that build predates the 26.2.x pin of section 7e; both lanes resolve 26.2.4
   now, and nothing in this list depends on the version),
   `libvulkan1 1.4.341.0`, `vulkan-tools 1.4.341.0`, `virglrenderer 1.2.0`;
 - the shipped `libvirglrenderer.so.1` really has the venus backend compiled in
@@ -1425,7 +1425,7 @@ Also worth recording: **Mesa version skew across the domains**, which is four
 versions and matters whenever a mesa source file is read to explain a symptom:
 DomA's AOSP tree builds **24.3.0**; the AGL cluster rootfs on SD p3 is scarthgap's
 **24.0.7**; the in-tree DomU (the `domu` moulin component, which does not carry
-`meta-xt-driver-domain`) is wrynose's **26.0.5**; and DomD is **26.2.2**, pinned
+`meta-xt-driver-domain`) is wrynose's **26.0.5**; and DomD is **26.2.4**, pinned
 ahead of poky by this series (section 7e).
 
 ### What DomA needs in the AOSP tree
@@ -2459,7 +2459,7 @@ is an experimental condition that explains the mechanism, not a tuning option.
 
 **DomU has one vcpu, so CPU is the scarcer resource there** in any case.
 
-### The durable fix existed upstream, and is now in: host mesa 26.2.2
+### The durable fix existed upstream, and is now in: host mesa 26.2.x
 
 This section originally ended "the durable fix is host-side: v3dv signalling without submitting
 an empty CL job. That is upstream v3dv work and is not a deliverable here." **It had already
@@ -2472,7 +2472,7 @@ of poky in `meta-xt-driver-domain/recipes-graphics/mesa/mesa.bbappend`. 26.2.0 a
 required follow-up `d4ee4a62885` ("honor wait dependencies for job-less submissions"), whose
 own description is this workload exactly: *semaphore chaining with an empty command buffer*.
 
-Measured on the shipping stack (both the Vulkan ICD and the GL side at 26.2.2):
+Measured with both the Vulkan ICD and the GL side at 26.2.2:
 
 | | 26.0.5 | 26.2.2 |
 |---|---|---|

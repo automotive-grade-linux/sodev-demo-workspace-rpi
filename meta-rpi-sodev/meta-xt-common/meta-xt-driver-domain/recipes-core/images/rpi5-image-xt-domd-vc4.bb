@@ -57,9 +57,9 @@ DOMU_GFX_PACKAGES = " \
 # mesa-vulkan-drivers. Confirmed in that lane's manifest: libvulkan1
 # 1.4.341.0 and mesa-vulkan-drivers are installed, and
 # /usr/lib/libvulkan_broadcom.so is in the rootfs. (That measurement was taken at
-# mesa 26.0.5, before this series' ungated `PV = "26.2.2"` in
-# meta-xt-driver-domain's mesa.bbappend; both lanes now resolve PV=26.2.2, and the
-# transitive-install argument above does not depend on the version.)
+# mesa 26.0.5, before the ungated `PV` in meta-xt-driver-domain's mesa.bbappend
+# (26.2.4 now, for both lanes); the transitive-install argument above does not depend
+# on the version.)
 #
 #   - mesa-vulkan-drivers : the V3DV ICD (libvulkan_broadcom.so) plus its ICD
 #     manifest. Arrives transitively today, as above. Listed explicitly because a

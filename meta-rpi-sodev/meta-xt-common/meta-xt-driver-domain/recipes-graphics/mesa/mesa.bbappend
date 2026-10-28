@@ -12,7 +12,7 @@
 PACKAGECONFIG:append = " glvnd"
 
 # ---------------------------------------------------------------------------
-# TEMPORARY VERSION PIN AHEAD OF POKY: mesa 26.0.5 -> 26.2.2
+# TEMPORARY VERSION PIN AHEAD OF POKY: mesa 26.0.5 -> 26.2.4
 #
 # Why: v3dv in 26.0.5 submits a real, fully-serialised V3D control-list job for
 # every vkQueueSubmit that signals a semaphore, purely to satisfy Vulkan's
@@ -34,16 +34,16 @@ PACKAGECONFIG:append = " glvnd"
 # whose own description is this exact workload -- semaphore chaining with an
 # empty command buffer.
 #
-# Verified by hand on the 26.2.2 tarball before writing this:
+# Verified on the 26.2.4 tarball (as before on 26.2.2):
 #   queue_submit_noop_job / job_emit_noop / noop_job   -> 0 hits
 #   drmSyncobjExportSyncFile / ...Import / sync_merge  -> present
 #   v3dv_queue.c:1033                                  -> the src_count == 0 fix
-#   sha256 matches docs.mesa3d.org/relnotes/26.2.2
+#   sha256 matches docs.mesa3d.org/relnotes/26.2.4
 #
 # Revisit at the next poky upgrade: once poky's mesa is >= 26.2.0 this whole
 # block goes away. Nothing else in this block is version-specific. The recipe's
 # own source patches (egl/wayland and v3d, at the end of this file) are not part
-# of the pin, but they were written against 26.2.2, so re-check their do_patch at
+# of the pin, but they were written against 26.2.x, so re-check their do_patch at
 # that upgrade.
 # The guest-side venus/virgl patches live in meta-agl-venus (DomU's mesa 24.0.7)
 # and are untouched by this pin.
@@ -54,10 +54,11 @@ PACKAGECONFIG:append = " glvnd"
 # testing two of them for no benefit. Consequence to state plainly: `--gpu=gl`
 # is the pre-Venus device model and the pre-Venus memory map, but NOT the
 # pre-Venus mesa. The gl lane was build-verified in this configuration.
-PV = "26.2.2"
-SRC_URI[sha256sum] = "eeb29ca7e56cfaa8e8a79538dcf834e3b18e501c31bef5145e959ea437cc4216"
+# 26.2.4 (was 26.2.2); this layer's 2 patches below apply to it with patch -F 0.
+PV = "26.2.4"
+SRC_URI[sha256sum] = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9"
 
-# poky's own patches, checked against 26.2.2:
+# poky's own patches, checked against 26.2.4 (same result as on 26.2.2):
 #   0001-meson-misdetects-64bit-atomics-on-mips-clang.patch  -> still applies, kept
 #   0001-gallivm-Fix-armhf-build-against-LLVM-22.patch       -> merged upstream (reverse-applies)
 #   0001-freedreno-...-build-path-into-binaries.patch        -> context moved; it is a

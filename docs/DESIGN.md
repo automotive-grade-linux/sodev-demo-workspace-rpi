@@ -336,7 +336,7 @@ identical and what this port changes:
   disabled): wrynose's Mesa 26.0.5 already covers the BCM2712-D0 V3D support
   they were pinned for, and a V3D-D0 regression fallback would mean re-vendoring
   the 24.2.7 recipes. DomD's Mesa is pinned again now, ahead of wrynose, to
-  26.2.2: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
+  26.2.4: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
   `meta-xt-driver-domain`'s `mesa.bbappend` carries the pin (in both `--gpu`
   lanes), glvnd, and two source patches of its own: egl/wayland allocating a
   client's scanout buffers on the display device, and v3d filling its tiled blit
