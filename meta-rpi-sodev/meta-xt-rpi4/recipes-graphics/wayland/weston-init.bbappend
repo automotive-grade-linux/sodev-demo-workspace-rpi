@@ -220,3 +220,43 @@ do_install:append() {
         ${D}${systemd_system_unitdir}/weston.service.d/99-rpi4-priority.conf
 }
 FILES:${PN} += "${systemd_system_unitdir}/weston.service.d/99-rpi4-priority.conf"
+
+# 5. gbm-format=argb8888 on HDMI-A-1 (DomA's output, section 3), for the underlay.
+#
+# weston puts a view on a plane UNDER the primary only when the primary has alpha to
+# show it through; with the default xrgb8888 output it disables the underlay
+# (libweston/backend-drm/drm-gbm.c) and a WebView's video, which sits under the
+# translucent UI, stays on the GPU. The other half is the vc4 zpos patch in
+# linux-raspberrypi_6.18.bbappend (an overlay may go under the primary); neither does
+# anything without the other. Measured 2026-10-23: the video on an HVS plane under the
+# UI, eye-checked, a local 1080p60 clip in a WebView (fullscreen and HMI, DomA on 3
+# vCPUs) 22 -> 38-44 shown/s.
+RPI4_HDMI1_GBM_FORMAT ?= "gbm-format=argb8888"
+
+do_install[postfuncs] += "rpi4_hdmi1_gbm_format"
+do_install[vardeps] += "RPI4_HDMI1_GBM_FORMAT"
+
+rpi4_hdmi1_gbm_format:raspberrypi4-64() {
+    ini="${D}${sysconfdir}/xdg/weston/weston.ini"
+    if [ ! -f "$ini" ]; then
+        bbfatal "weston-init.bbappend (rpi4): $ini not installed"
+    fi
+    if grep -q '^gbm-format=' "$ini"; then
+        bbfatal "weston-init.bbappend (rpi4): $ini already sets a gbm-format; check which output before adding ${RPI4_HDMI1_GBM_FORMAT}"
+    fi
+    n=$(grep -cx 'name=HDMI-A-1' "$ini")
+    if [ "$n" != "1" ]; then
+        bbfatal "weston-init.bbappend (rpi4): expected exactly one name=HDMI-A-1 in $ini, found $n"
+    fi
+    sed -i '/^name=HDMI-A-1$/a ${RPI4_HDMI1_GBM_FORMAT}' "$ini"
+    sec=$(awk '/^name=/{o=$0} $0=="${RPI4_HDMI1_GBM_FORMAT}"{print o}' "$ini")
+    if [ "$sec" != "name=HDMI-A-1" ]; then
+        bbfatal "weston-init.bbappend (rpi4): ${RPI4_HDMI1_GBM_FORMAT} ended up in '$sec' of $ini"
+    fi
+    bbnote "weston-init.bbappend (rpi4): HDMI-A-1 ${RPI4_HDMI1_GBM_FORMAT}"
+}
+
+# Default is a no-op: this board-specific step only runs on raspberrypi4-64.
+rpi4_hdmi1_gbm_format() {
+    :
+}

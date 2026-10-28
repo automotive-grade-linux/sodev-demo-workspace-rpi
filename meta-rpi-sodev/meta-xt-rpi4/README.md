@@ -222,8 +222,10 @@ with it:
   scanout of the decoded video (`media-isp`, `isp-scanout`, `isp-skip-copy`,
   `media-sg-rw`, `fb-invalidate`, and `isp-scanout-depth` at 2 instead of the code's
   4), the SAND buffer on a weston overlay plane without the ISP (`sand-scanout`,
-  `sand-skip-isp`), and the guest's planes on weston subsurfaces in the HMI case
-  (`plane-handoff`). Only qemu 11.1.2 reads them (`q11-063`, `q11-066`); qemu 10.0.2
+  `sand-skip-isp`), the guest's planes on weston subsurfaces in the HMI case
+  (`plane-handoff`), and the decoder's SAND buffer as such a plane's buffer, scaled by
+  the HVS (`plane-sand`, with `q11-097` for the proxy). Only qemu 11.1.2 reads them
+  (`q11-063`, `q11-066`, `q11-081`); qemu 10.0.2
   does nothing with them. Removing a file turns its feature off (`isp-scanout-depth`:
   back to 4).
 * **`RPI4_DOMA_HOST_SAND`** (`xt-xen-cfg-doma`'s bbappend; `1` by default with qemu

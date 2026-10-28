@@ -204,3 +204,17 @@ SRC_URI:append = " file://xen-config-a4b-frontend.cfg"
 # this board, plus swiotlb-xen for the restricted DMA, plus the built-in vsock
 # stack DomA needs. See files/bcm2711-domd-hw.cfg.
 SRC_URI:append = " file://bcm2711-domd-hw.cfg"
+
+# -----------------------------------------------------------------------------
+# vc4: an overlay plane may go under the primary (underlay)
+# -----------------------------------------------------------------------------
+# The primary's zpos was immutable 0 and the overlays' range 1..17, so weston never
+# had an underlay plane (it needs a plane whose zpos_min is below the primary's,
+# libweston/backend-drm/drm.c) and a WebView's video, which sits under the
+# translucent UI, was composited on V3D every frame. With the primary at 1 (1..17)
+# and the overlays down to 0, the video goes on an HVS plane under the UI. Measured
+# on the RPi4 (2026-10-23) together with weston's gbm-format=argb8888
+# (weston-init.bbappend) and qemu q11-097: a local 1080p60 clip in a WebView
+# (fullscreen and HMI, DomA on 3 vCPUs) 22 -> 38-44 shown/s. Not in meta-xt-rpi5: not
+# measured there.
+SRC_URI:append = " file://0001-drm-vc4-let-an-overlay-plane-go-under-the-primary.patch"
