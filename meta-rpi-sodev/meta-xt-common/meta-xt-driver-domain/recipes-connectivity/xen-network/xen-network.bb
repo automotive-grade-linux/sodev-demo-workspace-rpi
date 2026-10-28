@@ -143,6 +143,10 @@ do_install() {
     install -m 0755 ${S}/domd-flatbridge-up ${D}${bindir}/domd-flatbridge-up
 }
 
+# 1: domd-flatbridge-up drops the guests' QUIC (UDP/443) out of the Wi-Fi -- see the rule
+# there for what was measured and what it costs. Off here; meta-xt-rpi4 turns it on.
+XT_DOMD_DROP_GUEST_QUIC ??= "0"
+
 # [C2 single source] Enforce the DomD static addresses from sodev-net.inc so the
 # topology lives in exactly one place. Only DomD eth0 (flat L2) and the
 # Dom0<->DomD vif (xen-netfront) carry a static Address here. xenbr0 stays
@@ -163,9 +167,12 @@ do_install:append() {
     sed -i \
         -e 's|^XENBR0_ADDR=.*|XENBR0_ADDR=${XT_DOMD_XENBR0_IP}/24|' \
         -e 's|^UPLINK_GW=.*|UPLINK_GW=${XT_PC_UPLINK_GW_IP}|' \
+        -e 's|^DROP_GUEST_QUIC=.*|DROP_GUEST_QUIC=${XT_DOMD_DROP_GUEST_QUIC}|' \
         ${D}${bindir}/domd-flatbridge-up
     grep -q '^XENBR0_ADDR=${XT_DOMD_XENBR0_IP}/24$' ${D}${bindir}/domd-flatbridge-up || \
         bbfatal "domd-flatbridge-up: XENBR0_ADDR substitution did not take"
     grep -q '^UPLINK_GW=${XT_PC_UPLINK_GW_IP}$' ${D}${bindir}/domd-flatbridge-up || \
         bbfatal "domd-flatbridge-up: UPLINK_GW substitution did not take"
+    grep -q '^DROP_GUEST_QUIC=${XT_DOMD_DROP_GUEST_QUIC}$' ${D}${bindir}/domd-flatbridge-up || \
+        bbfatal "domd-flatbridge-up: DROP_GUEST_QUIC substitution did not take"
 }

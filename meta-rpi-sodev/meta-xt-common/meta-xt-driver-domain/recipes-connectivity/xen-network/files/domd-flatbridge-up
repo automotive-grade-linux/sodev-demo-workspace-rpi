@@ -17,6 +17,10 @@ log() { echo "domd-flatbridge-up: $*"; }
 # the values here.
 XENBR0_ADDR=192.168.10.10/24
 UPLINK_GW=192.168.10.1
+# 1: drop the guests' QUIC (UDP to port 443) out of the Wi-Fi (see the rule below).
+# Rewritten at do_install time from XT_DOMD_DROP_GUEST_QUIC (xen-network.bb: 0, set
+# to 1 for the Raspberry Pi 4 by meta-xt-rpi4's xen-network.bbappend).
+DROP_GUEST_QUIC=0
 # Self-report progress into xenstore (readable from Dom0 as
 # /local/domain/1/data/flatbridge even when DomD console output is
 # backpressured and sshd is down -- the exact situation this instruments).
@@ -194,6 +198,31 @@ if command -v iptables >/dev/null 2>&1; then
             -j TCPMSS --set-mss 1360 \
             || log "note: MSS cap ($_dir) skipped (needs xt_TCPMSS and xt_tcpudp)"
     done
+    # Keep the guests off QUIC (HTTP/3) when DROP_GUEST_QUIC=1: drop their UDP to port 443
+    #   out of the Wi-Fi, so Chromium (the WebView) and other clients fall back to TCP+TLS
+    #   by themselves. MEASURED ON THE RPi4, 2026-10-27 (720p60 H.264 full screen in the
+    #   WebView): over QUIC each ~25 s segment fetch took DomA's NetworkService 250-420 ms
+    #   of CPU a second for 3-4 s (QUIC is processed in user space one datagram at a time;
+    #   TCP is batched by the kernel's GRO), both vCPUs saturated and the video stalled
+    #   0.5-1.5 s (progress 0.97x, 12-13% dropped). With this rule: 1.000x, 6.0% dropped,
+    #   no stall. TCP's bursts then run in softirq and starve DomA's audio: with QUIC off
+    #   by the WebView's own switch (--disable-quic, the same fall back to TCP) and no
+    #   threaded NAPI, DomD saw 6 and 2 ALSA XRUNs in two 580 s runs; with threaded NAPI
+    #   on DomA's vif as well, set at run time, none in a 580 s run, and none with this
+    #   rule and threaded NAPI in two 580 s runs, the second with the rule as written here
+    #   (DomA's init.xenvm-hwsim.rc sets threaded NAPI in both products). DROP, not
+    #   REJECT: the DomD image does not ship the REJECT target (ipt_REJECT.ko). What it
+    #   costs: QUIC's loss tolerance, 0-RTT and connection migration, for every guest app;
+    #   the product uses Wi-Fi only. The Raspberry Pi 5's DomA was seen fetching over TCP
+    #   already (UDP 0), so it is not switched on there. IPv4 only: QUIC over IPv6
+    #   (UDP6/443) is not dropped. The guests and DomD have only link-local IPv6 today, so
+    #   it cannot happen; an AP that hands out a global prefix would bring QUIC back
+    #   unnoticed -- an ip6tables counterpart is still to be added.
+    if [ "$DROP_GUEST_QUIC" = 1 ]; then
+        ipt_add -I FORWARD -i xenbr0 -o "$UPLINK_WIFI_IF" -p udp --dport 443 -j DROP \
+            && log "filter: guests' UDP/443 (QUIC) to $UPLINK_WIFI_IF dropped" \
+            || log "note: QUIC drop rule skipped (needs xt_tcpudp)"
+    fi
     # DomA's emulated cellular data link. minradio (the AAOS radio HAL) puts
     #   192.168.97.2/30 on DomA's buried_eth0 with .1 as the gateway and 8.8.8.8 as the
     #   DNS server (its RadioData.cpp; meta-xt-doma's init.xenvm-buried-eth0.rc says how
