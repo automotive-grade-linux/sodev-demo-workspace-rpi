@@ -1,0 +1,138 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 2 Oct 2026 10:56:12 +0900
+Subject: [PATCH] virtio-gpu: raise the control-queue interrupt once per batch
+
+virtio_gpu_ctrl_response() raised the control-queue interrupt for every
+response, in the middle of whatever batch produced it. Under Xen the
+guest's interrupt handler then reads the virtio ISR, and that read is a
+synchronous ioreq served by this same main loop -- which is still busy
+with the rest of the batch.
+
+Measured on the RPi4 (Xen 4.22, DomA AAOS on Venus, qemu in DomD): a
+trapped MMIO read of an idle register takes 45-60 us (p50), but DomA's
+virtio-gpu interrupt handler took 430 us on average, 354 times a
+second -- 16% of one guest CPU spent waiting for qemu.
+
+Defer the notification while a batch is being processed and raise it
+once at the end: in virtio_gpu_process_cmdq() and in the virgl fence
+poll (retired fences plus the commands they unblock).
+virtio_gpu_handle_gl_flushed() gets the same bracket, but it is the
+GL-flushed handler of the plain virtio-gpu device only: virtio-gpu-gl
+(DomA's device) installs virtio_gpu_gl_flushed(), which only calls
+virtio_gpu_process_cmdq(). Nesting is counted, so only the outermost end
+notifies. Responses that complete together now share one interrupt, and
+the guest's ISR read meets an idle main loop. Only
+virtio_gpu_ctrl_response() defers, and it only ever answers ctrl_vq.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -206,6 +206,9 @@
+     uint64_t hostmem;
+ 
+     bool processing_cmdq;
++    /* virtio_gpu_notify_defer_begin/end(): batched control-queue interrupt */
++    unsigned int notify_defer;
++    bool notify_pending;
+ 
+     uint32_t inflight;
+     struct {
+@@ -318,6 +321,8 @@
+                               struct virtio_gpu_ctrl_command *cmd,
+                               struct virtio_gpu_ctrl_hdr *resp,
+                               size_t resp_len);
++void virtio_gpu_notify_defer_begin(VirtIOGPU *g);
++void virtio_gpu_notify_defer_end(VirtIOGPU *g);
+ void virtio_gpu_ctrl_response_nodata(VirtIOGPU *g,
+                                      struct virtio_gpu_ctrl_command *cmd,
+                                      enum virtio_gpu_ctrl_type type);
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -177,10 +177,42 @@
+                       __func__, s, resp_len);
+     }
+     virtqueue_push(cmd->vq, &cmd->elem, s);
+-    virtio_notify(VIRTIO_DEVICE(g), cmd->vq);
++    if (g->notify_defer) {
++        g->notify_pending = true;
++    } else {
++        virtio_notify(VIRTIO_DEVICE(g), cmd->vq);
++    }
+     cmd->finished = true;
+ }
+ 
++/*
++ * Batch the control-queue interrupt. Between begin and end, responses are only
++ * pushed to the used ring; the interrupt is raised once, when the outermost end
++ * is reached, i.e. after the batch instead of in the middle of it.
++ *
++ * Why: under Xen the guest's interrupt handler reads the ISR, and that read is a
++ * synchronous ioreq served by this main loop. Raised mid-batch, the interrupt
++ * brought the guest back while the loop was still busy with the rest of the
++ * batch (RPi4 DomA: 430 us per virtio-gpu interrupt against a 45-60 us round
++ * trip). Raised at the end, the read meets an idle loop, and responses that
++ * complete together share one interrupt.
++ *
++ * Only virtio_gpu_ctrl_response() defers, and it only ever answers ctrl_vq.
++ */
++void virtio_gpu_notify_defer_begin(VirtIOGPU *g)
++{
++    g->notify_defer++;
++}
++
++void virtio_gpu_notify_defer_end(VirtIOGPU *g)
++{
++    assert(g->notify_defer);
++    if (--g->notify_defer == 0 && g->notify_pending) {
++        g->notify_pending = false;
++        virtio_notify(VIRTIO_DEVICE(g), g->ctrl_vq);
++    }
++}
++
+ void virtio_gpu_ctrl_response_nodata(VirtIOGPU *g,
+                                      struct virtio_gpu_ctrl_command *cmd,
+                                      enum virtio_gpu_ctrl_type type)
+@@ -1037,6 +1069,7 @@
+         return;
+     }
+     g->processing_cmdq = true;
++    virtio_gpu_notify_defer_begin(g);
+     while (!QTAILQ_EMPTY(&g->cmdq)) {
+         cmd = QTAILQ_FIRST(&g->cmdq);
+ 
+@@ -1072,6 +1105,7 @@
+         }
+     }
+     g->processing_cmdq = false;
++    virtio_gpu_notify_defer_end(g);
+ }
+ 
+ static void virtio_gpu_process_fenceq(VirtIOGPU *g)
+@@ -1094,8 +1128,10 @@
+ {
+     VirtIOGPU *g = container_of(b, VirtIOGPU, parent_obj);
+ 
++    virtio_gpu_notify_defer_begin(g);
+     virtio_gpu_process_fenceq(g);
+     virtio_gpu_process_cmdq(g);
++    virtio_gpu_notify_defer_end(g);
+ }
+ 
+ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1271,8 +1271,11 @@
+     VirtIOGPU *g = opaque;
+     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
++    /* fences retired by the poll and the commands they unblock: one interrupt */
++    virtio_gpu_notify_defer_begin(g);
+     virgl_renderer_poll();
+     virtio_gpu_process_cmdq(g);
++    virtio_gpu_notify_defer_end(g);
+     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
+         /*
+          * FENCE RETIREMENT IS DISCOVERED ONLY HERE (and at the end of the

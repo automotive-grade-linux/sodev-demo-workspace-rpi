@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-media: write decoded frames straight into the guest's
+ virgl resource
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0228-v10-virtio-media-direct-virgl-transfer.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/display/virtio-gpu-virgl.c          |  4 ++
+ hw/virtio/meson.build                  |  2 +
+ hw/virtio/virtio-media-virgl-stub.c    | 14 +++++++
+ hw/virtio/virtio-media-virgl.c         | 35 +++++++++++++++++
+ hw/virtio/virtio-media.c               | 52 ++++++++++++++++++++++++++
+ include/hw/virtio/virtio-gpu.h         |  7 ++++
+ include/hw/virtio/virtio-media-virgl.h | 22 +++++++++++
+ include/hw/virtio/virtio-media.h       | 21 +++++++++++
+ 8 files changed, 157 insertions(+)
+ create mode 100644 hw/virtio/virtio-media-virgl-stub.c
+ create mode 100644 hw/virtio/virtio-media-virgl.c
+ create mode 100644 include/hw/virtio/virtio-media-virgl.h
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index e81d9b159..869d9ba9a 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1576,10 +1576,13 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
+     }
+ }
+ 
++bool virtio_gpu_virgl_ready;
++
+ static bool virtio_gpu_virgl_reset(VirtIOGPU *g)
+ {
+     struct virtio_gpu_simple_resource *res, *tmp;
+ 
++    virtio_gpu_virgl_ready = false;
+     /*
+      * Virgl blob resource unmapping can be suspended and
+      * deferred on unref, ensure that destruction is completed.
+@@ -1652,6 +1655,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+         error_report("virgl could not be initialized: %d", ret);
+         return ret;
+     }
++    virtio_gpu_virgl_ready = true;
+ 
+     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                   virtio_gpu_fence_poll, g);
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index 48fe27211..bdf582b96 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -97,6 +97,8 @@ system_virtio_ss.add_all(when: 'CONFIG_VIRTIO_PCI', if_true: virtio_pci_ss)
+ 
+ system_ss.add_all(when: 'CONFIG_VIRTIO', if_true: system_virtio_ss)
+ system_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media.c'))
++system_ss.add(when: ['CONFIG_VIRTIO_MEDIA', virgl], if_true: [files('virtio-media-virgl.c'), virgl],
++                                                     if_false: files('virtio-media-virgl-stub.c'))
+ stub_ss.add(files('vhost-stub.c'))
+ stub_ss.add(files('vhost-user-stub.c'))
+ stub_ss.add(files('virtio-stub.c'))
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+new file mode 100644
+index 000000000..8a5d052d6
+--- /dev/null
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -0,0 +1,14 @@
++/*
++ * virtio-media -> virgl bridge, stub for builds without virglrenderer.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/virtio/virtio-media-virgl.h"
++
++int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
++                                uint32_t height, uint32_t stride,
++                                void *host, size_t len)
++{
++    return -ENOTSUP;
++}
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+new file mode 100644
+index 000000000..46f352877
+--- /dev/null
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -0,0 +1,35 @@
++/*
++ * virtio-media -> libvirglrenderer bridge (see the header).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/iov.h"
++#include "hw/virtio/virtio-gpu.h"
++#include "hw/virtio/virtio-media-virgl.h"
++#include <virglrenderer.h>
++
++int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
++                                uint32_t height, uint32_t stride,
++                                void *host, size_t len)
++{
++    /* struct virgl_box is opaque in virglrenderer.h; qemu passes its own
++     * identically laid out virtio_gpu_box (as hw/display/virtio-gpu-virgl.c). */
++    struct virtio_gpu_box box = { .x = 0, .y = 0, .z = 0,
++                                  .w = width, .h = height, .d = 1 };
++    struct iovec iov = { .iov_base = host, .iov_len = len };
++
++    if (!virtio_gpu_virgl_ready) {
++        return -EAGAIN;
++    }
++    /*
++     * ctx 0: virglrenderer 1.2 looks the resource up globally and, with no
++     * context, transfers straight through the pipe resource
++     * (virgl_renderer_transfer_write_iov -> vrend_renderer_transfer_pipe).
++     * level 0, layer_stride 0, offset 0: one linear 2D image; stride is the
++     * host buffer's bytesperline, which may differ from the resource's.
++     */
++    return virgl_renderer_transfer_write_iov(res_id, 0, 0, stride, 0,
++                                             (struct virgl_box *)&box,
++                                             0, &iov, 1);
++}
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index cc3398146..f6acf1fe8 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -16,12 +16,14 @@
+ #include "qapi/error.h"
+ #include "qemu/error-report.h"
+ #include "qemu/iov.h"
++#include "qemu/log.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/module.h"
+ #include "hw/core/qdev-properties.h"
+ #include "system/address-spaces.h"
+ #include "hw/virtio/virtio.h"
+ #include "hw/virtio/virtio-media.h"
++#include "hw/virtio/virtio-media-virgl.h"
+ #include "standard-headers/linux/virtio_ids.h"
+ #include "system/dma.h"
+ 
+@@ -451,6 +453,29 @@ static void virtio_media_host_readable(void *opaque)
+                     if (!q->host_map[evt.buffer.index][p] || used == 0) {
+                         continue;
+                     }
++                    /*
++                     * Direct path: the frame is already on the host, and the
++                     * guest told us which virgl resource it is going to
++                     * sample. Push it there and skip the copy into guest
++                     * memory (see host_xfer in the header). Single-plane
++                     * RGBA only; a planar format falls back to the copy.
++                     */
++                    if (vm->host_xfer && gb->virgl_res && p == 0 &&
++                        gb->num_planes == 1 && q->width && q->height) {
++                        int r = virtio_media_virgl_transfer(
++                                    gb->virgl_res, q->width, q->height,
++                                    q->bytesperline,
++                                    q->host_map[evt.buffer.index][p], used);
++                        if (r == 0) {
++                            continue;
++                        }
++                        vm->host_xfer_fail++;
++                        if (vm->host_xfer_fail <= 4) {
++                            qemu_log("virtio-media-diag: host_xfer res=%u "
++                                     "failed (%d), copying to guest instead\n",
++                                     gb->virgl_res, r);
++                        }
++                    }
+                     if (!virtio_media_sg_copy(vm, &gb->planes[p],
+                                               q->host_map[evt.buffer.index][p],
+                                               used, true)) {
+@@ -710,6 +735,23 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+     q->type = rb->type;
+     q->mplane = V4L2_TYPE_IS_MULTIPLANAR(rb->type);
+     q->num_bufs = host_rb.count;
++    {
++        /* Geometry for the direct virgl transfer (host-xfer). */
++        struct v4l2_format fmt = { .type = rb->type };
++
++        q->width = q->height = q->bytesperline = 0;
++        if (ioctl(s->fd, VIDIOC_G_FMT, &fmt) == 0) {
++            if (q->mplane) {
++                q->width = fmt.fmt.pix_mp.width;
++                q->height = fmt.fmt.pix_mp.height;
++                q->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
++            } else {
++                q->width = fmt.fmt.pix.width;
++                q->height = fmt.fmt.pix.height;
++                q->bytesperline = fmt.fmt.pix.bytesperline;
++            }
++        }
++    }
+ 
+     for (i = 0; i < host_rb.count; i++) {
+         struct v4l2_buffer b = { .type = rb->type, .index = i };
+@@ -817,6 +859,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+     gb = &q->guest[b->index];
+     virtio_media_free_buffer_sgl(gb);
+     gb->num_planes = nplanes;
++    /*
++     * reserved2 is a side channel from the guest's v4l2_codec2 HAL: the virgl
++     * resource id of the gralloc buffer these USERPTR pages belong to (0 when
++     * the HAL has none). The V4L2 core passes the field through
++     * untouched and so does the guest virtio-media driver. It is zeroed for
++     * the host QBUF below; vb2 rejects non-zero reserved fields.
++     */
++    gb->virgl_res = b->reserved2;
+ 
+     for (p = 0; p < nplanes; p++) {
+         uint32_t plane_len = guest_planes ? guest_planes[p].length : b->length;
+@@ -894,6 +944,7 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+         struct v4l2_plane host_planes[VIDEO_MAX_PLANES] = {};
+ 
+         hb.memory = V4L2_MEMORY_MMAP;
++        hb.reserved2 = 0;
+         if (guest_planes) {
+             memcpy(host_planes, guest_planes, nplanes * sizeof(host_planes[0]));
+             for (p = 0; p < nplanes; p++) {
+@@ -1402,6 +1453,7 @@ static const VMStateDescription vmstate_virtio_media = {
+ 
+ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
++    DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+ };
+ 
+ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 220231ec9..271e16200 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -409,6 +409,13 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+                                   struct virtio_gpu_ctrl_command *cmd);
+ void virtio_gpu_virgl_fence_poll(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g);
++/*
++ * True between a successful virgl_renderer_init() and the next reset. Other
++ * device models in the same process (virtio-media) consult it before calling
++ * into libvirglrenderer directly; before init the library's tables are NULL
++ * and any lookup would crash.
++ */
++extern bool virtio_gpu_virgl_ready;
+ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset_async_fences(VirtIOGPU *g);
+ void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+new file mode 100644
+index 000000000..04a25e0f2
+--- /dev/null
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -0,0 +1,22 @@
++/*
++ * virtio-media -> libvirglrenderer bridge.
++ *
++ * Writes a linear RGBA frame that lives in host memory into a virgl resource
++ * owned by the virtio-gpu-gl device in the same process. Built only when
++ * QEMU is linked with virglrenderer; the stub returns -ENOTSUP otherwise.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_VIRTIO_MEDIA_VIRGL_H
++#define HW_VIRTIO_MEDIA_VIRGL_H
++
++/*
++ * Returns 0 on success, -EAGAIN while the renderer is not initialised,
++ * -ENOTSUP without virgl, or the positive virglrenderer error otherwise.
++ * Must be called on the main loop (the GL context lives there).
++ */
++int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
++                                uint32_t height, uint32_t stride,
++                                void *host, size_t len);
++
++#endif
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index fd7836557..19cc345e8 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -169,6 +169,11 @@ typedef struct VirtIOMediaPlaneSg {
+ typedef struct VirtIOMediaBuffer {
+     bool queued;
+     uint32_t num_planes;          /* 1 for single-planar */
++    /*
++     * virgl resource id of the guest buffer, if the guest told us (QBUF
++     * v4l2_buffer.reserved2, see virtio_media_qbuf). 0 = not given.
++     */
++    uint32_t virgl_res;
+     VirtIOMediaPlaneSg planes[VIDEO_MAX_PLANES];
+ } VirtIOMediaBuffer;
+ 
+@@ -180,6 +185,10 @@ typedef struct VirtIOMediaQueue {
+     bool streaming;
+     uint32_t num_bufs;
+     uint32_t num_host_planes;
++    /* Host format of this queue, from VIDIOC_G_FMT after REQBUFS. */
++    uint32_t width;
++    uint32_t height;
++    uint32_t bytesperline;
+     /* Host MMAP buffers this device allocated on the host fd, mmap()ed. */
+     void *host_map[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
+     uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
+@@ -205,6 +214,18 @@ struct VirtIOMedia {
+ 
+     /* Properties. */
+     char *v4l2_device;            /* host /dev/videoN to proxy */
++    /*
++     * host-xfer: when a CAPTURE buffer completes and the guest has given the
++     * virgl resource id of the gralloc buffer behind it, write the decoded
++     * frame from the host V4L2 buffer straight into that resource through
++     * libvirglrenderer, instead of copying it into the guest's pages and
++     * letting the guest issue TRANSFER_TO_HOST. Both run in this process on
++     * the main loop. The guest pages are then NOT updated; anything in the
++     * guest that reads the frame with the CPU sees stale data. Only the
++     * compositor path (GL sampling of the host resource) is served.
++     */
++    bool host_xfer;
++    uint64_t host_xfer_fail;
+ 
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-media: keep CAPTURE buffers coherent when the GPU
+ copies them
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0230-v10-virtio-media-coherent-capture-buffers-with-gpu-xfer.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index bc094b762..4b8977736 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -752,8 +752,21 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+      * vb2 honours the flag only if the driver sets allow_cache_hints, and
+      * clears it otherwise, so on a driver without it nothing changes; the
+      * cache maintenance then happens in vb2's buf_prepare/buf_finish.
++     *
++     * With gpu-xfer the CPU never reads a CAPTURE buffer (the GPU does, over
++     * dmabuf), so a cacheable mapping buys nothing there and the non-coherent
++     * flag only costs vb2 a dcache invalidate of the whole frame on every
++     * DQBUF (3.7 MB at 720p: 5-6 % of the device model's CPU at 60 fps).
++     * Leave CAPTURE coherent in that case; OUTPUT (the bitstream the CPU
++     * copies in) keeps the cacheable mapping. The fallback paths that do
++     * read CAPTURE with the CPU then run at Normal-NC speed, which is the
++     * pre-0227 behaviour.
+      */
+-    host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
++    if (s->vm->gpu_xfer && virtio_media_queue_index(rb->type) == 1) {
++        host_rb.flags = 0;
++    } else {
++        host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
++    }
+     if (ioctl(s->fd, VIDIOC_REQBUFS, &host_rb) < 0) {
+         int err = errno;
+         struct v4l2_format fmt = { .type = rb->type };

@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: give decoder mode an RGBA output and the
+ direct virgl transfer
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0245-v10-hw-virtio-media-give-decoder-mode-an-RGBA-output-and-the-direct-virgl-transfer.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-decoder.c | 106 ++++++++++++++++++++++++-------
+ 1 file changed, 82 insertions(+), 24 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 1e61c3deb..d9d595045 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -20,7 +20,7 @@
+  *     ever passed false, by the encoder.
+  *
+  * So the conversion happens here instead: the guest sees an ordinary stateful
+- * decoder -- V4L2_PIX_FMT_HEVC in, linear NV12 out, SOURCE_CHANGE and
++ * decoder -- V4L2_PIX_FMT_HEVC in, linear RGBA out, SOURCE_CHANGE and
+  * DECODER_CMD as usual -- and the stateless driving is libavcodec's problem.
+  * That keeps the virtio-media protocol unchanged, and neither the guest
+  * driver nor the Android side needs anything HEVC- or stateless-specific.
+@@ -57,6 +57,7 @@
+ #include "qemu/cutils.h"        /* pstrcpy */
+ #include "qapi/error.h"
+ #include "hw/virtio/virtio-media.h"
++#include "hw/virtio/virtio-media-virgl.h"
+ 
+ #ifdef CONFIG_VIRTIO_MEDIA_DECODER
+ 
+@@ -73,14 +74,25 @@
+  * V4L2_CAP_VIDEO_M2M_MPLANE and creates OUTPUT_MPLANE/CAPTURE_MPLANE queues
+  * (V4L2Decoder::start()), so offering the single-planar types would fail
+  * its very first check.
+- *
+- * NV12 with ONE plane, not NM12 with two: v4l2_codec2 accepts both
+- * (kSupportedOutputFourccs in V4L2Decoder.h) but a single contiguous plane
+- * is one SG copy per frame instead of two, and gralloc hands out a single
+- * YCBCR_420_888 allocation anyway.
+  */
+ #define DEC_OUT_FOURCC  V4L2_PIX_FMT_HEVC
+-#define DEC_CAP_FOURCC  V4L2_PIX_FMT_NV12
++/*
++ * RGBA, NOT NV12, AND THAT IS NOT A PREFERENCE.
++ *
++ * DomA's guest GL is Mesa virgl (V3D 7.1.10.2) and it does NOT export
++ * GL_EXT_YUV_target -- measured on the board, the extension string simply is
++ * not there. Without it an NV12 EGLImage cannot be bound as a texture, so
++ * SurfaceFlinger has nothing to sample and the video area stays black no matter
++ * how correct the decode is: 876 frames delivered, 1 dropped, 29.8 fps, and a
++ * black rectangle. The proxy path hit the same wall and answered it the same
++ * way, and v4l2_codec2 asks for AB24 when
++ * ro.vendor.v4l2_codec2.prefer_rgba is set, and AB24 is this.
++ *
++ * An NV12 output from this mode could not reach a screen, so RGBA replaces it
++ * rather than joining it, which keeps ENUM_FMT single-entry and NV12 off the
++ * negotiation path entirely.
++ */
++#define DEC_CAP_FOURCC  V4L2_PIX_FMT_RGBA32
+ 
+ /*
+  * What we tell the guest before the stream's own resolution is known.
+@@ -264,15 +276,14 @@ static void dec_norm_dims(uint32_t *w, uint32_t *h)
+ static uint32_t dec_cap_sizeimage(uint32_t w, uint32_t h)
+ {
+     /*
+-     * NV12: w*h of luma followed by ceil(h/2) rows of w bytes of interleaved
+-     * CbCr. Written out rather than as w*h*3/2 so it stays correct if a caller
+-     * ever gets an odd height past dec_norm_dims(), and computed in 64 bits with
+-     * a cap because DEC_MAX_W * DEC_MAX_H * 3 / 2 is 25 MB -- comfortably inside
+-     * u32, but only because of the clamp, and this must not depend on that.
++     * RGBA8888: one plane, 4 bytes per pixel, no subsampling and so no odd
++     * height to round. Computed in 64 bits and capped at the largest frame
++     * dec_norm_dims() lets through, DEC_MAX_W * DEC_MAX_H * 4 (67 MB), so a
++     * caller that bypassed the clamp gets a refusal rather than a wrapped u32.
+      */
+-    uint64_t sz = (uint64_t)w * h + (uint64_t)w * ((h + 1) / 2);
++    uint64_t sz = (uint64_t)w * h * 4;
+ 
+-    if (sz > (uint64_t)DEC_MAX_W * DEC_MAX_H * 2) {
++    if (sz > (uint64_t)DEC_MAX_W * DEC_MAX_H * 4) {
+         return 0;   /* callers treat 0 as "refuse" */
+     }
+     return (uint32_t)sz;
+@@ -303,7 +314,7 @@ static void dec_fill_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+         pix->pixelformat = DEC_CAP_FOURCC;
+         pix->width = d->coded_w;
+         pix->height = d->coded_h;
+-        pix->plane_fmt[0].bytesperline = d->coded_w;
++        pix->plane_fmt[0].bytesperline = d->coded_w * 4;
+         pix->plane_fmt[0].sizeimage = dec_cap_sizeimage(d->coded_w,
+                                                         d->coded_h);
+     }
+@@ -410,9 +421,19 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+     uint8_t *buf;
+     bool ok;
+ 
++    /*
++     * coded_w/h always went through dec_norm_dims(), so this cannot be 0 today;
++     * refusing here keeps a zero size from reaching g_malloc() and sws_scale()
++     * whichever path set the dimensions.
++     */
++    if (need == 0) {
++        error_report_once("virtio-media/dec: no RGBA capture size for %ux%u",
++                          w, h);
++        return false;
++    }
+     if (gb->num_planes < 1 || gb->planes[0].len < need) {
+         error_report_once("virtio-media/dec: capture buffer %d is %u bytes, "
+-                     "need %zu for %ux%u NV12", index,
++                     "need %zu for %ux%u RGBA", index,
+                      gb->num_planes ? gb->planes[0].len : 0u, need, w, h);
+         return false;
+     }
+@@ -426,9 +447,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+      */
+     buf = g_malloc(need);
+     dst_data[0] = buf;
+-    dst_data[1] = buf + (size_t)w * h;
+-    dst_linesize[0] = w;
+-    dst_linesize[1] = w;
++    dst_linesize[0] = (int)(w * 4);
+ 
+     /*
+      * The fast path is only valid when the frame IS the size the guest's buffer
+@@ -438,11 +457,11 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+      * of the source planes. Route any mismatch through swscale, which is what
+      * the scaling case already does.
+      */
+-    if (fr->format == AV_PIX_FMT_NV12 &&
++    if (fr->format == AV_PIX_FMT_RGBA &&
+         (uint32_t)fr->width == w && (uint32_t)fr->height == h) {
+         av_image_copy(dst_data, dst_linesize,
+                       (const uint8_t **)fr->data, fr->linesize,
+-                      AV_PIX_FMT_NV12, w, h);
++                      AV_PIX_FMT_RGBA, w, h);
+     } else {
+         /*
+          * THE CACHE KEY INCLUDES THE INPUT GEOMETRY.
+@@ -462,7 +481,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+             d->sws_w != (int)w || d->sws_h != (int)h) {
+             sws_freeContext(d->sws);
+             d->sws = sws_getContext(fr->width, fr->height, fr->format,
+-                                    w, h, AV_PIX_FMT_NV12,
++                                    w, h, AV_PIX_FMT_RGBA,
+                                     SWS_BILINEAR, NULL, NULL, NULL);
+             d->sws_src_fmt = fr->format;
+             d->sws_src_w = fr->width;
+@@ -471,7 +490,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+             d->sws_h = h;
+         }
+         if (!d->sws) {
+-            error_report_once("virtio-media/dec: no conversion from %d to NV12",
++            error_report_once("virtio-media/dec: no conversion from %d to RGBA",
+                          fr->format);
+             g_free(buf);
+             return false;
+@@ -480,6 +499,45 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+                   0, fr->height, dst_data, dst_linesize);
+     }
+ 
++    /*
++     * PUT THE FRAME WHERE THE COMPOSITOR LOOKS.
++     *
++     * minigbm's virgl backend has blob disabled, so a gralloc buffer's guest
++     * pages are ordinary guest RAM while the pixels SurfaceFlinger samples live
++     * in the host-side GL resource. Copying into the guest pages therefore
++     * updates the wrong copy: the guest never runs gralloc lock/unlock around
++     * our write, so no TRANSFER_TO_HOST is ever issued and the host resource
++     * keeps whatever it had. That is the other half of the black picture, and
++     * going through gralloc lock instead does not help -- lock does
++     * TRANSFER_FROM_HOST first and would overwrite the frame with the host's
++     * empty resource.
++     *
++     * 0228 already built the way out for the proxy path: the guest passes the
++     * resource id of the gralloc buffer in v4l2_buffer.reserved2 (v4l2_codec2
++     * fills it in) and
++     * virtio_media_virgl_transfer() writes the host bytes into the resource
++     * with ctx_id 0, which resolves globally. Same device model, same main
++     * loop, one copy instead of two plus a guest round trip.
++     *
++     * The guest pages are deliberately left alone on this path; only GL
++     * sampling of the host resource sees the frame, which is the only consumer
++     * video playback has. Anything that fails -- no resource id, host-xfer off,
++     * a multi-plane buffer, or the transfer itself -- falls back to the copy,
++     * which is correct for a guest that does read the pages even if it cannot
++     * display them.
++     */
++    if (s->vm->host_xfer && gb->virgl_res && gb->num_planes == 1) {
++        int r = virtio_media_virgl_transfer(gb->virgl_res, w, h,
++                                            w * 4, buf, need);
++        if (r == 0) {
++            g_free(buf);
++            *bytesused = need;
++            return true;
++        }
++        error_report_once("virtio-media/dec: host_xfer res=%u failed (%d), "
++                          "falling back to the guest copy", gb->virgl_res, r);
++    }
++
+     ok = virtio_media_sg_copy(s->vm, &gb->planes[0], buf, need, true);
+     g_free(buf);
+     if (!ok) {
+@@ -980,7 +1038,7 @@ static int dec_enum_fmt(struct v4l2_fmtdesc *f)
+     f->flags = out ? V4L2_FMT_FLAG_COMPRESSED : 0;
+     f->pixelformat = out ? DEC_OUT_FOURCC : DEC_CAP_FOURCC;
+     pstrcpy((char *)f->description, sizeof(f->description),
+-            out ? "HEVC" : "NV12");
++            out ? "HEVC" : "RGBA");
+     memset(f->reserved, 0, sizeof(f->reserved));
+     return 0;
+ }

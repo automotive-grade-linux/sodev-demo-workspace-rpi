@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: invalidate the RGBA target before the NV12
+ draw
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0247-v10-hw-virtio-media-invalidate-the-RGBA-target-before-the-NV12-draw.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-virgl.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 5ec4e01c9..72e53c31e 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -489,6 +489,7 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+     float cscale = full ? 1.0f : 255.0f / 224.0f;
+     float c[4] = { coef[0] * cscale, coef[1] * cscale, coef[2] * cscale,
+                    coef[3] * cscale };
++    static const GLenum invalidate = GL_COLOR_ATTACHMENT0;
+     GLenum status;
+ 
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
+@@ -499,6 +500,16 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+         return -EIO;
+     }
++    /*
++     * The triangle below covers the whole target, so its old contents are
++     * dead. Say so: without it the tiled GPU loads the full RGBA target into
++     * its tile buffer before drawing (3.7 MB for a 1280x720 frame). This must
++     * stay after glCheckFramebufferStatus: glFramebufferTexture2D marks the
++     * attachment incomplete again, the check is what runs the completeness
++     * test, and Mesa ignores an invalidate on an attachment that has not
++     * passed it.
++     */
++    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &invalidate);
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_BLEND);
+     glDisable(GL_DEPTH_TEST);

@@ -1,0 +1,1740 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] hw/virtio: add a native virtio-media device
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0216-v10-hw-virtio-add-a-native-virtio-media-device.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same device; class_init takes const void *data, headers moved to
+hw/core/qdev-properties.h and system/address-spaces.h, the virtio name
+table now ends at VIRTIO_ID_SPI, and the device-id comment says 11.1.2's
+header stops at 45.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [native virtio-media device model for Xen; upstream qemu has none and hosts virtio-media via vhost-user, which cannot work under Xen]
+---
+ hw/virtio/Kconfig                           |    8 +
+ hw/virtio/meson.build                       |    2 +
+ hw/virtio/virtio-media-pci.c                |   92 ++
+ hw/virtio/virtio-media.c                    | 1301 +++++++++++++++++++
+ hw/virtio/virtio.c                          |    3 +-
+ include/hw/virtio/virtio-media.h            |  233 ++++
+ include/standard-headers/linux/virtio_ids.h |    8 +
+ 7 files changed, 1646 insertions(+), 1 deletion(-)
+ create mode 100644 hw/virtio/virtio-media-pci.c
+ create mode 100644 hw/virtio/virtio-media.c
+ create mode 100644 include/hw/virtio/virtio-media.h
+
+diff --git a/hw/virtio/Kconfig b/hw/virtio/Kconfig
+index 91cf83340..1b080fe78 100644
+--- a/hw/virtio/Kconfig
++++ b/hw/virtio/Kconfig
+@@ -146,3 +146,11 @@ config VHOST_USER_RTC
+     bool
+     default y
+     depends on VIRTIO && VHOST_USER
++
++config VIRTIO_MEDIA
++    bool
++    default y
++    depends on VIRTIO
++    # The device is a V4L2 client on the host, so it needs videodev2.h and the
++    # ioctl ABI. Linux-only by construction, like VIRTIO_INPUT_HOST.
++    depends on LINUX
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index 0e0232351..48fe27211 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -91,10 +91,12 @@ virtio_pci_ss.add(when: 'CONFIG_VIRTIO_IOMMU', if_true: files('virtio-iommu-pci.
+ virtio_pci_ss.add(when: 'CONFIG_VIRTIO_MEM', if_true: files('virtio-mem-pci.c'))
+ virtio_pci_ss.add(when: 'CONFIG_VHOST_VDPA_DEV', if_true: files('vdpa-dev-pci.c'))
+ virtio_pci_ss.add(when: 'CONFIG_VIRTIO_MD', if_true: files('virtio-md-pci.c'))
++virtio_pci_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media-pci.c'))
+ 
+ system_virtio_ss.add_all(when: 'CONFIG_VIRTIO_PCI', if_true: virtio_pci_ss)
+ 
+ system_ss.add_all(when: 'CONFIG_VIRTIO', if_true: system_virtio_ss)
++system_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media.c'))
+ stub_ss.add(files('vhost-stub.c'))
+ stub_ss.add(files('vhost-user-stub.c'))
+ stub_ss.add(files('virtio-stub.c'))
+diff --git a/hw/virtio/virtio-media-pci.c b/hw/virtio/virtio-media-pci.c
+new file mode 100644
+index 000000000..26cfe4e34
+--- /dev/null
++++ b/hw/virtio/virtio-media-pci.c
+@@ -0,0 +1,92 @@
++/*
++ * VIRTIO-MEDIA PCI bindings.
++ *
++ * virtio-pci and not virtio-mmio, because that is what this platform's guests
++ * use (doma.cfg: transport=pci for all slots) and what libxl's out-of-tree
++ * virtio-pci support wires up. Note that a shared memory region -- which
++ * virtio-media would need for MMAP buffers -- can only be carried over
++ * virtio-pci anyway (virtio-mmio.c returns -1 for VIRTIO_MMIO_SHM_LEN_*), so
++ * there is no mmio variant worth having even though this device is USERPTR-only
++ * and exposes no such region.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qom/object.h"
++#include "qapi/error.h"
++#include "hw/virtio/virtio-pci.h"
++#include "hw/virtio/virtio-media.h"
++
++#define TYPE_VIRTIO_MEDIA_PCI "virtio-media-pci"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMediaPCI, VIRTIO_MEDIA_PCI)
++
++struct VirtIOMediaPCI {
++    VirtIOPCIProxy parent_obj;
++
++    VirtIOMedia vdev;
++};
++
++static const Property virtio_media_pci_properties[] = {
++    DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
++                    VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
++    /*
++     * Two vectors: one for the command queue, one for the event queue. The
++     * guest on this board has no MSI to use them with (GIC-400, no ITS, and Xen
++     * emulates no GICv2m frame), so this only matters for a future platform;
++     * legacy INTx is what is actually delivered, one SPI per PCI slot with
++     * Xen patch 4.22-0010.
++     */
++    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
++};
++
++static void virtio_media_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
++{
++    VirtIOMediaPCI *dev = VIRTIO_MEDIA_PCI(vpci_dev);
++    DeviceState *vdev = DEVICE(&dev->vdev);
++
++    /*
++     * Force modern (virtio 1.0) as the sound device does. The guest driver has
++     * no legacy path, and doma.cfg already passes disable-legacy=on for every
++     * slot; forcing it here means a config line that forgets to cannot produce
++     * a device the driver silently will not bind to.
++     */
++    virtio_pci_force_virtio_1(vpci_dev);
++    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
++}
++
++static void virtio_media_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioPCIClass *vpciklass = VIRTIO_PCI_CLASS(klass);
++    PCIDeviceClass *pcidevklass = PCI_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, virtio_media_pci_properties);
++    dc->desc = "Virtio Media (host V4L2 proxy)";
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++
++    vpciklass->realize = virtio_media_pci_realize;
++    pcidevklass->class_id = PCI_CLASS_MULTIMEDIA_VIDEO;
++}
++
++static void virtio_media_pci_instance_init(Object *obj)
++{
++    VirtIOMediaPCI *dev = VIRTIO_MEDIA_PCI(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_MEDIA);
++}
++
++static const VirtioPCIDeviceTypeInfo virtio_media_pci_info = {
++    .generic_name  = TYPE_VIRTIO_MEDIA_PCI,
++    .instance_size = sizeof(VirtIOMediaPCI),
++    .instance_init = virtio_media_pci_instance_init,
++    .class_init    = virtio_media_pci_class_init,
++};
++
++static void virtio_media_pci_register(void)
++{
++    virtio_pci_types_register(&virtio_media_pci_info);
++}
++
++type_init(virtio_media_pci_register);
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+new file mode 100644
+index 000000000..e4d1e609e
+--- /dev/null
++++ b/hw/virtio/virtio-media.c
+@@ -0,0 +1,1301 @@
++/*
++ * VIRTIO-MEDIA device model.
++ *
++ * See include/hw/virtio/virtio-media.h for why this is a native device rather
++ * than a vhost-user backend, and why it is USERPTR-only.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <poll.h>
++
++#include "qapi/error.h"
++#include "qemu/error-report.h"
++#include "qemu/iov.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "hw/core/qdev-properties.h"
++#include "system/address-spaces.h"
++#include "hw/virtio/virtio.h"
++#include "hw/virtio/virtio-media.h"
++#include "standard-headers/linux/virtio_ids.h"
++#include "system/dma.h"
++
++/* ------------------------------------------------------------------------- */
++/* ioctl code table                                                          */
++/* ------------------------------------------------------------------------- */
++
++/*
++ * The driver sends only _IOC_NR(ioctl), not the whole encoded value
++ * (VIRTIO_MEDIA_IOCTL_CODE in its scatterlist_builder.c:27), so the direction
++ * and payload size have to be recovered here before the host kernel will
++ * accept the call: video_ioctl2() dispatches on the full value and v4l2 core
++ * checks _IOC_SIZE against the handler's expectation.
++ *
++ * A table rather than a computed encoding, because the direction is not
++ * derivable from the number. Only the ioctls a stateful decoder needs are
++ * listed; anything else is answered with ENOTTY, which is what a V4L2 device
++ * returns for an ioctl it does not implement, so the guest degrades the same
++ * way it would against real hardware. Add entries as new needs appear rather
++ * than transcribing all of videodev2.h -- an entry with the wrong size is a
++ * silent memory bug, so each one should be justified by something that calls it.
++ */
++typedef struct {
++    unsigned long code;
++    const char *name;
++} VirtIOMediaIoctl;
++
++#define IOCTL_ENTRY(x) { x, #x }
++
++static const VirtIOMediaIoctl virtio_media_ioctls[] = {
++    /* Capability and format negotiation. */
++    IOCTL_ENTRY(VIDIOC_QUERYCAP),
++    IOCTL_ENTRY(VIDIOC_ENUM_FMT),
++    IOCTL_ENTRY(VIDIOC_G_FMT),
++    IOCTL_ENTRY(VIDIOC_S_FMT),
++    IOCTL_ENTRY(VIDIOC_TRY_FMT),
++    IOCTL_ENTRY(VIDIOC_ENUM_FRAMESIZES),
++    IOCTL_ENTRY(VIDIOC_ENUM_FRAMEINTERVALS),
++    IOCTL_ENTRY(VIDIOC_G_SELECTION),
++    IOCTL_ENTRY(VIDIOC_S_SELECTION),
++    /* Buffers. DQBUF is deliberately absent: see the header. */
++    IOCTL_ENTRY(VIDIOC_REQBUFS),
++    IOCTL_ENTRY(VIDIOC_QUERYBUF),
++    IOCTL_ENTRY(VIDIOC_QBUF),
++    IOCTL_ENTRY(VIDIOC_CREATE_BUFS),
++    IOCTL_ENTRY(VIDIOC_STREAMON),
++    IOCTL_ENTRY(VIDIOC_STREAMOFF),
++    /* Controls. */
++    IOCTL_ENTRY(VIDIOC_QUERYCTRL),
++    IOCTL_ENTRY(VIDIOC_QUERY_EXT_CTRL),
++    IOCTL_ENTRY(VIDIOC_QUERYMENU),
++    IOCTL_ENTRY(VIDIOC_G_CTRL),
++    IOCTL_ENTRY(VIDIOC_S_CTRL),
++    IOCTL_ENTRY(VIDIOC_G_EXT_CTRLS),
++    IOCTL_ENTRY(VIDIOC_S_EXT_CTRLS),
++    IOCTL_ENTRY(VIDIOC_TRY_EXT_CTRLS),
++    /* Events and decoder commands -- stateful decoding needs all of these. */
++    IOCTL_ENTRY(VIDIOC_SUBSCRIBE_EVENT),
++    IOCTL_ENTRY(VIDIOC_UNSUBSCRIBE_EVENT),
++    IOCTL_ENTRY(VIDIOC_DECODER_CMD),
++    IOCTL_ENTRY(VIDIOC_TRY_DECODER_CMD),
++};
++
++#undef IOCTL_ENTRY
++
++static const VirtIOMediaIoctl *virtio_media_lookup_ioctl(uint32_t nr)
++{
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(virtio_media_ioctls); i++) {
++        if (_IOC_NR(virtio_media_ioctls[i].code) == nr) {
++            return &virtio_media_ioctls[i];
++        }
++    }
++    return NULL;
++}
++
++/* ------------------------------------------------------------------------- */
++/* sessions and queues                                                       */
++/* ------------------------------------------------------------------------- */
++
++static VirtIOMediaSession *virtio_media_find_session(VirtIOMedia *vm, uint32_t id)
++{
++    VirtIOMediaSession *s;
++
++    QLIST_FOREACH(s, &vm->sessions, next) {
++        if (s->id == id) {
++            return s;
++        }
++    }
++    return NULL;
++}
++
++/*
++ * Which of the session's two queue states a v4l2_buf_type belongs to. Anything
++ * that is not an output queue is treated as capture, which matches the driver's
++ * own two-queue model.
++ */
++static int virtio_media_queue_index(uint32_t type)
++{
++    switch (type) {
++    case V4L2_BUF_TYPE_VIDEO_OUTPUT:
++    case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
++        return 0;
++    default:
++        return 1;
++    }
++}
++
++static void virtio_media_free_buffer_sgl(VirtIOMediaBuffer *b)
++{
++    int p;
++
++    for (p = 0; p < VIDEO_MAX_PLANES; p++) {
++        g_free(b->planes[p].ents);
++        b->planes[p].ents = NULL;
++        b->planes[p].nents = 0;
++        b->planes[p].len = 0;
++    }
++    b->num_planes = 0;
++    b->queued = false;
++}
++
++/* Drop every host MMAP mapping and every remembered guest SG list. */
++static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *q)
++{
++    int i, p;
++
++    for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
++        for (p = 0; p < VIDEO_MAX_PLANES; p++) {
++            if (q->host_map[i][p]) {
++                munmap(q->host_map[i][p], q->host_len[i][p]);
++                q->host_map[i][p] = NULL;
++                q->host_len[i][p] = 0;
++            }
++        }
++        virtio_media_free_buffer_sgl(&q->guest[i]);
++    }
++    q->num_bufs = 0;
++    q->num_host_planes = 0;
++    q->streaming = false;
++}
++
++static void virtio_media_session_free(VirtIOMediaSession *s)
++{
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
++        virtio_media_queue_release(s, &s->queues[i]);
++    }
++    if (s->fd >= 0) {
++        qemu_set_fd_handler(s->fd, NULL, NULL, NULL);
++        close(s->fd);
++    }
++    g_free(s);
++}
++
++/* ------------------------------------------------------------------------- */
++/* guest memory <-> host buffer copying                                      */
++/* ------------------------------------------------------------------------- */
++
++/*
++ * Copy between a host linear buffer and the guest pages listed in an SG list.
++ *
++ * dma_memory_map() per entry, not one big map: the entries are arbitrary guest
++ * physical addresses with no requirement to be contiguous, and mapping them
++ * individually is what every other emulated DMA device here does. Under
++ * grant_usage=0 (foreign mapping) this resolves through the Xen mapcache and
++ * costs a hash lookup per entry, not a hypercall.
++ *
++ * A short map is handled rather than asserted: address_space_map() is allowed
++ * to return less than asked for when a region boundary is crossed, and treating
++ * that as fatal would turn a legal guest layout into a device crash -- which,
++ * because one QEMU serves every DomA virtio device, would take the guest's
++ * rootfs disk down with it.
++ */
++static bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
++                                 void *host, size_t host_len, bool to_guest)
++{
++    size_t done = 0;
++    uint32_t i;
++
++    for (i = 0; i < sg->nents && done < host_len; i++) {
++        hwaddr gpa = sg->ents[i].start;
++        size_t remaining = sg->ents[i].len;
++
++        while (remaining > 0 && done < host_len) {
++            hwaddr mapped = remaining;
++            void *p;
++
++            p = dma_memory_map(&address_space_memory, gpa, &mapped,
++                               to_guest ? DMA_DIRECTION_FROM_DEVICE
++                                        : DMA_DIRECTION_TO_DEVICE,
++                               MEMTXATTRS_UNSPECIFIED);
++            if (!p || mapped == 0) {
++                error_report("virtio-media: cannot map guest 0x%" HWADDR_PRIx
++                             " (%zu bytes)", gpa, remaining);
++                return false;
++            }
++            if (mapped > host_len - done) {
++                mapped = host_len - done;
++            }
++            if (to_guest) {
++                memcpy(p, (uint8_t *)host + done, mapped);
++            } else {
++                memcpy((uint8_t *)host + done, p, mapped);
++            }
++            dma_memory_unmap(&address_space_memory, p, mapped,
++                             to_guest ? DMA_DIRECTION_FROM_DEVICE
++                                      : DMA_DIRECTION_TO_DEVICE,
++                             mapped);
++            done += mapped;
++            gpa += mapped;
++            remaining -= mapped;
++        }
++    }
++    return true;
++}
++
++/* ------------------------------------------------------------------------- */
++/* events                                                                    */
++/* ------------------------------------------------------------------------- */
++
++/*
++ * Push one event onto the event queue.
++ *
++ * If the guest has no buffer posted the event is DROPPED, with a warning, and
++ * not retried. Buffering it here instead would grow without bound while the
++ * guest is wedged, and the driver keeps several buffers posted at all times
++ * (virtio_media_send_event_buffer is called for each one at probe and again
++ * after each event), so an empty queue means the guest has stopped consuming.
++ */
++static void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(vm);
++    VirtQueueElement *elem;
++    size_t written;
++
++    elem = virtqueue_pop(vm->event_vq, sizeof(VirtQueueElement));
++    if (!elem) {
++        warn_report_once("virtio-media: event queue empty, dropping event");
++        return;
++    }
++    written = iov_from_buf(elem->in_sg, elem->in_num, 0, evt, len);
++    virtqueue_push(vm->event_vq, elem, written);
++    virtio_notify(vdev, vm->event_vq);
++    g_free(elem);
++}
++
++static void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
++{
++    struct virtio_media_event_error evt = {
++        .hdr = { .event = VIRTIO_MEDIA_EVT_ERROR, .session_id = s->id },
++        .err = err,
++    };
++
++    virtio_media_send_event(s->vm, &evt, sizeof(evt));
++}
++
++/*
++ * Drain everything the host device has ready for us: completed buffers and
++ * V4L2 events.
++ *
++ * Called from the main loop via qemu_set_fd_handler, so it must not block. Both
++ * DQBUF and DQEVENT are issued non-blockingly (the fd is opened O_NONBLOCK) and
++ * the loop stops on EAGAIN.
++ *
++ * V4L2_EVENT_SOURCE_CHANGE is why the event half is not optional: a stateful
++ * H.264 decoder reports the resolution that way, and v4l2_codec2 waits for it
++ * before allocating capture buffers. A decoder with no event path stalls at the
++ * first frame with nothing in the log to say why.
++ */
++static void virtio_media_host_readable(void *opaque)
++{
++    VirtIOMediaSession *s = opaque;
++    VirtIOMedia *vm = s->vm;
++    int i;
++
++    /* V4L2 events first: a SOURCE_CHANGE tells the guest to re-negotiate. */
++    for (;;) {
++        struct virtio_media_event_event evt = {
++            .hdr = { .event = VIRTIO_MEDIA_EVT_EVENT, .session_id = s->id },
++        };
++
++        if (ioctl(s->fd, VIDIOC_DQEVENT, &evt.event) < 0) {
++            break;
++        }
++        virtio_media_send_event(vm, &evt, sizeof(evt));
++    }
++
++    /* Then completed buffers, on both queues. */
++    for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
++        VirtIOMediaQueue *q = &s->queues[i];
++
++        if (!q->streaming || q->num_bufs == 0) {
++            continue;
++        }
++        for (;;) {
++            struct virtio_media_event_dqbuf evt = {
++                .hdr = { .event = VIRTIO_MEDIA_EVT_DQBUF, .session_id = s->id },
++            };
++            VirtIOMediaBuffer *gb;
++            uint32_t p;
++
++            evt.buffer.type = q->type;
++            evt.buffer.memory = V4L2_MEMORY_MMAP;
++            if (q->mplane) {
++                evt.buffer.length = q->num_host_planes;
++                evt.buffer.m.planes = evt.planes;
++            }
++            if (ioctl(s->fd, VIDIOC_DQBUF, &evt.buffer) < 0) {
++                break;
++            }
++            if (evt.buffer.index >= VIRTIO_MEDIA_MAX_BUFFERS) {
++                error_report("virtio-media: host returned buffer index %u",
++                             evt.buffer.index);
++                break;
++            }
++            gb = &q->guest[evt.buffer.index];
++
++            /*
++             * NOTE: A BUFFER THE GUEST NO LONGER OWNS GETS NO EVENT.
++             *
++             * STREAMOFF dequeues everything on the host side and clears
++             * gb->queued, and the guest's own STREAMOFF clears its
++             * pending_dqbufs. If a completion for a pre-STREAMOFF buffer were
++             * still reported, the driver would queue it again and decrement
++             * queue->queued_bufs, which it does with no floor
++             * (virtio_media_process_dqbuf_event: "queue->queued_bufs -= 1"),
++             * so the counter would wrap and the queue would look permanently
++             * busy.
++             */
++            if (!gb->queued) {
++                continue;
++            }
++
++            /*
++             * A capture buffer carries the decoded frame, so it has to be
++             * copied into the guest pages the guest gave us at QBUF time
++             * before the guest is told the buffer is done.
++             */
++            if (i == 1) {
++                for (p = 0; p < gb->num_planes; p++) {
++                    size_t used = q->mplane ? evt.planes[p].bytesused
++                                            : evt.buffer.bytesused;
++
++                    if (used > q->host_len[evt.buffer.index][p]) {
++                        used = q->host_len[evt.buffer.index][p];
++                    }
++                    if (used > gb->planes[p].len) {
++                        used = gb->planes[p].len;
++                    }
++                    if (!q->host_map[evt.buffer.index][p] || used == 0) {
++                        continue;
++                    }
++                    if (!virtio_media_sg_copy(vm, &gb->planes[p],
++                                              q->host_map[evt.buffer.index][p],
++                                              used, true)) {
++                        virtio_media_send_error_event(s, EFAULT);
++                        return;
++                    }
++                }
++            }
++            gb->queued = false;
++
++            /*
++             * The guest asked for USERPTR, so that is what its v4l2_buffer must
++             * say. The host index is reused as the guest index -- both REQBUFS
++             * are issued together with the same count, so the pools are
++             * one-to-one.
++             *
++             * The m union is zeroed rather than left holding host mmap offsets.
++             * Strictly it does not have to be: the driver preserves the union
++             * it recorded at QBUF time and overwrites whatever arrives here
++             * ("Preserve the 'm' union that was passed to us during QBUF so
++             * userspace gets back the information it submitted", and the same
++             * per plane). Zeroing keeps host addresses out of a structure that
++             * crosses into the guest anyway, which costs nothing and does not
++             * depend on the driver continuing to do that.
++             */
++            evt.buffer.memory = V4L2_MEMORY_USERPTR;
++            memset(&evt.buffer.m, 0, sizeof(evt.buffer.m));
++            if (q->mplane) {
++                for (p = 0; p < q->num_host_planes; p++) {
++                    memset(&evt.planes[p].m, 0, sizeof(evt.planes[p].m));
++                }
++            }
++            virtio_media_send_event(vm, &evt, sizeof(evt));
++        }
++    }
++}
++
++/*
++ * Attach the main-loop fd handler only while something is streaming.
++ *
++ * See the comment in virtio_media_do_open() for why attaching it earlier breaks
++ * the host queue. Idempotent: qemu_set_fd_handler() with the same arguments is
++ * a no-op, and with NULL it detaches.
++ *
++ * NOTE: THE ASSUMPTION THIS MAKES, WRITTEN DOWN SO IT CAN BE FALSIFIED.
++ * A stateful decoder subscribes to V4L2_EVENT_SOURCE_CHANGE before it streams,
++ * so there is a window -- between SUBSCRIBE_EVENT and the first STREAMON -- in
++ * which this device is not polling and an event would sit in the host's queue
++ * unnoticed. That is believed to be harmless here because bcm2835-codec only
++ * emits source-change after it has consumed bitstream, which cannot happen
++ * before the OUTPUT queue is streaming, and OUTPUT STREAMON attaches the
++ * handler. vivid never emits source-change at all, so a test against vivid
++ * cannot tell either way.
++ *
++ * IF AN EVENT TURNS OUT TO BE MISSED, DO NOT GO BACK TO ATTACHING AT OPEN --
++ * that is the fileio trap. Attach on SUBSCRIBE_EVENT with a POLLPRI-only
++ * registration instead: vb2_poll() starts file-I/O emulation only for
++ * POLLIN/POLLOUT, so polling for POLLPRI (which is how V4L2 signals events)
++ * does not poison the queue. qemu_set_fd_handler()'s read handler polls POLLIN,
++ * so that needs a different mechanism (an AioContext handler with
++ * G_IO_PRI, or a small helper thread doing poll(POLLPRI) + DQEVENT).
++ */
++static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
++{
++    bool want = false;
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
++        if (s->queues[i].streaming) {
++            want = true;
++        }
++    }
++    if (want) {
++        /*
++         * NOTE: BOTH CALLBACKS ARE THE SAME FUNCTION, AND THE WRITE ONE IS NOT
++         * OPTIONAL. THIS IS THE MISSED-EVENT CASE THE COMMENT ABOVE
++         * PREDICTED.
++         *
++         * qemu polls a read handler for G_IO_IN and nothing else
++         * (util/aio-posix.c: pfd.events = io_read ? G_IO_IN|G_IO_HUP|G_IO_ERR
++         * : 0). V4L2 signals events with POLLPRI, and an M2M device signals a
++         * completed OUTPUT buffer with POLLOUT -- v4l2_m2m_poll_for_data()
++         * sets EPOLLOUT for a non-empty src done_list and EPOLLIN only for the
++         * dst one. So a read handler alone runs the drain only when a CAPTURE
++         * buffer is ready.
++         *
++         * For a stateful decoder that deadlocks: no frame until the guest
++         * renegotiates its capture format, no renegotiation until it sees
++         * V4L2_EVENT_SOURCE_CHANGE, and nothing reads that event until a frame
++         * arrives. Measured on RPi4 2026-09-03 with the guest driver's
++         * event_trace=1 -- across a full 8-second VTS H.264 decode attempt the
++         * guest received EVT_EVENT 0 and EVT_DQBUF 0, so the drain never ran
++         * once, and the guest never even got its input buffer back.
++         *
++         * POLLOUT breaks it in the order the comment above already assumed:
++         * the decoder consumes the bitstream, the OUTPUT buffer completes, and
++         * this same drain issues DQEVENT before it looks at buffers.
++         *
++         * It does not busy-loop -- vb2 raises POLLOUT for an output queue with
++         * a non-empty done_list, and the drain empties it, so the level
++         * clears. And it does not reopen virtio_media_do_open()'s fileio trap,
++         * which needs a queue with NO buffers while this handler is attached
++         * only while one is streaming.
++         *
++         * POLLPRI stays unwatched, which is acceptable only because of that
++         * ordering. A host decoder that raised SOURCE_CHANGE WITHOUT returning
++         * the OUTPUT buffer would need the POLLPRI-only registration described
++         * above instead.
++         */
++        qemu_set_fd_handler(s->fd, virtio_media_host_readable,
++                            virtio_media_host_readable, s);
++    } else {
++        qemu_set_fd_handler(s->fd, NULL, NULL, NULL);
++    }
++}
++
++/* ------------------------------------------------------------------------- */
++/* command handlers                                                          */
++/* ------------------------------------------------------------------------- */
++
++static int virtio_media_do_open(VirtIOMedia *vm, uint32_t *session_id)
++{
++    VirtIOMediaSession *s;
++    int fd;
++
++    /*
++     * O_NONBLOCK because DQBUF and DQEVENT are polled from the main loop; a
++     * blocking fd would stop the whole QEMU process, and with it every other
++     * DomA virtio device, until a frame arrived.
++     */
++    fd = qemu_open_old(vm->v4l2_device, O_RDWR | O_NONBLOCK);
++    if (fd < 0) {
++        return errno ? errno : EIO;
++    }
++
++    s = g_new0(VirtIOMediaSession, 1);
++    s->vm = vm;
++    s->fd = fd;
++    s->id = vm->next_session_id++;
++    s->queues[0].type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++    s->queues[1].type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    QLIST_INSERT_HEAD(&vm->sessions, s, next);
++
++    /*
++     * NOTE: THE fd HANDLER IS *NOT* REGISTERED HERE. IT POISONS THE HOST QUEUE.
++     *
++     * qemu_set_fd_handler() makes the main loop poll the fd for POLLIN, and
++     * vb2_poll() -- reached through the driver's poll fop -- STARTS FILE-I/O
++     * EMULATION when the queue has no buffers yet and the device advertises
++     * V4L2_CAP_READWRITE (vivid does; so does bcm2835-codec). Once fileio is
++     * active, vb2_verify_memory_type() returns -EBUSY for every REQBUFS, so the
++     * guest can never allocate buffers.
++     *
++     * Measured against vivid: with the handler registered at open, the guest's
++     * first REQBUFS came back EBUSY every time, on a freshly reloaded vivid with
++     * no other process holding the node, and even a REQBUFS(count=0) -- the
++     * documented way to release a queue -- failed the same way. QUERYCAP and
++     * G_FMT on the same fd kept working, which is what pointed at queue state
++     * rather than the fd.
++     *
++     * So the handler is attached only while a queue is actually streaming
++     * (see virtio_media_update_fd_handler), which is also the only time there is
++     * anything to drain.
++     */
++    info_report("virtio-media: session %u opened %s as fd %d",
++                s->id, vm->v4l2_device, fd);
++    *session_id = s->id;
++    return 0;
++}
++
++static int virtio_media_do_close(VirtIOMedia *vm, uint32_t session_id)
++{
++    VirtIOMediaSession *s = virtio_media_find_session(vm, session_id);
++
++    if (!s) {
++        return EINVAL;
++    }
++    QLIST_REMOVE(s, next);
++    virtio_media_session_free(s);
++    return 0;
++}
++
++/*
++ * REQBUFS: allocate the host's own MMAP buffers alongside the guest's USERPTR
++ * ones.
++ *
++ * The guest wants USERPTR, but bcm2835-codec offers only MMAP and DMABUF
++ * (bcm2835-v4l2-codec.c sets io_modes = VB2_MMAP | VB2_DMABUF on both queues),
++ * so the host side has to own real buffers and this device copies between them
++ * and the guest's pages. That copy is unavoidable on this hardware and is the
++ * cost the design accepts: the protocol carries every guest buffer, a DMABUF
++ * one included, as USERPTR SG runs, so there is no dma-buf to hand the host.
++ */
++static int virtio_media_reqbufs(VirtIOMediaSession *s,
++                                struct v4l2_requestbuffers *rb)
++{
++    VirtIOMediaQueue *q = &s->queues[virtio_media_queue_index(rb->type)];
++    struct v4l2_requestbuffers host_rb;
++    uint32_t i, p;
++    int ret;
++
++    /* A count of zero frees the pool; do the same on both sides. */
++    virtio_media_queue_release(s, q);
++
++    host_rb = *rb;
++    host_rb.memory = V4L2_MEMORY_MMAP;
++    /*
++     * reserved must be zero or the kernel may reject the call; the guest's copy
++     * carries whatever its own header version put there.
++     */
++    memset(host_rb.reserved, 0, sizeof(host_rb.reserved));
++    if (ioctl(s->fd, VIDIOC_REQBUFS, &host_rb) < 0) {
++        int err = errno;
++        struct v4l2_format fmt = { .type = rb->type };
++        struct v4l2_capability cap = {};
++
++        error_report("virtio-media: host REQBUFS(type=%u count=%u memory=MMAP) "
++                     "failed on fd %d: %s (%d)", host_rb.type, host_rb.count,
++                     s->fd, strerror(err), err);
++        /* State dump: which of the EBUSY preconditions actually holds. */
++        if (ioctl(s->fd, VIDIOC_QUERYCAP, &cap) == 0) {
++            error_report("  host caps=0x%08x device_caps=0x%08x card=%.32s",
++                         cap.capabilities, cap.device_caps, cap.card);
++        }
++        if (ioctl(s->fd, VIDIOC_G_FMT, &fmt) == 0) {
++            error_report("  host G_FMT type=%u ok", rb->type);
++        } else {
++            error_report("  host G_FMT type=%u: %s", rb->type, strerror(errno));
++        }
++        return err;
++    }
++    info_report("virtio-media: host REQBUFS type=%u -> count=%u caps=0x%x (fd %d)",
++                host_rb.type, host_rb.count, host_rb.capabilities, s->fd);
++    if (host_rb.count > VIRTIO_MEDIA_MAX_BUFFERS) {
++        /*
++         * Give the surplus back rather than silently tracking fewer buffers
++         * than the host has queued -- the indices would then not line up.
++         */
++        host_rb.count = VIRTIO_MEDIA_MAX_BUFFERS;
++        if (ioctl(s->fd, VIDIOC_REQBUFS, &host_rb) < 0) {
++            return errno;
++        }
++    }
++
++    q->type = rb->type;
++    q->mplane = V4L2_TYPE_IS_MULTIPLANAR(rb->type);
++    q->num_bufs = host_rb.count;
++
++    for (i = 0; i < host_rb.count; i++) {
++        struct v4l2_buffer b = { .type = rb->type, .index = i };
++        struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
++        uint32_t nplanes;
++
++        if (q->mplane) {
++            b.length = VIDEO_MAX_PLANES;
++            b.m.planes = planes;
++        }
++        if (ioctl(s->fd, VIDIOC_QUERYBUF, &b) < 0) {
++            ret = errno;
++            goto fail;
++        }
++        nplanes = q->mplane ? b.length : 1;
++        q->num_host_planes = nplanes;
++
++        for (p = 0; p < nplanes; p++) {
++            uint32_t len = q->mplane ? planes[p].length : b.length;
++            uint32_t off = q->mplane ? planes[p].m.mem_offset
++                                     : b.m.offset;
++            void *map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED,
++                             s->fd, off);
++
++            if (map == MAP_FAILED) {
++                ret = errno;
++                goto fail;
++            }
++            q->host_map[i][p] = map;
++            q->host_len[i][p] = len;
++        }
++    }
++
++    /* Report back what the guest asked for: USERPTR, and the real count. */
++    rb->count = host_rb.count;
++    rb->capabilities = host_rb.capabilities;
++    return 0;
++
++fail:
++    virtio_media_queue_release(s, q);
++    return ret;
++}
++
++/*
++ * QBUF, the only ioctl whose payload is not a straight pass-through.
++ *
++ * Layout of the command payload, from the guest's
++ * scatterlist_builder_add_buffer() + _add_buffer_userptr():
++ *   struct v4l2_buffer
++ *   struct v4l2_plane[buffer.length]            (multiplanar only)
++ *   struct virtio_media_sg_entry[...]           one run per non-empty plane
++ *
++ * The SG runs are concatenated with no count in between: each plane's run is
++ * as long as that plane's length divided into page-sized-or-smaller entries, so
++ * the only way to split them is to walk the entries accumulating lengths until
++ * the plane's length is reached. That is what the loop below does.
++ */
++static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
++                             size_t payload_len)
++{
++    struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++    struct v4l2_plane *guest_planes = NULL;
++    struct virtio_media_sg_entry *ents;
++    size_t offset = sizeof(*b);
++    VirtIOMediaQueue *q;
++    VirtIOMediaBuffer *gb;
++    uint32_t nplanes, p;
++    size_t max_ents, ent_idx = 0;
++
++    if (payload_len < sizeof(*b)) {
++        return EINVAL;
++    }
++    q = &s->queues[virtio_media_queue_index(b->type)];
++    if (b->index >= q->num_bufs) {
++        return EINVAL;
++    }
++    if (b->memory != V4L2_MEMORY_USERPTR) {
++        /*
++         * The wire is USERPTR only: this device exposes no shared memory
++         * region, so the guest driver has no MMAP buffers, and it sends a
++         * DMABUF buffer as USERPTR runs. Say so rather than failing somewhere
++         * deeper.
++         */
++        error_report("virtio-media: QBUF memory type %u is not supported "
++                     "(the wire carries USERPTR only)", b->memory);
++        return EINVAL;
++    }
++
++    nplanes = 1;
++    if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++        nplanes = b->length;
++        if (nplanes == 0 || nplanes > VIDEO_MAX_PLANES) {
++            return EINVAL;
++        }
++        if (payload_len < offset + nplanes * sizeof(*guest_planes)) {
++            return EINVAL;
++        }
++        guest_planes = (struct v4l2_plane *)(payload + offset);
++        offset += nplanes * sizeof(*guest_planes);
++    }
++
++    ents = (struct virtio_media_sg_entry *)(payload + offset);
++    max_ents = (payload_len - offset) / sizeof(*ents);
++
++    gb = &q->guest[b->index];
++    virtio_media_free_buffer_sgl(gb);
++    gb->num_planes = nplanes;
++
++    for (p = 0; p < nplanes; p++) {
++        uint32_t plane_len = guest_planes ? guest_planes[p].length : b->length;
++        size_t accumulated = 0;
++        size_t first = ent_idx;
++
++        while (accumulated < plane_len && ent_idx < max_ents) {
++            accumulated += ents[ent_idx].len;
++            ent_idx++;
++        }
++        if (accumulated < plane_len) {
++            error_report("virtio-media: QBUF plane %u wants %u bytes but the "
++                         "SG list only covers %zu", p, plane_len, accumulated);
++            virtio_media_free_buffer_sgl(gb);
++            return EINVAL;
++        }
++        gb->planes[p].nents = ent_idx - first;
++        gb->planes[p].len = plane_len;
++        /*
++         * g_malloc + memcpy, not g_memdup2(): that needs glib 2.68 and this
++         * qemu targets 2.56 (there is a g_memdup2_qemu shim, but an explicit
++         * copy is clearer than depending on which shim exists).
++         */
++        gb->planes[p].ents = g_malloc((ent_idx - first) * sizeof(*ents));
++        memcpy(gb->planes[p].ents, &ents[first],
++               (ent_idx - first) * sizeof(*ents));
++    }
++
++    /*
++     * An output buffer carries the bitstream the guest just wrote, so it has to
++     * be copied into the host buffer BEFORE the host is asked to consume it.
++     * A capture buffer is empty at this point and only its SG list matters.
++     */
++    if (virtio_media_queue_index(b->type) == 0) {
++        for (p = 0; p < nplanes; p++) {
++            size_t used = guest_planes ? guest_planes[p].bytesused
++                                       : b->bytesused;
++
++            if (used > q->host_len[b->index][p]) {
++                used = q->host_len[b->index][p];
++            }
++            if (used == 0 || !q->host_map[b->index][p]) {
++                continue;
++            }
++            if (!virtio_media_sg_copy(s->vm, &gb->planes[p],
++                                      q->host_map[b->index][p], used, false)) {
++                virtio_media_free_buffer_sgl(gb);
++                return EFAULT;
++            }
++        }
++    }
++
++    /* Now queue the host's own buffer, which is MMAP. */
++    {
++        struct v4l2_buffer hb = *b;
++        struct v4l2_plane host_planes[VIDEO_MAX_PLANES] = {};
++
++        hb.memory = V4L2_MEMORY_MMAP;
++        if (guest_planes) {
++            memcpy(host_planes, guest_planes, nplanes * sizeof(host_planes[0]));
++            for (p = 0; p < nplanes; p++) {
++                host_planes[p].m.mem_offset = 0;
++                host_planes[p].length = q->host_len[b->index][p];
++            }
++            hb.m.planes = host_planes;
++            hb.length = nplanes;
++        } else {
++            hb.m.offset = 0;
++            hb.length = q->host_len[b->index][0];
++        }
++        if (ioctl(s->fd, VIDIOC_QBUF, &hb) < 0) {
++            int err = errno;
++            virtio_media_free_buffer_sgl(gb);
++            return err;
++        }
++    }
++
++    gb->queued = true;
++    return 0;
++}
++
++/*
++ * The payload goes back to the guest verbatim, and the pointers repointed for
++ * the host ioctl now hold an address in vm->cmd_buf. Zero them before that
++ * happens, so no host heap address crosses into the guest. The guest restores
++ * its own pointers from what it kept (scatterlist_builder_retrieve_buffer and
++ * scatterlist_builder_retrieve_ext_ctrls), so nothing reads the value.
++ */
++static void virtio_media_unpoint(unsigned long code, uint8_t *payload)
++{
++    struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++
++    if (code == VIDIOC_G_EXT_CTRLS || code == VIDIOC_S_EXT_CTRLS ||
++        code == VIDIOC_TRY_EXT_CTRLS) {
++        ((struct v4l2_ext_controls *)payload)->controls = NULL;
++    } else if (code == VIDIOC_QUERYBUF && V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++        b->m.planes = NULL;
++    }
++}
++
++/*
++ * Everything else: hand the payload to the host device unchanged.
++ *
++ * The guest and the host are both aarch64 Linux, so every struct in
++ * videodev2.h has the same layout on both sides and no translation is needed.
++ * That identity is the whole reason virtio-media can be an ioctl proxy.
++ */
++static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
++                                    uint8_t *payload, size_t work_len)
++{
++    VirtIOMediaQueue *q;
++    int ret;
++
++    /*
++     * work_len is sized from max(what the guest sent, _IOC_SIZE) by the caller,
++     * so this only fires if the scratch buffer itself was too small -- which
++     * would mean an ioctl with a payload larger than VIRTIO_MEDIA_CMD_BUF_SIZE.
++     */
++    if (_IOC_SIZE(code) > work_len) {
++        return EINVAL;
++    }
++
++    /*
++     * S_EXT_CTRLS and friends carry a userspace pointer to the control array,
++     * which the guest serialised as the bytes right after the header. Repoint
++     * it at that copy before the host kernel dereferences it.
++     */
++    if (code == VIDIOC_G_EXT_CTRLS || code == VIDIOC_S_EXT_CTRLS ||
++        code == VIDIOC_TRY_EXT_CTRLS) {
++        struct v4l2_ext_controls *c = (struct v4l2_ext_controls *)payload;
++        struct v4l2_ext_control *ctrls =
++            (struct v4l2_ext_control *)(payload + sizeof(*c));
++        size_t need = sizeof(*c) + (size_t)c->count * sizeof(struct v4l2_ext_control);
++        uint32_t i;
++
++        if (work_len < need) {
++            return EINVAL;
++        }
++        /*
++         * Compound controls point at a further payload. A stateful H.264
++         * decoder does not use any (v4l2_codec2 only sets integer controls),
++         * and honouring them would mean walking a second serialised region, so
++         * refuse them loudly instead of dereferencing a guest pointer. Checked
++         * on the serialised copy before c->controls is repointed: this return
++         * does not reach virtio_media_unpoint(), and the payload still goes
++         * back to the guest.
++         */
++        for (i = 0; i < c->count; i++) {
++            if (ctrls[i].size != 0) {
++                error_report("virtio-media: compound control 0x%x is not "
++                             "supported", ctrls[i].id);
++                return EINVAL;
++            }
++        }
++        c->controls = ctrls;
++    }
++
++    /*
++     * QUERYBUF on a multiplanar queue carries m.planes, which is a pointer into
++     * the GUEST's address space. QBUF rebuilds the planes array and the
++     * ext-controls array is repointed above; QUERYBUF needs the same, or the
++     * guest pointer goes straight to the host's ioctl() and the host kernel
++     * faults on it: every multiplanar QUERYBUF fails with EFAULT, regardless
++     * of memory type ("FAIL QUERYBUF: Bad address" from a DMABUF client).
++     *
++     * The guest already serialises the planes array immediately after the
++     * v4l2_buffer in the command payload, which is exactly what the QBUF
++     * handler parses. Repoint m.planes at that copy.
++     */
++    if (code == VIDIOC_QUERYBUF) {
++        struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++
++        if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++            size_t need = sizeof(*b) +
++                          (size_t)b->length * sizeof(struct v4l2_plane);
++
++            if (b->length == 0 || b->length > VIDEO_MAX_PLANES ||
++                work_len < need) {
++                return EINVAL;
++            }
++            b->m.planes = (struct v4l2_plane *)(payload + sizeof(*b));
++        }
++    }
++
++    ret = ioctl(s->fd, code, payload) < 0 ? errno : 0;
++    virtio_media_unpoint(code, payload);
++    if (ret) {
++        return ret;
++    }
++
++    /* Track streaming state so the completion path knows which queues to drain. */
++    if (code == VIDIOC_STREAMON || code == VIDIOC_STREAMOFF) {
++        uint32_t type = *(uint32_t *)payload;
++
++        q = &s->queues[virtio_media_queue_index(type)];
++        q->streaming = (code == VIDIOC_STREAMON);
++        if (code == VIDIOC_STREAMOFF) {
++            int i;
++            for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
++                q->guest[i].queued = false;
++            }
++        }
++        virtio_media_update_fd_handler(s);
++    }
++    return 0;
++}
++
++/* ------------------------------------------------------------------------- */
++/* command queue                                                             */
++/* ------------------------------------------------------------------------- */
++
++static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VirtIOMedia *vm = VIRTIO_MEDIA(vdev);
++    VirtQueueElement *elem;
++
++    for (;;) {
++        struct virtio_media_cmd_header hdr;
++        size_t out_len, in_len, resp_len = 0;
++        uint8_t *resp = vm->cmd_buf;
++        int status = 0;
++
++        elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
++        if (!elem) {
++            break;
++        }
++        out_len = iov_size(elem->out_sg, elem->out_num);
++        in_len = iov_size(elem->in_sg, elem->in_num);
++
++        /*
++         * NOTE: in_len MAY LEGITIMATELY BE ZERO. VIRTIO_MEDIA_CMD_CLOSE is
++         * sent with no device-writable descriptor at all -- the driver calls
++         * virtio_media_send_command(vv, sgs, 1, 0, 0, NULL) from
++         * virtio_media_session_close(). Requiring room for a response header
++         * would reject CLOSE as malformed ("malformed command (out 16, in 0)",
++         * 16 being exactly sizeof(struct virtio_media_cmd_close)) AND detach
++         * its descriptor without pushing it. The driver still waits for the
++         * buffer to come back (it only skips READING the response when
++         * in_sgs == 0), so closing a session would hang forever and leak the
++         * host fd.
++         *
++         * So only the command header is required here; how much response
++         * fits is decided per command, and resp_len is clamped to in_len
++         * before the write, which yields a zero-length push for CLOSE.
++         */
++        if (out_len < sizeof(hdr)) {
++            error_report("virtio-media: malformed command (out %zu, in %zu)",
++                         out_len, in_len);
++            virtqueue_detach_element(vq, elem, 0);
++            g_free(elem);
++            continue;
++        }
++        iov_to_buf(elem->out_sg, elem->out_num, 0, &hdr, sizeof(hdr));
++
++        switch (hdr.cmd) {
++        case VIRTIO_MEDIA_CMD_OPEN: {
++            struct virtio_media_resp_open *r =
++                (struct virtio_media_resp_open *)resp;
++            uint32_t id = 0;
++
++            status = virtio_media_do_open(vm, &id);
++            memset(r, 0, sizeof(*r));
++            r->session_id = id;
++            resp_len = sizeof(*r);
++            break;
++        }
++        case VIRTIO_MEDIA_CMD_CLOSE: {
++            struct virtio_media_cmd_close c;
++
++            if (out_len < sizeof(c)) {
++                status = EINVAL;
++                resp_len = sizeof(struct virtio_media_resp_header);
++                break;
++            }
++            iov_to_buf(elem->out_sg, elem->out_num, 0, &c, sizeof(c));
++            status = virtio_media_do_close(vm, c.session_id);
++            /*
++             * CLOSE has no response payload beyond the header, and the driver
++             * does not even wait for it (virtio_media_close kicks and moves
++             * on), so nothing more is written here.
++             */
++            resp_len = sizeof(struct virtio_media_resp_header);
++            break;
++        }
++        case VIRTIO_MEDIA_CMD_IOCTL: {
++            struct virtio_media_cmd_ioctl c;
++            const VirtIOMediaIoctl *desc;
++            VirtIOMediaSession *s;
++            size_t payload_len, work_len;
++            uint8_t *payload = resp + sizeof(struct virtio_media_resp_ioctl);
++
++            resp_len = sizeof(struct virtio_media_resp_ioctl);
++            if (out_len < sizeof(c)) {
++                status = EINVAL;
++                break;
++            }
++            iov_to_buf(elem->out_sg, elem->out_num, 0, &c, sizeof(c));
++            s = virtio_media_find_session(vm, c.session_id);
++            if (!s) {
++                status = EINVAL;
++                break;
++            }
++            desc = virtio_media_lookup_ioctl(c.code);
++            if (!desc) {
++                /*
++                 * ENOTTY, not EINVAL: this is what a V4L2 device returns for an
++                 * ioctl it does not implement, so the guest falls back exactly
++                 * as it would against real hardware instead of treating the
++                 * call as malformed.
++                 */
++                status = ENOTTY;
++                break;
++            }
++
++            /*
++             * NOTE: THE WORK BUFFER IS SIZED FROM THE IOCTL, NOT FROM WHAT THE
++             * GUEST SENT.
++             *
++             * An _IOR ioctl carries NO command payload: the driver's
++             * virtio_media_send_r_ioctl() puts only the command in the
++             * device-readable part (out = [cmd], in = [resp, payload]). Sizing
++             * the work area from out_len therefore gives zero bytes, and both
++             * the pass-through's length check and the response sizing below
++             * would reject or truncate it. VIDIOC_QUERYCAP is _IOR and is the
++             * FIRST ioctl every V4L2 client issues, so this is not a corner
++             * case -- it is the difference between the guest seeing a working
++             * device and seeing nothing.
++             *
++             * Bytes the guest did not send are zeroed, so a read-only ioctl
++             * starts from a clean structure rather than whatever the previous
++             * command left in the shared scratch buffer.
++             */
++            payload_len = out_len - sizeof(c);
++            work_len = MAX(payload_len, (size_t)_IOC_SIZE(desc->code));
++            if (work_len > VIRTIO_MEDIA_CMD_BUF_SIZE - resp_len) {
++                work_len = VIRTIO_MEDIA_CMD_BUF_SIZE - resp_len;
++            }
++            if (payload_len > work_len) {
++                payload_len = work_len;
++            }
++            if (payload_len) {
++                iov_to_buf(elem->out_sg, elem->out_num, sizeof(c),
++                           payload, payload_len);
++            }
++            memset(payload + payload_len, 0, work_len - payload_len);
++
++            if (desc->code == VIDIOC_REQBUFS) {
++                if (payload_len < sizeof(struct v4l2_requestbuffers)) {
++                    status = EINVAL;
++                } else {
++                    status = virtio_media_reqbufs(
++                        s, (struct v4l2_requestbuffers *)payload);
++                }
++            } else if (desc->code == VIDIOC_QBUF) {
++                /* QBUF parses the SG runs, so it needs the SENT length. */
++                status = virtio_media_qbuf(s, payload, payload_len);
++            } else {
++                status = virtio_media_passthrough(s, desc->code, payload,
++                                                  work_len);
++            }
++
++            /*
++             * The response payload exists only for _IOR / _IOWR. Its size comes
++             * from what the driver made room for (in_len) bounded by what the
++             * ioctl actually produces (_IOC_SIZE) -- NOT from payload_len,
++             * which is zero for _IOR and would silently truncate the reply to a
++             * bare header. The driver then fails the whole call with
++             * "received response is too short".
++             */
++            if (in_len > resp_len) {
++                size_t want = in_len - resp_len;
++
++                if (want > work_len) {
++                    want = work_len;
++                }
++                resp_len += want;
++            }
++            break;
++        }
++        case VIRTIO_MEDIA_CMD_MMAP:
++        case VIRTIO_MEDIA_CMD_MUNMAP:
++            /*
++             * No shared memory region is exposed, so MMAP buffers cannot exist.
++             * The guest only reaches here if it ignored the missing SHM region;
++             * ENODEV is the honest answer.
++             */
++            status = ENODEV;
++            resp_len = sizeof(struct virtio_media_resp_header);
++            break;
++        default:
++            error_report("virtio-media: unknown command %u", hdr.cmd);
++            status = EINVAL;
++            resp_len = sizeof(struct virtio_media_resp_header);
++            break;
++        }
++
++        /*
++         * The driver reads the status as a POSITIVE errno and negates it
++         * itself ("Host returns a positive error code"), so it is stored as-is.
++         */
++        ((struct virtio_media_resp_header *)resp)->status = status;
++        ((struct virtio_media_resp_header *)resp)->padding = 0;
++
++        if (resp_len > in_len) {
++            resp_len = in_len;
++        }
++        if (resp_len) {
++            iov_from_buf(elem->in_sg, elem->in_num, 0, resp, resp_len);
++        }
++        virtqueue_push(vq, elem, resp_len);
++        g_free(elem);
++    }
++    virtio_notify(vdev, vq);
++}
++
++/*
++ * The event queue only ever carries device-to-driver traffic. The driver posts
++ * empty buffers on it and this handler does nothing with the kick: buffers are
++ * consumed by virtio_media_send_event() when there is something to report.
++ */
++static void virtio_media_handle_event(VirtIODevice *vdev, VirtQueue *vq)
++{
++}
++
++/* ------------------------------------------------------------------------- */
++/* device                                                                    */
++/* ------------------------------------------------------------------------- */
++
++static void virtio_media_get_config(VirtIODevice *vdev, uint8_t *config)
++{
++    VirtIOMedia *vm = VIRTIO_MEDIA(vdev);
++    uint32_t cfg[2];
++
++    cfg[0] = cpu_to_le32(vm->device_caps);
++    cfg[1] = cpu_to_le32(vm->device_type);
++    memcpy(config, cfg, sizeof(cfg));
++}
++
++static uint64_t virtio_media_get_features(VirtIODevice *vdev, uint64_t features,
++                                          Error **errp)
++{
++    return features;
++}
++
++static void virtio_media_realize(DeviceState *dev, Error **errp)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VirtIOMedia *vm = VIRTIO_MEDIA(dev);
++    struct v4l2_capability cap;
++    int fd;
++
++    if (!vm->v4l2_device) {
++        error_setg(errp, "virtio-media: the v4l2-device property is required");
++        return;
++    }
++
++    /*
++     * Open the host device once here, purely to read its capabilities into
++     * config space, and close it again. Sessions get their own fd: V4L2 state
++     * (formats, buffers, controls) is per-fd, and the guest may open the device
++     * several times.
++     *
++     * Failing realize rather than deferring is deliberate: a device that
++     * appears in the guest but can never work would have the guest's decoder
++     * probe, register /dev/videoN and fail at the first ioctl, which is much
++     * harder to diagnose than the domain refusing to start.
++     */
++    fd = qemu_open_old(vm->v4l2_device, O_RDWR);
++    if (fd < 0) {
++        error_setg_errno(errp, errno, "virtio-media: cannot open %s",
++                         vm->v4l2_device);
++        return;
++    }
++    memset(&cap, 0, sizeof(cap));
++    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
++        error_setg_errno(errp, errno, "virtio-media: QUERYCAP failed on %s",
++                         vm->v4l2_device);
++        close(fd);
++        return;
++    }
++    close(fd);
++
++    /*
++     * device_caps, not capabilities: the former is the per-node set, which is
++     * what a V4L2 client must look at on a driver that reports
++     * V4L2_CAP_DEVICE_CAPS, and every modern driver does.
++     */
++    vm->device_caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
++                      ? cap.device_caps : cap.capabilities;
++    /*
++     * 0 == VFL_TYPE_VIDEO. Written as a literal because that enum lives in
++     * the kernel's media/v4l2-dev.h, not in the uapi header this file can
++     * include -- the guest driver passes this value straight to
++     * video_register_device() (virtio_media_driver.c:908), so it has to be
++     * the kernel's numbering and not something reinvented here.
++     */
++    vm->device_type = 0;
++    vm->next_session_id = 1;
++    QLIST_INIT(&vm->sessions);
++    vm->cmd_buf = g_malloc0(VIRTIO_MEDIA_CMD_BUF_SIZE);
++
++    virtio_init(vdev, VIRTIO_ID_MEDIA, 2 * sizeof(uint32_t));
++    vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
++    vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
++
++    info_report("virtio-media: proxying %s (device_caps 0x%08x)",
++                vm->v4l2_device, vm->device_caps);
++}
++
++static void virtio_media_unrealize(DeviceState *dev)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VirtIOMedia *vm = VIRTIO_MEDIA(dev);
++    VirtIOMediaSession *s, *next;
++
++    QLIST_FOREACH_SAFE(s, &vm->sessions, next, next) {
++        QLIST_REMOVE(s, next);
++        virtio_media_session_free(s);
++    }
++    g_free(vm->cmd_buf);
++    vm->cmd_buf = NULL;
++    virtio_delete_queue(vm->command_vq);
++    virtio_delete_queue(vm->event_vq);
++    virtio_cleanup(vdev);
++}
++
++/*
++ * No migration support. Every session holds a host file descriptor and host
++ * mmap()s of hardware buffers, none of which can be serialised, and the DomA
++ * device model is not migrated on this platform. unmigratable is honest about
++ * that; a silently-broken migration would be worse.
++ */
++static const VMStateDescription vmstate_virtio_media = {
++    .name = "virtio-media",
++    .unmigratable = 1,
++};
++
++static const Property virtio_media_properties[] = {
++    DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
++};
++
++static void virtio_media_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, virtio_media_properties);
++    dc->vmsd = &vmstate_virtio_media;
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    vdc->realize = virtio_media_realize;
++    vdc->unrealize = virtio_media_unrealize;
++    vdc->get_config = virtio_media_get_config;
++    vdc->get_features = virtio_media_get_features;
++}
++
++static const TypeInfo virtio_media_info = {
++    .name = TYPE_VIRTIO_MEDIA,
++    .parent = TYPE_VIRTIO_DEVICE,
++    .instance_size = sizeof(VirtIOMedia),
++    .class_init = virtio_media_class_init,
++};
++
++static void virtio_register_types(void)
++{
++    type_register_static(&virtio_media_info);
++}
++
++type_init(virtio_register_types)
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index daa560733..1392cd880 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -198,7 +198,8 @@ const char *virtio_device_names[] = {
+     [VIRTIO_ID_AUDIO_POLICY] = "virtio-audio-pol",
+     [VIRTIO_ID_BT] = "virtio-bluetooth",
+     [VIRTIO_ID_GPIO] = "virtio-gpio",
+-    [VIRTIO_ID_SPI] = "virtio-spi"
++    [VIRTIO_ID_SPI] = "virtio-spi",
++    [VIRTIO_ID_MEDIA] = "virtio-media"
+ };
+ 
+ static const char *virtio_id_to_name(uint16_t device_id)
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+new file mode 100644
+index 000000000..c990d788f
+--- /dev/null
++++ b/include/hw/virtio/virtio-media.h
+@@ -0,0 +1,233 @@
++/*
++ * VIRTIO-MEDIA device -- proxies a host V4L2 device into the guest.
++ *
++ * On this platform the device model runs in DomD, which owns the only real
++ * video hardware (bcm2835-codec, /dev/video10..13 on a Raspberry Pi 4), so the
++ * host side of virtio-media is a plain V4L2 client: guest ioctls are forwarded
++ * to a file descriptor on a host /dev/videoN.
++ *
++ * WHY A NATIVE DEVICE AND NOT A vhost-user BACKEND.
++ * The upstream way to host virtio-media is vhost-user; there is no in-tree
++ * device model in any QEMU release. vhost-user does not work under Xen: QEMU's
++ * implementation requires every guest memory region to be backed by a file
++ * descriptor (vhost_user_get_mr_data -> memory_region_get_fd), and the Xen
++ * machines' RAM regions are anonymous memory_region_init_ram() blocks with no
++ * fd, so the memory table cannot be built at all. That is what
++ * VHOST_USER_PROTOCOL_F_XEN_MMAP would fix, and it is still unimplemented in
++ * QEMU master (2026-08). A native device has no such problem: it reaches guest
++ * memory through address_space_map(), the same path the virtio-blk, virtio-net
++ * and virtio-snd devices on this board already use.
++ *
++ * WHY USERPTR ONLY.
++ * virtio-media's MMAP buffers live in a VIRTIO shared memory region, which on
++ * virtio-pci is a BAR, and the machinery to expose one only landed in QEMU
++ * 11.1.0. USERPTR needs none of it: the driver serialises the guest pages of
++ * each buffer as an array of virtio_media_sg_entry {u64 start; u32 len;} into
++ * the device-readable part of the descriptor chain
++ * (scatterlist_builder_add_buffer_userptr), so this device only ever maps plain
++ * guest physical addresses. With the DMABUF support the guest kernel patches
++ * add, the driver sends a DMABUF buffer as USERPTR runs as well, and that
++ * needs no module parameter: virtio-media.ko's allow_userptr gates only a
++ * queue whose user space itself asks for V4L2_MEMORY_USERPTR
++ * (virtio_media_reqbufs() in virtio_media_ioctls.c).
++ *
++ * This depends on the domain being configured with grant_usage=0 (foreign
++ * mapping), which doma.cfg does. Grant mapping would require the guest to
++ * grant each page, and deferred mapping of arbitrary guest addresses is exactly
++ * what that model forbids.
++ *
++ * DQBUF NEVER REACHES THIS DEVICE. The driver serves VIDIOC_DQBUF from its own
++ * queue->pending_dqbufs list (virtio_media_ioctls.c virtio_media_dqbuf), which
++ * is filled by VIRTIO_MEDIA_EVT_DQBUF events on the event queue. So buffer
++ * completion is an event this device sends, not an ioctl it answers.
++ */
++
++#ifndef QEMU_VIRTIO_MEDIA_H
++#define QEMU_VIRTIO_MEDIA_H
++
++#include <linux/videodev2.h>
++
++#include "hw/virtio/virtio.h"
++#include "qom/object.h"
++#include "qemu/queue.h"
++
++#define TYPE_VIRTIO_MEDIA "virtio-media-device"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMedia, VIRTIO_MEDIA)
++
++/* Commands and events, from the driver's protocol.h. */
++#define VIRTIO_MEDIA_CMD_OPEN   1
++#define VIRTIO_MEDIA_CMD_CLOSE  2
++#define VIRTIO_MEDIA_CMD_IOCTL  3
++#define VIRTIO_MEDIA_CMD_MMAP   4
++#define VIRTIO_MEDIA_CMD_MUNMAP 5
++
++#define VIRTIO_MEDIA_EVT_ERROR  0
++#define VIRTIO_MEDIA_EVT_DQBUF  1
++#define VIRTIO_MEDIA_EVT_EVENT  2
++
++/*
++ * All of these are byte-for-byte the driver's structures. They are plain
++ * host-endian: virtio-media has no endianness conversion and both sides of
++ * this link are aarch64 little-endian, which is also why the v4l2 structures
++ * below can be passed to the host kernel unmodified.
++ */
++struct virtio_media_cmd_header {
++    uint32_t cmd;
++    uint32_t padding;
++};
++
++struct virtio_media_resp_header {
++    uint32_t status;
++    uint32_t padding;
++};
++
++struct virtio_media_cmd_open {
++    struct virtio_media_cmd_header hdr;
++};
++
++struct virtio_media_resp_open {
++    struct virtio_media_resp_header hdr;
++    uint32_t session_id;
++    uint32_t padding;
++};
++
++struct virtio_media_cmd_close {
++    struct virtio_media_cmd_header hdr;
++    uint32_t session_id;
++    uint32_t padding;
++};
++
++struct virtio_media_cmd_ioctl {
++    struct virtio_media_cmd_header hdr;
++    uint32_t session_id;
++    uint32_t code;
++};
++
++struct virtio_media_resp_ioctl {
++    struct virtio_media_resp_header hdr;
++};
++
++struct virtio_media_sg_entry {
++    uint64_t start;
++    uint32_t len;
++    uint32_t reserved;
++};
++
++struct virtio_media_event_header {
++    uint32_t event;
++    uint32_t session_id;
++};
++
++struct virtio_media_event_error {
++    struct virtio_media_event_header hdr;
++    uint32_t err;
++    uint32_t reserved;
++};
++
++struct virtio_media_event_dqbuf {
++    struct virtio_media_event_header hdr;
++    struct v4l2_buffer buffer;
++    struct v4l2_plane planes[VIDEO_MAX_PLANES];
++};
++
++struct virtio_media_event_event {
++    struct virtio_media_event_header hdr;
++    struct v4l2_event event;
++};
++
++/*
++ * The driver posts event buffers of exactly this size and rejects a longer
++ * reply, so it is a protocol constant and not a choice made here
++ * (VIRTIO_MEDIA_EVENT_MAX_SIZE in the driver's protocol.h).
++ */
++#define VIRTIO_MEDIA_EVENT_MAX_SIZE sizeof(struct virtio_media_event_dqbuf)
++
++/*
++ * Enough for any single V4L2 ioctl payload plus the arrays that follow it: a
++ * v4l2_buffer with VIDEO_MAX_PLANES planes and one SG list per plane. A 4 KiB
++ * page holds 4096 bytes, so 1024 entries covers a 4 MiB plane -- larger than
++ * any 4K NV12 plane -- and the guest's own descriptor chain is bounded well
++ * below that anyway (DESC_CHAIN_MAX_LEN).
++ */
++#define VIRTIO_MEDIA_CMD_BUF_SIZE (256 * 1024)
++
++/*
++ * One guest USERPTR buffer, remembered between QBUF and completion.
++ *
++ * The guest hands over its pages at QBUF time and the frame only exists later,
++ * so the SG list has to be kept. Only the descriptions are kept, never a live
++ * mapping: holding an address_space_map() across an unbounded wait would pin a
++ * bounce buffer for as long as the session lives, and the guest may have
++ * dozens of buffers queued. Pages are mapped at completion, copied, unmapped.
++ */
++typedef struct VirtIOMediaPlaneSg {
++    uint32_t nents;
++    uint32_t len;
++    struct virtio_media_sg_entry *ents;
++} VirtIOMediaPlaneSg;
++
++typedef struct VirtIOMediaBuffer {
++    bool queued;
++    uint32_t num_planes;          /* 1 for single-planar */
++    VirtIOMediaPlaneSg planes[VIDEO_MAX_PLANES];
++} VirtIOMediaBuffer;
++
++#define VIRTIO_MEDIA_MAX_BUFFERS 32
++
++typedef struct VirtIOMediaQueue {
++    uint32_t type;                /* the v4l2_buf_type this state is for */
++    bool mplane;
++    bool streaming;
++    uint32_t num_bufs;
++    uint32_t num_host_planes;
++    /* Host MMAP buffers this device allocated on the host fd, mmap()ed. */
++    void *host_map[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
++    uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
++    /* Guest buffers by index, mirrored onto the host buffer of the same index. */
++    VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
++} VirtIOMediaQueue;
++
++typedef struct VirtIOMediaSession {
++    struct VirtIOMedia *vm;
++    uint32_t id;
++    int fd;
++    /*
++     * Two queues per session is all a codec needs, and it is what the guest
++     * driver models too (VIRTIO_MEDIA_LAST_QUEUE). Indexed by
++     * virtio_media_queue_index().
++     */
++    VirtIOMediaQueue queues[2];
++    QLIST_ENTRY(VirtIOMediaSession) next;
++} VirtIOMediaSession;
++
++struct VirtIOMedia {
++    VirtIODevice parent_obj;
++
++    /* Properties. */
++    char *v4l2_device;            /* host /dev/videoN to proxy */
++
++    VirtQueue *command_vq;
++    VirtQueue *event_vq;
++
++    /*
++     * Config space, exactly as the driver reads it:
++     *   u32 @0  device_caps  (virtio_media_driver.c:895)
++     *   u32 @4  device_type  (video_register_device type, :908)
++     * Both come from the host device at realize time so the guest sees the
++     * real capabilities rather than something invented here.
++     */
++    uint32_t device_caps;
++    uint32_t device_type;
++
++    uint32_t next_session_id;
++    QLIST_HEAD(, VirtIOMediaSession) sessions;
++
++    /*
++     * Scratch for one command. The command queue is drained from the main loop
++     * and never re-entered, so one buffer is enough and it keeps a per-command
++     * allocation out of the path.
++     */
++    uint8_t *cmd_buf;
++};
++
++#endif /* QEMU_VIRTIO_MEDIA_H */
+diff --git a/include/standard-headers/linux/virtio_ids.h b/include/standard-headers/linux/virtio_ids.h
+index 6c12db16f..1c2f2e56e 100644
+--- a/include/standard-headers/linux/virtio_ids.h
++++ b/include/standard-headers/linux/virtio_ids.h
+@@ -69,6 +69,14 @@
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ #define VIRTIO_ID_SPI			45 /* virtio spi */
++/*
++ * 48 is virtio-media. Not in this copy of the header because the device was
++ * standardised later; the number is fixed by the virtio-media specification
++ * and is what the guest driver's id_table matches
++ * (virtio_media_driver.c:39). Re-checked against qemu 11.1.2: the header
++ * stops at 45 (spi), so 48 is free.
++ */
++#define VIRTIO_ID_MEDIA			48 /* virtio media */
+ 
+ /*
+  * Virtio Transitional IDs

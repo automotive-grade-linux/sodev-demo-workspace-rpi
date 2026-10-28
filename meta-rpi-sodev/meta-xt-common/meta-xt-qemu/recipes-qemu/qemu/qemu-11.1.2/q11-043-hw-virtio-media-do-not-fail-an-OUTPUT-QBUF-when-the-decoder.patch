@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: do not fail an OUTPUT QBUF when the decoder
+ is full
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0219-v10-hw-virtio-media-do-not-fail-an-OUTPUT-QBUF-when-the-decoder-is-full.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-decoder.c | 150 +++++++++++++++++++++++++++++--
+ 1 file changed, 145 insertions(+), 5 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 322f56cfd..7ac6fcb92 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -109,6 +109,15 @@
+ /* Frames one dec_pump() call may deliver; see the loop for why it is bounded. */
+ #define DEC_PUMP_MAX_FRAMES 4
+ 
++/*
++ * What the input backlog may hold. Bounded for the reason DEC_MAX_OUT_SIZE is:
++ * the guest decides how much it queues, so a guest that feeds input while never
++ * giving the decoder anywhere to put frames must not be able to grow QEMU
++ * without limit. Past the bound QBUF goes back to refusing the buffer.
++ */
++#define DEC_MAX_BACKLOG_PKTS 32
++#define DEC_MAX_BACKLOG_BYTES (16 * 1024 * 1024)
++
+ struct VirtIOMediaDec {
+     /* Negotiated formats. */
+     uint32_t coded_w, coded_h;      /* what the CAPTURE format currently says */
+@@ -143,6 +152,12 @@ struct VirtIOMediaDec {
+     AVPacket *pkt;
+     AVFrame *frame;         /* scratch for receive_frame */
+     AVFrame *held;          /* a frame received while awaiting_reconfig */
++    /*
++     * Packets taken from the guest that libavcodec has not accepted yet, in
++     * stream order. See dec_backlog_push().
++     */
++    GQueue *backlog;
++    size_t backlog_bytes;
+     struct SwsContext *sws; /* only if the decoder does not give us NV12 */
+     /*
+      * The full cache key. Input geometry is part of it: see dec_write_frame.
+@@ -464,6 +479,86 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+     return true;
+ }
+ 
++/*
++ * THE INPUT BACKLOG EXISTS BECAUSE VIDIOC_QBUF MUST NOT FAIL.
++ *
++ * Decoding happens inside the OUTPUT QBUF that carries the packet, so
++ * without a backlog libavcodec being full surfaces as QBUF returning -EAGAIN.
++ * No V4L2 client expects that. v4l2_codec2 fails the decode outright
++ * (pumpDecodeRequest -> Failed to QBUF to input queue -> state Error); on the
++ * board a 1080p HEVC stream died that way on its fourth input buffer, while
++ * the SOURCE_CHANGE it needed in order to allocate buffers the frames would
++ * fit in was already in the event queue, not yet polled. Neither side is
++ * wrong: the guest cannot act on an event it has not read, and
++ * awaiting_reconfig stops dec_pump() draining, so the packet after the first
++ * IDR has nowhere to go.
++ *
++ * So take the bytes and hold them. A real driver does the same -- the OUTPUT
++ * buffer completes once its data has been copied out, long before any frame
++ * comes back -- and the backlog is drained from dec_pump(), i.e. from the next
++ * QBUF on either queue, once there is room.
++ *
++ * ORDER IS THE WHOLE POINT. Everything that feeds libavcodec has to go through
++ * the queue once the queue is non-empty; see dec_qbuf.
++ */
++static bool dec_backlog_push(VirtIOMediaDec *d, AVPacket *src)
++{
++    AVPacket *p;
++
++    if (g_queue_get_length(d->backlog) >= DEC_MAX_BACKLOG_PKTS ||
++        d->backlog_bytes + (size_t)src->size > DEC_MAX_BACKLOG_BYTES) {
++        return false;
++    }
++    p = av_packet_alloc();
++    if (!p) {
++        return false;
++    }
++    if (av_packet_ref(p, src) < 0) {
++        av_packet_free(&p);
++        return false;
++    }
++    d->backlog_bytes += (size_t)p->size;
++    g_queue_push_tail(d->backlog, p);
++    return true;
++}
++
++static void dec_backlog_clear(VirtIOMediaDec *d)
++{
++    AVPacket *p;
++
++    if (!d->backlog) {
++        return;
++    }
++    while ((p = g_queue_pop_head(d->backlog)) != NULL) {
++        av_packet_free(&p);
++    }
++    d->backlog_bytes = 0;
++}
++
++/*
++ * Feed as much of the backlog as libavcodec will take. A packet it refuses
++ * stays at the head: order is the whole point of a bitstream.
++ */
++static void dec_backlog_drain(VirtIOMediaDec *d)
++{
++    while (!g_queue_is_empty(d->backlog)) {
++        AVPacket *p = g_queue_peek_head(d->backlog);
++        int r = avcodec_send_packet(d->avctx, p);
++
++        if (r == AVERROR(EAGAIN)) {
++            return;
++        }
++        g_queue_pop_head(d->backlog);
++        d->backlog_bytes -= (size_t)p->size;
++        av_packet_free(&p);
++        if (r < 0 && r != AVERROR_EOF) {
++            error_report_once("virtio-media/dec: backlog send_packet: %d", r);
++            dec_backlog_clear(d);
++            return;
++        }
++    }
++}
++
+ /*
+  * Pull frames out of libavcodec while the guest has buffers to put them in.
+  *
+@@ -489,6 +584,14 @@ static void dec_pump(VirtIOMediaSession *s)
+         av_frame_free(&d->held);
+     }
+ 
++    /*
++     * Then anything taken while the decoder was full or mid-reconfiguration:
++     * it is older than whatever the QBUF that got us here brought.
++     */
++    if (!d->awaiting_reconfig) {
++        dec_backlog_drain(d);
++    }
++
+     /*
+      * BOUNDED. This runs on the QEMU main loop from a virtqueue handler, and the
+      * guest can have 32 CAPTURE buffers queued, so an unbounded loop let one
+@@ -732,6 +835,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+     }
+ 
+     d = g_new0(VirtIOMediaDec, 1);
++    d->backlog = g_queue_new();
+     d->coded_w = DEC_MIN_W;
+     d->coded_h = DEC_MIN_H;
+     d->visible_w = DEC_MIN_W;
+@@ -794,6 +898,8 @@ fail:
+     av_frame_free(&d->frame);
+     av_frame_free(&d->swframe);
+     av_buffer_unref(&d->hwdev);
++    dec_backlog_clear(d);
++    g_queue_free(d->backlog);
+     g_free(d);
+     return ENOMEM;
+ }
+@@ -813,6 +919,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     av_frame_free(&d->held);
+     av_frame_free(&d->swframe);
+     av_buffer_unref(&d->hwdev);
++    dec_backlog_clear(d);
++    g_queue_free(d->backlog);
+     sws_freeContext(d->sws);
+     g_free(d);
+     s->dec = NULL;
+@@ -1179,7 +1287,25 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+         d->pkt->pts = (int64_t)b->timestamp.tv_sec * 1000000 +
+                       b->timestamp.tv_usec;
+ 
+-        r = avcodec_send_packet(d->avctx, d->pkt);
++        /*
++         * ORDER IS NOT NEGOTIABLE. A packet may go straight to libavcodec only
++         * when nothing is already waiting: if the backlog is non-empty and we
++         * sent this one now it would overtake the packets in front of it: as
++         * soon as dec_pump() freed a slot, the QBUF that followed would jump
++         * the queue. An out-of-order bitstream is exactly what it sounds like:
++         * measured on the board with that ordering, libavcodec logged "Could
++         * not find ref with POC 7" and then "frame_post_process: Decode fail"
++         * for a sixth of the frames of a clean 5 s clip (three quarters of a
++         * longer one), every frame came back AV_FRAME_FLAG_CORRUPT, and the
++         * picture was black while every counter said the stream was playing.
++         *
++         * Nor while a reconfiguration is outstanding: dec_pump() will not drain
++         * libavcodec (the guest buffers are still the old size), so this packet
++         * would only find it full.
++         */
++        r = (d->awaiting_reconfig || !g_queue_is_empty(d->backlog))
++                ? AVERROR(EAGAIN)
++                : avcodec_send_packet(d->avctx, d->pkt);
+         /*
+          * NOTE: EAGAIN MEANS THE PACKET WAS NOT CONSUMED, SO IT MUST BE RESENT.
+          *
+@@ -1197,14 +1323,26 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+          */
+         if (r == AVERROR(EAGAIN)) {
+             dec_pump(s);
+-            r = avcodec_send_packet(d->avctx, d->pkt);
++            /* dec_pump() may have emptied the backlog; if it did not, queue. */
++            if (!d->awaiting_reconfig && g_queue_is_empty(d->backlog)) {
++                r = avcodec_send_packet(d->avctx, d->pkt);
++            }
++        }
++        /*
++         * Not taken. Hold the bytes rather than failing the QBUF; only a
++         * backlog that is itself full falls through.
++         */
++        if (r == AVERROR(EAGAIN) && dec_backlog_push(d, d->pkt)) {
++            r = 0;
+         }
+         av_packet_unref(d->pkt);
+         if (r == AVERROR(EAGAIN)) {
+             /*
+-             * Still full. Give the buffer back to the guest unconsumed rather
+-             * than reporting it complete: bytesused 0 with no data is how a
+-             * stateful decoder says "nothing was taken from this one".
++             * Give the buffer back to the guest unconsumed rather than
++             * reporting it complete: bytesused 0 with no data is how a stateful
++             * decoder says "nothing was taken from this one". The guest has
++             * queued DEC_MAX_BACKLOG_* worth of input without collecting a
++             * single frame to get here.
+              */
+             gb->queued = false;
+             return EAGAIN;
+@@ -1248,6 +1386,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+             /* Input stopped: the decoder's state is no longer meaningful. */
+             avcodec_flush_buffers(d->avctx);
+             av_frame_free(&d->held);
++            dec_backlog_clear(d);
+             d->draining = false;
+             d->drain_done = false;
+         }
+@@ -1318,6 +1457,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+         if (d->draining) {
+             avcodec_flush_buffers(d->avctx);
+             av_frame_free(&d->held);
++            dec_backlog_clear(d);
+             d->draining = false;
+             d->drain_done = false;
+         }

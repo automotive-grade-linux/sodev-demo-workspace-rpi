@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-gpu: add a refresh_rate property for the generated
+ EDID
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0236-v10-virtio-gpu-edid-refresh-rate-property.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-base.c   | 11 ++++++++++-
+ include/hw/virtio/virtio-gpu.h |  8 +++++++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 270fbaae1..42d632f5a 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -64,7 +64,16 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
+         .height_mm = g->req_state[scanout].height_mm,
+         .prefx = g->req_state[scanout].width,
+         .prefy = g->req_state[scanout].height,
+-        .refresh_rate = g->req_state[scanout].refresh_rate,
++        /*
++         * A configured refresh rate wins over what the UI reported. Without
++         * it the EDID advertises qemu's 75000 mHz default: on RPi4 DomA the
++         * panel is 1920x720@60, SurfaceFlinger then ran its vsync at 75 Hz,
++         * and a 60 fps video layer asking for 60 Hz ExactOrMultiple could
++         * only be served at 75/2 = 37.5 Hz -- the ~38-40 fps ceiling seen on
++         * every HW-decode measurement (2026-09-05).
++         */
++        .refresh_rate = g->conf.refresh_rate ? g->conf.refresh_rate
++                                             : g->req_state[scanout].refresh_rate,
+     };
+ 
+     for (output_idx = 0, node = g->conf.outputs;
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 271e16200..b5b85d36f 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -133,6 +133,11 @@ struct virtio_gpu_base_conf {
+     uint32_t yres;
+     uint64_t hostmem;
+     VirtIOGPUOutputList *outputs;
++    /*
++     * EDID refresh rate in mHz. 0 = what the UI reports, else qemu's 75000
++     * default. The guest's SurfaceFlinger derives its vsync from this.
++     */
++    uint32_t refresh_rate;
+ };
+ 
+ struct virtio_gpu_ctrl_command {
+@@ -176,7 +181,8 @@ struct VirtIOGPUBaseClass {
+     DEFINE_PROP_BIT("edid", _state, _conf.flags, \
+                     VIRTIO_GPU_FLAG_EDID_ENABLED, true), \
+     DEFINE_PROP_UINT32("xres", _state, _conf.xres, 1280), \
+-    DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800)
++    DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800), \
++    DEFINE_PROP_UINT32("refresh_rate", _state, _conf.refresh_rate, 0)
+ 
+ typedef struct VGPUDMABuf {
+     QemuDmaBuf *buf;

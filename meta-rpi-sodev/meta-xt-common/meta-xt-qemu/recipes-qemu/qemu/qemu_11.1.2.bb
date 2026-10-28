@@ -10,9 +10,11 @@
 #
 # The patches are q11-NNN-*.patch in qemu-11.1.2/ (generated with git format-patch; do
 # not edit the hunks by hand -- bitbake treats fuzz as fatal). Each patch's header says
-# what it does and, for a port, what changed. One 10.0.2 patch is not carried here:
-# 0117 (qemu 11.1.2 already takes SDL's EGLDisplay), whose place would have been
-# q11-016 -- the number is left free so references to the others stay valid.
+# what it does and, for a port, what changed. Two 10.0.2 patches are not carried: 0117
+# (qemu 11.1.2 already takes SDL's EGLDisplay), whose place would have been q11-016 --
+# the number is left free so references to the others stay valid -- and 0249 (qemu 11
+# has its own ring_idx context fences), which came after 0248 = q11-050 and so leaves
+# no gap.
 
 require recipes-devtools/qemu/qemu_10.2.0.bb
 
@@ -59,6 +61,33 @@ SYSTEMD_SERVICE:${PN}-guest-agent = ""
 # add a pulseaudio DEPENDS to the DomD build.
 PACKAGECONFIG:remove = "pulseaudio"
 
+# libavcodec for the decoder mode q11-041 adds and q11-042 drives, and ONLY for the
+# Raspberry Pi 5.
+#
+# The two boards reach hardware decode through different host devices, and only one
+# of them needs a codec library in the device model. On a Pi 4 the host device is
+# bcm2835-codec, which is a STATEFUL V4L2 decoder, so q11-023's plain one-node proxy is
+# the whole path: the guest's stateful decoder maps onto a stateful host decoder and
+# nothing parses the bitstream in qemu. BCM2712's only decode block is codec@800000
+# driven by rpi-hevc-dec, and that is STATELESS -- a media device plus a request fd
+# per frame, with the caller expected to parse the bitstream and build the DPB.
+# virtio-media cannot carry either: its protocol has five commands and no file
+# descriptors, and Android's external/v4l2_codec2 has no stateless support at all.
+# So q11-041 converts on the host, offering the guest an ordinary stateful HEVC decoder
+# and letting libavcodec do the stateless driving.
+#
+# rpidistro-ffmpeg rather than poky's ffmpeg: only the Raspberry Pi fork carries the
+# v4l2request hwaccel that q11-042 uses. Named as the RECIPE, so PREFERRED_PROVIDER is
+# not involved -- that only decides who provides the virtual `ffmpeg`, and this
+# DEPENDS is unambiguous on its own.
+#
+# The dependency is what turns decoder mode on, not a configure switch: meson finds
+# the three libraries with pkg-config, and the file q11-041 adds stubs itself out when
+# they are absent. That is why the Pi 4 binary is unaffected even though the patches
+# are applied for both boards -- it gets the stub, and its device argument
+# (XT_DOMA_HWDEC_DEVARG, v4l2-device=/dev/video10) never selects decoder mode.
+DEPENDS:append:raspberrypi5 = " rpidistro-ffmpeg"
+
 # qemu 11 removed the GlusterFS block driver and its configure option; the
 # 10.2.0 recipe body still maps the PACKAGECONFIG to --disable-glusterfs.
 PACKAGECONFIG:remove = "glusterfs"
@@ -81,7 +110,7 @@ SRC_URI:append:class-target = " file://q11-009-xen-mapcache-leave-first-in-bucke
 SRC_URI:append:class-target = " file://q11-010-pci-host-gpex-shrink-memory-region-from-256MB-to-128MB.patch"
 SRC_URI:append:class-target = " file://q11-011-xen-mapcache-adjust-bucket-size.patch"
 SRC_URI:append:class-target = " file://q11-012-Revert-xen-mapcache-leave-first-in-buckets-unmapped.patch"
-# q11-013..022: ports of this layer's qemu 10.0.2 patches, in the 10.0.2 recipe's order;
+# q11-013..050: ports of this layer's qemu 10.0.2 patches, in the 10.0.2 recipe's order;
 #   they were ported in one batch, so their Date: lines are seconds apart.
 SRC_URI:append:class-target = " file://q11-013-configure-use-the-host-python-and-meson-instead-of-a-venv.patch"
 SRC_URI:append:class-target = " file://q11-014-hw-arm-accept-xenpv-and-its-libxl-published-PCI-layout.patch"
@@ -92,3 +121,31 @@ SRC_URI:append:class-target = " file://q11-019-xen-do-not-silently-drop-IOREQ-MM
 SRC_URI:append:class-target = " file://q11-020-virtio-gpu-xen-pin-shmem-backed-blobs-through-udmabuf-before.patch"
 SRC_URI:append:class-target = " file://q11-021-xen-keep-the-autostart-device-model-alive-without-a-QMP-moni.patch"
 SRC_URI:append:class-target = " file://q11-022-hw-xen-xen-pvh-common-allow-one-INTX-line-per-virtio-pci-slo.patch"
+SRC_URI:append:class-target = " file://q11-023-hw-virtio-add-a-native-virtio-media-device.patch"
+SRC_URI:append:class-target = " file://q11-024-audio-alsa-report-the-generic-buffer-as-free-as-7.0-did.patch"
+SRC_URI:append:class-target = " file://q11-025-virtio-media-process-the-command-queue-from-a-bottom-half.patch"
+SRC_URI:append:class-target = " file://q11-026-virtio-media-drain-only-what-poll-actually-reports.patch"
+SRC_URI:append:class-target = " file://q11-027-xen-mapcache-keep-foreign-bucket-heads-mapped-when-unlocked.patch"
+SRC_URI:append:class-target = " file://q11-028-virtio-media-merge-adjacent-SG-entries.patch"
+SRC_URI:append:class-target = " file://q11-029-xen-mapcache-find-reverse-entries-by-hash-not-by-list-walk.patch"
+SRC_URI:append:class-target = " file://q11-030-virtio-media-request-non-coherent-cacheable-host-MMAP-buffer.patch"
+SRC_URI:append:class-target = " file://q11-031-virtio-media-write-decoded-frames-straight-into-the-guest-s.patch"
+SRC_URI:append:class-target = " file://q11-032-virtio-media-copy-decoded-frames-into-the-virgl-resource-on.patch"
+SRC_URI:append:class-target = " file://q11-033-virtio-media-keep-CAPTURE-buffers-coherent-when-the-GPU-copi.patch"
+SRC_URI:append:class-target = " file://q11-034-virtio-media-run-the-CAPTURE-queue-as-NV12-on-the-host-conve.patch"
+SRC_URI:append:class-target = " file://q11-035-xen-never-unregister-IOREQ-MMIO-ranges.patch"
+SRC_URI:append:class-target = " file://q11-036-virtio-gpu-gl-suppress-guest-notifications-while-draining-th.patch"
+SRC_URI:append:class-target = " file://q11-037-virtio-media-park-the-host-fd-handler-while-poll-reports-onl.patch"
+SRC_URI:append:class-target = " file://q11-038-virtio-gpu-virgl-poll-for-retired-fences-every-1-ms-instead.patch"
+SRC_URI:append:class-target = " file://q11-039-virtio-gpu-add-a-refresh_rate-property-for-the-generated-EDI.patch"
+SRC_URI:append:class-target = " file://q11-040-virtio-media-add-output-coherent-and-gpu-fence-fd.patch"
+SRC_URI:append:class-target = " file://q11-041-hw-virtio-media-add-a-stateful-decoder-mode-backed-by-libavc.patch"
+SRC_URI:append:class-target = " file://q11-042-hw-virtio-media-drive-decoder-mode-with-the-v4l2request-hwac.patch"
+SRC_URI:append:class-target = " file://q11-043-hw-virtio-media-do-not-fail-an-OUTPUT-QBUF-when-the-decoder.patch"
+SRC_URI:append:class-target = " file://q11-044-hw-virtio-media-return-the-OUTPUT-buffer-timestamp-on-comple.patch"
+SRC_URI:append:class-target = " file://q11-045-hw-virtio-media-give-decoder-mode-an-RGBA-output-and-the-dir.patch"
+SRC_URI:append:class-target = " file://q11-046-virtio-snd-drain-the-TX-queue-from-a-dedicated-thread-tx-pol.patch"
+SRC_URI:append:class-target = " file://q11-047-hw-arm-pass-the-virtio-pci-INTX-line-count-to-the-GPEX.patch"
+SRC_URI:append:class-target = " file://q11-048-hw-virtio-media-let-host-nv12-scale-the-frame-down-to-the-di.patch"
+SRC_URI:append:class-target = " file://q11-049-hw-virtio-media-invalidate-the-RGBA-target-before-the-NV12-d.patch"
+SRC_URI:append:class-target = " file://q11-050-virtio-gpu-raise-the-control-queue-interrupt-once-per-batch.patch"

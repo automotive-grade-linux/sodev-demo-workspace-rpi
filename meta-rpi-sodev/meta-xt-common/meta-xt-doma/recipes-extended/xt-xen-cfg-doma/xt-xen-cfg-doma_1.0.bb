@@ -96,13 +96,12 @@ XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 # [hardware decode] Whether DomA is given a virtio-media device. Comes from the
 # moulin GPU parameter through the domd and dom0 component confs, for a reason that
 # is a hard dependency and not a policy: the decoder the guest talks to IS a
-# virtio-media device, and only the qemu 10.0.2 device model has one, so GPU=gl is
-# false, and GPU=vulkan gives whatever the board yaml sets for that lane: true,
-# except in a Dom0 flavour whose DomD has no decoder (the Pi 5's linux one). The
-# same parameter sets it on the AOSP side, where it
-# gates the c2 HAL and its seccomp policy (the HAL's sepolicy is built in every
-# lane) -- the two halves must agree or the guest declares a HAL for a device
-# that is not on the bus.
+# virtio-media device, which only the qemu 10.0.2 and 11.1.2 device models have, so
+# GPU=gl is false, and GPU=vulkan gives whatever the board yaml sets for that lane:
+# true, except in a Dom0 flavour whose DomD has no decoder (the Pi 5's linux one).
+# The same parameter sets it on the AOSP side, where it gates the c2 HAL and its
+# seccomp policy (the HAL's sepolicy is built in every lane) -- the two halves must
+# agree or the guest declares a HAL for a device that is not on the bus.
 #
 # Defaulted for the same reason BOARD_RAM is: a standalone bitbake outside moulin
 # must still install a working config, and "no decoder" is the one configuration
@@ -289,7 +288,7 @@ do_install() {
     # fails here.
     if [ "$doma_hwdec" = "yes" ]; then
         case "${XT_DM_QEMU_VERSION}" in
-        7.*) bbfatal "XT_DOMA_HWDEC=true with a qemu ${XT_DM_QEMU_VERSION} device model: virtio-media exists only in the 10.0.2 one" ;;
+        7.*) bbfatal "XT_DOMA_HWDEC=true with a qemu ${XT_DM_QEMU_VERSION} device model: virtio-media exists only in the 10.0.2 and 11.1.2 ones" ;;
         esac
     fi
     # Fail loudly rather than ship a placeholder: xl's parser would reject the bare
@@ -322,7 +321,7 @@ do_install() {
     fi
 
     # [audio] Substitute the virtio-snd device-model property that only the patched
-    # qemu 10.0.2 has, and empty the token on 7.0.0.
+    # qemu 10.0.2 and 11.1.2 have, and empty the token on 7.0.0.
     #
     # tx-poll-us comes from qemu patch
     # 0243-v10-virtio-snd-drain-tx-from-a-dedicated-thread.patch: it drains the TX
@@ -386,8 +385,9 @@ do_install() {
     # [display] Substitute the board's extra virtio-gpu-gl-pci properties on the
     # qemu 10 device model, and empty the token on 7.0.0. Keyed on the device
     # model's version for the same reason as tx-poll-us above: the properties this
-    # carries come from patches only the 10.0.2 device model has (refresh_rate is
-    # 0236), and a 7.0.0 device model exits on an unknown property.
+    # carries come from patches only the 10.0.2 and 11.1.2 device models have
+    # (refresh_rate is 0236 / q11-039), and a 7.0.0 device model exits on an unknown
+    # property.
     if ! grep -q 'virtio-gpu-gl-pci,XT_DOMA_GPU_PROPS_PLACEHOLDER' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "XT_DOMA_GPU_PROPS_PLACEHOLDER not found in doma.cfg"
     fi

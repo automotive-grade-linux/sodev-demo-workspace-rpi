@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-snd: drain the TX queue from a dedicated thread
+ (tx-poll-us)
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0243-v10-virtio-snd-drain-tx-from-a-dedicated-thread.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same thread; qemu 11 embeds VirtIOSoundPCM in VirtIOSound, so
+vsnd->pcm->streams becomes vsnd->pcm.streams.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/audio/virtio-snd.c         | 59 +++++++++++++++++++++++++++++++++++
+ include/hw/audio/virtio-snd.h |  9 ++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/hw/audio/virtio-snd.c b/hw/audio/virtio-snd.c
+index 694bcebb6..b76ecae40 100644
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -20,6 +20,7 @@
+ #include "qemu/log.h"
+ #include "qemu/error-report.h"
+ #include "qemu/lockable.h"
++#include "qemu/main-loop.h"   /* bql_lock/bql_unlock for the TX thread */
+ #include "system/runstate.h"
+ #include "trace.h"
+ #include "qapi/error.h"
+@@ -32,6 +33,7 @@
+ #define VIRTIO_SOUND_HDA_FN_NID 0
+ 
+ static void virtio_snd_pcm_out_cb(void *data, int available);
++static void *virtio_snd_tx_thread(void *opaque);
+ static void virtio_snd_process_cmdq(VirtIOSound *s);
+ static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
+ static void virtio_snd_pcm_in_cb(void *data, int available);
+@@ -85,8 +87,49 @@ static const Property virtio_snd_properties[] = {
+                        VIRTIO_SOUND_STREAM_DEFAULT),
+     DEFINE_PROP_UINT32("chmaps", VirtIOSound, snd_conf.chmaps,
+                        VIRTIO_SOUND_CHMAP_DEFAULT),
++    /*
++     * Drain TX from a dedicated thread every N us (0 = off). On Xen the main
++     * loop also runs virtio-media's QBUF work for the video and cannot hand a
++     * virtio queue to an iothread (xen_io_listener has no .eventfd_add), so
++     * the backend's audio callback is delayed by the video and the guest
++     * blocks in its own PCM write. Recommended: half the ALSA period, i.e.
++     * 10000 for period-length=20000.
++     */
++    DEFINE_PROP_UINT32("tx-poll-us", VirtIOSound, tx_poll_us, 0),
+ };
+ 
++/*
++ * TX drain thread. See the tx-poll-us property.
++ *
++ * It calls the very same drain function the audio backend's callback calls,
++ * with available=INT_MAX: AUD_write() returns short when the backend is full
++ * and the loop inside already treats a 0-byte write as "stop". The BQL is held
++ * across the drain because the audio subsystem expects it, so this thread waits
++ * only for the longest single BQL hold instead of for everything the main loop
++ * has queued behind the video.
++ */
++static void *virtio_snd_tx_thread(void *opaque)
++{
++    VirtIOSound *vsnd = opaque;
++
++    while (!qatomic_read(&vsnd->tx_thread_stop)) {
++        bql_lock();
++        if (vsnd->pcm.streams) {
++            for (uint32_t i = 0; i < vsnd->snd_conf.streams; i++) {
++                VirtIOSoundPCMStream *stream = vsnd->pcm.streams[i];
++
++                if (stream && stream->info.direction == VIRTIO_SND_D_OUTPUT
++                    && stream->voice.out && stream->active) {
++                    virtio_snd_pcm_out_cb(stream, INT_MAX);
++                }
++            }
++        }
++        bql_unlock();
++        g_usleep(vsnd->tx_poll_us);
++    }
++    return NULL;
++}
++
+ static void
+ virtio_snd_get_config(VirtIODevice *vdev, uint8_t *config)
+ {
+@@ -1100,6 +1143,15 @@ static void virtio_snd_realize(DeviceState *dev, Error **errp)
+     QTAILQ_INIT(&vsnd->cmdq);
+     QSIMPLEQ_INIT(&vsnd->invalid);
+ 
++    if (vsnd->tx_poll_us) {
++        vsnd->tx_thread_stop = false;
++        qemu_thread_create(&vsnd->tx_thread, "virtio-snd-tx",
++                           virtio_snd_tx_thread, vsnd, QEMU_THREAD_JOINABLE);
++        vsnd->tx_thread_started = true;
++        info_report("virtio-snd: draining TX from a dedicated thread every"
++                    " %u us", vsnd->tx_poll_us);
++    }
++
+     for (uint32_t i = 0; i < vsnd->snd_conf.streams; i++) {
+         status = virtio_snd_set_pcm_params(vsnd, i, &default_params);
+         if (status != cpu_to_le32(VIRTIO_SND_S_OK)) {
+@@ -1339,6 +1391,13 @@ static void virtio_snd_unrealize(DeviceState *dev)
+     VirtIOSound *vsnd = VIRTIO_SND(dev);
+     VirtIOSoundPCMStream *stream;
+ 
++    if (vsnd->tx_thread_started) {
++        qatomic_set(&vsnd->tx_thread_stop, true);
++        bql_unlock();
++        qemu_thread_join(&vsnd->tx_thread);
++        bql_lock();
++        vsnd->tx_thread_started = false;
++    }
+     qemu_del_vm_change_state_handler(vsnd->vmstate);
+     trace_virtio_snd_unrealize(vsnd);
+ 
+diff --git a/include/hw/audio/virtio-snd.h b/include/hw/audio/virtio-snd.h
+index e28f1be5d..f793849d1 100644
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -221,6 +221,15 @@ struct VirtIOSound {
+     QemuMutex cmdq_mutex;
+     QTAILQ_HEAD(, virtio_snd_ctrl_command) cmdq;
+     bool processing_cmdq;
++    /*
++     * tx-poll-us: drain the TX queue from our own thread every this many
++     * microseconds instead of waiting for the audio backend's main-loop
++     * callback, which the video path delays on Xen. 0 = upstream behaviour.
++     */
++    uint32_t tx_poll_us;
++    QemuThread tx_thread;
++    bool tx_thread_started;
++    bool tx_thread_stop;
+     /*
+      * Convenience queue to keep track of invalid tx/rx queue messages inside
+      * the tx/rx callbacks.

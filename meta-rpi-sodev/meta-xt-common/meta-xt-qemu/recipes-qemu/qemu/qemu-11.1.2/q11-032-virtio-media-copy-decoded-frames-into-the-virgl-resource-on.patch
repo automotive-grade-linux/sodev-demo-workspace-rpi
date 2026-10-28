@@ -1,0 +1,680 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-media: copy decoded frames into the virgl resource on
+ the GPU
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0229-v10-virtio-media-gpu-copy-into-virgl-resource.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/meson.build                  |   4 +-
+ hw/virtio/virtio-media-virgl-stub.c    |  24 ++
+ hw/virtio/virtio-media-virgl.c         | 389 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media.c               |  66 +++++
+ include/hw/virtio/virtio-media-virgl.h |  47 ++-
+ include/hw/virtio/virtio-media.h       |  16 +
+ 6 files changed, 539 insertions(+), 7 deletions(-)
+
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index bdf582b96..a9d1cfb2b 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -97,8 +97,8 @@ system_virtio_ss.add_all(when: 'CONFIG_VIRTIO_PCI', if_true: virtio_pci_ss)
+ 
+ system_ss.add_all(when: 'CONFIG_VIRTIO', if_true: system_virtio_ss)
+ system_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media.c'))
+-system_ss.add(when: ['CONFIG_VIRTIO_MEDIA', virgl], if_true: [files('virtio-media-virgl.c'), virgl],
+-                                                     if_false: files('virtio-media-virgl-stub.c'))
++system_ss.add(when: ['CONFIG_VIRTIO_MEDIA', virgl, opengl], if_true: [files('virtio-media-virgl.c'), virgl, opengl],
++                                                             if_false: files('virtio-media-virgl-stub.c'))
+ stub_ss.add(files('vhost-stub.c'))
+ stub_ss.add(files('vhost-user-stub.c'))
+ stub_ss.add(files('virtio-stub.c'))
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+index 8a5d052d6..093593a96 100644
+--- a/hw/virtio/virtio-media-virgl-stub.c
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -12,3 +12,27 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+ {
+     return -ENOTSUP;
+ }
++
++void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
++                              uint32_t stride, uint32_t len, int *err)
++{
++    close(dmabuf_fd);
++    if (err) {
++        *err = -ENOTSUP;
++    }
++    return NULL;
++}
++
++int virtio_media_gpu_blit(void *handle, uint32_t res_id)
++{
++    return -ENOTSUP;
++}
++
++int virtio_media_gpu_wait(void *handle)
++{
++    return 0;
++}
++
++void virtio_media_gpu_release(void *handle)
++{
++}
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 46f352877..de09cb288 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -1,13 +1,24 @@
+ /*
+- * virtio-media -> libvirglrenderer bridge (see the header).
++ * virtio-media -> libvirglrenderer / GL bridge (see the header).
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ #include "qemu/osdep.h"
+ #include "qemu/iov.h"
++#include "qemu/log.h"
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-media-virgl.h"
+ #include <virglrenderer.h>
++#include <epoxy/egl.h>
++#include <epoxy/gl.h>
++
++/* drm_fourcc.h values, spelled out to avoid a libdrm dependency. */
++#define VM_DRM_FORMAT_ABGR8888  0x34324241u   /* 'AB24': R,G,B,A byte order */
++#define VM_DRM_FORMAT_MOD_LINEAR 0ull
++
++#ifndef EGL_NO_CONFIG_KHR
++#define EGL_NO_CONFIG_KHR ((EGLConfig)0)
++#endif
+ 
+ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+                                 uint32_t height, uint32_t stride,
+@@ -33,3 +44,379 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+                                              (struct virgl_box *)&box,
+                                              0, &iov, 1);
+ }
++
++/* ---------------------------------------------------------------------- */
++/* GPU path                                                                */
++
++typedef struct VirtIOMediaGpuBuf {
++    int fd;
++    uint32_t width, height, stride, len;
++    GLuint tex;
++    GLuint read_fbo;          /* the blit's read FBO, made on first use */
++    GLsync sync;              /* last copy that read this buffer, or NULL */
++} VirtIOMediaGpuBuf;
++
++/*
++ * Context discipline. The display is SDL (gl=es) or egl-headless; either way
++ * virglrenderer's context is current on the main loop while it processes
++ * commands, and SDL caches "which context is current" and short-circuits
++ * SDL_GL_MakeCurrent. So this file never goes through SDL or dpy_gl_ctx_*:
++ * it saves the raw EGL state, switches to its own context (created once,
++ * sharing objects with virgl's), and restores the exact saved state before
++ * returning. virglrenderer re-asserts its own context before every command
++ * (virgl_renderer_force_ctx_0) so the detour is invisible to it.
++ */
++static struct {
++    bool tried;
++    EGLDisplay dpy;
++    EGLContext ctx;
++    GLuint draw_fbo;
++} gpu;
++
++typedef struct GpuSaved {
++    EGLDisplay dpy;
++    EGLContext ctx;
++    EGLSurface draw, read;
++    EGLenum api;
++} GpuSaved;
++
++/*
++ * Buffers released while no GL context could be made current (virgl reset,
++ * or not up yet). Their GL objects live in the share group of gpu.ctx, which
++ * outlives that, and the texture keeps the imported dmabuf alive, so they are
++ * deleted the next time gpu_enter() succeeds rather than leaked.
++ */
++static GSList *gpu_orphans;
++
++static void gpu_free_buf(VirtIOMediaGpuBuf *b)
++{
++    if (b->sync) {
++        glClientWaitSync(b->sync, GL_SYNC_FLUSH_COMMANDS_BIT,
++                         200 * 1000 * 1000ull);
++        glDeleteSync(b->sync);
++    }
++    if (b->read_fbo) {
++        glDeleteFramebuffers(1, &b->read_fbo);
++    }
++    glDeleteTextures(1, &b->tex);
++    g_free(b);
++}
++
++static void gpu_reap_orphans(void)
++{
++    g_slist_free_full(gpu_orphans, (GDestroyNotify)gpu_free_buf);
++    gpu_orphans = NULL;
++}
++
++static bool gpu_have_egl_ext(EGLDisplay dpy, const char *name)
++{
++    const char *exts = eglQueryString(dpy, EGL_EXTENSIONS);
++    return exts && epoxy_extension_in_string(exts, name);
++}
++
++static bool gpu_create_context(EGLDisplay dpy, EGLContext share)
++{
++    EGLConfig cfg = EGL_NO_CONFIG_KHR;
++    EGLint ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
++
++    if (!gpu_have_egl_ext(dpy, "EGL_KHR_image_base") ||
++        !gpu_have_egl_ext(dpy, "EGL_EXT_image_dma_buf_import") ||
++        !gpu_have_egl_ext(dpy, "EGL_KHR_surfaceless_context")) {
++        qemu_log("virtio-media-diag: gpu_xfer: EGL lacks image_base / "
++                 "dma_buf_import / surfaceless_context, GPU path disabled\n");
++        return false;
++    }
++    if (!gpu_have_egl_ext(dpy, "EGL_KHR_no_config_context")) {
++        EGLint id = 0, n = 0;
++        EGLint attrs[] = { EGL_CONFIG_ID, 0, EGL_NONE };
++
++        if (!eglQueryContext(dpy, share, EGL_CONFIG_ID, &id)) {
++            return false;
++        }
++        attrs[1] = id;
++        if (!eglChooseConfig(dpy, attrs, &cfg, 1, &n) || n != 1) {
++            return false;
++        }
++    }
++    gpu.ctx = eglCreateContext(dpy, cfg, share, ctx_attrs);
++    if (gpu.ctx == EGL_NO_CONTEXT) {
++        qemu_log("virtio-media-diag: gpu_xfer: eglCreateContext failed "
++                 "(0x%x), GPU path disabled\n", eglGetError());
++        return false;
++    }
++    gpu.dpy = dpy;
++    return true;
++}
++
++/*
++ * Switch to the bridge context. false = nothing current (virgl idle or not
++ * initialised) or the context could not be created: caller falls back.
++ */
++static bool gpu_enter(GpuSaved *sv)
++{
++    if (!virtio_gpu_virgl_ready) {
++        return false;
++    }
++    sv->ctx = eglGetCurrentContext();
++    if (sv->ctx == EGL_NO_CONTEXT) {
++        return false;
++    }
++    sv->dpy = eglGetCurrentDisplay();
++    sv->draw = eglGetCurrentSurface(EGL_DRAW);
++    sv->read = eglGetCurrentSurface(EGL_READ);
++    sv->api = eglQueryAPI();
++
++    if (gpu.ctx == EGL_NO_CONTEXT) {
++        if (gpu.tried) {
++            return false;
++        }
++        gpu.tried = true;
++        if (sv->api != EGL_OPENGL_ES_API) {
++            eglBindAPI(EGL_OPENGL_ES_API);
++        }
++        if (!gpu_create_context(sv->dpy, sv->ctx)) {
++            if (sv->api != EGL_OPENGL_ES_API) {
++                eglBindAPI(sv->api);
++            }
++            return false;
++        }
++        if (!eglMakeCurrent(gpu.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, gpu.ctx)) {
++            qemu_log("virtio-media-diag: gpu_xfer: eglMakeCurrent(aux) failed "
++                     "(0x%x), GPU path disabled\n", eglGetError());
++            eglDestroyContext(gpu.dpy, gpu.ctx);
++            gpu.ctx = EGL_NO_CONTEXT;
++            eglBindAPI(sv->api);
++            return false;
++        }
++        /*
++         * Not glCopyImageSubData: Mesa v3d wires resource_copy_region to
++         * util_resource_copy_region, a CPU map + copy, which lands in the
++         * very v3d_move_pixels tiling this path exists to avoid (measured
++         * 2026-09-05). glBlitFramebuffer goes through pipe->blit, where
++         * v3d_tfu_blit turns a full-surface same-format copy into a TFU job.
++         */
++        glGenFramebuffers(1, &gpu.draw_fbo);
++        qemu_log("virtio-media-diag: gpu_xfer: aux GL context ready (%s)\n",
++                 glGetString(GL_RENDERER));
++        return true;
++    }
++    if (sv->dpy != gpu.dpy) {
++        return false;
++    }
++    if (!eglMakeCurrent(gpu.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, gpu.ctx)) {
++        return false;
++    }
++    gpu_reap_orphans();
++    return true;
++}
++
++static void gpu_leave(const GpuSaved *sv)
++{
++    eglMakeCurrent(sv->dpy, sv->draw, sv->read, sv->ctx);
++    if (eglQueryAPI() != sv->api) {
++        eglBindAPI(sv->api);
++    }
++}
++
++void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
++                              uint32_t stride, uint32_t len, int *err)
++{
++    GpuSaved sv;
++    VirtIOMediaGpuBuf *b;
++    EGLImageKHR img;
++    EGLint attrs[] = {
++        EGL_WIDTH, width,
++        EGL_HEIGHT, height,
++        EGL_LINUX_DRM_FOURCC_EXT, VM_DRM_FORMAT_ABGR8888,
++        EGL_DMA_BUF_PLANE0_FD_EXT, dmabuf_fd,
++        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
++        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
++        /*
++         * Say "linear" explicitly. Without a modifier Mesa v3d imports with
++         * DRM_FORMAT_MOD_INVALID and guesses; a wrong guess reads the buffer
++         * as UIF tiles and shows garbage, not an error.
++         */
++        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(VM_DRM_FORMAT_MOD_LINEAR & 0xffffffffu),
++        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(VM_DRM_FORMAT_MOD_LINEAR >> 32),
++        EGL_NONE
++    };
++    int e = -EINVAL;
++
++    if (!gpu_enter(&sv)) {
++        close(dmabuf_fd);
++        if (err) {
++            *err = gpu.tried && gpu.ctx == EGL_NO_CONTEXT ? -ENOTSUP : -EAGAIN;
++        }
++        return NULL;
++    }
++    if (!gpu_have_egl_ext(gpu.dpy, "EGL_EXT_image_dma_buf_import_modifiers")) {
++        /* Drop the modifier pair; the array ends at the first EGL_NONE. */
++        attrs[12] = EGL_NONE;
++    }
++
++    img = eglCreateImageKHR(gpu.dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
++                            NULL, attrs);
++    if (img == EGL_NO_IMAGE_KHR) {
++        qemu_log("virtio-media-diag: gpu_xfer: eglCreateImageKHR(%ux%u stride "
++                 "%u fd %d) failed (0x%x)\n", width, height, stride, dmabuf_fd,
++                 eglGetError());
++        goto out_fail;
++    }
++
++    b = g_new0(VirtIOMediaGpuBuf, 1);
++    b->fd = dmabuf_fd;
++    b->width = width;
++    b->height = height;
++    b->stride = stride;
++    b->len = len;
++
++    while (glGetError() != GL_NO_ERROR) {
++        /* clear stale errors */
++    }
++    glGenTextures(1, &b->tex);
++    glBindTexture(GL_TEXTURE_2D, b->tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    eglDestroyImageKHR(gpu.dpy, img);
++    if (glGetError() != GL_NO_ERROR) {
++        qemu_log("virtio-media-diag: gpu_xfer: glEGLImageTargetTexture2DOES "
++                 "failed\n");
++        glDeleteTextures(1, &b->tex);
++        g_free(b);
++        goto out_fail;
++    }
++    gpu_leave(&sv);
++    return b;
++
++out_fail:
++    gpu_leave(&sv);
++    close(dmabuf_fd);
++    if (err) {
++        *err = e;
++    }
++    return NULL;
++}
++
++int virtio_media_gpu_blit(void *handle, uint32_t res_id)
++{
++    VirtIOMediaGpuBuf *b = handle;
++    struct virgl_renderer_resource_info info;
++    GpuSaved sv;
++    GLenum status, gl_err;
++    int ret = 0;
++
++    if (!b) {
++        return -EINVAL;
++    }
++    if (!virtio_gpu_virgl_ready) {
++        return -EAGAIN;
++    }
++    memset(&info, 0, sizeof(info));
++    if (virgl_renderer_resource_get_info(res_id, &info) != 0 || !info.tex_id) {
++        return -EINVAL;
++    }
++    /*
++     * The TFU path in Mesa v3d needs a full-surface copy between identical
++     * formats: the gralloc resource is padded to the same width as the V4L2
++     * bytesperline (368 for 360 wide, 1280 for 720p), which is why this
++     * matches in practice. VIRGL_FORMAT_R8G8B8A8_UNORM = 67 is what minigbm
++     * creates for HAL_PIXEL_FORMAT_RGBA_8888 and matches AB24 byte for byte.
++     */
++    if (info.width != b->width || info.height != b->height ||
++        info.virgl_format != 67 /* VIRGL_FORMAT_R8G8B8A8_UNORM */) {
++        return -EINVAL;
++    }
++    if (!gpu_enter(&sv)) {
++        return -EAGAIN;
++    }
++    while (glGetError() != GL_NO_ERROR) {
++        /* clear stale errors */
++    }
++    if (b->sync) {
++        /* Previous copy of this buffer must be gone before we reuse the fence. */
++        glDeleteSync(b->sync);
++        b->sync = NULL;
++    }
++
++    if (!b->read_fbo) {
++        glGenFramebuffers(1, &b->read_fbo);
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read_fbo);
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_2D, b->tex, 0);
++    } else {
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read_fbo);
++    }
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
++    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, info.tex_id, 0);
++    status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
++    if (status != GL_FRAMEBUFFER_COMPLETE ||
++        glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++        ret = -EIO;
++        goto out;
++    }
++    glBlitFramebuffer(0, 0, b->width, b->height, 0, 0, b->width, b->height,
++                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    gl_err = glGetError();
++    if (gl_err != GL_NO_ERROR) {
++        qemu_log("virtio-media-diag: gpu_xfer: copy to res %u tex %u failed, "
++                 "GL error 0x%x\n", res_id, info.tex_id, gl_err);
++        ret = -EIO;
++        goto out;
++    }
++    b->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    /* Submit now so virgl's next draw (other context) orders behind it. */
++    glFlush();
++out:
++    gpu_leave(&sv);
++    return ret;
++}
++
++int virtio_media_gpu_wait(void *handle)
++{
++    VirtIOMediaGpuBuf *b = handle;
++    GpuSaved sv;
++    GLenum r;
++    int ret;
++
++    if (!b || !b->sync) {
++        return 0;
++    }
++    if (!gpu_enter(&sv)) {
++        return -EAGAIN;
++    }
++    r = glClientWaitSync(b->sync, 0, 0);
++    if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
++        ret = 0;
++    } else {
++        /* Bounded: a TFU job on a 720p frame is well under a millisecond. */
++        r = glClientWaitSync(b->sync, GL_SYNC_FLUSH_COMMANDS_BIT,
++                             200 * 1000 * 1000ull);
++        ret = (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) ? 1 : -EIO;
++    }
++    glDeleteSync(b->sync);
++    b->sync = NULL;
++    gpu_leave(&sv);
++    return ret;
++}
++
++void virtio_media_gpu_release(void *handle)
++{
++    VirtIOMediaGpuBuf *b = handle;
++    GpuSaved sv;
++
++    if (!b) {
++        return;
++    }
++    close(b->fd);
++    if (gpu_enter(&sv)) {
++        gpu_free_buf(b);
++        gpu_leave(&sv);
++    } else {
++        gpu_orphans = g_slist_prepend(gpu_orphans, b);
++    }
++}
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index f6acf1fe8..bc094b762 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -153,6 +153,10 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+     int i, p;
+ 
+     for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
++        if (q->gpu_buf[i]) {
++            virtio_media_gpu_release(q->gpu_buf[i]);
++            q->gpu_buf[i] = NULL;
++        }
+         for (p = 0; p < VIDEO_MAX_PLANES; p++) {
+             if (q->host_map[i][p]) {
+                 munmap(q->host_map[i][p], q->host_len[i][p]);
+@@ -165,6 +169,7 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+     q->num_bufs = 0;
+     q->num_host_planes = 0;
+     q->streaming = false;
++    q->gpu_failed = false;
+ }
+ 
+ static void virtio_media_session_free(VirtIOMediaSession *s)
+@@ -460,6 +465,58 @@ static void virtio_media_host_readable(void *opaque)
+                      * memory (see host_xfer in the header). Single-plane
+                      * RGBA only; a planar format falls back to the copy.
+                      */
++                    /*
++                     * GPU path first (gpu_xfer in the header): export the
++                     * host buffer once, then copy on the GPU each frame.
++                     * The width handed to GL is the padded one, which is
++                     * also the gralloc resource's width.
++                     */
++                    if (vm->gpu_xfer && gb->virgl_res && p == 0 &&
++                        gb->num_planes == 1 && q->width && q->height &&
++                        q->bytesperline >= q->width * 4 && !q->gpu_failed) {
++                        uint32_t idx = evt.buffer.index;
++                        int r;
++
++                        if (!q->gpu_buf[idx]) {
++                            struct v4l2_exportbuffer eb = {
++                                .type = q->type, .index = idx, .plane = 0,
++                                .flags = O_RDONLY | O_CLOEXEC,
++                            };
++                            int e = 0;
++
++                            if (ioctl(s->fd, VIDIOC_EXPBUF, &eb) < 0) {
++                                q->gpu_failed = true;
++                                qemu_log("virtio-media-diag: gpu_xfer: "
++                                         "VIDIOC_EXPBUF failed (%d), GPU "
++                                         "path off for this queue\n", errno);
++                            } else {
++                                q->gpu_buf[idx] = virtio_media_gpu_import(
++                                        eb.fd, q->bytesperline / 4, q->height,
++                                        q->bytesperline, q->host_len[idx][p],
++                                        &e);
++                                if (!q->gpu_buf[idx] && e != -EAGAIN) {
++                                    q->gpu_failed = true;
++                                    qemu_log("virtio-media-diag: gpu_xfer: "
++                                             "import failed (%d), GPU path "
++                                             "off for this queue\n", e);
++                                }
++                            }
++                        }
++                        r = q->gpu_buf[idx]
++                            ? virtio_media_gpu_blit(q->gpu_buf[idx], gb->virgl_res)
++                            : -EAGAIN;
++                        if (r == 0) {
++                            continue;
++                        }
++                        if (r != -EAGAIN) {
++                            vm->gpu_xfer_fail++;
++                            if (vm->gpu_xfer_fail <= 4) {
++                                qemu_log("virtio-media-diag: gpu_xfer res=%u "
++                                         "failed (%d), using host_xfer\n",
++                                         gb->virgl_res, r);
++                            }
++                        }
++                    }
+                     if (vm->host_xfer && gb->virgl_res && p == 0 &&
+                         gb->num_planes == 1 && q->width && q->height) {
+                         int r = virtio_media_virgl_transfer(
+@@ -938,6 +995,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+         }
+     }
+ 
++    /*
++     * A capture buffer that the GPU copied from (gpu-xfer) must not go back
++     * to the codec while that copy may still be reading it.
++     */
++    if (virtio_media_queue_index(b->type) == 1 && q->gpu_buf[b->index]) {
++        virtio_media_gpu_wait(q->gpu_buf[b->index]);
++    }
++
+     /* Now queue the host's own buffer, which is MMAP. */
+     {
+         struct v4l2_buffer hb = *b;
+@@ -1454,6 +1519,7 @@ static const VMStateDescription vmstate_virtio_media = {
+ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
++    DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
+ };
+ 
+ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 04a25e0f2..6193a4cfd 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -1,9 +1,24 @@
+ /*
+- * virtio-media -> libvirglrenderer bridge.
++ * virtio-media -> libvirglrenderer / GL bridge.
+  *
+- * Writes a linear RGBA frame that lives in host memory into a virgl resource
+- * owned by the virtio-gpu-gl device in the same process. Built only when
+- * QEMU is linked with virglrenderer; the stub returns -ENOTSUP otherwise.
++ * Two ways to get a decoded frame that lives in a host V4L2 buffer into the
++ * virgl resource the guest is going to sample, both running in this process
++ * on the main loop:
++ *
++ *  - virtio_media_virgl_transfer(): CPU path. virglrenderer's
++ *    transfer_write_iov -> glTexSubImage2D. On V3D (RPi4) Mesa tiles the
++ *    linear image into UIF with the CPU (v3d_move_pixels_general_percpp),
++ *    which costs 7-9 ms per 720p frame.
++ *
++ *  - virtio_media_gpu_*(): GPU path. The host V4L2 buffer is exported as a
++ *    dmabuf, imported as a linear EGLImage texture, and copied into the virgl
++ *    resource's texture on the GPU (Mesa v3d turns a full-surface raster ->
++ *    UIF copy into a TFU job). The CPU touches no pixel. Needs its own EGL
++ *    context sharing with virgl's; see virtio-media-virgl.c for the context
++ *    discipline.
++ *
++ * Built only when QEMU is linked with virglrenderer; the stub returns
++ * -ENOTSUP / NULL otherwise.
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+@@ -19,4 +34,28 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+                                 uint32_t height, uint32_t stride,
+                                 void *host, size_t len);
+ 
++/*
++ * GPU path. All calls on the main loop.
++ *
++ * import: takes ownership of dmabuf_fd (closed on release or failure).
++ *   width is the padded width in pixels (bytesperline / 4), height the
++ *   number of rows, stride the bytesperline. Returns an opaque handle or
++ *   NULL (errno-style reason in *err: -EAGAIN no GL context yet, -ENOTSUP
++ *   missing EGL/GL features, -EINVAL import rejected).
++ * blit: copies the whole imported image into virgl resource res_id.
++ *   Returns 0, or -EINVAL when the resource does not match the image
++ *   (size / format), -EAGAIN when no GL context is current, -EIO on GL
++ *   error. On 0 a fence is armed for the buffer.
++ * wait: makes sure the last blit that read this buffer has completed on the
++ *   GPU before the buffer is handed back to the V4L2 device. Returns 1 if it
++ *   actually had to wait, 0 if the fence was already signalled or absent,
++ *   negative if the wait failed (the caller should still requeue).
++ * release: frees the GL objects and the fd.
++ */
++void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
++                              uint32_t stride, uint32_t len, int *err);
++int virtio_media_gpu_blit(void *handle, uint32_t res_id);
++int virtio_media_gpu_wait(void *handle);
++void virtio_media_gpu_release(void *handle);
++
+ #endif
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 19cc345e8..2da0ed63d 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -191,6 +191,14 @@ typedef struct VirtIOMediaQueue {
+     uint32_t bytesperline;
+     /* Host MMAP buffers this device allocated on the host fd, mmap()ed. */
+     void *host_map[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
++    /*
++     * gpu-xfer: the same host buffers exported as dmabuf and imported into
++     * GL (virtio-media-virgl.c), created lazily at the first DQBUF of each
++     * index, dropped with the mappings. gpu_failed stops retrying once the
++     * import has been refused for this queue.
++     */
++    void *gpu_buf[VIRTIO_MEDIA_MAX_BUFFERS];
++    bool gpu_failed;
+     uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
+     /* Guest buffers by index, mirrored onto the host buffer of the same index. */
+     VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
+@@ -226,6 +234,14 @@ struct VirtIOMedia {
+      */
+     bool host_xfer;
+     uint64_t host_xfer_fail;
++    /*
++     * gpu-xfer: like host-xfer, but the copy into the virgl resource is done
++     * by the GPU (dmabuf import + TFU copy on V3D) instead of virglrenderer's
++     * CPU tiling. Tried first; falls back to host-xfer, then to the copy into
++     * guest memory.
++     */
++    bool gpu_xfer;
++    uint64_t gpu_xfer_fail;
+ 
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;

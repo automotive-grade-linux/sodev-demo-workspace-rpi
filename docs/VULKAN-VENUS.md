@@ -23,7 +23,7 @@ This is the authoritative list of what that means:
 | Xen + libxl | `4.22-0007/0008/0009/0010` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices, one SPI per virtio-pci slot); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
 | rpi4 4 GiB SKU memory | DomD 1440 MiB / DomA 2048 MiB | DomD 1056 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
-| DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in qemu 10.0.2 |
+| DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in the qemu 10.0.2 and 11.1.2 device models |
 
 Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.4 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from
@@ -281,8 +281,8 @@ selectable and is what this section's 10.0.2 measurements are of. The fork also 
 sources too old (see the skew note below).
 
 A second device model, qemu 11.1.2 (`qemu_11.1.2.bb`: the upstream release
-tarball with the fork's v10.0.2-xt commits and this layer's first 10.0.2 ports
-as `q11-NNN` patches), is both boards' `vulkan`-lane device model, with
+tarball with the fork's v10.0.2-xt commits and this layer's 10.0.2 series ported
+onto it as `q11-NNN` patches), is both boards' `vulkan`-lane device model, with
 weston 16.0.0 and virglrenderer 1.3.0. Each board yaml selects it by setting
 `PREFERRED_VERSION_qemu` to `"11.1.2"` on the `vulkan` lane's DomD conf line and,
 with `--dom0=linux`, `XT_DOM0_QEMU_VERSION` to the same value: that

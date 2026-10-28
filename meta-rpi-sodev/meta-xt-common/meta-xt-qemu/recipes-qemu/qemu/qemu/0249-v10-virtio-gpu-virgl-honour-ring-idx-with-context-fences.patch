@@ -1,0 +1,140 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 2 Oct 2026 11:51:06 +0900
+Subject: [PATCH] virtio-gpu-virgl: honour INFO_RING_IDX with context fences
+
+A Venus guest that negotiated CONTEXT_INIT sends its fenced SUBMIT_3D
+with VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX: a fence on
+one ring of that context. virgl_process_cmd() ignored ring_idx and
+always created a ctx0 fence with virgl_renderer_create_fence(). On the
+RPi4 (AAOS WebView, ~150 such fences a second) that meant an EGL sync
+created on the main thread per fence, polled every millisecond, and a
+fence that signals when vrend's GL work is done instead of when the
+Venus context reaches it.
+
+Create a per-context fence (virgl_renderer_context_create_fence,
+mergeable) for those commands and retire them from the v3
+write_context_fence callback, every pending fence of that ctx/ring up to
+the reported id. ctx0 retirement skips them. If virglrenderer refuses
+the context fence the command falls back to a ctx0 fence as before. The
+callback struct is raised to version 3 (still 4 with an EGL display).
+
+virglrenderer frees a context's pending context fences when the context
+is destroyed, without reporting them, and a guest process that exits or
+is killed sends CTX_DESTROY without waiting for its fences. So
+CTX_DESTROY, once the context is gone, answers every command still
+waiting on a fence of one of its rings. Left in the queue they would
+never be answered (leaking the guest's descriptors and keeping the fence
+poll timer running), and a new context reusing the ctx_id would retire
+them.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -550,6 +550,35 @@
+     virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen, cc.debug_name);
+ }
+ 
++/*
++ * Answer the commands waiting on a fence of one of ctx_id's rings
++ * (INFO_RING_IDX): those of ring ring_idx up to fence_id, or with any_ring
++ * all of them.
++ */
++static void virgl_retire_ring_fences(VirtIOGPU *g, uint32_t ctx_id,
++                                     bool any_ring, uint32_t ring_idx,
++                                     uint64_t fence_id)
++{
++    struct virtio_gpu_ctrl_command *cmd, *tmp;
++
++    QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
++        if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) ||
++            cmd->cmd_hdr.ctx_id != ctx_id ||
++            (!any_ring && cmd->cmd_hdr.ring_idx != ring_idx) ||
++            cmd->cmd_hdr.fence_id > fence_id) {
++            continue;
++        }
++        trace_virtio_gpu_fence_resp(cmd->cmd_hdr.fence_id);
++        virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
++        QTAILQ_REMOVE(&g->fenceq, cmd, next);
++        g_free(cmd);
++        g->inflight--;
++        if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
++            trace_virtio_gpu_dec_inflight_fences(g->inflight);
++        }
++    }
++}
++
+ static void virgl_cmd_context_destroy(VirtIOGPU *g,
+                                       struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -559,6 +588,12 @@
+     trace_virtio_gpu_cmd_ctx_destroy(cd.hdr.ctx_id);
+ 
+     virgl_renderer_context_destroy(cd.hdr.ctx_id);
++    /*
++     * virglrenderer frees the context's pending ring fences without reporting
++     * them, so answer those commands now: otherwise they stay in fenceq
++     * forever (and a new context reusing ctx_id would retire them instead).
++     */
++    virgl_retire_ring_fences(g, cd.hdr.ctx_id, true, 0, UINT64_MAX);
+ }
+ 
+ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
+@@ -1177,6 +1212,20 @@
+     }
+ 
+     trace_virtio_gpu_fence_ctrl(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
++    /*
++     * A fence on one of the context's rings (Venus timelines) belongs to that
++     * context: it signals when the context reaches it, which a ctx0 (vrend)
++     * fence does not express. It also spares the main thread an EGL sync per
++     * fence. Fall back to ctx0 only if virglrenderer refuses it.
++     */
++    if ((cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) &&
++        !virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id,
++                                             VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
++                                             cmd->cmd_hdr.ring_idx,
++                                             cmd->cmd_hdr.fence_id)) {
++        return;
++    }
++    cmd->cmd_hdr.flags &= ~VIRTIO_GPU_FLAG_INFO_RING_IDX;
+     virgl_renderer_create_fence(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
+ }
+ 
+@@ -1193,6 +1242,10 @@
+         if (cmd->cmd_hdr.fence_id > fence) {
+             continue;
+         }
++        /* context-ring fences are retired by virgl_write_context_fence() */
++        if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
++            continue;
++        }
+         trace_virtio_gpu_fence_resp(cmd->cmd_hdr.fence_id);
+         virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+         QTAILQ_REMOVE(&g->fenceq, cmd, next);
+@@ -1237,9 +1290,22 @@
+                                    qctx);
+ }
+ 
++/*
++ * Per-context fence (v3 callback). Fences signal in order within one ring, and with
++ * VIRGL_RENDERER_FENCE_FLAG_MERGEABLE virglrenderer may report only the latest, so
++ * retire every pending fence of that ring up to fence_id.
++ */
++static void virgl_write_context_fence(void *opaque, uint32_t ctx_id,
++                                      uint32_t ring_idx, uint64_t fence_id)
++{
++    virgl_retire_ring_fences(opaque, ctx_id, false, ring_idx, fence_id);
++}
++
+ static struct virgl_renderer_callbacks virtio_gpu_3d_cbs = {
+-    .version             = 1,
++    /* >= 3 for write_context_fence; raised to 4 below when an EGL display is set */
++    .version             = 3,
+     .write_fence         = virgl_write_fence,
++    .write_context_fence = virgl_write_context_fence,
+     .create_gl_context   = virgl_create_context,
+     .destroy_gl_context  = virgl_destroy_context,
+     .make_current        = virgl_make_context_current,

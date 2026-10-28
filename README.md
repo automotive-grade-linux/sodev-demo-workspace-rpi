@@ -289,7 +289,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | Dom0 (zephyr) | Zephyr xenstore server (patch series under `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`, applied on the upstream Zephyr Dom0 tree) |
 | Dom0 (linux) / DomD kernel | Linux 6.18.33 (`linux-raspberrypi`) |
 | DomD graphics | Mesa 26.2.4 (pinned ahead of wrynose's 26.0.5 by `meta-xt-driver-domain`'s `mesa.bbappend`, in both `--gpu` lanes), weston (kiosk-shell): 16.0.0 from `meta-xt-driver-domain` on both boards' `vulkan` lane, poky's 15.0.0 on `gl`; libdrm 2.4.131; virglrenderer: 1.3.0 from `meta-xt-driver-domain` on both boards' `vulkan` lane, poky's 1.2.0 on `gl` |
-| DomD device-model | `--gpu=vulkan` (the default): QEMU 11.1.2 (the upstream release with the fork's commits and the first ports) on both boards; `--gpu=gl`: 7.0.0-xt. Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock. The fork's 10.0.2-xt recipe stays in `meta-xt-qemu` and is selected by setting `PREFERRED_VERSION_qemu` to `"10.0.2"` on the `vulkan` lane's DomD conf line of the board yaml (with weston and virglrenderer back to 15.% and 1.2.%) and, for `--dom0=linux`, `XT_DOM0_QEMU_VERSION` to the same value (that Dom0 writes the guest cfgs). |
+| DomD device-model | `--gpu=vulkan` (the default): QEMU 11.1.2 (the upstream release with the 10.0.2-xt patches ported onto it) on both boards; `--gpu=gl`: 7.0.0-xt. Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock. The fork's 10.0.2-xt recipe stays in `meta-xt-qemu` and is selected by setting `PREFERRED_VERSION_qemu` to `"10.0.2"` on the `vulkan` lane's DomD conf line of the board yaml (with weston and virglrenderer back to 15.% and 1.2.%) and, for `--dom0=linux`, `XT_DOM0_QEMU_VERSION` to the same value (that Dom0 writes the guest cfgs). |
 | DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch, plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
 | DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). The virtio contract is the V4H one: a complete V4H-built AAOS image (kernel, ramdisk and p4 from one build) boots unmodified -- measured in 2026-07 with a V4H Android 17 image on this stack while it was still Android 15. `build.sh` nevertheless accepts only prebuilt bundles that declare this tree's own generation (Android 17 / GKI 6.18.32, `BUNDLE-INFO`): the failure it guards against is a *mixed* set, a guest kernel and a `vendor_dlkm` from different builds, which share no `module_layout` and boot to a black panel |
 | DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`meta-xt-domz/zephyr-apps/domz/`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
@@ -536,7 +536,7 @@ licenses in order to be used in a commercial product". Accepting a flag only let
 the recipe build; it says nothing about which licences, if any, apply.
 
 **What is included.** DomA's hardware HEVC decode runs through DomD: the device
-model (qemu 10.0.2) drives the BCM2712 HEVC decoder (`rpi-hevc-dec`) with
+model (qemu 10.0.2 or 11.1.2) drives the BCM2712 HEVC decoder (`rpi-hevc-dec`) with
 libavcodec's V4L2 request-API hwaccel. Upstream FFmpeg, and so poky's `ffmpeg`, does
 not have that hwaccel; Raspberry Pi's FFmpeg fork does. meta-raspberrypi builds the
 fork as `rpidistro-ffmpeg`, from the RPi-Distro/ffmpeg tree that Raspberry Pi OS
@@ -557,7 +557,7 @@ DomD `conf:` list in `rpi5-sodev.yaml` writes
 The Dom0 `conf:` list of the `linux` flavour writes the same three lines into
 `yocto/build-dom0/conf/moulin.conf`: that Dom0's image installs no qemu, but its
 build makes the qemu xen-tools recommends, and on the `vulkan` lane that is the
-10.0.2 one, which needs this FFmpeg.
+11.1.2 one, which needs this FFmpeg.
 `meta-xt-rpi5` itself does not accept the flag, so a build that adds the layer
 without this configuration stops with "Has a restricted license 'commercial' which
 is not listed in your LICENSE_FLAGS_ACCEPTED" until its own configuration accepts
@@ -575,7 +575,8 @@ needs FFmpeg, or the build stops at `Nothing PROVIDES 'rpidistro-ffmpeg'`:
   `vulkan` choice of the `GPU` parameter gives `XT_DOMA_HWDEC`), which takes the
   virtio-media decoder out of `doma.cfg` and the codec2 HAL out of DomA;
 - remove `rpidistro-ffmpeg` from `DEPENDS:append:raspberrypi5` in
-  `meta-xt-common/meta-xt-qemu/recipes-qemu/qemu/qemu_10.0.2.bb`;
+  `meta-xt-common/meta-xt-qemu/recipes-qemu/qemu/qemu_11.1.2.bb` (and in
+  `qemu_10.0.2.bb`, if that one is selected);
 - remove `ffmpeg` from `DOMD_HEVC_PACKAGES:raspberrypi5` in
   `meta-xt-rpi5/recipes-core/images/rpi5-image-xt-domd-v4h.bbappend`.
 

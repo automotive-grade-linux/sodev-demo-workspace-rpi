@@ -1,0 +1,1899 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: add a stateful decoder mode backed by
+ libavcodec
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0217-v10-hw-virtio-media-add-a-stateful-decoder-mode.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/meson.build            |    6 +
+ hw/virtio/virtio-media-decoder.c | 1384 ++++++++++++++++++++++++++++++
+ hw/virtio/virtio-media.c         |  195 ++++-
+ include/hw/virtio/virtio-media.h |   72 ++
+ meson.build                      |   31 +
+ 5 files changed, 1667 insertions(+), 21 deletions(-)
+ create mode 100644 hw/virtio/virtio-media-decoder.c
+
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index a9d1cfb2b..0ecc6d4d9 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -97,6 +97,12 @@ system_virtio_ss.add_all(when: 'CONFIG_VIRTIO_PCI', if_true: virtio_pci_ss)
+ 
+ system_ss.add_all(when: 'CONFIG_VIRTIO', if_true: system_virtio_ss)
+ system_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media.c'))
++# Decoder mode links libavcodec/libavutil/libswscale. The file is compiled
++# unconditionally and stubs itself out when CONFIG_VIRTIO_MEDIA_DECODER is unset,
++# so virtio-media.c needs no #ifdef and a build without ffmpeg still links.
++system_ss.add(when: 'CONFIG_VIRTIO_MEDIA',
++              if_true: [files('virtio-media-decoder.c'),
++                        libavcodec, libavutil, libswscale])
+ system_ss.add(when: ['CONFIG_VIRTIO_MEDIA', virgl, opengl], if_true: [files('virtio-media-virgl.c'), virgl, opengl],
+                                                              if_false: files('virtio-media-virgl-stub.c'))
+ stub_ss.add(files('vhost-stub.c'))
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+new file mode 100644
+index 000000000..4e724f1a5
+--- /dev/null
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -0,0 +1,1384 @@
++/*
++ * VIRTIO-MEDIA decoder mode -- a STATEFUL decoder for the guest, driven by
++ * libavcodec on the host.
++ *
++ * WHY THIS EXISTS. On a Raspberry Pi 5 the only video decode block is
++ * codec@800000 (brcm,bcm2712-hevc-dec), and its driver rpi-hevc-dec is a
++ * STATELESS V4L2 decoder: it registers a media device (hevc_d.c:281) and
++ * expects the client to parse the bitstream, fill v4l2_ctrl_hevc_{sps,pps,
++ * slice_params,decode_params}, build the DPB, and submit each frame through a
++ * request fd. Two things make that impossible to expose to DomA directly:
++ *
++ *   - virtio-media has no media device and no request fd. Its protocol has
++ *     five commands (OPEN/CLOSE/IOCTL/MMAP/MUNMAP) and no concept of a file
++ *     descriptor, and the guest driver registers only a video_device, so there
++ *     is nothing for MEDIA_IOC_REQUEST_ALLOC to act on.
++ *   - Android's external/v4l2_codec2 has no stateless support at all: zero
++ *     references to V4L2_CID_STATELESS, media_request or
++ *     MEDIA_IOC_REQUEST_ALLOC, and its one slice-based option (the
++ *     sliceBased argument of V4L2Device::c2ProfileToV4L2PixFmt()) is only
++ *     ever passed false, by the encoder.
++ *
++ * So the conversion happens here instead: the guest sees an ordinary stateful
++ * decoder -- V4L2_PIX_FMT_HEVC in, linear NV12 out, SOURCE_CHANGE and
++ * DECODER_CMD as usual -- and the stateless driving is libavcodec's problem.
++ * That keeps the virtio-media protocol unchanged, and neither the guest
++ * driver nor the Android side needs anything HEVC- or stateless-specific.
++ *
++ * WHY libavcodec RATHER THAN A HAND-ROLLED PARSER. The fields rpi-hevc-dec
++ * actually reads are few (18 of v4l2_ctrl_hevc_slice_params, 15 of sps, 7 of
++ * pps), but a bitstream is positional: everything ahead of a field has to be
++ * parsed to reach it, and decode_params.dpb plus the per-slice ref_idx lists
++ * are POC computation and reference-picture-set management -- the hard part of
++ * HEVC. Hand-rolled that is ~2000-2500 lines of correctness-critical code.
++ * meta-raspberrypi's rpidistro-ffmpeg already ships the whole stateless stack
++ * (v4l2_request_hevc.c, v4l2_req_media.c, the generation-specific
++ * v4l2_req_hevc_v1..v4.c, /dev/mediaN discovery, a poll multiplexer) plus SAND
++ * detiling with an AArch64 NEON implementation. Reusing it is the difference
++ * between a dependency and a decoder.
++ *
++ * WHAT THIS FILE IS. The guest-facing stateful contract, on top of
++ * libavcodec's HEVC decoder; which backend libavcodec decodes with (software,
++ * or the v4l2request hwaccel on codec@800000) does not change that contract.
++ * Decoder mode needs NO host V4L2 device, so an x86 qemu running the guest
++ * kernel and virtio-media.ko can drive it end-to-end with a real HEVC stream.
++ *
++ * ONE THING DECODER MODE GETS FOR FREE. The proxy path has to poll a host fd
++ * for events, which is where the vb2_poll()/file-I/O-emulation trap lives (see
++ * virtio_media_update_fd_handler). Here there is no host fd and no poll:
++ * completions and SOURCE_CHANGE are produced synchronously by the QBUF that
++ * caused them, so that entire failure mode does not exist.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/error-report.h"
++#include "qemu/cutils.h"        /* pstrcpy */
++#include "qapi/error.h"
++#include "hw/virtio/virtio-media.h"
++
++#ifdef CONFIG_VIRTIO_MEDIA_DECODER
++
++#include <libavcodec/avcodec.h>
++#include <libavutil/imgutils.h>
++#include <libswscale/swscale.h>
++
++/*
++ * Guest-visible constants.
++ *
++ * MPLANE, not the single-planar API: v4l2_codec2 requires
++ * V4L2_CAP_VIDEO_M2M_MPLANE and creates OUTPUT_MPLANE/CAPTURE_MPLANE queues
++ * (V4L2Decoder::start()), so offering the single-planar types would fail
++ * its very first check.
++ *
++ * NV12 with ONE plane, not NM12 with two: v4l2_codec2 accepts both
++ * (kSupportedOutputFourccs in V4L2Decoder.h) but a single contiguous plane
++ * is one SG copy per frame instead of two, and gralloc hands out a single
++ * YCBCR_420_888 allocation anyway.
++ */
++#define DEC_OUT_FOURCC  V4L2_PIX_FMT_HEVC
++#define DEC_CAP_FOURCC  V4L2_PIX_FMT_NV12
++
++/*
++ * What we tell the guest before the stream's own resolution is known.
++ * v4l2_codec2 deliberately configures the smallest format it can and waits for
++ * SOURCE_CHANGE (setupInitialOutput/setupMinimalOutputFormat), so this only has
++ * to be a legal, small size.
++ */
++#define DEC_MIN_W 128
++#define DEC_MIN_H 128
++#define DEC_MAX_W 4096
++#define DEC_MAX_H 4096
++
++/*
++ * Reported through V4L2_CID_MIN_BUFFERS_FOR_CAPTURE. v4l2_codec2 reads it and
++ * adds its own headroom (kNumExtraOutputBuffers, in
++ * V4L2Decoder::getNumOutputBuffers()). HEVC allows up to 16 reference
++ * pictures, and libavcodec holds frames it has not yet output, so a number
++ * below the DPB size would deadlock: the guest would own too few buffers for
++ * the decoder to ever make progress.
++ */
++#define DEC_MIN_CAP_BUFS 18
++
++/* Compressed input we are willing to accept for one frame. */
++#define DEC_MAX_OUT_SIZE (4 * 1024 * 1024)
++
++/* Frames one dec_pump() call may deliver; see the loop for why it is bounded. */
++#define DEC_PUMP_MAX_FRAMES 4
++
++struct VirtIOMediaDec {
++    /* Negotiated formats. */
++    uint32_t coded_w, coded_h;      /* what the CAPTURE format currently says */
++    uint32_t visible_w, visible_h;  /* the stream's cropping rectangle */
++    uint32_t out_sizeimage;         /* OUTPUT sizeimage the guest asked for */
++
++    /*
++     * Set once libavcodec has told us the real resolution. Until then the
++     * guest's CAPTURE format is the placeholder above and no frame may be
++     * delivered -- the buffers are the wrong size.
++     */
++    bool stream_fmt_known;
++    uint32_t stream_w, stream_h;
++
++    /* Event subscriptions. Unsubscribed events must not be sent. */
++    bool sub_source_change;
++    bool sub_eos;
++
++    /*
++     * A SOURCE_CHANGE has been sent and the guest has not finished
++     * re-negotiating. Frames are held rather than written into buffers sized
++     * for the old format.
++     */
++    bool awaiting_reconfig;
++
++    /* Stateful drain, driven by VIDIOC_DECODER_CMD(V4L2_DEC_CMD_STOP). */
++    bool draining;
++    bool drain_done;
++
++    /* libavcodec. */
++    AVCodecContext *avctx;
++    AVPacket *pkt;
++    AVFrame *frame;         /* scratch for receive_frame */
++    AVFrame *held;          /* a frame received while awaiting_reconfig */
++    struct SwsContext *sws; /* only if the decoder does not give us NV12 */
++    /*
++     * The full cache key. Input geometry is part of it: see dec_write_frame.
++     */
++    int sws_src_fmt;
++    int sws_src_w, sws_src_h;
++    int sws_w, sws_h;
++};
++
++/* ------------------------------------------------------------------------- */
++/* helpers                                                                   */
++/* ------------------------------------------------------------------------- */
++
++bool virtio_media_dec_available(void)
++{
++    return true;
++}
++
++/*
++ * NORMALISE A RESOLUTION BEFORE IT IS EVER STORED.
++ *
++ * Clamped to [MIN, MAX] and ROUNDED UP TO EVEN, and every path that sets
++ * coded_w/coded_h or stream_w/stream_h goes through here. Two separate bugs made
++ * that necessary:
++ *
++ *   ODD HEIGHT UNDER-SIZED THE BUFFER. sizeimage was w*h*3/2, but NV12's real
++ *   size is w*h + w*ceil(h/2): the chroma plane has ceil(h/2) rows, not h/2.
++ *   For 1920x1079 that is 960 bytes short, and dec_write_frame() g_malloc()s
++ *   sizeimage and then hands the pointer to av_image_copy()/sws_scale(), which
++ *   write ceil(h/2) chroma rows -- a heap overflow whose CONTENTS are decoded
++ *   picture data, i.e. attacker-chosen. Reachable two ways: a guest that never
++ *   subscribes to SOURCE_CHANGE can simply S_FMT an odd height (ENUM_FRAMESIZES
++ *   advertises step 2 but nothing enforced it), and a stream whose SPS
++ *   conformance window crops to an odd height forces it even for a well-behaved
++ *   guest.
++ *
++ *   THE CLAMP WAS BYPASSED once the stream size was known: S_FMT took
++ *   stream_w/stream_h verbatim, and those come from the SPS. DEC_MAX_W/H were
++ *   documented but not enforced, so an 8192x8192 stream made every frame a
++ *   100 MB allocation, and at extreme sizes w*h*3 overflows u32 and sizeimage
++ *   becomes tiny while the copy stays huge.
++ *
++ * Rounding up rather than down is deliberate: the buffer is then at least as
++ * large as the frame needs, so a decoder that produces an odd height writes
++ * inside it.
++ */
++static void dec_norm_dims(uint32_t *w, uint32_t *h)
++{
++    uint32_t ww = *w, hh = *h;
++
++    if (ww < DEC_MIN_W) {
++        ww = DEC_MIN_W;
++    }
++    if (hh < DEC_MIN_H) {
++        hh = DEC_MIN_H;
++    }
++    if (ww > DEC_MAX_W) {
++        ww = DEC_MAX_W;
++    }
++    if (hh > DEC_MAX_H) {
++        hh = DEC_MAX_H;
++    }
++    *w = (ww + 1) & ~1u;
++    *h = (hh + 1) & ~1u;
++}
++
++static uint32_t dec_cap_sizeimage(uint32_t w, uint32_t h)
++{
++    /*
++     * NV12: w*h of luma followed by ceil(h/2) rows of w bytes of interleaved
++     * CbCr. Written out rather than as w*h*3/2 so it stays correct if a caller
++     * ever gets an odd height past dec_norm_dims(), and computed in 64 bits with
++     * a cap because DEC_MAX_W * DEC_MAX_H * 3 / 2 is 25 MB -- comfortably inside
++     * u32, but only because of the clamp, and this must not depend on that.
++     */
++    uint64_t sz = (uint64_t)w * h + (uint64_t)w * ((h + 1) / 2);
++
++    if (sz > (uint64_t)DEC_MAX_W * DEC_MAX_H * 2) {
++        return 0;   /* callers treat 0 as "refuse" */
++    }
++    return (uint32_t)sz;
++}
++
++/*
++ * Fill a v4l2_pix_format_mplane for whichever queue was asked about. Both
++ * G_FMT and S_FMT answer with this, so the guest can never observe a format we
++ * did not agree to.
++ */
++static void dec_fill_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
++{
++    struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++    bool out = V4L2_TYPE_IS_OUTPUT(f->type);
++
++    memset(pix, 0, sizeof(*pix));
++    pix->field = V4L2_FIELD_NONE;
++    pix->colorspace = V4L2_COLORSPACE_REC709;
++    pix->num_planes = 1;
++
++    if (out) {
++        pix->pixelformat = DEC_OUT_FOURCC;
++        pix->width = d->coded_w;
++        pix->height = d->coded_h;
++        pix->plane_fmt[0].sizeimage = d->out_sizeimage;
++        pix->plane_fmt[0].bytesperline = 0;   /* compressed: no line stride */
++    } else {
++        pix->pixelformat = DEC_CAP_FOURCC;
++        pix->width = d->coded_w;
++        pix->height = d->coded_h;
++        pix->plane_fmt[0].bytesperline = d->coded_w;
++        pix->plane_fmt[0].sizeimage = dec_cap_sizeimage(d->coded_w,
++                                                        d->coded_h);
++    }
++}
++
++static void dec_send_v4l2_event(VirtIOMediaSession *s, uint32_t type,
++                                uint32_t changes)
++{
++    struct virtio_media_event_event evt = {
++        .hdr = { .event = VIRTIO_MEDIA_EVT_EVENT, .session_id = s->id },
++    };
++
++    evt.event.type = type;
++    if (type == V4L2_EVENT_SOURCE_CHANGE) {
++        evt.event.u.src_change.changes = changes;
++    }
++    virtio_media_send_event(s->vm, &evt, sizeof(evt));
++}
++
++/*
++ * Complete one buffer towards the guest.
++ *
++ * bytesused is what the guest reads; flags carries V4L2_BUF_FLAG_LAST at the
++ * end of a drain. memory is reported as USERPTR because that is what the guest
++ * asked for, and the m union is zeroed so no host address crosses the boundary
++ * (the driver preserves the union it recorded at QBUF time anyway).
++ */
++static void dec_complete_buffer(VirtIOMediaSession *s, int qi, uint32_t index,
++                                uint32_t bytesused, uint32_t flags,
++                                int64_t pts_us)
++{
++    VirtIOMediaQueue *q = &s->queues[qi];
++    struct virtio_media_event_dqbuf evt = {
++        .hdr = { .event = VIRTIO_MEDIA_EVT_DQBUF, .session_id = s->id },
++    };
++
++    evt.buffer.index = index;
++    evt.buffer.type = q->type;
++    evt.buffer.memory = V4L2_MEMORY_USERPTR;
++    evt.buffer.bytesused = bytesused;
++    evt.buffer.flags = flags;
++    evt.buffer.field = V4L2_FIELD_NONE;
++    evt.buffer.sequence = 0;
++    if (pts_us >= 0) {
++        evt.buffer.timestamp.tv_sec = pts_us / 1000000;
++        evt.buffer.timestamp.tv_usec = pts_us % 1000000;
++    }
++    if (q->mplane) {
++        evt.buffer.length = 1;
++        evt.planes[0].bytesused = bytesused;
++        evt.planes[0].length = q->guest[index].planes[0].len;
++    }
++    /*
++     * NOTE: NO HOST ADDRESS CROSSES THIS BOUNDARY.
++     *
++     * The whole evt struct is copied into the guest's event queue, so setting
++     * evt.buffer.m.planes = evt.planes would hand the guest a QEMU STACK
++     * ADDRESS on every completion, defeating host ASLR. The proxy path zeroes
++     * both the buffer union and each plane union for
++     * exactly this reason (virtio-media.c, "keeps host addresses out of a
++     * structure that crosses into the guest"), and the driver reinstates the m
++     * union it recorded at QBUF time anyway, so nothing is lost by zeroing.
++     */
++    memset(&evt.buffer.m, 0, sizeof(evt.buffer.m));
++    if (q->mplane) {
++        memset(&evt.planes[0].m, 0, sizeof(evt.planes[0].m));
++    }
++    q->guest[index].queued = false;
++    virtio_media_send_event(s->vm, &evt, sizeof(evt));
++}
++
++/* The lowest-indexed CAPTURE buffer the guest has queued, or -1. */
++static int dec_next_cap_buffer(VirtIOMediaSession *s)
++{
++    VirtIOMediaQueue *q = &s->queues[1];
++    uint32_t i;
++
++    for (i = 0; i < q->num_bufs; i++) {
++        if (q->guest[i].queued) {
++            return (int)i;
++        }
++    }
++    return -1;
++}
++
++/*
++ * Write one decoded frame into the guest's pages as NV12.
++ *
++ * The frame is converted only when it is not already NV12: libavcodec's
++ * software HEVC decoder produces YUV420P, and the hwaccel path will produce
++ * something else again, so this stays a general conversion rather than an
++ * assumption about the backend.
++ */
++static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
++                            uint32_t *bytesused)
++{
++    VirtIOMediaDec *d = s->dec;
++    VirtIOMediaQueue *q = &s->queues[1];
++    VirtIOMediaBuffer *gb = &q->guest[index];
++    uint32_t w = d->coded_w, h = d->coded_h;
++    size_t need = dec_cap_sizeimage(w, h);
++    uint8_t *dst_data[4] = { NULL };
++    int dst_linesize[4] = { 0 };
++    uint8_t *buf;
++    bool ok;
++
++    if (gb->num_planes < 1 || gb->planes[0].len < need) {
++        error_report_once("virtio-media/dec: capture buffer %d is %u bytes, "
++                     "need %zu for %ux%u NV12", index,
++                     gb->num_planes ? gb->planes[0].len : 0u, need, w, h);
++        return false;
++    }
++
++    /*
++     * Staged through one host allocation rather than scattered directly into
++     * the guest pages: the guest side is a scatter-gather list of arbitrary
++     * runs, and both sws_scale() and av_image_copy() want plane pointers with
++     * strides. One memcpy per frame is the same cost the proxy path already
++     * pays for bcm2835-codec.
++     */
++    buf = g_malloc(need);
++    dst_data[0] = buf;
++    dst_data[1] = buf + (size_t)w * h;
++    dst_linesize[0] = w;
++    dst_linesize[1] = w;
++
++    /*
++     * The fast path is only valid when the frame IS the size the guest's buffer
++     * was computed for. It is not always: in the not-subscribed path above, the
++     * guest keeps its own format and the frame can be larger, and
++     * av_image_copy() with the DESTINATION geometry would then read past the end
++     * of the source planes. Route any mismatch through swscale, which is what
++     * the scaling case already does.
++     */
++    if (fr->format == AV_PIX_FMT_NV12 &&
++        (uint32_t)fr->width == w && (uint32_t)fr->height == h) {
++        av_image_copy(dst_data, dst_linesize,
++                      (const uint8_t **)fr->data, fr->linesize,
++                      AV_PIX_FMT_NV12, w, h);
++    } else {
++        /*
++         * THE CACHE KEY INCLUDES THE INPUT GEOMETRY.
++         *
++         * The context is built from fr->width/fr->height, so a cache keyed on
++         * the OUTPUT w/h and the pixel format only is not enough. A session
++         * whose stream changes resolution while the guest keeps one CAPTURE
++         * format -- possible whenever SOURCE_CHANGE is not subscribed -- would
++         * reuse a context built for the previous, larger input: sws reads
++         * srcW pixels per row out of a buffer whose stride is now smaller,
++         * running off the end of the AVFrame and writing whatever it finds into
++         * the guest's page. A host memory disclosure, and a SIGSEGV on the last
++         * row.
++         */
++        if (!d->sws || d->sws_src_fmt != fr->format ||
++            d->sws_src_w != fr->width || d->sws_src_h != fr->height ||
++            d->sws_w != (int)w || d->sws_h != (int)h) {
++            sws_freeContext(d->sws);
++            d->sws = sws_getContext(fr->width, fr->height, fr->format,
++                                    w, h, AV_PIX_FMT_NV12,
++                                    SWS_BILINEAR, NULL, NULL, NULL);
++            d->sws_src_fmt = fr->format;
++            d->sws_src_w = fr->width;
++            d->sws_src_h = fr->height;
++            d->sws_w = w;
++            d->sws_h = h;
++        }
++        if (!d->sws) {
++            error_report_once("virtio-media/dec: no conversion from %d to NV12",
++                         fr->format);
++            g_free(buf);
++            return false;
++        }
++        sws_scale(d->sws, (const uint8_t * const *)fr->data, fr->linesize,
++                  0, fr->height, dst_data, dst_linesize);
++    }
++
++    ok = virtio_media_sg_copy(s->vm, &gb->planes[0], buf, need, true);
++    g_free(buf);
++    if (!ok) {
++        return false;
++    }
++    *bytesused = need;
++    return true;
++}
++
++/* Deliver one frame if a buffer is free; returns false if it could not. */
++static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
++{
++    uint32_t bytesused = 0;
++    int index = dec_next_cap_buffer(s);
++
++    if (index < 0) {
++        return false;
++    }
++    if (!dec_write_frame(s, index, fr, &bytesused)) {
++        virtio_media_send_error_event(s, EFAULT);
++        return true;   /* consumed: the session is broken either way */
++    }
++    dec_complete_buffer(s, 1, (uint32_t)index, bytesused, 0, fr->pts);
++    return true;
++}
++
++/*
++ * Pull frames out of libavcodec while the guest has buffers to put them in.
++ *
++ * Called from every path that can change either side of that condition: an
++ * OUTPUT QBUF (new input), a CAPTURE QBUF (new space) and DECODER_CMD(STOP)
++ * (end of input). Nothing else drives decoding, which is why there is no fd
++ * handler and no thread here.
++ */
++static void dec_pump(VirtIOMediaSession *s)
++{
++    VirtIOMediaDec *d = s->dec;
++    int n;
++
++    if (!d->avctx) {
++        return;
++    }
++
++    /* A frame held across a format change goes first, in stream order. */
++    if (d->held) {
++        if (d->awaiting_reconfig || !dec_deliver(s, d->held)) {
++            return;
++        }
++        av_frame_free(&d->held);
++    }
++
++    /*
++     * BOUNDED. This runs on the QEMU main loop from a virtqueue handler, and the
++     * guest can have 32 CAPTURE buffers queued, so an unbounded loop let one
++     * OUTPUT QBUF perform 32 software decodes plus 32 colour conversions plus 32
++     * SG copies before the main loop turned again -- at 4K that is hundreds of
++     * megabytes of memory traffic, during which DomA's virtio-blk (served by
++     * this same QEMU) is stopped. Bounding it per call costs nothing in
++     * throughput because the next QBUF pumps again.
++     */
++    for (n = 0; n < DEC_PUMP_MAX_FRAMES; n++) {
++        int r;
++
++        if (d->awaiting_reconfig) {
++            return;
++        }
++        if (dec_next_cap_buffer(s) < 0) {
++            return;
++        }
++
++        r = avcodec_receive_frame(d->avctx, d->frame);
++        if (r == AVERROR(EAGAIN)) {
++            return;
++        }
++        if (r == AVERROR_EOF) {
++            /*
++             * End of the drain. The guest is told with a zero-length CAPTURE
++             * buffer carrying V4L2_BUF_FLAG_LAST, which is what v4l2_codec2
++             * waits for after DECODER_CMD(STOP); V4L2Decoder::serviceDeviceTask()
++             * ends the drain on it.
++             */
++            if (d->draining && !d->drain_done) {
++                int index = dec_next_cap_buffer(s);
++
++                if (index >= 0) {
++                    dec_complete_buffer(s, 1, (uint32_t)index, 0,
++                                        V4L2_BUF_FLAG_LAST, -1);
++                    d->drain_done = true;
++                    if (d->sub_eos) {
++                        dec_send_v4l2_event(s, V4L2_EVENT_EOS, 0);
++                    }
++                }
++            }
++            return;
++        }
++        if (r < 0) {
++            error_report_once("virtio-media/dec: avcodec_receive_frame: %d", r);
++            virtio_media_send_error_event(s, EIO);
++            return;
++        }
++
++        /*
++         * First frame, or a mid-stream resolution change: tell the guest and
++         * stop until it has re-negotiated. The frame itself is kept -- dropping
++         * it would lose the IDR the guest needs to start from.
++         */
++        if (!d->stream_fmt_known ||
++            (uint32_t)d->frame->width != d->stream_w ||
++            (uint32_t)d->frame->height != d->stream_h) {
++            uint32_t sw = d->frame->width, sh = d->frame->height;
++
++            /*
++             * Normalise HERE as well as in S_FMT: this is the value S_FMT will
++             * be forced to, so an un-normalised stream size would propagate
++             * straight into coded_w/h and from there into the allocation size.
++             * visible_* keeps the frame's real (cropped) size, which is what
++             * G_SELECTION should report -- the two differ by up to one pixel
++             * and that is the whole point of a compose rectangle.
++             */
++            d->visible_w = sw;
++            d->visible_h = sh;
++            dec_norm_dims(&sw, &sh);
++            d->stream_fmt_known = true;
++            d->stream_w = sw;
++            d->stream_h = sh;
++            if (d->sub_source_change) {
++                /*
++                 * NOTE: PUBLISH THE NEW SIZE BEFORE SENDING THE EVENT.
++                 *
++                 * The V4L2 stateful decoder sequence is: receive
++                 * SOURCE_CHANGE, then G_FMT(CAPTURE) to learn the new
++                 * resolution. Applying the stream size only in S_FMT would
++                 * leave G_FMT after the event reporting the old placeholder
++                 * (128x128 while the S_FMT reply carries the sizeimage of
++                 * 640x360), and a client that trusts G_FMT (the documented
++                 * way, and the only way for one that does not call S_FMT at
++                 * all) would allocate 128x128 buffers for a 640x360 stream.
++                 *
++                 * Only on this path. When the guest has NOT subscribed there is
++                 * no renegotiation coming, so its chosen format must stay put and
++                 * dec_write_frame() scales into it.
++                 */
++                d->coded_w = d->stream_w;
++                d->coded_h = d->stream_h;
++                /*
++                 * Hold this frame across the renegotiation rather than dropping
++                 * it: it is the IDR the guest has to start decoding from.
++                 * d->held is NULL here -- the block above either delivered it or
++                 * returned.
++                 */
++                d->held = av_frame_clone(d->frame);
++                av_frame_unref(d->frame);
++                d->awaiting_reconfig = true;
++                dec_send_v4l2_event(s, V4L2_EVENT_SOURCE_CHANGE,
++                                    V4L2_EVENT_SRC_CH_RESOLUTION);
++                return;
++            }
++            /*
++             * NOT SUBSCRIBED: fall through and deliver, scaled into whatever
++             * format the guest already chose (dec_write_frame does that).
++             *
++             * Holding the frame and `continue`-ing here would be wrong twice
++             * over: the held frame would not be delivered until the NEXT
++             * dec_pump() entry, so it would arrive after frames pulled later in
++             * this same loop, and a second format change in the same loop would
++             * overwrite d->held WITHOUT freeing it -- an AVFrame leak per
++             * change. There is nothing to hold for in this path anyway: no
++             * event was sent, so there is no renegotiation to wait for.
++             */
++        }
++
++        if (!dec_deliver(s, d->frame)) {
++            /*
++             * No buffer after all (a race with STREAMOFF); keep the frame.
++             * av_frame_free first: d->held should be NULL by the reasoning at
++             * the top of this function, but an assignment over a non-NULL held
++             * frame is a silent leak and the guard costs nothing.
++             */
++            av_frame_free(&d->held);
++            d->held = av_frame_clone(d->frame);
++            av_frame_unref(d->frame);
++            return;
++        }
++        av_frame_unref(d->frame);
++    }
++}
++
++/* ------------------------------------------------------------------------- */
++/* open / close                                                              */
++/* ------------------------------------------------------------------------- */
++
++bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
++{
++    if (!vm->decoder) {
++        return true;
++    }
++    if (strcmp(vm->decoder, "hevc") != 0) {
++        error_setg(errp, "virtio-media: decoder='%s' is not supported "
++                   "(only 'hevc')", vm->decoder);
++        return false;
++    }
++    if (!avcodec_find_decoder(AV_CODEC_ID_HEVC)) {
++        error_setg(errp, "virtio-media: libavcodec has no HEVC decoder");
++        return false;
++    }
++    /*
++     * device_caps is what the guest reads out of config space, and
++     * v4l2_codec2 refuses to start without M2M_MPLANE (V4L2Decoder::start()).
++     * In proxy mode this comes from the host device's QUERYCAP; there is no
++     * host device here, so it is set from what this file implements.
++     */
++    vm->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++    vm->device_type = 0;   /* VFL_TYPE_VIDEO */
++    return true;
++}
++
++int virtio_media_dec_open(VirtIOMediaSession *s)
++{
++    VirtIOMediaDec *d;
++    const AVCodec *codec;
++
++    codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
++    if (!codec) {
++        return ENODEV;
++    }
++
++    d = g_new0(VirtIOMediaDec, 1);
++    d->coded_w = DEC_MIN_W;
++    d->coded_h = DEC_MIN_H;
++    d->visible_w = DEC_MIN_W;
++    d->visible_h = DEC_MIN_H;
++    d->out_sizeimage = DEC_MAX_OUT_SIZE;
++    d->sws_src_fmt = AV_PIX_FMT_NONE;
++    d->sws_src_w = -1;
++    d->sws_src_h = -1;
++
++    d->avctx = avcodec_alloc_context3(codec);
++    d->pkt = av_packet_alloc();
++    d->frame = av_frame_alloc();
++    if (!d->avctx || !d->pkt || !d->frame) {
++        goto fail;
++    }
++    /*
++     * One thread. Frame-threaded decoding would reorder completions relative
++     * to the QBUF that produced them, and this device delivers completions
++     * synchronously from that QBUF; it would also make libavcodec hold frames
++     * across calls in a way the buffer accounting here does not model.
++     */
++    d->avctx->thread_count = 1;
++    if (avcodec_open2(d->avctx, codec, NULL) < 0) {
++        goto fail;
++    }
++
++    s->dec = d;
++    s->fd = -1;
++    return 0;
++
++fail:
++    if (d->avctx) {
++        avcodec_free_context(&d->avctx);
++    }
++    av_packet_free(&d->pkt);
++    av_frame_free(&d->frame);
++    g_free(d);
++    return ENOMEM;
++}
++
++void virtio_media_dec_close(VirtIOMediaSession *s)
++{
++    VirtIOMediaDec *d = s->dec;
++
++    if (!d) {
++        return;
++    }
++    if (d->avctx) {
++        avcodec_free_context(&d->avctx);
++    }
++    av_packet_free(&d->pkt);
++    av_frame_free(&d->frame);
++    av_frame_free(&d->held);
++    sws_freeContext(d->sws);
++    g_free(d);
++    s->dec = NULL;
++}
++
++/* ------------------------------------------------------------------------- */
++/* ioctls                                                                    */
++/* ------------------------------------------------------------------------- */
++
++static int dec_querycap(struct v4l2_capability *cap)
++{
++    memset(cap, 0, sizeof(*cap));
++    pstrcpy((char *)cap->driver, sizeof(cap->driver), "virtio-media");
++    pstrcpy((char *)cap->card, sizeof(cap->card), "virtio-media HEVC decoder");
++    pstrcpy((char *)cap->bus_info, sizeof(cap->bus_info), "platform:virtio");
++    /* Any non-zero value; nothing in this path keys off the number. */
++    cap->version = (6 << 16) | (18 << 8);
++    cap->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++    cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
++    return 0;
++}
++
++static int dec_enum_fmt(struct v4l2_fmtdesc *f)
++{
++    bool out = V4L2_TYPE_IS_OUTPUT(f->type);
++
++    if (f->index != 0) {
++        return EINVAL;   /* exactly one format per queue */
++    }
++    f->flags = out ? V4L2_FMT_FLAG_COMPRESSED : 0;
++    f->pixelformat = out ? DEC_OUT_FOURCC : DEC_CAP_FOURCC;
++    pstrcpy((char *)f->description, sizeof(f->description),
++            out ? "HEVC" : "NV12");
++    memset(f->reserved, 0, sizeof(f->reserved));
++    return 0;
++}
++
++static int dec_s_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
++{
++    struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++
++    if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++        /*
++         * The guest picks the compressed buffer size; the pixel format is not
++         * negotiable (this is an HEVC decoder). Answering with our format
++         * rather than failing is what V4L2 asks of S_FMT.
++         */
++        if (pix->num_planes >= 1 && pix->plane_fmt[0].sizeimage) {
++            uint32_t sz = pix->plane_fmt[0].sizeimage;
++
++            if (sz > DEC_MAX_OUT_SIZE) {
++                sz = DEC_MAX_OUT_SIZE;
++            }
++            d->out_sizeimage = sz;
++        }
++    } else {
++        /*
++         * CAPTURE: the resolution is the stream's, not the guest's. Clamp what
++         * it asked for into range and, once the stream is known, force the
++         * stream's own size -- a guest that configures something else would
++         * get buffers the decoder cannot fill.
++         */
++        uint32_t w = pix->width, h = pix->height;
++
++        if (d->stream_fmt_known) {
++            w = d->stream_w;
++            h = d->stream_h;
++        }
++        /*
++         * ALWAYS, not only in the else branch. Without it the stream-known path
++         * would rely on stream_w/h having been normalised where they are
++         * recorded (they are) to keep an odd height from overflowing and a size
++         * above DEC_MAX out; normalising again here is belt and braces.
++         */
++        dec_norm_dims(&w, &h);
++        if (dec_cap_sizeimage(w, h) == 0) {
++            return EINVAL;
++        }
++        d->coded_w = w;
++        d->coded_h = h;
++        /*
++         * Accepting the new format is what ends a reconfiguration: the guest
++         * has been told the resolution and has now asked for it.
++         */
++        d->awaiting_reconfig = false;
++    }
++    dec_fill_fmt(d, f);
++    return 0;
++}
++
++static int dec_enum_framesizes(struct v4l2_frmsizeenum *fs)
++{
++    if (fs->index != 0) {
++        return EINVAL;
++    }
++    if (fs->pixel_format != DEC_OUT_FOURCC &&
++        fs->pixel_format != DEC_CAP_FOURCC) {
++        return EINVAL;
++    }
++    fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++    fs->stepwise.min_width = DEC_MIN_W;
++    fs->stepwise.max_width = DEC_MAX_W;
++    fs->stepwise.step_width = 2;
++    fs->stepwise.min_height = DEC_MIN_H;
++    fs->stepwise.max_height = DEC_MAX_H;
++    fs->stepwise.step_height = 2;
++    return 0;
++}
++
++static int dec_g_selection(VirtIOMediaDec *d, struct v4l2_selection *sel)
++{
++    /*
++     * v4l2_codec2 asks for COMPOSE on the CAPTURE queue and falls back to
++     * G_CROP if that fails (V4L2Decoder::getVisibleRect()). Answering
++     * COMPOSE is the sanctioned form for a decoder's visible rectangle.
++     */
++    if (V4L2_TYPE_IS_OUTPUT(sel->type)) {
++        return EINVAL;
++    }
++    switch (sel->target) {
++    case V4L2_SEL_TGT_COMPOSE:
++    case V4L2_SEL_TGT_COMPOSE_DEFAULT:
++    case V4L2_SEL_TGT_COMPOSE_BOUNDS:
++    case V4L2_SEL_TGT_CROP:
++    case V4L2_SEL_TGT_CROP_DEFAULT:
++    case V4L2_SEL_TGT_CROP_BOUNDS:
++        sel->r.left = 0;
++        sel->r.top = 0;
++        sel->r.width = d->visible_w ? d->visible_w : d->coded_w;
++        sel->r.height = d->visible_h ? d->visible_h : d->coded_h;
++        return 0;
++    default:
++        return EINVAL;
++    }
++}
++
++static int dec_reqbufs(VirtIOMediaSession *s, struct v4l2_requestbuffers *rb)
++{
++    VirtIOMediaQueue *q;
++    int qi = virtio_media_queue_index(rb->type);
++    uint32_t i;
++
++    /*
++     * Only the two queues this device has. Without this any buf_type was
++     * accepted -- VBI_CAPTURE included -- and virtio_media_queue_index() folded
++     * it onto the capture queue, so q->type came back to the guest as something
++     * it never asked for.
++     */
++    if (rb->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
++        rb->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++        return EINVAL;
++    }
++    if (rb->memory != V4L2_MEMORY_USERPTR) {
++        /*
++         * Same restriction as the proxy path, for the same reason: MMAP would
++         * need a VIRTIO shared memory region this device does not have.
++         */
++        return EINVAL;
++    }
++    q = &s->queues[qi];
++
++    /* REQBUFS(0) frees; it is also how the guest starts a reconfiguration. */
++    for (i = 0; i < q->num_bufs; i++) {
++        virtio_media_free_buffer_sgl(&q->guest[i]);
++        q->guest[i].queued = false;
++    }
++    if (rb->count > VIRTIO_MEDIA_MAX_BUFFERS) {
++        rb->count = VIRTIO_MEDIA_MAX_BUFFERS;
++    }
++    q->type = rb->type;
++    q->mplane = V4L2_TYPE_IS_MULTIPLANAR(rb->type);
++    q->num_bufs = rb->count;
++    q->num_host_planes = 1;
++    /*
++     * DMABUF is advertised alongside USERPTR. The wire stays USERPTR-only and
++     * dec_reqbufs above still refuses any other memory type -- it is the GUEST
++     * DRIVER that accepts V4L2_MEMORY_DMABUF from user-space, builds the
++     * sg_entry array from the exporter's sg_table, and substitutes USERPTR in
++     * both REQBUFS and QBUF before they reach here.
++     *
++     * That translation is not optional. USERPTR cannot carry a dmabuf at all: a
++     * dmabuf mmap is VM_PFNMAP and pin_user_pages_fast() refuses such a VMA
++     * (-EFAULT, mm/gup.c check_vma_flags). So DMABUF is exactly as usable here
++     * as USERPTR, and reporting USERPTR alone tells a conforming client the
++     * opposite.
++     */
++    rb->capabilities = V4L2_BUF_CAP_SUPPORTS_USERPTR |
++                       V4L2_BUF_CAP_SUPPORTS_DMABUF;
++    /*
++     * A CAPTURE REQBUFS with buffers ends a reconfiguration, as S_FMT does.
++     * S_FMT is OPTIONAL after SOURCE_CHANGE -- the sequence the V4L2 stateful
++     * decoder documentation prescribes is G_FMT, G_SELECTION, REQBUFS,
++     * STREAMON -- so if only S_FMT cleared awaiting_reconfig, a client that
++     * follows the spec exactly would wait forever while dec_pump() returned in
++     * silence, with nothing in any log. v4l2_codec2 does call S_FMT, so the
++     * board alone would not show the difference; other clients depend on
++     * this.
++     */
++    if (qi == 1 && rb->count > 0) {
++        s->dec->awaiting_reconfig = false;
++    }
++    return 0;
++}
++
++static int dec_querybuf(VirtIOMediaSession *s, uint8_t *payload,
++                        size_t work_len)
++{
++    VirtIOMediaDec *d = s->dec;
++    struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++    VirtIOMediaQueue *q;
++    int qi = virtio_media_queue_index(b->type);
++    uint32_t len;
++
++    q = &s->queues[qi];
++    if (b->index >= q->num_bufs) {
++        return EINVAL;
++    }
++    len = (qi == 0) ? d->out_sizeimage
++                    : dec_cap_sizeimage(d->coded_w, d->coded_h);
++
++    b->memory = V4L2_MEMORY_USERPTR;
++    b->flags = q->guest[b->index].queued ? V4L2_BUF_FLAG_QUEUED : 0;
++    b->field = V4L2_FIELD_NONE;
++    b->bytesused = 0;
++    if (q->mplane) {
++        struct v4l2_plane *planes;
++
++        /*
++         * NOTE: b->m.planes IS A GUEST POINTER. NEVER DEREFERENCE IT.
++         *
++         * Writing through it after a NULL check segfaults QEMU the moment the
++         * guest runs QUERYBUF -- and QUERYBUF is the second thing any client
++         * does, so the whole session dies with the device model. A NULL check
++         * is worse than useless here: a non-NULL guest address is exactly the
++         * dangerous case.
++         *
++         * The driver serialises the plane array immediately after the
++         * v4l2_buffer in the payload, the same layout QBUF uses (which is why
++         * virtio_media_qbuf_take_sg finds it at that offset), and copies it back
++         * to userspace itself. So the array to fill is in OUR buffer, and the
++         * union is set to point at it for the caller's benefit only.
++         */
++        if (work_len < sizeof(*b) + sizeof(*planes)) {
++            return EINVAL;
++        }
++        planes = (struct v4l2_plane *)(payload + sizeof(*b));
++        memset(planes, 0, sizeof(*planes));
++        planes[0].length = len;
++        planes[0].bytesused = 0;
++        b->length = 1;
++        /*
++         * The filled array is at the offset the driver already expects (right
++         * after the v4l2_buffer, the same layout QBUF uses), so the pointer
++         * itself carries no information the driver needs -- and this payload is
++         * written back to the guest verbatim, so leaving vm->cmd_buf's address
++         * in it would leak the host heap layout. Zero, do not point.
++         */
++        b->m.planes = NULL;
++    } else {
++        b->length = len;
++    }
++    return 0;
++}
++
++/*
++ * QBUF. OUTPUT carries one compressed frame; CAPTURE gives us space to put a
++ * decoded one. Both take the guest's SG list first, because that is what the
++ * copy in either direction needs.
++ */
++static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
++{
++    VirtIOMediaDec *d = s->dec;
++    struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++    struct v4l2_plane *guest_planes = NULL;
++    VirtIOMediaQueue *q;
++    VirtIOMediaBuffer *gb;
++    int qi, ret;
++
++    if (payload_len < sizeof(*b)) {
++        return EINVAL;
++    }
++    qi = virtio_media_queue_index(b->type);
++    q = &s->queues[qi];
++    if (b->index >= q->num_bufs) {
++        return EINVAL;
++    }
++
++    ret = virtio_media_qbuf_take_sg(s, payload, payload_len, &guest_planes);
++    if (ret) {
++        return ret;
++    }
++    gb = &q->guest[b->index];
++    if (gb->num_planes < 1) {
++        return EINVAL;
++    }
++    gb->queued = true;
++
++    if (qi == 0) {
++        size_t used = guest_planes ? guest_planes[0].bytesused : b->bytesused;
++        uint8_t *buf;
++        int r;
++
++        if (used > gb->planes[0].len) {
++            used = gb->planes[0].len;
++        }
++        /*
++         * AND against the negotiated OUTPUT size. gb->planes[0].len is the
++         * guest's own plane.length, validated only against the sum of its SG
++         * entry lengths -- and those are guest u32s, so one entry claiming
++         * 0xFFFFFFFF was enough to reach g_malloc(4 GiB) below. g_malloc aborts
++         * on failure, so that was a one-command guest-triggered QEMU exit, and
++         * this QEMU also serves DomA's rootfs disk. DEC_MAX_OUT_SIZE was
++         * documented as the bound but only ever applied in S_FMT.
++         */
++        if (used > d->out_sizeimage) {
++            gb->queued = false;
++            return EINVAL;
++        }
++        /*
++         * An empty OUTPUT buffer is how some clients signal end of stream
++         * without DECODER_CMD. Treat it as a flush rather than feeding
++         * libavcodec a zero-length packet, which it would reject.
++         *
++         * Completing the buffer without the flush would leave any client that
++         * relies on the convention hung with no output and no error.
++         */
++        if (used == 0) {
++            if (!d->draining) {
++                d->draining = true;
++                d->drain_done = false;
++                avcodec_send_packet(d->avctx, NULL);
++            }
++            dec_complete_buffer(s, 0, b->index, 0, 0, -1);
++            dec_pump(s);
++            return 0;
++        }
++        /*
++         * Input after a drain has been requested. V4L2 wants the client to issue
++         * DECODER_CMD(START) first; without this the packet went to a
++         * flushed avctx, libavcodec answered AVERROR_EOF, the code below treated
++         * that as success and reported the buffer consumed -- a silently dropped
++         * frame.
++         */
++        if (d->draining) {
++            gb->queued = false;
++            return EPIPE;
++        }
++
++        buf = g_malloc(used);
++        if (!virtio_media_sg_copy(s->vm, &gb->planes[0], buf, used, false)) {
++            g_free(buf);
++            gb->queued = false;
++            return EFAULT;
++        }
++
++        av_packet_unref(d->pkt);
++        if (av_new_packet(d->pkt, used) < 0) {
++            g_free(buf);
++            gb->queued = false;
++            return ENOMEM;
++        }
++        memcpy(d->pkt->data, buf, used);
++        g_free(buf);
++        d->pkt->pts = (int64_t)b->timestamp.tv_sec * 1000000 +
++                      b->timestamp.tv_usec;
++
++        r = avcodec_send_packet(d->avctx, d->pkt);
++        /*
++         * NOTE: EAGAIN MEANS THE PACKET WAS NOT CONSUMED, SO IT MUST BE RESENT.
++         *
++         * Unref'ing the packet and returning EAGAIN to the guest would rely on
++         * the guest re-queueing it. Nothing re-queues on a QBUF that returns
++         * -EAGAIN -- no V4L2 client does, and v4l2_codec2 does not -- so the
++         * frame would be silently lost, and the buffer left marked queued so
++         * the guest would never get it back either. Reachable with no malice
++         * at all: REQBUFS(OUTPUT) + STREAMON without ever queueing a CAPTURE
++         * buffer fills the decoder, and every subsequent input frame would
++         * disappear.
++         *
++         * Drain what we can and retry the SAME packet once; only unref after it
++         * is actually taken.
++         */
++        if (r == AVERROR(EAGAIN)) {
++            dec_pump(s);
++            r = avcodec_send_packet(d->avctx, d->pkt);
++        }
++        av_packet_unref(d->pkt);
++        if (r == AVERROR(EAGAIN)) {
++            /*
++             * Still full. Give the buffer back to the guest unconsumed rather
++             * than reporting it complete: bytesused 0 with no data is how a
++             * stateful decoder says "nothing was taken from this one".
++             */
++            gb->queued = false;
++            return EAGAIN;
++        }
++        if (r < 0 && r != AVERROR_EOF) {
++            error_report_once("virtio-media/dec: avcodec_send_packet: %d", r);
++            gb->queued = false;
++            return EIO;
++        }
++        /*
++         * The compressed data has been copied out, so the buffer is done. This
++         * is reported before any decoded frame, which is the order a stateful
++         * decoder gives: input completion does not wait for output.
++         */
++        dec_complete_buffer(s, 0, b->index, (uint32_t)used, 0, -1);
++    }
++
++    dec_pump(s);
++    return 0;
++}
++
++static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
++{
++    VirtIOMediaDec *d = s->dec;
++    int qi = virtio_media_queue_index(type);
++    VirtIOMediaQueue *q = &s->queues[qi];
++    uint32_t i;
++
++    q->streaming = on;
++    if (!on) {
++        /*
++         * STREAMOFF returns every buffer to the guest WITHOUT an event: the
++         * driver drops its pending_dqbufs at STREAMOFF, and an event for a
++         * buffer the guest no longer owns makes it decrement queued_bufs with
++         * no floor -- the same wrap the proxy path guards against.
++         */
++        for (i = 0; i < q->num_bufs; i++) {
++            q->guest[i].queued = false;
++        }
++        if (qi == 0) {
++            /* Input stopped: the decoder's state is no longer meaningful. */
++            avcodec_flush_buffers(d->avctx);
++            av_frame_free(&d->held);
++            d->draining = false;
++            d->drain_done = false;
++        }
++    } else if (qi == 1) {
++        /* Same reasoning as in dec_reqbufs: STREAMON(CAPTURE) also ends it. */
++        d->awaiting_reconfig = false;
++        dec_pump(s);
++    }
++    return 0;
++}
++
++static int dec_g_ext_ctrls(VirtIOMediaDec *d, struct v4l2_ext_controls *c)
++{
++    uint32_t i;
++
++    for (i = 0; i < c->count; i++) {
++        switch (c->controls[i].id) {
++        case V4L2_CID_MIN_BUFFERS_FOR_CAPTURE:
++            c->controls[i].value = DEC_MIN_CAP_BUFS;
++            break;
++        case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
++            c->controls[i].value = 1;
++            break;
++        default:
++            c->error_idx = i;
++            return EINVAL;
++        }
++    }
++    return 0;
++}
++
++static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
++                           bool try_only)
++{
++    VirtIOMediaDec *d = s->dec;
++
++    switch (cmd->cmd) {
++    case V4L2_DEC_CMD_STOP:
++    case V4L2_DEC_CMD_START:
++        break;
++    default:
++        return EINVAL;
++    }
++    if (try_only) {
++        /*
++         * v4l2_codec2 calls TRY_DECODER_CMD(STOP) during start() and aborts
++         * the whole component if it fails ("Device does not support flushing",
++         * in V4L2Decoder::start()), so this has to succeed before anything
++         * else works.
++         */
++        return 0;
++    }
++
++    if (cmd->cmd == V4L2_DEC_CMD_STOP) {
++        if (!d->draining) {
++            d->draining = true;
++            d->drain_done = false;
++            avcodec_send_packet(d->avctx, NULL);   /* flush packet */
++        }
++        dec_pump(s);
++    } else {
++        /*
++         * START is only meaningful while draining. Unconditionally flushing
++         * threw away the reference frames of a healthy session, so a guest that
++         * issues START mid-stream (legal, and a no-op per the spec) got silent
++         * corruption from the next frame on.
++         */
++        if (d->draining) {
++            avcodec_flush_buffers(d->avctx);
++            av_frame_free(&d->held);
++            d->draining = false;
++            d->drain_done = false;
++        }
++    }
++    return 0;
++}
++
++int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
++                           uint8_t *payload, size_t payload_len,
++                           size_t work_len)
++{
++    VirtIOMediaDec *d = s->dec;
++    int ret;
++
++    if (!d) {
++        return ENODEV;
++    }
++    if (_IOC_SIZE(code) > work_len) {
++        return EINVAL;
++    }
++
++    switch (code) {
++    case VIDIOC_QUERYCAP:
++        return dec_querycap((struct v4l2_capability *)payload);
++
++    case VIDIOC_ENUM_FMT:
++        return dec_enum_fmt((struct v4l2_fmtdesc *)payload);
++
++    case VIDIOC_G_FMT:
++        dec_fill_fmt(d, (struct v4l2_format *)payload);
++        return 0;
++
++    case VIDIOC_S_FMT:
++    case VIDIOC_TRY_FMT:
++        /*
++         * TRY_FMT must not change state. It shares the clamping logic by
++         * running against a copy.
++         */
++        if (code == VIDIOC_TRY_FMT) {
++            VirtIOMediaDec tmp = *d;
++            return dec_s_fmt(&tmp, (struct v4l2_format *)payload);
++        }
++        return dec_s_fmt(d, (struct v4l2_format *)payload);
++
++    case VIDIOC_ENUM_FRAMESIZES:
++        return dec_enum_framesizes((struct v4l2_frmsizeenum *)payload);
++
++    case VIDIOC_G_SELECTION:
++        return dec_g_selection(d, (struct v4l2_selection *)payload);
++
++    case VIDIOC_REQBUFS:
++        if (payload_len < sizeof(struct v4l2_requestbuffers)) {
++            return EINVAL;
++        }
++        return dec_reqbufs(s, (struct v4l2_requestbuffers *)payload);
++
++    case VIDIOC_QUERYBUF:
++        if (payload_len < sizeof(struct v4l2_buffer)) {
++            return EINVAL;
++        }
++        return dec_querybuf(s, payload, work_len);
++
++    case VIDIOC_QBUF:
++        return dec_qbuf(s, payload, payload_len);
++
++    case VIDIOC_STREAMON:
++    case VIDIOC_STREAMOFF:
++        return dec_streamon(s, *(uint32_t *)payload,
++                            code == VIDIOC_STREAMON);
++
++    case VIDIOC_G_EXT_CTRLS: {
++        struct v4l2_ext_controls *c = (struct v4l2_ext_controls *)payload;
++        size_t need = sizeof(*c) + (size_t)c->count * sizeof(*c->controls);
++
++        if (work_len < need) {
++            return EINVAL;
++        }
++        c->controls = (struct v4l2_ext_control *)(payload + sizeof(*c));
++        ret = dec_g_ext_ctrls(d, c);
++        /*
++         * Same reason as QUERYBUF: this payload goes back to the guest, and the
++         * array is at the offset the driver expects, so the pointer is only a
++         * host heap address on the wire.
++         */
++        c->controls = NULL;
++        return ret;
++    }
++
++    case VIDIOC_S_EXT_CTRLS:
++    case VIDIOC_TRY_EXT_CTRLS:
++        /* No writable controls: a stateful HEVC decoder needs none. */
++        return EINVAL;
++
++    case VIDIOC_SUBSCRIBE_EVENT: {
++        struct v4l2_event_subscription *sub =
++            (struct v4l2_event_subscription *)payload;
++
++        if (sub->type == V4L2_EVENT_SOURCE_CHANGE) {
++            d->sub_source_change = true;
++        } else if (sub->type == V4L2_EVENT_EOS) {
++            d->sub_eos = true;
++        } else {
++            return EINVAL;
++        }
++        return 0;
++    }
++
++    case VIDIOC_UNSUBSCRIBE_EVENT: {
++        struct v4l2_event_subscription *sub =
++            (struct v4l2_event_subscription *)payload;
++
++        if (sub->type == V4L2_EVENT_SOURCE_CHANGE) {
++            d->sub_source_change = false;
++        } else if (sub->type == V4L2_EVENT_EOS) {
++            d->sub_eos = false;
++        }
++        return 0;
++    }
++
++    case VIDIOC_DECODER_CMD:
++        return dec_decoder_cmd(s, (struct v4l2_decoder_cmd *)payload, false);
++
++    case VIDIOC_TRY_DECODER_CMD:
++        return dec_decoder_cmd(s, (struct v4l2_decoder_cmd *)payload, true);
++
++    default:
++        /* Same contract as the proxy path: unimplemented means ENOTTY. */
++        return ENOTTY;
++    }
++}
++
++#else /* !CONFIG_VIRTIO_MEDIA_DECODER */
++
++/*
++ * Built without libavcodec. The stubs keep virtio-media.c free of #ifdef and
++ * turn `decoder=hevc` into a clear realize-time error rather than a device
++ * that answers every ioctl with ENODEV.
++ */
++
++bool virtio_media_dec_available(void)
++{
++    return false;
++}
++
++bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
++{
++    if (!vm->decoder) {
++        return true;
++    }
++    error_setg(errp, "virtio-media: decoder mode needs libavcodec, which this "
++               "build does not have");
++    return false;
++}
++
++int virtio_media_dec_open(VirtIOMediaSession *s)
++{
++    return ENODEV;
++}
++
++void virtio_media_dec_close(VirtIOMediaSession *s)
++{
++}
++
++int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
++                           uint8_t *payload, size_t payload_len,
++                           size_t work_len)
++{
++    return ENODEV;
++}
++
++#endif /* CONFIG_VIRTIO_MEDIA_DECODER */
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index faac3cdc5..554664800 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -122,7 +122,7 @@ static VirtIOMediaSession *virtio_media_find_session(VirtIOMedia *vm, uint32_t i
+  * that is not an output queue is treated as capture, which matches the driver's
+  * own two-queue model.
+  */
+-static int virtio_media_queue_index(uint32_t type)
++int virtio_media_queue_index(uint32_t type)
+ {
+     switch (type) {
+     case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+@@ -133,7 +133,7 @@ static int virtio_media_queue_index(uint32_t type)
+     }
+ }
+ 
+-static void virtio_media_free_buffer_sgl(VirtIOMediaBuffer *b)
++void virtio_media_free_buffer_sgl(VirtIOMediaBuffer *b)
+ {
+     int p;
+ 
+@@ -313,6 +313,8 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
+     for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
+         virtio_media_queue_release(s, &s->queues[i]);
+     }
++    /* No-op unless this session is in decoder mode. */
++    virtio_media_dec_close(s);
+     if (s->fd >= 0) {
+         qemu_set_fd_handler(s->fd, NULL, NULL, NULL);
+         close(s->fd);
+@@ -339,8 +341,8 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
+  * because one QEMU serves every DomA virtio device, would take the guest's
+  * rootfs disk down with it.
+  */
+-static bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
+-                                 void *host, size_t host_len, bool to_guest)
++bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
++                          void *host, size_t host_len, bool to_guest)
+ {
+     size_t done = 0;
+     uint32_t i;
+@@ -395,7 +397,7 @@ static bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
+  * (virtio_media_send_event_buffer is called for each one at probe and again
+  * after each event), so an empty queue means the guest has stopped consuming.
+  */
+-static void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
++void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(vm);
+     VirtQueueElement *elem;
+@@ -412,7 +414,7 @@ static void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len
+     g_free(elem);
+ }
+ 
+-static void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
++void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
+ {
+     struct virtio_media_event_error evt = {
+         .hdr = { .event = VIRTIO_MEDIA_EVT_ERROR, .session_id = s->id },
+@@ -826,6 +828,15 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
+     bool want = false;
+     int i;
+ 
++    /*
++     * Decoder mode has no host fd to poll, and needs none: completions and
++     * SOURCE_CHANGE are produced synchronously by the QBUF or DECODER_CMD that
++     * caused them. That also means the whole vb2_poll()/file-I/O hazard
++     * described above cannot arise there.
++     */
++    if (s->fd < 0) {
++        return;
++    }
+     for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
+         if (s->queues[i].streaming) {
+             want = true;
+@@ -883,16 +894,53 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
+ static int virtio_media_do_open(VirtIOMedia *vm, uint32_t *session_id)
+ {
+     VirtIOMediaSession *s;
+-    int fd;
++    int fd = -1;
+ 
+     /*
+-     * O_NONBLOCK because DQBUF and DQEVENT are polled from the main loop; a
+-     * blocking fd would stop the whole QEMU process, and with it every other
+-     * DomA virtio device, until a frame arrived.
++     * Decoder mode opens nothing: libavcodec owns the hardware and this device
++     * model synthesises the guest-facing decoder, so there is no host V4L2
++     * node to proxy. Everything below that touches fd is skipped by the
++     * fd < 0 checks.
+      */
+-    fd = qemu_open_old(vm->v4l2_device, O_RDWR | O_NONBLOCK);
+-    if (fd < 0) {
+-        return errno ? errno : EIO;
++    if (!vm->decoder) {
++        /*
++         * O_NONBLOCK because DQBUF and DQEVENT are polled from the main loop; a
++         * blocking fd would stop the whole QEMU process, and with it every other
++         * DomA virtio device, until a frame arrived.
++         */
++        fd = qemu_open_old(vm->v4l2_device, O_RDWR | O_NONBLOCK);
++        if (fd < 0) {
++            return errno ? errno : EIO;
++        }
++    }
++
++    /*
++     * NOTE: CAP THE NUMBER OF SESSIONS.
++     *
++     * In proxy mode qemu_open_old() eventually fails on RLIMIT_NOFILE, which is
++     * a crude but real limit. Decoder mode opens NOTHING, so that limit
++     * disappears entirely -- and each decoder session carries an AVCodecContext
++     * and, once it decodes, a DPB (HEVC allows 16 reference pictures). A guest
++     * looping OPEN could take DomD to its OOM killer, and the process it would
++     * kill also serves DomA's rootfs disk.
++     *
++     * Counted rather than tracked in a field so there is one source of truth.
++     */
++    {
++        VirtIOMediaSession *it;
++        unsigned n = 0;
++
++        QLIST_FOREACH(it, &vm->sessions, next) {
++            n++;
++        }
++        if (n >= VIRTIO_MEDIA_MAX_SESSIONS) {
++            if (fd >= 0) {
++                close(fd);
++            }
++            error_report_once("virtio-media: refusing more than %u sessions",
++                              VIRTIO_MEDIA_MAX_SESSIONS);
++            return EMFILE;
++        }
+     }
+ 
+     s = g_new0(VirtIOMediaSession, 1);
+@@ -924,8 +972,36 @@ static int virtio_media_do_open(VirtIOMedia *vm, uint32_t *session_id)
+      * (see virtio_media_update_fd_handler), which is also the only time there is
+      * anything to drain.
+      */
+-    info_report("virtio-media: session %u opened %s as fd %d",
+-                s->id, vm->v4l2_device, fd);
++    if (vm->decoder) {
++        int ret = virtio_media_dec_open(s);
++
++        if (ret) {
++            QLIST_REMOVE(s, next);
++            g_free(s);
++            return ret;
++        }
++        /*
++         * Reported once. A guest can loop OPEN/CLOSE and a line per
++         * iteration fills DomD's journal; the first one says which mode is
++         * running. Written with an explicit flag because qemu has
++         * error_report_once and warn_report_once but no info_report_once.
++         */
++        static bool dec_open_logged;
++
++        if (!dec_open_logged) {
++            dec_open_logged = true;
++            info_report("virtio-media: session %u opened as a %s decoder",
++                        s->id, vm->decoder);
++        }
++    } else {
++        static bool proxy_open_logged;
++
++        if (!proxy_open_logged) {
++            proxy_open_logged = true;
++            info_report("virtio-media: session %u opened %s as fd %d",
++                        s->id, vm->v4l2_device, fd);
++        }
++    }
+     *session_id = s->id;
+     return 0;
+ }
+@@ -1136,8 +1212,9 @@ fail:
+  * the only way to split them is to walk the entries accumulating lengths until
+  * the plane's length is reached. That is what the loop below does.
+  */
+-static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+-                             size_t payload_len)
++int virtio_media_qbuf_take_sg(VirtIOMediaSession *s, uint8_t *payload,
++                              size_t payload_len,
++                              struct v4l2_plane **guest_planes_out)
+ {
+     struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
+     struct v4l2_plane *guest_planes = NULL;
+@@ -1241,6 +1318,38 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+         }
+     }
+ 
++    /*
++     * The plane array pointer is handed back because both callers need it:
++     * bytesused lives there for a multiplanar buffer, and it points into the
++     * caller's payload rather than into anything owned here.
++     */
++    if (guest_planes_out) {
++        *guest_planes_out = guest_planes;
++    }
++    return 0;
++}
++
++static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
++                             size_t payload_len)
++{
++    struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++    struct v4l2_plane *guest_planes = NULL;
++    VirtIOMediaQueue *q = &s->queues[virtio_media_queue_index(b->type)];
++    VirtIOMediaBuffer *gb = &q->guest[b->index];
++    uint32_t nplanes, p;
++    int ret;
++
++    /*
++     * The SG bookkeeping is shared with decoder mode, which needs the guest
++     * pages but has no host buffer to queue. Extracted verbatim; nothing in it
++     * changed.
++     */
++    ret = virtio_media_qbuf_take_sg(s, payload, payload_len, &guest_planes);
++    if (ret) {
++        return ret;
++    }
++    nplanes = gb->num_planes;
++
+     /*
+      * An output buffer carries the bitstream the guest just wrote, so it has to
+      * be copied into the host buffer BEFORE the host is asked to consume it.
+@@ -1647,7 +1756,17 @@ static void virtio_media_command_bh(void *opaque)
+             }
+             memset(payload + payload_len, 0, work_len - payload_len);
+ 
+-            if (desc->code == VIDIOC_REQBUFS) {
++            /*
++             * ONE BRANCH IS THE WHOLE OF DECODER MODE at this level.
++             * Everything above -- the session lookup, the SG serialisation,
++             * the scratch sizing, the response framing below -- is shared,
++             * which is why this is a mode of this device rather than a
++             * second device.
++             */
++            if (vm->decoder) {
++                status = virtio_media_dec_ioctl(s, desc->code, payload,
++                                                payload_len, work_len);
++            } else if (desc->code == VIDIOC_REQBUFS) {
+                 if (payload_len < sizeof(struct v4l2_requestbuffers)) {
+                     status = EINVAL;
+                 } else {
+@@ -1768,8 +1887,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+     struct v4l2_capability cap;
+     int fd;
+ 
++    /*
++     * Decoder mode needs no host device, so v4l2-device is not required there;
++     * virtio_media_dec_realize() sets device_caps from what the decoder
++     * implements and rejects an unsupported or unbuildable codec.
++     */
++    if (vm->decoder) {
++        if (!virtio_media_dec_realize(vm, errp)) {
++            return;
++        }
++        goto init_common;
++    }
++
+     if (!vm->v4l2_device) {
+-        error_setg(errp, "virtio-media: the v4l2-device property is required");
++        error_setg(errp, "virtio-media: the v4l2-device property is required "
++                   "unless the decoder property is set");
+         return;
+     }
+ 
+@@ -1814,6 +1946,8 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+      * the kernel's numbering and not something reinvented here.
+      */
+     vm->device_type = 0;
++
++init_common:
+     vm->next_session_id = 1;
+     QLIST_INIT(&vm->sessions);
+     vm->cmd_buf = g_malloc0(VIRTIO_MEDIA_CMD_BUF_SIZE);
+@@ -1824,8 +1958,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+     vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
+     virtio_media_gpu_set_fence_fd(vm->gpu_fence_fd);
+ 
+-    info_report("virtio-media: proxying %s (device_caps 0x%08x)",
+-                vm->v4l2_device, vm->device_caps);
++    /*
++     * Say which mode this is. The first decoder-mode run printed
++     *   virtio-media: proxying (null) (device_caps 0x04004000)
++     * because this line reads v4l2_device unconditionally and there is no host
++     * device in decoder mode. The caps were right; the message was not, and a
++     * "(null)" in a boot log is exactly the kind of thing that sends the next
++     * person looking for a missing property.
++     */
++    if (vm->decoder) {
++        info_report("virtio-media: %s decoder, no host device "
++                    "(device_caps 0x%08x)", vm->decoder, vm->device_caps);
++    } else {
++        info_report("virtio-media: proxying %s (device_caps 0x%08x)",
++                    vm->v4l2_device, vm->device_caps);
++    }
+ }
+ 
+ static void virtio_media_unrealize(DeviceState *dev)
+@@ -1859,6 +2006,12 @@ static const VMStateDescription vmstate_virtio_media = {
+ 
+ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
++    /*
++     * decoder=hevc turns this into a stateful HEVC decoder backed by
++     * libavcodec instead of a proxy for a host V4L2 node. Mutually exclusive
++     * with v4l2-device in practice: nothing reads it in decoder mode.
++     */
++    DEFINE_PROP_STRING("decoder", VirtIOMedia, decoder),
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+     DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
+     DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 78b14da9d..12052fcac 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -179,6 +179,15 @@ typedef struct VirtIOMediaBuffer {
+ 
+ #define VIRTIO_MEDIA_MAX_BUFFERS 32
+ 
++/*
++ * Concurrent sessions. Proxy mode is limited by RLIMIT_NOFILE anyway; decoder
++ * mode opens no fd, so without this a guest could allocate an AVCodecContext and
++ * a DPB per OPEN until DomD's OOM killer took this process -- which also serves
++ * DomA's rootfs. Eight is well above what a media stack opens (v4l2_codec2 uses
++ * one per codec instance and advertises 8 concurrent instances).
++ */
++#define VIRTIO_MEDIA_MAX_SESSIONS 8
++
+ typedef struct VirtIOMediaQueue {
+     uint32_t type;                /* the v4l2_buf_type this state is for */
+     bool mplane;
+@@ -220,10 +229,21 @@ typedef struct VirtIOMediaQueue {
+     VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
+ } VirtIOMediaQueue;
+ 
++/* Opaque decoder-mode state; see hw/virtio/virtio-media-decoder.c. */
++typedef struct VirtIOMediaDec VirtIOMediaDec;
++
+ typedef struct VirtIOMediaSession {
+     struct VirtIOMedia *vm;
+     uint32_t id;
++    /*
++     * The proxied host V4L2 device, or -1 in decoder mode -- there is no host
++     * V4L2 device then, because libavcodec owns the hardware and this device
++     * model synthesises the guest-facing decoder. Everything that touches fd
++     * has to be skipped in that mode; the hooks are marked in virtio-media.c.
++     */
+     int fd;
++    /* Non-NULL only in decoder mode. */
++    VirtIOMediaDec *dec;
+     /*
+      * The main-loop fd handler was detached because poll() reported only
+      * POLLERR (a streaming queue with no buffer queued). Re-attached by the
+@@ -244,6 +264,18 @@ struct VirtIOMedia {
+ 
+     /* Properties. */
+     char *v4l2_device;            /* host /dev/videoN to proxy */
++    /*
++     * "hevc" selects decoder mode: no host V4L2 device is opened and the guest
++     * is offered a STATEFUL HEVC decoder backed by libavcodec. Unset (the
++     * default) keeps the original proxy behaviour byte for byte.
++     *
++     * WHY A SECOND MODE RATHER THAN A SECOND DEVICE. The protocol handling --
++     * sessions, the SG serialisation, the event queue, the ioctl table -- is
++     * the whole of the proven part and is identical either way. Only what sits
++     * behind an ioctl changes, so the split is one branch at the dispatch
++     * point rather than a second copy of the transport.
++     */
++    char *decoder;
+     /*
+      * host-xfer: when a CAPTURE buffer completes and the guest has given the
+      * virgl resource id of the gralloc buffer behind it, write the decoded
+@@ -350,4 +382,44 @@ struct VirtIOMedia {
+     uint8_t *cmd_buf;
+ };
+ 
++/* ------------------------------------------------------------------------- */
++/* shared with virtio-media-decoder.c                                        */
++/* ------------------------------------------------------------------------- */
++/*
++ * These four were static until decoder mode needed them. Nothing about them
++ * changed; only the linkage. Keeping them in virtio-media.c rather than moving
++ * them means the proxy path is textually untouched.
++ */
++bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
++                          void *host, size_t len, bool to_guest);
++void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len);
++void virtio_media_send_error_event(VirtIOMediaSession *s, int err);
++void virtio_media_free_buffer_sgl(VirtIOMediaBuffer *b);
++int virtio_media_queue_index(uint32_t type);
++/*
++ * Parse the guest's QBUF payload into q->guest[index]'s SG lists. Split out of
++ * virtio_media_qbuf() so decoder mode can take the guest pages without also
++ * performing the host-side QBUF that has no meaning there.
++ */
++int virtio_media_qbuf_take_sg(VirtIOMediaSession *s, uint8_t *payload,
++                              size_t payload_len,
++                              struct v4l2_plane **guest_planes_out);
++
++/* ------------------------------------------------------------------------- */
++/* decoder mode (virtio-media-decoder.c)                                     */
++/* ------------------------------------------------------------------------- */
++/*
++ * All five are no-ops or hard failures when the device was built without
++ * libavcodec, so virtio-media.c needs no #ifdef of its own.
++ */
++bool virtio_media_dec_available(void);
++/* Validate the `decoder` property at realize time. Returns false and sets errp. */
++bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp);
++int virtio_media_dec_open(VirtIOMediaSession *s);
++void virtio_media_dec_close(VirtIOMediaSession *s);
++/* Serves every ioctl in decoder mode; returns a positive errno on failure. */
++int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
++                           uint8_t *payload, size_t payload_len,
++                           size_t work_len);
++
+ #endif /* QEMU_VIRTIO_MEDIA_H */
+diff --git a/meson.build b/meson.build
+index 40e3f4ec4..85ced3251 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1333,6 +1333,34 @@ if not get_option('alsa').auto() or (host_os == 'linux' and have_system)
+   alsa = dependency('alsa', required: get_option('alsa'),
+                     method: 'pkg-config')
+ endif
++
++# libavcodec for the virtio-media decoder mode (hw/virtio/virtio-media-decoder.c).
++#
++# required: false, and no meson_options.txt entry: this is a downstream BSP delta,
++# and the only consumer stubs itself out when the dependency is missing, so an
++# absent ffmpeg has to degrade rather than fail configure. The three libraries are
++# taken together because the decoder needs all of them (decode, image layout,
++# colour conversion) and a partial set would fail at link time instead of here.
++#
++# host_os, not targetos, and no kwargs: static_kwargs -- qemu removed both before
++# 10.0.2. See the forward-port note in the commit message.
++libavcodec = not_found
++libavutil = not_found
++libswscale = not_found
++if host_os == 'linux' and have_system
++  libavcodec = dependency('libavcodec', required: false,
++                          method: 'pkg-config')
++  libavutil = dependency('libavutil', required: false,
++                         method: 'pkg-config')
++  libswscale = dependency('libswscale', required: false,
++                          method: 'pkg-config')
++endif
++have_virtio_media_decoder = libavcodec.found() and libavutil.found() and libswscale.found()
++if not have_virtio_media_decoder
++  libavcodec = not_found
++  libavutil = not_found
++  libswscale = not_found
++endif
+ jack = not_found
+ if not get_option('jack').auto() or have_system
+   jack = dependency('jack', required: get_option('jack'),
+@@ -2271,6 +2299,9 @@ endif
+ config_host_data = configuration_data()
+ 
+ config_host_data.set('CONFIG_HAVE_RUST', have_rust)
++# Set next to the variable's definition, not next to the dependency lookups
++# above: config_host_data does not exist yet at that point in this qemu version.
++config_host_data.set('CONFIG_VIRTIO_MEDIA_DECODER', have_virtio_media_decoder)
+ audio_drivers_selected = []
+ if have_system
+   audio_drivers_available = {

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] xen/mapcache: keep foreign bucket heads mapped when unlocked
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0224-v10-xen-mapcache-keep-foreign-bucket-heads-mapped.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/xen/xen-mapcache.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index 7dfe8dc95..58bcf0709 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -596,6 +596,26 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+     if (entry->lock > 0) {
+         return;
+     }
++    /*
++     * Keep the head entry of a bucket mapped once its lock drops to zero,
++     * unless it is a grant. This is what every release up to 9.0 did
++     * (upstream's "|| pentry == NULL" early return, removed in 9.1), and it
++     * is what makes this a cache: a foreign mapping that is torn down on
++     * every unlock is re-created by a privcmd hypercall on the next
++     * address_space_map() of the same page.
++     * Upstream started unmapping head entries so that transient grant
++     * mappings can be released (the guest has to be able to revoke them);
++     * a foreign mapping of guest RAM has no such requirement.
++     *
++     * Measured on RPi4 DomD, qemu 10.0.2, virtio-media copying a 942 KB
++     * decoded frame into guest USERPTR pages one 4 KiB entry at a time:
++     * about 6 ms per frame in dma_memory_map()/dma_memory_unmap(), i.e.
++     * 230 map+unmap hypercall pairs, where the memcpy itself is 0.6 ms.
++     * Every DMA-capable device (virtio-blk, -net, -gpu) pays the same tax.
++     */
++    if (pentry == NULL && !(entry->flags & XEN_MAPCACHE_ENTRY_GRANT)) {
++        return;
++    }
+ 
+     ram_block_notify_remove(entry->vaddr_base, entry->size, entry->size);
+     if (entry->flags & XEN_MAPCACHE_ENTRY_GRANT) {

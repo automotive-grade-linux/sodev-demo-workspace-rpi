@@ -526,3 +526,14 @@ SRC_URI:append:class-target = " file://0246-v10-hw-virtio-media-let-host-nv12-sc
 # render per frame 3.21 -> 2.77 ms at 1080p60, 1.25 -> 0.99 ms at 720p60. Its
 # context is 0231's; the line numbers assume 0246, so it stays after it.
 SRC_URI:append:class-target = " file://0247-v10-hw-virtio-media-invalidate-the-RGBA-target-before-the-NV12-draw.patch"
+
+# 0248-v10: raise virtio-gpu's control-queue interrupt once per batch instead of per
+#   response. Under Xen the guest's ISR read is a synchronous ioreq to this main loop;
+#   raised mid-batch it waited for the rest of the batch (RPi4 DomA: 430 us per
+#   virtio-gpu interrupt vs a 45-60 us round trip, 16% of a guest CPU).
+SRC_URI:append:class-target = " file://0248-v10-virtio-gpu-coalesce-control-queue-notifications.patch"
+
+# 0249-v10: fenced SUBMIT_3D from a Venus guest carries INFO_RING_IDX (a fence on a
+#   context ring); create a virgl context fence for it instead of a ctx0 EGL fence
+#   (RPi4 DomA: ~150/s, each an EGL sync on the main thread).
+SRC_URI:append:class-target = " file://0249-v10-virtio-gpu-virgl-honour-ring-idx-with-context-fences.patch"

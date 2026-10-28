@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: return the OUTPUT buffer timestamp on
+ completion
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0244-v10-hw-virtio-media-return-the-OUTPUT-buffer-timestamp-on-completion.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-decoder.c | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 7ac6fcb92..1e61c3deb 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -109,6 +109,33 @@
+ /* Frames one dec_pump() call may deliver; see the loop for why it is bounded. */
+ #define DEC_PUMP_MAX_FRAMES 4
+ 
++/*
++ * THE TIMESTAMP OF AN OUTPUT BUFFER MUST COME BACK WITH IT.
++ *
++ * Completing an OUTPUT buffer with pts_us = -1 leaves dec_complete_buffer's
++ * timestamp at zero, so the guest gets tv_sec = 0 for every input buffer it
++ * queues. v4l2_codec2 carries its bitstreamId in exactly that field and looks
++ * the decode callback up by it:
++ *
++ *     int32_t id = dequeuedBuffer->getTimeStamp().tv_sec;
++ *     auto it = mPendingDecodeCbs.find(id);
++ *     if (it == mPendingDecodeCbs.end()) { ALOGW("Callback is already abandoned."); continue; }
++ *
++ * so bitstreamId 0 matches and every later one does not (measured on the
++ * board without this: "Callback is already abandoned" once per input buffer
++ * from the second on). Those callbacks are how the component learns its input
++ * was consumed, so CCodec stops recycling, the output buffers are never
++ * returned to the surface, and the pool saturates (instrumented
++ * C2SurfaceSyncObj: max=23 cur=23, status ACTIVE), which stalls
++ * fetchGraphicBlock in C2_BLOCKING for good.
++ *
++ * V4L2 is explicit that the timestamp travels with the buffer (and from the
++ * OUTPUT buffer to the CAPTURE buffer decoded from it), so echoing it is not a
++ * workaround for this one client.
++ */
++#define DEC_IN_PTS(b) \
++    ((int64_t)(b)->timestamp.tv_sec * 1000000 + (b)->timestamp.tv_usec)
++
+ /*
+  * What the input backlog may hold. Bounded for the reason DEC_MAX_OUT_SIZE is:
+  * the guest decides how much it queues, so a guest that feeds input while never
+@@ -1253,7 +1280,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+                 d->drain_done = false;
+                 avcodec_send_packet(d->avctx, NULL);
+             }
+-            dec_complete_buffer(s, 0, b->index, 0, 0, -1);
++            dec_complete_buffer(s, 0, b->index, 0, 0, DEC_IN_PTS(b));
+             dec_pump(s);
+             return 0;
+         }
+@@ -1357,7 +1384,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+          * is reported before any decoded frame, which is the order a stateful
+          * decoder gives: input completion does not wait for output.
+          */
+-        dec_complete_buffer(s, 0, b->index, (uint32_t)used, 0, -1);
++        dec_complete_buffer(s, 0, b->index, (uint32_t)used, 0, DEC_IN_PTS(b));
+     }
+ 
+     dec_pump(s);
