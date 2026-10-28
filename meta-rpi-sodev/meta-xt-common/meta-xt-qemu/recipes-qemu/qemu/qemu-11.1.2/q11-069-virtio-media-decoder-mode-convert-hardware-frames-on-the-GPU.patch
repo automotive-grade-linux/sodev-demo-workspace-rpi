@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 15:14:24 +0900
+Subject: [PATCH] virtio-media: decoder mode: convert hardware frames on
+ the GPU
+
+In decoder mode each hardware-decoded frame was brought back to the CPU:
+av_hwframe_transfer_data() detiled the SAND frame into YUV420P, swscale
+converted that to RGBA, and virglrenderer's transfer uploaded it into
+the guest's resource -- three passes over the frame, all on the main
+loop. On a Raspberry Pi 5 with HEVC 1080p60 (while DomU's cluster still
+drew at 1920x1080) the codec CLI reached 60.9 fps without rendering and
+55.6 fps with it, and the main thread ran at 80.8% of a core at
+55.5 fps.
+
+With host-sand set, keep the frame as DRM_PRIME and do what the proxy
+mode does with bcm2835-codec's buffers: import the dmabuf into GL
+(host-sand=1 through EGL with the SAND modifier, host-sand=2 as a linear
+texture detiled in the shader) and let the GPU convert it into the
+guest's RGBA resource. The imports are cached per dmabuf, since
+libavcodec's pool recycles its buffers; the fd is duplicated, because an
+import owns and closes its fd. The cache is emptied when the stream
+changes size, the input stops or the frames come from another pool, so
+it does not keep an old pool's CMA alive.
+
+The decoder writes another frame into a buffer once the frame is
+released, so the GPU has to be done reading it first. As in the proxy,
+which waits at the capture buffer's next QBUF, the wait is deferred: the
+last two blitted frames stay referenced and each is waited for when it
+leaves that queue, normally long after its fence has signalled. Waiting
+right after each blit stopped the main loop for the whole conversion.
+
+The frame has to be one dmabuf with the chroma after the luma in each
+column and be the size of the guest's buffer; anything else, or an
+import or blit that fails, goes through the CPU path as before. After a
+failure other than "no GL context yet" the CPU path takes the rest of
+the stream, until the input stops or, with SOURCE_CHANGE subscribed,
+the size changes; 120 frames in a row without a GL context are reported
+once.
+
+With or without host-sand, the CPU path now converts with the GPU
+path's colour matrix: BT.709 for an unspecified stream of 720 lines or
+more, and the frame's range, where libswscale's default was BT.601
+limited. A stream thus keeps its colours when it moves between the two
+paths. The "hardware decode active" line is logged on the GPU path too,
+and a failed download in the CPU path reports EIO, as it did before.
+
+Measured on the Raspberry Pi 5 (2026-10-15, codec CLI, HEVC 1080p60, GL
+SurfaceFlinger, the AGL cluster running in DomU at 1920x720):
+- CPU path (host-sand=0): 60.5-61.3 fps decoding, 54.2-54.7 rendering
+- host-sand=2, waiting after each blit: 74.2-75.4 and 53.1-55.0
+- host-sand=1, waiting after each blit: 91.9-95.3 and 58.3-59.1
+- host-sand=1, deferred wait: 133.8-136.9 and 66.3-66.5, with the main
+  thread at about 17% of a core
+Played at its own rate the clip shows 61 fps on screen, frames in
+order and with the right colours (checked with a webcam).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 367 ++++++++++++++++++++++++++++++-
+ 1 file changed, 359 insertions(+), 8 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index d9d5950..a90f873 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -64,6 +64,7 @@
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/hwcontext.h>   /* av_hwdevice_ctx_create, transfer */
++#include <libavutil/hwcontext_drm.h> /* AVDRMFrameDescriptor */
+ #include <libavutil/pixdesc.h>     /* av_get_pix_fmt_name, for the diag */
+ #include <libswscale/swscale.h>
+ 
+@@ -121,6 +122,42 @@
+ /* Frames one dec_pump() call may deliver; see the loop for why it is bounded. */
+ #define DEC_PUMP_MAX_FRAMES 4
+ 
++/*
++ * host-sand: GPU imports of the decoder's buffers kept at once. libavcodec's
++ * v4l2request pool recycles its buffers (DPB + thread_count + a few, and one
++ * more whenever none is free, e.g. while DEC_GPU_HOLD frames are held), so
++ * this only has to be larger than that; a full cache is emptied and refilled.
++ */
++#define DEC_GPU_CACHE 40
++/*
++ * host-sand: hardware frames kept referenced after their blit, so that the GPU
++ * finishes reading one while the next is decoded (see dec_gpu_hold()). The
++ * pool grows by this many buffers: v4l2request allocates another destination
++ * buffer when none is free, as long as extra_hw_frames is unset (it is).
++ */
++#define DEC_GPU_HOLD 2
++/* -EAGAIN (no GL context) this many frames in a row is reported once. */
++#define DEC_GPU_AGAIN_WARN 120
++
++/* DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(h): vendor 0x07, code 4, h in 8..55 */
++#define DEC_MOD_VENDOR(m)   ((m) >> 56)
++#define DEC_MOD_CODE(m)     ((m) & 0xffu)
++#define DEC_MOD_PARAM(m)    (((m) >> 8) & ((1ull << 48) - 1))
++
++typedef struct DecGpuEntry {
++    dev_t dev;
++    ino_t ino;
++    uint32_t w, h;
++    int matrix;
++    void *handle;
++} DecGpuEntry;
++
++/* A blitted hardware frame and the import whose GPU work reads it. */
++typedef struct DecGpuHeld {
++    AVFrame *frame;
++    void *handle;
++} DecGpuHeld;
++
+ /*
+  * THE TIMESTAMP OF AN OUTPUT BUFFER MUST COME BACK WITH IT.
+  *
+@@ -204,6 +241,9 @@ struct VirtIOMediaDec {
+     int sws_src_fmt;
+     int sws_src_w, sws_src_h;
+     int sws_w, sws_h;
++    int sws_matrix;
++    /* errno for the error event when dec_write_frame() fails (0 = EFAULT) */
++    int write_err;
+ 
+     /*
+      * v4l2request hwaccel. hwdev is NULL when it could not be opened, and
+@@ -214,6 +254,22 @@ struct VirtIOMediaDec {
+     AVBufferRef *hwdev;
+     AVFrame *swframe;
+     bool hw_logged;
++
++    /*
++     * host-sand: hardware frames reach the guest's RGBA resource on the GPU
++     * (dec_gpu_write), not through the CPU. gpu_off once that has failed for
++     * a reason other than "no GL context yet"; the CPU path then takes every
++     * frame, as without host-sand, until the input is stopped or the stream
++     * changes size with SOURCE_CHANGE subscribed (dec_gpu_reset).
++     */
++    bool gpu_off;
++    bool gpu_logged;
++    unsigned gpu_again;
++    AVBufferRef *gpu_fctx; /* the hw_frames_ctx the imports came from */
++    DecGpuEntry gpu[DEC_GPU_CACHE];
++    unsigned gpu_n;
++    DecGpuHeld gpu_held[DEC_GPU_HOLD];
++    unsigned gpu_held_n;
+ };
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -400,6 +456,257 @@ static int dec_next_cap_buffer(VirtIOMediaSession *s)
+     return -1;
+ }
+ 
++/* ------------------------------------------------------------------------- */
++/* host-sand: hardware frames on the GPU                                     */
++/* ------------------------------------------------------------------------- */
++
++/* Give the oldest held frame back to the decoder once the GPU has read it. */
++static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
++{
++    DecGpuHeld *h = &d->gpu_held[0];
++
++    if (virtio_media_gpu_wait(h->handle) < 0) {
++        warn_report_once("virtio-media/dec: host-sand: GPU wait failed");
++    }
++    av_frame_free(&h->frame);
++    d->gpu_held_n--;
++    memmove(&d->gpu_held[0], &d->gpu_held[1],
++            d->gpu_held_n * sizeof(d->gpu_held[0]));
++}
++
++static void dec_gpu_clear(VirtIOMediaDec *d)
++{
++    unsigned i;
++
++    /* the held frames' waits use the imports, so they go first */
++    while (d->gpu_held_n) {
++        dec_gpu_unhold_oldest(d);
++    }
++    for (i = 0; i < d->gpu_n; i++) {
++        virtio_media_gpu_release(d->gpu[i].handle);
++    }
++    d->gpu_n = 0;
++}
++
++/*
++ * A new stream (input stopped, or the size changed): drop the imports of the
++ * old buffers, so they do not pin the old pool's CMA while the new one is
++ * allocated, and give the GPU path another try.
++ */
++static void dec_gpu_reset(VirtIOMediaDec *d)
++{
++    dec_gpu_clear(d);
++    av_buffer_unref(&d->gpu_fctx);
++    d->gpu_off = false;
++    d->gpu_again = 0;
++}
++
++/*
++ * NOTE: THE GPU WAIT IS DEFERRED, AS THE PROXY'S IS.
++ *
++ * The decoder writes another frame into a buffer as soon as the frame is
++ * released, so the GPU has to be done reading it first. Waiting right after
++ * the blit stopped the main loop for the whole conversion every frame; keep a
++ * reference instead and wait when the frame leaves this queue, DEC_GPU_HOLD
++ * frames later, by which time the fence has normally signalled. The proxy
++ * waits at the capture buffer's next QBUF for the same reason.
++ */
++static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
++{
++    AVFrame *ref = av_frame_alloc();
++
++    if (ref && av_frame_ref(ref, fr) < 0) {
++        av_frame_free(&ref);
++    }
++    if (!ref) {
++        /* no reference to keep: wait now, as before */
++        if (virtio_media_gpu_wait(handle) < 0) {
++            warn_report_once("virtio-media/dec: host-sand: GPU wait failed");
++        }
++        return;
++    }
++    if (d->gpu_held_n == DEC_GPU_HOLD) {
++        dec_gpu_unhold_oldest(d);
++    }
++    d->gpu_held[d->gpu_held_n].frame = ref;
++    d->gpu_held[d->gpu_held_n].handle = handle;
++    d->gpu_held_n++;
++}
++
++/* Keep hardware frames as DRM_PRIME for dec_gpu_write instead of downloading. */
++static bool dec_gpu_wanted(VirtIOMediaSession *s)
++{
++    return s->vm->host_sand && s->vm->gpu_xfer && !s->dec->gpu_off;
++}
++
++/*
++ * The YCbCr -> RGB coefficients for virtio_media_gpu_import_*: 0 = BT.601
++ * limited, 1 = BT.709 limited, +2 = full range. An unspecified matrix is
++ * BT.709 from 720 lines up, as for the proxy's V4L2 default. The CPU path
++ * converts a frame with the same choice (dec_sws_colorspace), so a stream
++ * looks the same whichever path takes a frame.
++ */
++static int dec_gpu_matrix(const AVFrame *fr)
++{
++    bool is709 = fr->colorspace == AVCOL_SPC_BT709 ||
++                 (fr->colorspace == AVCOL_SPC_UNSPECIFIED && fr->height >= 720);
++
++    return (is709 ? 1 : 0) | (fr->color_range == AVCOL_RANGE_JPEG ? 2 : 0);
++}
++
++/*
++ * The same coefficients for libswscale (its default is BT.601 limited,
++ * whatever the frame says). Only YCbCr input has a matrix; RGBA output is
++ * always full range.
++ */
++static void dec_sws_colorspace(struct SwsContext *sws, enum AVPixelFormat src,
++                               int matrix)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(src);
++    int *inv, *tab, src_range, dst_range, bri, con, sat;
++
++    if (!desc || (desc->flags & AV_PIX_FMT_FLAG_RGB) ||
++        sws_getColorspaceDetails(sws, &inv, &src_range, &tab, &dst_range,
++                                 &bri, &con, &sat) < 0) {
++        return;
++    }
++    sws_setColorspaceDetails(sws,
++                             sws_getCoefficients(matrix & 1 ? SWS_CS_ITU709
++                                                            : SWS_CS_ITU601),
++                             matrix & 2 ? 1 : 0, tab, 1, bri, con, sat);
++}
++
++/*
++ * THE SAME PATH AS THE PROXY'S host-sand.
++ *
++ * rpi-hevc-dec writes its frames as SAND (NV12 in 128-byte columns) into a
++ * dmabuf; libavcodec hands them over as DRM_PRIME. Downloading one meant three
++ * passes over the frame on this thread -- detile to YUV420P, swscale to RGBA,
++ * glTexSubImage2D into the guest's resource -- about 9 ms of CPU a 1080p frame
++ * before the upload (DomD's ffmpeg on the Raspberry Pi 5: 4.4 ms/frame for the
++ * hardware alone, 13.2 ms with the two conversions), which held 1080p60 under
++ * 60 fps. Instead import the dmabuf into GL and let the GPU convert it into the
++ * guest's resource, as the proxy does for bcm2835-codec's buffers
++ * (virtio-media.c, gpu_xfer): no pass over the pixels on the CPU.
++ *
++ * One dmabuf with the chroma after the luma in each column (V4L2's NV12_COL128;
++ * the fork's v4l2request is made to choose it over the two-buffer form), the
++ * modifier carrying the column height. host-sand=1 imports it through EGL with
++ * that modifier, host-sand=2 reads it as a linear texture and detiles in the
++ * shader. Returns 0 when the guest's resource holds the frame, -EAGAIN when
++ * there is no GL context yet, another negative errno when this path cannot take
++ * the frame; the caller then converts it on the CPU.
++ */
++static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
++                         const AVFrame *fr, uint32_t w, uint32_t h)
++{
++    VirtIOMediaDec *d = s->dec;
++    const AVDRMFrameDescriptor *desc = (const void *)fr->data[0];
++    const AVDRMLayerDescriptor *l;
++    DecGpuEntry *e = NULL;
++    struct stat st;
++    uint64_t mod;
++    uint32_t col, uv_offset;
++    int matrix = dec_gpu_matrix(fr);
++    unsigned i;
++    int err = 0, r;
++
++    if (!gb->virgl_res || gb->num_planes != 1 || !desc) {
++        return -EINVAL;
++    }
++    /* Unscaled only: the guest's buffer is the frame's size (see dec_pump). */
++    if ((uint32_t)fr->width != w || (uint32_t)fr->height != h) {
++        return -ENOTSUP;
++    }
++    l = &desc->layers[0];
++    mod = desc->objects[0].format_modifier;
++    if (desc->nb_objects != 1 || desc->nb_layers != 1 || l->nb_planes != 2 ||
++        l->planes[0].object_index != 0 || l->planes[1].object_index != 0 ||
++        l->planes[0].offset != 0 ||
++        DEC_MOD_VENDOR(mod) != 0x07 || DEC_MOD_CODE(mod) != 4) {
++        return -ENOTSUP;
++    }
++    col = (uint32_t)DEC_MOD_PARAM(mod);
++    uv_offset = (uint32_t)l->planes[1].offset;
++    /* luma_rows (uv_offset / 128) lines of Y, then the CbCr lines, per column */
++    if (uv_offset % 128 || uv_offset / 128 < h || col < uv_offset / 128 + h / 2) {
++        return -ENOTSUP;
++    }
++    if (fstat(desc->objects[0].fd, &st) < 0) {
++        return -errno;
++    }
++    /*
++     * Another pool (the hwaccel was set up again): its buffers are new ones.
++     * The reference keeps the old context's address from being reused by the
++     * new one, which would hide the change.
++     */
++    if (fr->hw_frames_ctx &&
++        (!d->gpu_fctx || fr->hw_frames_ctx->data != d->gpu_fctx->data)) {
++        dec_gpu_clear(d);
++        av_buffer_unref(&d->gpu_fctx);
++        d->gpu_fctx = av_buffer_ref(fr->hw_frames_ctx);
++    }
++
++    for (i = 0; i < d->gpu_n; i++) {
++        DecGpuEntry *c = &d->gpu[i];
++
++        if (c->dev == st.st_dev && c->ino == st.st_ino &&
++            c->w == w && c->h == h && c->matrix == matrix) {
++            e = c;
++            break;
++        }
++    }
++    if (!e) {
++        int fd;
++
++        /* Another size: the old imports are of no further use. */
++        if (d->gpu_n && (d->gpu[0].w != w || d->gpu[0].h != h)) {
++            dec_gpu_clear(d);
++        }
++        if (d->gpu_n == DEC_GPU_CACHE) {
++            dec_gpu_clear(d);
++        }
++        /* the imports own and close their fd; the frame's stays with the pool */
++        fd = fcntl(desc->objects[0].fd, F_DUPFD_CLOEXEC, 0);
++        if (fd < 0) {
++            return -errno;
++        }
++        e = &d->gpu[d->gpu_n];
++        e->handle = s->vm->host_sand == 2
++            ? virtio_media_gpu_import_sand_linear(fd, w, uv_offset / 128, col,
++                                                  w, h, 1.0f,
++                                                  (uint32_t)desc->objects[0].size,
++                                                  matrix, &err)
++            : virtio_media_gpu_import_nv12(fd, w, h, w, uv_offset, w, h, 1.0f,
++                                           (uint32_t)desc->objects[0].size,
++                                           matrix, col, &err);
++        if (!e->handle) {
++            return err ? err : -EINVAL;
++        }
++        e->dev = st.st_dev;
++        e->ino = st.st_ino;
++        e->w = w;
++        e->h = h;
++        e->matrix = matrix;
++        d->gpu_n++;
++    }
++
++    r = virtio_media_gpu_blit(e->handle, gb->virgl_res);
++    if (r) {
++        return r;
++    }
++    dec_gpu_hold(d, fr, e->handle);
++    if (!d->gpu_logged) {
++        d->gpu_logged = true;
++        d->hw_logged = true;
++        info_report("virtio-media/dec: hardware decode active (v4l2request, "
++                    "host-sand=%u: frames reach the guest on the GPU, column "
++                    "height %u, chroma at %u, matrix %d)",
++                    s->vm->host_sand, col, uv_offset, matrix);
++    }
++    return 0;
++}
++
+ /*
+  * Write one decoded frame into the guest's pages as NV12.
+  *
+@@ -445,6 +752,36 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+      * strides. One memcpy per frame is the same cost the proxy path already
+      * pays for bcm2835-codec.
+      */
++    if (fr->format == AV_PIX_FMT_DRM_PRIME) {
++        int r = dec_gpu_write(s, gb, fr, w, h);
++        int t;
++
++        if (r == 0) {
++            d->gpu_again = 0;
++            *bytesused = need;
++            return true;
++        }
++        if (r != -EAGAIN) {
++            d->gpu_off = true;
++            dec_gpu_clear(d);
++            warn_report("virtio-media/dec: host-sand: the GPU cannot take this "
++                        "stream's frames (%d); converting them on the CPU", r);
++        } else if (++d->gpu_again == DEC_GPU_AGAIN_WARN) {
++            warn_report("virtio-media/dec: host-sand: no GL context for %u "
++                        "frames; converting them on the CPU", d->gpu_again);
++        }
++        /* This frame on the CPU, as dec_pump does without host-sand. */
++        av_frame_unref(d->swframe);
++        t = av_hwframe_transfer_data(d->swframe, fr, 0);
++        if (t < 0) {
++            error_report_once("virtio-media/dec: hwframe transfer: %d", t);
++            d->write_err = EIO; /* what dec_pump reports for the same failure */
++            return false;
++        }
++        av_frame_copy_props(d->swframe, fr);
++        fr = d->swframe;
++    }
++
+     buf = g_malloc(need);
+     dst_data[0] = buf;
+     dst_linesize[0] = (int)(w * 4);
+@@ -476,18 +813,25 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+          * the guest's page. A host memory disclosure, and a SIGSEGV on the last
+          * row.
+          */
++        int matrix = dec_gpu_matrix(fr);
++
+         if (!d->sws || d->sws_src_fmt != fr->format ||
+             d->sws_src_w != fr->width || d->sws_src_h != fr->height ||
+-            d->sws_w != (int)w || d->sws_h != (int)h) {
++            d->sws_w != (int)w || d->sws_h != (int)h ||
++            d->sws_matrix != matrix) {
+             sws_freeContext(d->sws);
+             d->sws = sws_getContext(fr->width, fr->height, fr->format,
+                                     w, h, AV_PIX_FMT_RGBA,
+                                     SWS_BILINEAR, NULL, NULL, NULL);
++            if (d->sws) {
++                dec_sws_colorspace(d->sws, fr->format, matrix);
++            }
+             d->sws_src_fmt = fr->format;
+             d->sws_src_w = fr->width;
+             d->sws_src_h = fr->height;
+             d->sws_w = w;
+             d->sws_h = h;
++            d->sws_matrix = matrix;
+         }
+         if (!d->sws) {
+             error_report_once("virtio-media/dec: no conversion from %d to RGBA",
+@@ -556,8 +900,10 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+     if (index < 0) {
+         return false;
+     }
++    s->dec->write_err = 0;
+     if (!dec_write_frame(s, index, fr, &bytesused)) {
+-        virtio_media_send_error_event(s, EFAULT);
++        virtio_media_send_error_event(s, s->dec->write_err ? s->dec->write_err
++                                                           : EFAULT);
+         return true;   /* consumed: the session is broken either way */
+     }
+     dec_complete_buffer(s, 1, (uint32_t)index, bytesused, 0, fr->pts);
+@@ -732,11 +1078,12 @@ static void dec_pump(VirtIOMediaSession *s)
+          * memcpy into the guest pages, so bring it back to the CPU and carry on
+          * with the frame the rest of this file already knows how to handle.
+          *
+-         * The download lands in the sw_format the driver produced, which on this
+-         * SoC is rpi4_8 (SAND/COL128), NOT NV12 -- measured, see dec_get_format.
+-         * That is exactly the case the sws path in dec_write_frame exists for,
+-         * and the libswscale in the fork detiles it with its AArch64 NEON code.
+-         * The fork's ffmpeg ran this conversion end to end on the board:
++         * The driver's sw_format on this SoC is rpi4_8 (SAND/COL128), NOT NV12
++         * -- measured, see dec_get_format. The download lands in YUV420P: the
++         * fork's hwcontext_drm offers that for rpi4_8 and detiles the columns
++         * itself (av_rpi_sand_to_planar_frame), and the sws path in
++         * dec_write_frame converts the YUV420P to RGBA. The fork's ffmpeg ran
++         * this conversion end to end on the board:
+          *   ffmpeg -hwaccel drm -i <clip> -pix_fmt nv12 -f rawvideo  -> 300 frames
+          * So no COL128-specific code is needed here, and none is added.
+          *
+@@ -744,7 +1091,7 @@ static void dec_pump(VirtIOMediaSession *s)
+          * d->frame (dec_deliver, d->held), and swapping in place keeps all of
+          * that ownership unchanged.
+          */
+-        if (d->frame->format == AV_PIX_FMT_DRM_PRIME) {
++        if (d->frame->format == AV_PIX_FMT_DRM_PRIME && !dec_gpu_wanted(s)) {
+             int t;
+ 
+             av_frame_unref(d->swframe);
+@@ -817,6 +1164,7 @@ static void dec_pump(VirtIOMediaSession *s)
+                  */
+                 d->held = av_frame_clone(d->frame);
+                 av_frame_unref(d->frame);
++                dec_gpu_reset(d);
+                 d->awaiting_reconfig = true;
+                 dec_send_v4l2_event(s, V4L2_EVENT_SOURCE_CHANGE,
+                                     V4L2_EVENT_SRC_CH_RESOLUTION);
+@@ -996,6 +1344,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     if (!d) {
+         return;
+     }
++    dec_gpu_clear(d);
++    av_buffer_unref(&d->gpu_fctx);
+     if (d->avctx) {
+         avcodec_free_context(&d->avctx);
+     }
+@@ -1472,6 +1822,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+             avcodec_flush_buffers(d->avctx);
+             av_frame_free(&d->held);
+             dec_backlog_clear(d);
++            dec_gpu_reset(d);
+             d->draining = false;
+             d->drain_done = false;
+         }

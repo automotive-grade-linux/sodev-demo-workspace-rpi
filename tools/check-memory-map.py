@@ -375,7 +375,8 @@ def low_free_ranges(banks, flavour):
 # candidate set and say plainly that the pick is unproven. Do NOT re-derive a rule from
 # a single new board.
 DOM0_BANK0_MEASURED = {
-    # BANK[0] 0xa0000000-0xc0000000; "Loading zImage ... to 00000000a0000000"
+    # BANK[0] 0xa0000000-0xc0000000; "Loading zImage ... to 00000000a0000000".
+    # Measured again with DomD's 896 MiB bank at 0x68000000 (2026-10-19, 8g map).
     ("zephyr", 512): 0xa0000000,
     # BANK[0] 0xe0000000-0x100000000; same log line, at 0xe0000000
     ("linux", 512): 0xe0000000,

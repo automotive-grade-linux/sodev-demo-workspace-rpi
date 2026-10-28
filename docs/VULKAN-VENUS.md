@@ -302,12 +302,17 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
   `SET_PRIMARY_RECT` (`q11-064`). It needs `XT_DOMA_OVERLAY_PLANES` > 0, and
   `do_install` refuses it with any other device model. Both boards set `1` with
   qemu 11.
-- The `/run/qemu-*` display-path switches `q11-063` and `q11-066` read, created at
-  boot by each board layer's `xt-qemu-display-toggles`: nine on the Raspberry Pi 4
-  (its ISP and SAND direct scanout among them), three on the Raspberry Pi 5 (the
-  plane handoff, `media-sg-rw` and `fb-invalidate`; the other five act only on a
-  buffer the Pi 4's proxy hands over, and the Pi 5 has no bcm2835 ISP for
-  `media-isp`).
+- The `/run/qemu-*` display-path switches `q11-063`, `q11-066`, `q11-071` and `q11-081`
+  read, created at boot by each board layer's `xt-qemu-display-toggles`:
+  nine on the Raspberry Pi 4 (its ISP and SAND direct scanout among them), nine on the
+  Raspberry Pi 5 (the plane handoff, `media-sg-rw`, `fb-invalidate`, the SAND direct
+  scanout of the decoder mode's buffers, `q11-071`, and `plane-sand`, `q11-081`, which
+  gives a plane the decoder's buffer; only the bcm2835 ISP's `media-isp` is left out,
+  the Pi 5 has none).
+- `RPI5_DOMA_HOST_SAND` (`meta-xt-rpi5`'s `xt-xen-cfg-doma` append; `1` with qemu
+  11.1.2, `0` otherwise): `host-sand=N` on DomA's virtio-media device, so the decoder
+  mode's HEVC frames reach the guest on the GPU (`q11-069`); the append refuses a
+  non-zero value with any other qemu.
 - `QEMU_XEN_MAPCACHE_MAX_MB`, which the DomD qemu wrapper exports for every
   device model it starts: it caps the foreign mapcache (`q11-053`) at
   `XT_QEMU_MAPCACHE_MAX_MB` from the DomD image recipe: 4608 on a Raspberry Pi 5
@@ -1507,7 +1512,12 @@ the buffer is UIF, the plane rejects it, and weston composites DomA with the GPU
 | situation (Raspberry Pi 5, DomA composited with GL) | needed? | measured |
 |---|---|---|
 | HMI only | for plane-only, yes (the client target is a scanout buffer) | V3D 17.6 -> 17.0% (2026-10-15); weston's state not compared |
+| HEVC 1080p60, SAND direct scanout | no: the decoder's SAND buffer goes to a plane from the device model directly | V3D 17.0 -> 16.6%, 61.07 -> 61.04 fps (2026-10-15) |
 | Vulkan composition with `/etc/qemu-gbm-layout` | redundant (gbm-layout makes DomA's resources linear already) | not measured |
+
+The cost is in decode speed when nothing is shown: `-S` of HEVC 1080p fell about
+5% (2026-10-15), and about 11% when decoder output was made linear too (a test
+build, not in this tree). Shown frame rates did not fall in this tree.
 
 Where qemu 10.0.2 and virglrenderer 1.2.0 are selected instead (no `0024`, no
 plane handoff) it changes nothing.
@@ -1516,9 +1526,10 @@ It is set where DomA should go to a plane: the Raspberry Pi 5 on qemu 11.1.2 and
 virglrenderer 1.3.0. The Raspberry Pi 4 has the same path (qemu 11.1.2,
 virglrenderer 1.3.0 and `0024`, the plane handoff) but is left off: its HVS has no
 IOMMU, so a linear v3d bo is not expected to go on a plane there and only the cost
-of a linear layout would remain (not measured). It is not needed with gbm-layout.
-The allocator cannot tell at allocation time whether the composer will put a buffer
-on a plane, so the property stays a global switch.
+would remain (not measured). It is not needed with gbm-layout. Making decoder output
+linear as well is a separate choice (its video layer could then go to a plane, at
+the -S cost above). The allocator cannot tell at allocation time whether the
+composer will put a buffer on a plane, so the property stays a global switch.
 
 ## 7. Phase 4-B — DomU (AGL-IC)
 

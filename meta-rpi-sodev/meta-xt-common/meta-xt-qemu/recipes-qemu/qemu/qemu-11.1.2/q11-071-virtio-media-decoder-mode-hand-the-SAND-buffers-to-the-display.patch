@@ -1,0 +1,846 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 19:23:16 +0900
+Subject: [PATCH] virtio-media: decoder mode: hand the SAND buffers to the
+ display
+
+q11-063 lets the proxy hand bcm2835-codec's SAND buffer to the display
+for the guest buffer it was converted into, so that weston puts a
+full-screen frame on an HVS plane without the GPU. Decoder mode
+(q11-069, libavcodec's v4l2request on rpi-hevc-dec) converted every
+frame on the GPU and the guest composed the result, so a full-screen
+HEVC frame took two GPU passes.
+
+Offer the decoder's buffer through ui/direct-scanout.h the same way:
+NV12 with the SAND128 modifier, one dma-buf, the chroma at the second
+plane's offset, published for the guest buffer's texture. The display
+takes it only when the guest scans that buffer out alone, full screen
+and unscaled (/run/qemu-isp-scanout); otherwise the guest's copy is
+shown as before. /run/qemu-sand-scanout turns the offer on.
+
+The pixels live in libavcodec's pool, not in a buffer the guest queues,
+so a frame stays showable while a reference to it is kept: from its
+delivery until the guest queues its buffer again, and past that while
+weston still shows it (hold). The references are bounded to 128 MiB and
+2 to 32 frames, and kept only while the display takes the buffers: for
+2 s after a start or after it stopped taking them, then again every
+10 s. Those 2 s keep references even for a video the display does not
+take -- not full screen, or a 4K frame in a 1080p window -- and the pool
+keeps every buffer it has allocated until the stream stops.
+direct_scanout_hit_within() is new for that. Two imports of one buffer
+with different colour matrices are two entries, each with its own
+reference: rare, and bounded the same way.
+
+The pool is rpi-hevc-dec's CAPTURE queue, 32 buffers at most, and only
+this thread lets its buffers go, so holding all of them would leave
+v4l2request waiting for itself for good. A buffer is seen here when its
+frame comes out, up to has_b_frames frames after the decoder took it;
+when the (30 - has_b_frames)-th one appears, the references held then,
+that frame's included, and one more become the most this pool may keep.
+Past that a new reference replaces another: first one the guest is done
+with and the compositor still holds (it may still be scanned out;
+counted), then one not on screen (its skipped conversion is made then),
+and one on screen only when all are. Should the decoder still find no
+free buffer, rpidistro-ffmpeg 0002 (meta-xt-rpi5) gives up the wait
+after 300 ms with ENOMEM: every reference is then let go, nothing is
+offered for 10 s, the bound comes down by two, and one frame is lost
+instead of the stream.
+
+With /run/qemu-sand-skip-isp the GPU conversion itself is left out
+while the display keeps taking the buffers (direct_scanout_skip_copy),
+and made late from the kept frame: when the display misses (12 at
+most per miss, oldest first, one wait) or before the reference to that
+frame goes. A conversion or a CPU write of a guest buffer withdraws
+its offer and its skipped conversion. Dropping the imports (a new
+pool, size or stream, or close) forgets this owner and prints what was
+offered, skipped and made late.
+
+The display's line on the frames it did not take came every 60
+misses, for good, for a window that is never taken: DomU's guest
+dma-buf, 90 lines a minute. While no frame is taken the next line now
+comes after twice as many misses, up to 3600 (2 lines a minute).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 591 ++++++++++++++++++++++++++++++-
+ include/ui/direct-scanout.h      |   2 +
+ ui/direct-scanout.c              |   6 +
+ ui/sdl2-wl-scanout.c             |  12 +-
+ 4 files changed, 602 insertions(+), 9 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index a90f873..93d268d 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -58,6 +58,8 @@
+ #include "qapi/error.h"
+ #include "hw/virtio/virtio-media.h"
+ #include "hw/virtio/virtio-media-virgl.h"
++#include "qemu/timer.h"
++#include "ui/direct-scanout.h"
+ 
+ #ifdef CONFIG_VIRTIO_MEDIA_DECODER
+ 
+@@ -150,8 +152,71 @@ typedef struct DecGpuEntry {
+     uint32_t w, h;
+     int matrix;
+     void *handle;
++    /* q11-dec-sand-scanout: the buffer as the display sees it (dec_ds_*) */
++    int show_fd;     /* a dup of the decoder buffer's fd, or -1 */
++    uint64_t seq;    /* content generation last published for this buffer */
++    AVFrame *ref;    /* keeps the decoder off the buffer while it may be shown */
++    bool held;       /* the compositor has it on screen */
++    bool unref_on_unhold; /* the guest is done with it: let go once off screen */
+ } DecGpuEntry;
+ 
++/*
++ * q11-dec-sand-scanout: a decoder frame is kept referenced for the display from
++ * its delivery until the guest queues its buffer again (it shows the frame in
++ * between, a couple of dozen frames later with v4l2_codec2's output delay), and
++ * past that while the compositor still has it on screen. The references are
++ * bounded as a share of the CMA the pool lives in: at most this many bytes'
++ * worth, between 2 and DEC_DS_REFS_MAX frames; beyond that one goes
++ * (dec_ds_keep says which), and that frame is shown from the guest's copy
++ * instead.
++ */
++#define DEC_DS_REFS_BYTES (128u << 20)
++#define DEC_DS_REFS_MAX 32
++/*
++ * The references cost the pool's CMA, so they are kept only while the display
++ * takes the buffers: after a start, or once it stopped taking them, for
++ * DEC_DS_PROBE_MS, and then again every DEC_DS_RETRY_MS (a video that is not
++ * full screen, or not the window's size -- a 4K one in a 1080p window -- is
++ * never taken).
++ *
++ * The limits of that probe: the pool keeps every buffer it allocated until the
++ * stream stops (v4l2request never frees one), so a probe that grew it leaves
++ * the CMA taken even when the display never took a frame; a video that goes
++ * full screen later is offered only at the next retry, up to DEC_DS_RETRY_MS
++ * on; and "the display takes" is any producer's buffer within the last second
++ * (direct_scanout_hit_within), not only this decoder's.
++ */
++#define DEC_DS_PROBE_MS 2000
++#define DEC_DS_RETRY_MS 10000
++/*
++ * libavcodec's pool is rpi-hevc-dec's CAPTURE queue, which takes VB2_MAX_FRAME
++ * (32) buffers and no more. Past that v4l2request waits for a buffer to come
++ * free, and only this thread frees them: with every buffer referenced here
++ * that wait would never end (rpidistro-ffmpeg 0002 bounds it, dec_ds_starved).
++ * The pool grows only when no buffer is free, and a buffer is seen here only
++ * when its frame comes out, up to has_b_frames frames after it was taken. So
++ * when the import of the (DEC_DS_POOL_SOFT - has_b_frames)-th buffer appears,
++ * every buffer of the DEC_DS_POOL_SOFT is in use, and the references held then
++ * plus one more is how many the pool has room for: they are not let grow past
++ * that (ds_refs_cap) for as long as the pool lives, which leaves the last
++ * buffer for the decoder's own references varying. Should the decoder run out
++ * even so (dec_ds_starved), the bound comes down by two. (The Raspberry Pi 5,
++ * HEVC 1080p60 with has_b_frames 2: set at the 28th import, 26 frames. With
++ * the held references alone, 23 or 24 at that point, a bound of 24 let frames
++ * the compositor still held go, 25 did not.)
++ */
++#define DEC_POOL_MAX 32
++#define DEC_DS_POOL_SOFT (DEC_POOL_MAX - 2)
++/* Skipped conversions one catch-up makes at most, oldest first. */
++#define DEC_DS_CATCH_MAX 12
++
++/* q11-dec-sand-scanout: a guest buffer whose copy was skipped, for the catch-up */
++typedef struct DecDsPend {
++    uint32_t res;
++    unsigned slot;
++    uint64_t seq;
++} DecDsPend;
++
+ /* A blitted hardware frame and the import whose GPU work reads it. */
+ typedef struct DecGpuHeld {
+     AVFrame *frame;
+@@ -270,6 +335,25 @@ struct VirtIOMediaDec {
+     unsigned gpu_n;
+     DecGpuHeld gpu_held[DEC_GPU_HOLD];
+     unsigned gpu_held_n;
++
++    /*
++     * q11-dec-sand-scanout: the decoder's SAND buffers handed to the display
++     * (ui/direct-scanout.h) for the guest buffer they were blitted into, so
++     * that a full-screen frame goes on a plane without the conversion.
++     */
++    uint64_t ds_epoch;                /* 0: nothing published since the last clear */
++    uint64_t ds_seq;
++    unsigned ds_fifo[DEC_GPU_CACHE];  /* slots holding a reference, oldest first */
++    unsigned ds_refs;
++    unsigned ds_refs_cap;             /* per gpu_fctx; 0: not set yet */
++    DecDsPend ds_pend[VIRTIO_MEDIA_MAX_BUFFERS]; /* oldest first */
++    unsigned ds_pend_n;
++    unsigned ds_by_buf[VIRTIO_MEDIA_MAX_BUFFERS]; /* guest capture buffer -> slot + 1 */
++    int64_t ds_probe_ms; /* when offering without the display taking began, 0: it takes */
++    int64_t ds_backoff_ms; /* no offers before this (dec_ds_starved) */
++    bool ds_logged;
++    uint64_t ds_pub_n, ds_skip_n, ds_catch_n, ds_lost_n, ds_evict_held_n;
++    uint64_t ds_starved_n, ds_evict_release_n;
+ };
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -474,10 +558,14 @@ static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
+             d->gpu_held_n * sizeof(d->gpu_held[0]));
+ }
+ 
++static void dec_ds_drop(VirtIOMediaDec *d);
++
+ static void dec_gpu_clear(VirtIOMediaDec *d)
+ {
+     unsigned i;
+ 
++    /* the display's references and fds name these entries' slots */
++    dec_ds_drop(d);
+     /* the held frames' waits use the imports, so they go first */
+     while (d->gpu_held_n) {
+         dec_gpu_unhold_oldest(d);
+@@ -497,6 +585,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+ {
+     dec_gpu_clear(d);
+     av_buffer_unref(&d->gpu_fctx);
++    d->ds_refs_cap = 0;
+     d->gpu_off = false;
+     d->gpu_again = 0;
+ }
+@@ -533,6 +622,404 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
+     d->gpu_held_n++;
+ }
+ 
++/* ------------------------------------------------------------------------- */
++/* q11-dec-sand-scanout: the decoder's buffers straight to the display        */
++/* ------------------------------------------------------------------------- */
++
++/*
++ * The proxy (q11-063) hands the display bcm2835-codec's SAND buffer for the
++ * guest buffer it was converted into, so that weston puts a full-screen frame
++ * on an HVS plane; this is the same for the decoder's (v4l2request) buffers.
++ * The display (ui/sdl2-gl.c, sdl2-wl-scanout.c) takes the buffer instead of the
++ * guest's copy only when the guest scans that copy out full screen and alone
++ * (/run/qemu-isp-scanout); otherwise the copy is shown as before.
++ *
++ * Unlike the proxy's, the pixels live in libavcodec's pool, not in a buffer the
++ * guest queues: a frame stays showable while a reference to it is kept, and the
++ * pool grows by the references (dec_ds_keep bounds them) and does not shrink
++ * back until the stream stops. With
++ * /run/qemu-sand-skip-isp the conversion itself is skipped while the display
++ * keeps taking the buffer (direct_scanout_skip_copy), and made late, from the
++ * kept reference, when it stops (dec_ds_catch_up).
++ */
++static bool dec_ds_file_on(const char *path, int64_t *checked, bool *on)
++{
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now - *checked >= 1000) {
++        *checked = now;
++        *on = access(path, F_OK) == 0;
++    }
++    return *on;
++}
++
++static bool dec_ds_on(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++
++    return dec_ds_file_on("/run/qemu-sand-scanout", &checked, &on);
++}
++
++static bool dec_ds_skip_on(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++
++    return dec_ds_file_on("/run/qemu-sand-skip-isp", &checked, &on);
++}
++
++static uint64_t dec_ds_epochs;
++
++static bool dec_ds_current(void *owner, uint32_t slot, uint64_t seq)
++{
++    VirtIOMediaDec *d = owner;
++
++    return slot < d->gpu_n && d->gpu[slot].ref && d->gpu[slot].seq == seq;
++}
++
++static void dec_ds_unref(VirtIOMediaDec *d, unsigned slot);
++
++static void dec_ds_hold(void *owner, uint32_t slot, bool held)
++{
++    VirtIOMediaDec *d = owner;
++
++    if (slot >= d->gpu_n) {
++        return;
++    }
++    d->gpu[slot].held = held;
++    if (!held && d->gpu[slot].unref_on_unhold) {
++        dec_ds_unref(d, slot);
++    }
++}
++
++static void dec_ds_pend_remove(VirtIOMediaDec *d, unsigned i)
++{
++    d->ds_pend_n--;
++    memmove(&d->ds_pend[i], &d->ds_pend[i + 1],
++            (d->ds_pend_n - i) * sizeof(d->ds_pend[0]));
++}
++
++/*
++ * The reference to slot's frame is about to go: a conversion skipped from it is
++ * made now, while the frame is still there, or the guest's copy stays stale.
++ */
++static void dec_ds_settle_slot(VirtIOMediaDec *d, unsigned slot)
++{
++    unsigned i = 0;
++
++    while (i < d->ds_pend_n) {
++        DecDsPend *p = &d->ds_pend[i];
++
++        if (p->slot != slot) {
++            i++;
++            continue;
++        }
++        if (dec_ds_current(d, slot, p->seq) &&
++            virtio_media_gpu_blit(d->gpu[slot].handle, p->res) == 0) {
++            /* the decoder must not write the buffer before the GPU read it */
++            dec_gpu_hold(d, d->gpu[slot].ref, d->gpu[slot].handle);
++            d->ds_catch_n++;
++        } else {
++            d->ds_lost_n++;
++        }
++        dec_ds_pend_remove(d, i);
++    }
++}
++
++static void dec_ds_unref(VirtIOMediaDec *d, unsigned slot)
++{
++    unsigned i;
++
++    dec_ds_settle_slot(d, slot);
++    av_frame_free(&d->gpu[slot].ref);
++    d->gpu[slot].unref_on_unhold = false;
++    for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
++        if (d->ds_by_buf[i] == slot + 1) {
++            d->ds_by_buf[i] = 0;
++        }
++    }
++    for (i = 0; i < d->ds_refs; i++) {
++        if (d->ds_fifo[i] == slot) {
++            d->ds_refs--;
++            memmove(&d->ds_fifo[i], &d->ds_fifo[i + 1],
++                    (d->ds_refs - i) * sizeof(d->ds_fifo[0]));
++            break;
++        }
++    }
++}
++
++/* Frames of this many bytes kept at most (DEC_DS_REFS_BYTES), 2 at least. */
++static unsigned dec_ds_max_refs(size_t bytes)
++{
++    size_t n = bytes ? DEC_DS_REFS_BYTES / bytes : DEC_DS_REFS_MAX;
++
++    return (unsigned)MAX(MIN(n, (size_t)DEC_DS_REFS_MAX), (size_t)2);
++}
++
++/*
++ * The guest queued capture buffer index again: it is done with the frame it
++ * showed from it, so the decoder may have that buffer back, once off screen.
++ */
++static void dec_ds_unpend(VirtIOMediaDec *d, uint32_t res);
++
++static void dec_ds_requeued(VirtIOMediaDec *d, unsigned index, uint32_t res)
++{
++    unsigned slot;
++
++    /* the buffer's next content comes from the decoder: nothing to catch up */
++    dec_ds_unpend(d, res);
++    if (index >= VIRTIO_MEDIA_MAX_BUFFERS || !d->ds_by_buf[index]) {
++        return;
++    }
++    slot = d->ds_by_buf[index] - 1;
++    d->ds_by_buf[index] = 0;
++    if (slot >= d->gpu_n) {
++        return;
++    }
++    if (d->gpu[slot].held) {
++        d->gpu[slot].unref_on_unhold = true;
++    } else {
++        dec_ds_unref(d, slot);
++    }
++}
++
++/* Keep fr (in slot) showable for guest buffer index, within the bound. */
++static bool dec_ds_keep(VirtIOMediaDec *d, unsigned slot, unsigned index,
++                        const AVFrame *fr, size_t bytes, int reorder)
++{
++    DecGpuEntry *e = &d->gpu[slot];
++    unsigned max = dec_ds_max_refs(bytes);
++    unsigned soft = DEC_DS_POOL_SOFT - (unsigned)MIN(MAX(reorder, 0), 16);
++
++    /*
++     * Normally a no-op: the decoder could write fr into this buffer only once
++     * its last reference was gone, so slot has no reference, and any skipped
++     * conversion from it was settled then; its seq is still the old content's,
++     * which makes nothing current here.
++     */
++    dec_ds_unref(d, slot);
++    if (!d->ds_refs_cap && d->gpu_n >= soft) {
++        /* fr, in the buffer that just appeared, is one of them; one more */
++        d->ds_refs_cap = d->ds_refs + 2;
++        info_report("virtio-media/dec: sand-scanout: %u of the decoder's "
++                    "buffers seen, up to %d more decoded ahead: keeping %u "
++                    "frames at most", d->gpu_n, reorder, d->ds_refs_cap);
++    }
++    if (d->ds_refs_cap) {
++        /* near the end of the pool: replace one, do not add */
++        max = MIN(max, d->ds_refs_cap);
++    }
++    while (d->ds_refs && d->ds_refs >= max) {
++        unsigned i, pick = 0;
++
++        /*
++         * Which frame goes. First the oldest one the guest is done with and
++         * the compositor still holds: most likely a newer frame has replaced
++         * it and it waits for its release, but it may still be scanned out
++         * (counted apart). Then the oldest one not on screen;
++         * the guest has still to show that one, so the display misses it and
++         * the skipped conversion of it is made now (dec_ds_settle_slot).
++         * The oldest of all only when every frame is on screen (counted, as
++         * the proxy does: it may be written over while shown).
++         */
++        for (i = 0; i < d->ds_refs; i++) {
++            if (d->gpu[d->ds_fifo[i]].unref_on_unhold) {
++                pick = i;
++                d->ds_evict_release_n++;
++                break;
++            }
++        }
++        if (i == d->ds_refs) {
++            for (i = 0; i < d->ds_refs && d->gpu[d->ds_fifo[i]].held; i++) {
++            }
++            if (i < d->ds_refs) {
++                pick = i;
++            } else {
++                d->ds_evict_held_n++;
++            }
++        }
++        dec_ds_unref(d, d->ds_fifo[pick]);
++    }
++    e->ref = av_frame_alloc();
++    if (!e->ref || av_frame_ref(e->ref, fr) < 0) {
++        av_frame_free(&e->ref);
++        return false;
++    }
++    /* a new generation: older offers of this buffer are stale from now */
++    e->seq = ++d->ds_seq;
++    d->ds_fifo[d->ds_refs++] = slot;
++    if (index < VIRTIO_MEDIA_MAX_BUFFERS) {
++        d->ds_by_buf[index] = slot + 1;
++    }
++    return true;
++}
++
++/*
++ * Let every kept frame go (the display does not take them): the decoder may
++ * reuse the buffers. The pool does not shrink; it only stops growing.
++ */
++static void dec_ds_release(VirtIOMediaDec *d)
++{
++    unsigned i;
++
++    for (i = 0; i < d->gpu_n; i++) {
++        if (!d->gpu[i].ref) {
++            continue;
++        }
++        if (d->gpu[i].held) {
++            d->gpu[i].unref_on_unhold = true;
++        } else {
++            dec_ds_unref(d, i);
++        }
++    }
++}
++
++/* Offer the decoder's buffers now? See DEC_DS_PROBE_MS. */
++static bool dec_ds_wanted(VirtIOMediaDec *d)
++{
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now < d->ds_backoff_ms) {
++        dec_ds_release(d);
++        return false;
++    }
++    if (direct_scanout_hit_within(1000)) {
++        d->ds_probe_ms = 0;
++        return true;
++    }
++    if (!d->ds_probe_ms || now - d->ds_probe_ms >= DEC_DS_RETRY_MS) {
++        d->ds_probe_ms = now;
++    }
++    if (now - d->ds_probe_ms < DEC_DS_PROBE_MS) {
++        return true;
++    }
++    dec_ds_release(d);
++    return false;
++}
++
++/* The guest buffer res got its content by the conversion: nothing to catch up. */
++static void dec_ds_unpend(VirtIOMediaDec *d, uint32_t res)
++{
++    unsigned i;
++
++    for (i = 0; i < d->ds_pend_n; i++) {
++        if (d->ds_pend[i].res == res) {
++            dec_ds_pend_remove(d, i);
++            return;
++        }
++    }
++}
++
++/*
++ * The display missed: make the skipped conversions, oldest first (the guest
++ * shows them in that order), DEC_DS_CATCH_MAX at most so that one miss does not
++ * stop the main loop for a whole queue's worth; the next miss makes the rest.
++ * The blits are on one GL context, so the GPU runs them in order and the last
++ * one's fence covers the others: one wait.
++ */
++static void dec_ds_catch_up(void *owner)
++{
++    VirtIOMediaDec *d = owner;
++    void *last = NULL;
++    unsigned n;
++
++    for (n = 0; d->ds_pend_n && n < DEC_DS_CATCH_MAX; n++) {
++        DecDsPend p = d->ds_pend[0];
++
++        dec_ds_pend_remove(d, 0);
++        if (dec_ds_current(d, p.slot, p.seq) &&
++            virtio_media_gpu_blit(d->gpu[p.slot].handle, p.res) == 0) {
++            last = d->gpu[p.slot].handle;
++            d->ds_catch_n++;
++        } else {
++            d->ds_lost_n++; /* the blit failed: the guest's copy is stale */
++        }
++    }
++    if (last && virtio_media_gpu_wait(last) < 0) {
++        warn_report_once("virtio-media/dec: host-sand: GPU wait failed");
++    }
++}
++
++/* Every entry goes (dec_gpu_clear): the display forgets this owner's buffers. */
++static void dec_ds_drop(VirtIOMediaDec *d)
++{
++    unsigned i;
++
++    if (d->ds_epoch) {
++        direct_scanout_forget(d);
++        d->ds_epoch = 0;
++    }
++    if (d->ds_pub_n) {
++        info_report("virtio-media/dec: sand-scanout: %" PRIu64 " offered, %"
++                    PRIu64 " conversions skipped, %" PRIu64 " made late, %"
++                    PRIu64 " lost, %u still skipped at the stop, %" PRIu64
++                    " let go before their release, %" PRIu64 " evicted on "
++                    "screen, %" PRIu64 " pool waits given up", d->ds_pub_n,
++                    d->ds_skip_n, d->ds_catch_n, d->ds_lost_n, d->ds_pend_n,
++                    d->ds_evict_release_n, d->ds_evict_held_n, d->ds_starved_n);
++        d->ds_pub_n = d->ds_skip_n = d->ds_catch_n = d->ds_lost_n = 0;
++        d->ds_evict_held_n = d->ds_starved_n = d->ds_evict_release_n = 0;
++    }
++    for (i = 0; i < d->gpu_n; i++) {
++        DecGpuEntry *e = &d->gpu[i];
++
++        av_frame_free(&e->ref);
++        e->held = false;
++        e->unref_on_unhold = false;
++        if (e->show_fd >= 0) {
++            close(e->show_fd);
++            e->show_fd = -1;
++        }
++    }
++    d->ds_refs = 0;
++    d->ds_pend_n = 0;
++    d->ds_probe_ms = 0;
++    memset(d->ds_by_buf, 0, sizeof(d->ds_by_buf));
++}
++
++/*
++ * libavcodec failed a frame with ENOMEM: with rpidistro-ffmpeg 0002 that is
++ * v4l2request giving up its wait for a free destination buffer, and only the
++ * frames held here can be what holds the pool. Let them all go -- the ones on
++ * screen too, which may tear for a frame -- and offer none for
++ * DEC_DS_RETRY_MS. Returns true when something was let go, so that decoding
++ * can go on; false leaves the error to the caller, as before.
++ */
++static bool dec_ds_starved(VirtIOMediaDec *d, int r)
++{
++    unsigned i, cap;
++
++    if (r != AVERROR(ENOMEM) || !d->ds_refs) {
++        return false;
++    }
++    d->ds_starved_n++;
++    warn_report("virtio-media/dec: sand-scanout: no free decoder buffer "
++                "with %u frames kept for the display; letting them go",
++                d->ds_refs);
++    /* the bound was too high for this stream */
++    cap = d->ds_refs_cap ? d->ds_refs_cap : d->ds_refs;
++    d->ds_refs_cap = cap > 4 ? cap - 2 : 2;
++    dec_ds_catch_up(d);
++    for (i = 0; i < d->gpu_n; i++) {
++        if (d->gpu[i].ref) {
++            dec_ds_unref(d, i);
++        }
++        /* the display forgets them below and sends no hold(false) */
++        d->gpu[i].held = false;
++        d->gpu[i].unref_on_unhold = false;
++    }
++    if (d->ds_epoch) {
++        direct_scanout_forget(d);
++        d->ds_epoch = 0;
++    }
++    while (d->gpu_held_n) {
++        dec_gpu_unhold_oldest(d);
++    }
++    d->ds_backoff_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + DEC_DS_RETRY_MS;
++    return true;
++}
++
+ /* Keep hardware frames as DRM_PRIME for dec_gpu_write instead of downloading. */
+ static bool dec_gpu_wanted(VirtIOMediaSession *s)
+ {
+@@ -606,10 +1093,11 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     DecGpuEntry *e = NULL;
+     struct stat st;
+     uint64_t mod;
+-    uint32_t col, uv_offset;
++    uint32_t col, uv_offset, tex;
+     int matrix = dec_gpu_matrix(fr);
+     unsigned i;
+     int err = 0, r;
++    bool show, skip;
+ 
+     if (!gb->virgl_res || gb->num_planes != 1 || !desc) {
+         return -EINVAL;
+@@ -645,6 +1133,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         dec_gpu_clear(d);
+         av_buffer_unref(&d->gpu_fctx);
+         d->gpu_fctx = av_buffer_ref(fr->hw_frames_ctx);
++        d->ds_refs_cap = 0; /* a new pool */
+     }
+ 
+     for (i = 0; i < d->gpu_n; i++) {
+@@ -688,14 +1177,77 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         e->w = w;
+         e->h = h;
+         e->matrix = matrix;
++        e->show_fd = -1;
++        e->seq = 0;
++        e->ref = NULL;
++        e->held = false;
++        e->unref_on_unhold = false;
+         d->gpu_n++;
+     }
+ 
+-    r = virtio_media_gpu_blit(e->handle, gb->virgl_res);
+-    if (r) {
+-        return r;
++    /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
++    tex = virtio_media_gpu_res_tex(gb->virgl_res);
++    show = tex && dec_ds_on() && direct_scanout_sand_usable() && dec_ds_wanted(d);
++    if (show && e->show_fd < 0) {
++        e->show_fd = fcntl(desc->objects[0].fd, F_DUPFD_CLOEXEC, 0);
++    }
++    show = show && e->show_fd >= 0 &&
++           dec_ds_keep(d, (unsigned)(e - d->gpu),
++                       (unsigned)(gb - s->queues[1].guest), fr,
++                       desc->objects[0].size, d->avctx->has_b_frames);
++    skip = show && dec_ds_skip_on() && direct_scanout_skip_copy();
++
++    if (!skip) {
++        r = virtio_media_gpu_blit(e->handle, gb->virgl_res);
++        if (r) {
++            if (show) {
++                /* not offered: no reference to keep, and its seq is stale */
++                dec_ds_unref(d, (unsigned)(e - d->gpu));
++                e->seq = ++d->ds_seq;
++            }
++            if (tex) {
++                direct_scanout_forget_tex(tex);
++            }
++            return r;
++        }
++        dec_gpu_hold(d, fr, e->handle);
++        dec_ds_unpend(d, gb->virgl_res);
++    }
++    if (show) {
++        DirectScanout ds = {
++            .owner = d, .epoch = d->ds_epoch ? d->ds_epoch : ++dec_ds_epochs,
++            .fd = e->show_fd, .width = w, .height = h,
++            .stride = (uint32_t)l->planes[0].pitch,
++            .fourcc = l->format, .modifier = mod,
++            .offset1 = uv_offset, .pitch1 = (uint32_t)l->planes[1].pitch,
++            .slot = (uint32_t)(e - d->gpu), .seq = e->seq,
++            .current = dec_ds_current, .hold = dec_ds_hold,
++        };
++
++        d->ds_epoch = ds.epoch;
++        if (skip) {
++            dec_ds_unpend(d, gb->virgl_res);
++            if (d->ds_pend_n < VIRTIO_MEDIA_MAX_BUFFERS) {
++                d->ds_pend[d->ds_pend_n++] = (DecDsPend) {
++                    .res = gb->virgl_res, .slot = ds.slot, .seq = ds.seq,
++                };
++            }
++            direct_scanout_set_catch_up(d, dec_ds_catch_up);
++            d->ds_skip_n++;
++        }
++        direct_scanout_publish(tex, &ds);
++        d->ds_pub_n++;
++        if (!d->ds_logged) {
++            d->ds_logged = true;
++            info_report("virtio-media/dec: sand-scanout: offering the decoder's "
++                        "buffers to the display (NV12 SAND128, column height %u, "
++                        "chroma at %u, up to %u frames kept)", col, uv_offset,
++                        dec_ds_max_refs(desc->objects[0].size));
++        }
++    } else if (tex) {
++        /* this content came by the conversion: an older offer would be stale */
++        direct_scanout_forget_tex(tex);
+     }
+-    dec_gpu_hold(d, fr, e->handle);
+     if (!d->gpu_logged) {
+         d->gpu_logged = true;
+         d->hw_logged = true;
+@@ -770,6 +1322,15 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+             warn_report("virtio-media/dec: host-sand: no GL context for %u "
+                         "frames; converting them on the CPU", d->gpu_again);
+         }
++        /* this content comes by the CPU: no skipped conversion, no offer */
++        if (gb->virgl_res) {
++            uint32_t tex = virtio_media_gpu_res_tex(gb->virgl_res);
++
++            dec_ds_unpend(d, gb->virgl_res);
++            if (tex) {
++                direct_scanout_forget_tex(tex);
++            }
++        }
+         /* This frame on the CPU, as dec_pump does without host-sand. */
+         av_frame_unref(d->swframe);
+         t = av_hwframe_transfer_data(d->swframe, fr, 0);
+@@ -782,6 +1343,15 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+         fr = d->swframe;
+     }
+ 
++    /* q11-dec-sand-scanout: the CPU wrote this copy, so no offer stands for it */
++    if (d->ds_epoch && gb->virgl_res) {
++        uint32_t tex = virtio_media_gpu_res_tex(gb->virgl_res);
++
++        if (tex) {
++            direct_scanout_forget_tex(tex);
++        }
++    }
++
+     buf = g_malloc(need);
+     dst_data[0] = buf;
+     dst_linesize[0] = (int)(w * 4);
+@@ -982,7 +1552,7 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+         g_queue_pop_head(d->backlog);
+         d->backlog_bytes -= (size_t)p->size;
+         av_packet_free(&p);
+-        if (r < 0 && r != AVERROR_EOF) {
++        if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r)) {
+             error_report_once("virtio-media/dec: backlog send_packet: %d", r);
+             dec_backlog_clear(d);
+             return;
+@@ -1068,6 +1638,9 @@ static void dec_pump(VirtIOMediaSession *s)
+             return;
+         }
+         if (r < 0) {
++            if (dec_ds_starved(d, r)) {
++                continue;
++            }
+             error_report_once("virtio-media/dec: avcodec_receive_frame: %d", r);
+             virtio_media_send_error_event(s, EIO);
+             return;
+@@ -1652,6 +2225,9 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+         return EINVAL;
+     }
+     gb->queued = true;
++    if (qi == 1) {
++        dec_ds_requeued(d, b->index, gb->virgl_res); /* q11-dec-sand-scanout */
++    }
+ 
+     if (qi == 0) {
+         size_t used = guest_planes ? guest_planes[0].bytesused : b->bytesused;
+@@ -1782,7 +2358,8 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+             gb->queued = false;
+             return EAGAIN;
+         }
+-        if (r < 0 && r != AVERROR_EOF) {
++        /* the packet was taken even so: that frame is lost, not the stream */
++        if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r)) {
+             error_report_once("virtio-media/dec: avcodec_send_packet: %d", r);
+             gb->queued = false;
+             return EIO;
+diff --git a/include/ui/direct-scanout.h b/include/ui/direct-scanout.h
+index 577835f..58c0e1f 100644
+--- a/include/ui/direct-scanout.h
++++ b/include/ui/direct-scanout.h
+@@ -53,5 +53,7 @@ void direct_scanout_note_flush(bool hit);
+ /* /run/qemu-isp-skip-copy is present and the recent flushes all hit */
+ bool direct_scanout_skip_copy(void);
+ void direct_scanout_set_catch_up(void *owner, void (*fn)(void *owner));
++/* q11-dec-sand-scanout: the last flush took a producer's buffer, within ms of now */
++bool direct_scanout_hit_within(int64_t ms);
+ 
+ #endif
+diff --git a/ui/direct-scanout.c b/ui/direct-scanout.c
+index 188141c..7ce4ef8 100644
+--- a/ui/direct-scanout.c
++++ b/ui/direct-scanout.c
+@@ -78,6 +78,12 @@ void direct_scanout_note_flush(bool hit)
+     }
+ }
+ 
++/* q11-dec-sand-scanout: the display took a producer's buffer in the last ms */
++bool direct_scanout_hit_within(int64_t ms)
++{
++    return streak && qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - last_hit_ms < ms;
++}
++
+ bool direct_scanout_skip_copy(void)
+ {
+     static int64_t checked = -1000000;
+diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
+index b2ff49d..aec8bf2 100644
+--- a/ui/sdl2-wl-scanout.c
++++ b/ui/sdl2-wl-scanout.c
+@@ -471,7 +471,7 @@ void sdl2_wl_scanout_off(void)
+ void sdl2_wl_scanout_miss(const char *why)
+ {
+     static struct { const char *why; uint64_t n; } m[8];
+-    static uint64_t last_print;
++    static uint64_t last_print, last_frames, every = 60;
+     GString *g;
+     int i;
+ 
+@@ -485,9 +485,17 @@ void sdl2_wl_scanout_miss(const char *why)
+         m[i].why = why;
+         m[i].n++;
+     }
+-    if (wl.fallbacks - last_print < 60 && last_print) {
++    if (wl.fallbacks - last_print < every && last_print) {
+         return;
+     }
++    /*
++     * q11-dec-sand-scanout: a window that is never taken (DomU's, a guest
++     * dma-buf) printed this every 60 misses for good. With no frame taken since
++     * the last line, the next comes after twice as many misses, up to 3600
++     * (a minute at 60 Hz).
++     */
++    every = wl.frames != last_frames ? 60 : MIN(every * 2, 3600);
++    last_frames = wl.frames;
+     last_print = wl.fallbacks;
+     g = g_string_new(NULL);
+     for (i = 0; i < ARRAY_SIZE(m) && m[i].why; i++) {

@@ -149,6 +149,7 @@ XT_DOMA_HWDEC ??= "false"
 #   gpu-fence-fd     export the blit fence as a sync_file and poll it, instead of two
 #                    eglMakeCurrent calls per CAPTURE QBUF.
 XT_DOMA_HWDEC_DEVARG ?= "v4l2-device=/dev/video10,output-coherent=on,gpu-fence-fd=on"
+# meta-xt-rpi5 appends its host-sand and gpu-fence-fd (RPI5_DOMA_HOST_SAND) to this.
 XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
 
 # [display] Extra virtio-gpu-gl-pci properties, substituted only on the qemu 10

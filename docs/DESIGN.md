@@ -71,9 +71,10 @@ image expects. It is a heap allocation, so no `xen,static-mem` bank moves and
 `0x1c0000000` (7 GiB), so on an 8 GB board every address in the map still exists —
 what does not fit is the total. The 8 GB map drops bank4 (`0x180000000` +1 GiB) and
 leaves the rest alone, giving DomD 3072 MiB: `0x50000000` is bank[0], where Xen's
-`place_modules()` puts the DomD kernel and DTB, and `0x20000000`/`0x80000000` are
-inside the VPU's 32-bit DMA window that carries vc4's CMA. The highest static-mem
-address drops to `0x180000000` (6 GiB). DomA gives back the other 1024 MiB, which
+`place_modules()` puts the DomD kernel and DTB, and `0x68000000` holds DomD's CMA
+(`cma=640M@0x68000000` with the Zephyr Dom0; that bank is 896 MiB, up to Dom0's
+`0xa0000000`, and bank3 is 1664 MiB). The highest static-mem
+address drops to `0x168000000`. DomA gives back the other 1024 MiB, which
 `xt-xen-cfg-doma` substitutes into `doma.cfg` from `BOARD_RAM`. Note that
 `meta-xt-doma` installs that recipe into **both** rootfs images, and the flavours
 differ in which copy `xl create` actually reads: DomD's in the zephyr flavour, Dom0's

@@ -98,8 +98,8 @@ PACKAGECONFIG:remove = "glusterfs"
 PACKAGECONFIG[glusterfs] = ""
 
 # The q11 patches apply in the order listed here, which is not their numbers' order: they
-# are grouped by the series that brings them (qemu 11.1.2 itself, the display path), and
-# the numbers follow the order they were written in.
+# are grouped by the series that brings them (qemu 11.1.2 itself, the display path,
+# HEVC), and the numbers follow the order they were written in.
 #
 # qemu 11.1.2 itself.
 # q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one).
@@ -199,3 +199,15 @@ SRC_URI:append:class-target = " file://q11-067-virtio-gpu-clear-overlay-and-hand
 #   scaled primary), so weston can put DomA's output on planes instead of the GPU.
 SRC_URI:append:class-target = " file://q11-070-ui-sdl2-hand-a-guest-dma-buf-scanout-to-weston-too.patch"
 SRC_URI:append:class-target = " file://q11-078-ui-sdl2-wl-scanout-cover-the-window-under-the-planes.patch"
+#
+# HEVC in decoder mode.
+# q11-069: decoder mode converts hardware (SAND) frames into the guest's resource on the
+#   GPU when host-sand is set, as the proxy mode does, instead of three CPU passes.
+# q11-071: decoder mode hands its SAND buffers to the display the way the proxy does
+#   (q11-063), so a full-screen HEVC frame goes on an HVS plane without the GPU. Off
+#   unless /run/qemu-sand-scanout and /run/qemu-isp-scanout exist (xt-qemu-display-toggles).
+# q11-081: a plane of the plane handoff whose texture a decoder filled gets the decoder's
+#   buffer, which the HVS scales (/run/qemu-plane-sand, off when absent).
+SRC_URI:append:class-target = " file://q11-069-virtio-media-decoder-mode-convert-hardware-frames-on-the-GPU.patch"
+SRC_URI:append:class-target = " file://q11-071-virtio-media-decoder-mode-hand-the-SAND-buffers-to-the-display.patch"
+SRC_URI:append:class-target = " file://q11-081-ui-sdl2-wl-scanout-give-a-plane-its-producer-s-buffer.patch"
