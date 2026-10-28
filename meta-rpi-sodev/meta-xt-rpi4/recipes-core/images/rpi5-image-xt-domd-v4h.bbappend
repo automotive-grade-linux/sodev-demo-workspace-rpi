@@ -205,3 +205,7 @@ DOMD_BT_PACKAGES:raspberrypi4-64 = " \
     xt-domd-bt-proxy \
     "
 IMAGE_INSTALL:append = " ${DOMD_BT_PACKAGES}"
+
+# The DomA device model's display-path switches (/run/qemu-*), created at boot by tmpfiles.d:
+# ISP / SAND direct scanout (q11-063) and the HMI plane handoff (q11-066); only qemu 11 reads them.
+IMAGE_INSTALL:append:raspberrypi4-64 = " xt-qemu-display-toggles"

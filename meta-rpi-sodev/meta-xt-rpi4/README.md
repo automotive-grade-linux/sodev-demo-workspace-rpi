@@ -205,6 +205,33 @@ Two consequences worth knowing:
 The Yocto-built DomD host services need no equivalent: meta-raspberrypi's own
 `DEFAULTTUNE = "cortexa72-nocrypto"` for raspberrypi4-64 already keeps them A72-safe.
 
+## DomA's display path with the qemu 11.1.2 device model
+
+The vulkan lane selects the qemu 11.1.2 device model (rpi4-sodev.yaml). These act only
+with it:
+
+* **`xt-qemu-display-toggles`**, installed in the DomD image on this board, is a
+  tmpfiles.d entry that creates the `/run/qemu-*` switches at boot: the ISP direct
+  scanout of the decoded video (`media-isp`, `isp-scanout`, `isp-skip-copy`,
+  `media-sg-rw`, `fb-invalidate`, and `isp-scanout-depth` at 2 instead of the code's
+  4), the SAND buffer on a weston overlay plane without the ISP (`sand-scanout`,
+  `sand-skip-isp`), and the guest's planes on weston subsurfaces in the HMI case
+  (`plane-handoff`). Only qemu 11.1.2 reads them (`q11-063`, `q11-066`); qemu 10.0.2
+  does nothing with them. Removing a file turns its feature off (`isp-scanout-depth`:
+  back to 4).
+* **`RPI4_DOMA_HOST_SAND`** (`xt-xen-cfg-doma`'s bbappend; `1` by default with qemu
+  11, `0` otherwise) adds
+  `host-sand=N` to DomA's virtio-media decoder: `0` is the decoder's NV12 output,
+  `1` SAND128 detiled by DomD's Mesa, `2` SAND sampled as one linear texture and
+  detiled in the shader. `sand-scanout` and `sand-skip-isp` need a value other than
+  `0`. Any value but `0`, `1` and `2`, or a value other than `0` with any other device
+  model, stops the build, because qemu 10.0.2 has no such property and would not
+  start DomA's device model.
+* **`XT_DOMA_OVERLAY_PLANES`** `3` and **`XT_DOMA_PLANE_SCALING`** `1` with qemu 11
+  (`xt-xen-cfg-doma`'s bbappend): three overlay planes for drm_hwcomposer and the
+  scaled primary plane, as on this board's doma.cfg since its display path was
+  measured.
+
 ## Known limitations and open items
 
 * **emmc2 is NOT behind the low-1 GiB VideoCore alias — the firmware rewrites its
@@ -328,6 +355,7 @@ recipes-core/images/                    rpi5-image-{minimal,xt}-domd wrappers (r
 recipes-extended/rp1-touch-forward/     retarget the touch panel to the attached output
 recipes-extended/xen/                   Xen 4.22 series + hypervisor Kconfig + BCM2711 passthrough quirks
 recipes-extended/xt-aaos-host-services/ widen COMPATIBLE_MACHINE for the AAOS host services
+recipes-extended/xt-qemu-display-toggles/ /run/qemu-* display-path switches for qemu 11.1.2
 recipes-extended/xt-rpi5-domain/        per-domain CPU pinning (recipe name shared with meta-xt-common)
 recipes-extended/xt-xen-cfg-{doma,domu}/ DomA memory and 1280x720 display, DomU vcpu pinning
 recipes-graphics/wayland/               weston output map and the HDMI-A-1 modeline

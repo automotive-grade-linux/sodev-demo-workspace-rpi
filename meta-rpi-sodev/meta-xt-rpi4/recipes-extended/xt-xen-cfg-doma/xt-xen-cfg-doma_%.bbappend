@@ -128,15 +128,40 @@ do_install[vardeps] += "RPI4_DOMA_GPU_RES_FROM RPI4_DOMA_GPU_RES"
 RPI4_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI4_DOMA_GPU_RES').split('xres=')[1].split(',')[0])}"
 XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = ",host-max-width=${RPI4_DOMA_HWDEC_MAX_W}"
 
-# DomA's overlay planes, as this board's doma.cfg has run them since its display path
-# was measured (2026-10-02 .. 10-13): three overlay planes let drm_hwcomposer scan the
-# app and the system bars out as DEVICE layers instead of SurfaceFlinger compositing
-# them on the GPU (with two planes on qemu 10.0.2, before the kernel refused a plane not
-# shown whole, a 640x360 video in a WebView dropped 25% of its frames instead of 35%).
-# Both halves come from the common recipe; the gl lane (qemu 7.0.0) gets no overlays
-# whatever this says. The Raspberry Pi 5 sets the same. A default (?=), so a local.conf
-# can override it; 0 turns both halves off.
+# host-sand=N (qemu 11 only, q11-059/061): 0 = the decoder's NV12 output, 1 = SAND128
+# detiled by DomD's Mesa, 2 = SAND sampled as one linear texture and detiled in the
+# shader. qemu 10 has no such property and would refuse to start the device model, so a
+# value other than 0 with any other device model stops the build, as XT_DOMA_PLANE_SCALING
+# does. On qemu 11 the default is 1, as this board's doma.cfg has run since its
+# display path was measured (2026-10-02 .. 10-13).
+RPI4_DOMA_HOST_SAND ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = "${@'' if d.getVar('RPI4_DOMA_HOST_SAND') == '0' else ',host-sand=' + d.getVar('RPI4_DOMA_HOST_SAND')}"
+do_install[vardeps] += "RPI4_DOMA_HOST_SAND"
+
+python () {
+    hs = d.getVar('RPI4_DOMA_HOST_SAND')
+    if hs not in ('0', '1', '2'):
+        bb.fatal("RPI4_DOMA_HOST_SAND='%s': expected 0, 1 or 2" % hs)
+    qv = d.getVar('XT_DM_QEMU_VERSION')
+    if hs != '0' and not qv.startswith('11.'):
+        bb.fatal("RPI4_DOMA_HOST_SAND=%s needs the qemu 11 device model (XT_DM_QEMU_VERSION='%s')" % (hs, qv))
+}
+
+# DomA's overlay planes and primary-plane scaling, as this board's doma.cfg has run
+# them since its display path was measured (2026-10-02 .. 10-13): three overlay planes
+# let drm_hwcomposer scan the app and the system bars out as DEVICE layers instead of
+# SurfaceFlinger compositing them on the GPU (with two planes on qemu 10.0.2, before the
+# kernel refused a plane not shown whole, a 640x360 video in a WebView dropped 25% of its
+# frames instead of 35%), and plane scaling lets
+# it put a scaled video on the primary plane (local 720p60 in the HMI 40 -> 52-55 fps).
+# Both halves come from the common recipe. Plane scaling needs the qemu 11.1.2 device
+# model, which this board's vulkan lane selects (rpi4-sodev.yaml); the common recipe
+# stops the build with any other, so the gl lane (qemu 7.0.0, which also gets no
+# overlays) keeps it at 0. The Raspberry Pi 5 sets the same. Defaults (?=), so a
+# local.conf can override them. For an A/B without the overlays, set both to 0: plane
+# scaling 1 with no overlay planes stops the build.
 XT_DOMA_OVERLAY_PLANES ?= "3"
+XT_DOMA_PLANE_SCALING ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
 
 # DomA's HDMI audio card. doma.cfg's literal is out.dev=plughw:vc4hdmi1, HDMI-A-2;
 # on this board DomA and the panel are on HDMI-A-1, whose card is vc4hdmi0 (the
