@@ -128,6 +128,16 @@ do_install[vardeps] += "RPI4_DOMA_GPU_RES_FROM RPI4_DOMA_GPU_RES"
 RPI4_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI4_DOMA_GPU_RES').split('xres=')[1].split(',')[0])}"
 XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = ",host-max-width=${RPI4_DOMA_HWDEC_MAX_W}"
 
+# DomA's overlay planes, as this board's doma.cfg has run them since its display path
+# was measured (2026-10-02 .. 10-13): three overlay planes let drm_hwcomposer scan the
+# app and the system bars out as DEVICE layers instead of SurfaceFlinger compositing
+# them on the GPU (with two planes on qemu 10.0.2, before the kernel refused a plane not
+# shown whole, a 640x360 video in a WebView dropped 25% of its frames instead of 35%).
+# Both halves come from the common recipe; the gl lane (qemu 7.0.0) gets no overlays
+# whatever this says. The Raspberry Pi 5 sets the same. A default (?=), so a local.conf
+# can override it; 0 turns both halves off.
+XT_DOMA_OVERLAY_PLANES ?= "3"
+
 # DomA's HDMI audio card. doma.cfg's literal is out.dev=plughw:vc4hdmi1, HDMI-A-2;
 # on this board DomA and the panel are on HDMI-A-1, whose card is vc4hdmi0 (the
 # 440 Hz tone of 2026-09-23 reached the panel through vc4hdmi0). In the zephyr
