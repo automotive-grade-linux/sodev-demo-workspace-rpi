@@ -521,6 +521,21 @@ PRODUCT_PACKAGES += DomaSettingsProviderRRO
 PRODUCT_VENDOR_PROPERTIES += \
     debug.renderengine.backend=skiaglthreaded \
     debug.hwui.renderer=skiagl
+
+# Linear scanout buffers (aosp-patches/external/minigbm 0003, virglrenderer 0024 in
+# DomD): the client target and the app layers the composer is handed become linear GBM
+# bos on the host, which vc4's RGB planes take (LINEAR or T_TILED only, not UIF), so
+# weston puts DomA's layers on planes instead of composing them with the GPU. The
+# costs: HEVC -S fell about 5% (2026-10-15), and a layer that weston or SurfaceFlinger
+# does compose with the GPU after all is sampled through a tiled shadow copy on every
+# draw (V3D cannot sample linear). The bos are v3d's, in system memory mapped through
+# the HVS's IOMMU; they take no CMA. Decoder output is not made linear. gralloc reads
+# it once, when it initialises. The Raspberry Pi 4 product leaves it off: its HVS has
+# no IOMMU, so these bos are not expected to go on a plane there and only the shadow
+# copies would remain (not measured).
+PRODUCT_VENDOR_PROPERTIES += \
+    vendor.minigbm.scanout_linear=true
+
 # Install the ICD. BOARD_MESA3D_VULKAN_DRIVERS only DEFINES the module --
 # Mesa's android/Android.mk expands it to vulkan.virtio with an install path of
 # /vendor/lib64/hw/vulkan.virtio.so -- and a module no product asks for is never
