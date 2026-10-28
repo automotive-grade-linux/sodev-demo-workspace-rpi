@@ -78,7 +78,8 @@ PACKAGECONFIG:remove = "pulseaudio"
 # virtio-media cannot carry either: its protocol has five commands and no file
 # descriptors, and Android's external/v4l2_codec2 has no stateless support at all.
 # So q11-041 converts on the host, offering the guest an ordinary stateful HEVC decoder
-# and letting libavcodec do the stateless driving.
+# and letting libavcodec do the stateless driving. q11-072 adds H.264 to the same
+# decoder, in software: the Pi 5 has no H.264 block.
 #
 # rpidistro-ffmpeg rather than poky's ffmpeg: only the Raspberry Pi fork carries the
 # v4l2request hwaccel that q11-042 uses. Named as the RECIPE, so PREFERRED_PROVIDER is
@@ -99,7 +100,7 @@ PACKAGECONFIG[glusterfs] = ""
 
 # The q11 patches apply in the order listed here, which is not their numbers' order: they
 # are grouped by the series that brings them (qemu 11.1.2 itself, the display path,
-# HEVC), and the numbers follow the order they were written in.
+# HEVC, H.264), and the numbers follow the order they were written in.
 #
 # qemu 11.1.2 itself.
 # q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one).
@@ -211,3 +212,25 @@ SRC_URI:append:class-target = " file://q11-078-ui-sdl2-wl-scanout-cover-the-wind
 SRC_URI:append:class-target = " file://q11-069-virtio-media-decoder-mode-convert-hardware-frames-on-the-GPU.patch"
 SRC_URI:append:class-target = " file://q11-071-virtio-media-decoder-mode-hand-the-SAND-buffers-to-the-display.patch"
 SRC_URI:append:class-target = " file://q11-081-ui-sdl2-wl-scanout-give-a-plane-its-producer-s-buffer.patch"
+#
+# H.264 in decoder mode, with the scaling of wide streams it is written on.
+# q11-072..074: decoder mode takes H.264 too (decoder=hevc+h264), decoded by libavcodec
+#   in software since the Pi 5 has no H.264 block: the frames reach the guest on the GPU
+#   through linear NV12 dma-bufs, and the decoding runs on a thread of its own.
+# q11-075: a drain waits for the backlog, so the last frames of a stream come out.
+# q11-076: decoder mode scales a stream wider than host-max-width down to it in the GPU
+#   conversion (q11-048's property, until now proxy only), so 4K reaches DomA at 1080p;
+#   for HEVC and H.264 alike, written on q11-073/074's software path, and q11-080 uses it.
+# q11-077: decoder mode reports a failed stream through V4L2 (an ERROR buffer, then EIO)
+#   instead of VIRTIO_MEDIA_EVT_ERROR, on which the guest driver freed an open session.
+# q11-079: decoder mode decodes H.264 (its decode thread) on two libavcodec frame threads.
+# q11-080: decoder mode decodes H.264 straight into dma-bufs the GPU samples (no CPU
+#   convert/copy).
+SRC_URI:append:class-target = " file://q11-072-virtio-media-decoder-mode-take-H.264-as-well.patch"
+SRC_URI:append:class-target = " file://q11-073-virtio-media-decoder-mode-convert-software-frames-on-the-GPU.patch"
+SRC_URI:append:class-target = " file://q11-074-virtio-media-decoder-mode-decode-in-software-on-a-thread.patch"
+SRC_URI:append:class-target = " file://q11-075-virtio-media-decoder-mode-drain-after-the-backlog.patch"
+SRC_URI:append:class-target = " file://q11-076-virtio-media-decoder-mode-scale-wide-streams-down-to-host-max-width.patch"
+SRC_URI:append:class-target = " file://q11-077-virtio-media-decoder-mode-report-a-failed-stream-through-V4L2.patch"
+SRC_URI:append:class-target = " file://q11-079-virtio-media-decoder-mode-decode-H.264-on-two-frame-threads.patch"
+SRC_URI:append:class-target = " file://q11-080-virtio-media-decoder-mode-decode-H.264-straight-into-dma-bufs.patch"

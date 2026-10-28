@@ -123,6 +123,8 @@ XT_DOMA_HWDEC ??= "false"
 #         and a request fd per frame, neither of which virtio-media can carry.
 #         qemu patches 0217-v10/0218-v10 therefore synthesise a stateful decoder
 #         and drive the stateless side through libavcodec's v4l2request hwaccel.
+#         With qemu 11.1.2 meta-xt-rpi5 makes it decoder=hevc+h264: the same
+#         device decodes H.264 too, in software (q11-072..074).
 #
 # The default is the RPi4 value and only raspberrypi5 overrides it, so the boards
 # that do not set it keep the generated file they had.
@@ -149,7 +151,8 @@ XT_DOMA_HWDEC ??= "false"
 #   gpu-fence-fd     export the blit fence as a sync_file and poll it, instead of two
 #                    eglMakeCurrent calls per CAPTURE QBUF.
 XT_DOMA_HWDEC_DEVARG ?= "v4l2-device=/dev/video10,output-coherent=on,gpu-fence-fd=on"
-# meta-xt-rpi5 appends its host-sand and gpu-fence-fd (RPI5_DOMA_HOST_SAND) to this.
+# meta-xt-rpi5 appends +h264 (RPI5_DOMA_H264), its host-sand and gpu-fence-fd
+# (RPI5_DOMA_HOST_SAND) and host-max-width (RPI5_DOMA_HWDEC_MAX_W) to this.
 XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
 
 # [display] Extra virtio-gpu-gl-pci properties, substituted only on the qemu 10

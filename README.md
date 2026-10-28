@@ -539,12 +539,13 @@ the recipe build; it says nothing about which licences, if any, apply.
 
 **What is included.** DomA's hardware HEVC decode runs through DomD: the device
 model (qemu 10.0.2 or 11.1.2) drives the BCM2712 HEVC decoder (`rpi-hevc-dec`) with
-libavcodec's V4L2 request-API hwaccel. Upstream FFmpeg, and so poky's `ffmpeg`, does
-not have that hwaccel; Raspberry Pi's FFmpeg fork does. meta-raspberrypi builds the
-fork as `rpidistro-ffmpeg`, from the RPi-Distro/ffmpeg tree that Raspberry Pi OS
-packages as `ffmpeg`. Like poky's `ffmpeg`, the recipe declares
-`LICENSE_FLAGS = "commercial"`. The Raspberry Pi 5 DomD image contains its libraries
-and the `ffmpeg` command-line tools.
+libavcodec's V4L2 request-API hwaccel. With qemu 11.1.2 the same libavcodec also
+decodes DomA's H.264, in software (`RPI5_DOMA_H264`, on by default there).
+Upstream FFmpeg, and so poky's `ffmpeg`, does not have that hwaccel; Raspberry
+Pi's FFmpeg fork does. meta-raspberrypi builds the fork as `rpidistro-ffmpeg`,
+from the RPi-Distro/ffmpeg tree that Raspberry Pi OS packages as `ffmpeg`. Like
+poky's `ffmpeg`, the recipe declares `LICENSE_FLAGS = "commercial"`. The Raspberry
+Pi 5 DomD image contains its libraries and the `ffmpeg` command-line tools.
 
 **Accepted by default, as Raspberry Pi OS does.** Raspberry Pi OS installs the same
 FFmpeg fork by default in its desktop image, and hardware HEVC decode on

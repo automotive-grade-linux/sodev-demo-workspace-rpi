@@ -313,6 +313,18 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
   11.1.2, `0` otherwise): `host-sand=N` on DomA's virtio-media device, so the decoder
   mode's HEVC frames reach the guest on the GPU (`q11-069`); the append refuses a
   non-zero value with any other qemu.
+- `RPI5_DOMA_H264` (the same append; `1` with qemu 11.1.2, `0` otherwise):
+  `decoder=hevc+h264`, so DomA's H.264 is decoded by libavcodec in software in DomD
+  (`q11-072` to `q11-074`) instead of by DomA's own software decoder, on two frame
+  threads (`q11-079`) and straight into dma-bufs the GPU reads, without the NV12
+  conversion and copy (`q11-080`); the append refuses `1` with any other qemu. A
+  stream the decoder mode cannot take is reported to DomA through V4L2 (`q11-077`),
+  and with overlay planes the qemu window under them is covered (`q11-078`).
+- `RPI5_DOMA_HWDEC_MAX_W` (the same append; DomA's display width from
+  `RPI5_DOMA_GPU_RES` with qemu 11.1.2, `0` otherwise): `host-max-width=N`, so a
+  stream wider than the display, such as 4K HEVC, reaches DomA scaled down to it by
+  the decoder mode's GPU conversion (`q11-076`); the append refuses a non-zero value
+  with any other qemu.
 - `QEMU_XEN_MAPCACHE_MAX_MB`, which the DomD qemu wrapper exports for every
   device model it starts: it caps the foreign mapcache (`q11-053`) at
   `XT_QEMU_MAPCACHE_MAX_MB` from the DomD image recipe: 4608 on a Raspberry Pi 5
@@ -1512,7 +1524,9 @@ the buffer is UIF, the plane rejects it, and weston composites DomA with the GPU
 | situation (Raspberry Pi 5, DomA composited with GL) | needed? | measured |
 |---|---|---|
 | HMI only | for plane-only, yes (the client target is a scanout buffer) | V3D 17.6 -> 17.0% (2026-10-15); weston's state not compared |
+| H.264 in DomA, 720p60 / 1080p60 | yes | V3D 67-71 -> 42-44% / 85-88 -> 52-54%, same frame rate, weston mixed -> plane-only (2026-10-15) |
 | HEVC 1080p60, SAND direct scanout | no: the decoder's SAND buffer goes to a plane from the device model directly | V3D 17.0 -> 16.6%, 61.07 -> 61.04 fps (2026-10-15) |
+| WebView H.264 1080p60 with the HMI | yes, together with qemu `q11-078` (opaque plane 0 and a backdrop) | weston mixed -> plane-only, DomA's steal 44/38 -> 27/23, 45.6/42.5 -> 51.2/46.5 shown per second (2026-10-17). The video layer itself stays UIF, as decoder output |
 | Vulkan composition with `/etc/qemu-gbm-layout` | redundant (gbm-layout makes DomA's resources linear already) | not measured |
 
 The cost is in decode speed when nothing is shown: `-S` of HEVC 1080p fell about

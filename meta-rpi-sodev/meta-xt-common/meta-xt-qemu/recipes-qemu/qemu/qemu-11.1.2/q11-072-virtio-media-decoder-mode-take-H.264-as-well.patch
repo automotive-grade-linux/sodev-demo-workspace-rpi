@@ -1,0 +1,635 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 00:09:57 +0900
+Subject: [PATCH] virtio-media: decoder mode: take H.264 as well
+
+Decoder mode (q11-041) offered one bitstream, HEVC, decoded by
+rpi-hevc-dec through libavcodec's v4l2request hwaccel. The Raspberry
+Pi 5 has no H.264 block, so the guest decoded H.264 itself: DomA's
+Android software decoder on two vCPUs played 1080p60 at 35.4 fps.
+DomD's libavcodec decodes the same stream at 95 fps on one thread.
+
+decoder= now names the bitstreams the device offers: "hevc", "h264"
+or both, joined by '+' (',' separates -device options), in any order.
+ENUM_FMT on OUTPUT lists them HEVC first, and a session starts with
+the first. S_FMT(OUTPUT) with another one opens libavcodec again for
+it, and answers EBUSY while OUTPUT has buffers or either queue
+streams; TRY_FMT changes nothing. H.264 is decoded in software, with
+no hwaccel tried; HEVC keeps its path.
+
+A frame libavcodec cannot decode (AVERROR_INVALIDDATA) is now that
+frame lost: it used to end the session with EIO. Should a switch fail
+to open either codec, avctx stays NULL: libavcodec is then called
+only through dec_av_send, dec_av_receive and dec_av_flush, which
+answer ENODEV or do nothing, and an S_FMT to that same codec tries to
+open it again. The card name drops "HEVC".
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16, AOSP's codec tool
+with -T; DomA's v4l2_codec2 picks c2.v4l2.avc.decoder before
+c2.android.avc): H.264 1080p60 at 47.7 and 47.9 fps with the main loop
+at 98 to 102% of a core, 720p60 at 61.1 and 61.2 fps. The frame goes
+through swscale to RGBA and glTexSubImage2D on the main loop; the next
+two patches take that off the CPU and the loop.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 325 ++++++++++++++++++++++++-------
+ hw/virtio/virtio-media.c         |   7 +-
+ include/hw/virtio/virtio-media.h |   7 +-
+ 3 files changed, 266 insertions(+), 73 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index c97e9f8b2..1b182b849 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -20,8 +20,9 @@
+  *     ever passed false, by the encoder.
+  *
+  * So the conversion happens here instead: the guest sees an ordinary stateful
+- * decoder -- V4L2_PIX_FMT_HEVC in, linear RGBA out, SOURCE_CHANGE and
+- * DECODER_CMD as usual -- and the stateless driving is libavcodec's problem.
++ * decoder -- V4L2_PIX_FMT_HEVC in (or H.264, decoded in software: see
++ * dec_codecs), linear RGBA out, SOURCE_CHANGE and DECODER_CMD as usual -- and
++ * the stateless driving is libavcodec's problem.
+  * That keeps the virtio-media protocol unchanged, and neither the guest
+  * driver nor the Android side needs anything HEVC- or stateless-specific.
+  *
+@@ -38,8 +39,9 @@
+  * between a dependency and a decoder.
+  *
+  * WHAT THIS FILE IS. The guest-facing stateful contract, on top of
+- * libavcodec's HEVC decoder; which backend libavcodec decodes with (software,
+- * or the v4l2request hwaccel on codec@800000) does not change that contract.
++ * libavcodec's HEVC and H.264 decoders; which backend libavcodec decodes with
++ * (software, or the v4l2request hwaccel on codec@800000) does not change that
++ * contract.
+  * Decoder mode needs NO host V4L2 device, so an x86 qemu running the guest
+  * kernel and virtio-media.ko can drive it end-to-end with a real HEVC stream.
+  *
+@@ -78,7 +80,26 @@
+  * (V4L2Decoder::start()), so offering the single-planar types would fail
+  * its very first check.
+  */
+-#define DEC_OUT_FOURCC  V4L2_PIX_FMT_HEVC
++/*
++ * q11-dec-h264: the bitstreams this mode takes. decoder= names the ones a
++ * device offers: "hevc", "h264", or both joined by '+' (',' separates -device
++ * options), in any order: ENUM_FMT lists them in this table's order, and a
++ * session starts with the first. The Raspberry Pi 5 has no H.264 block, so
++ * H.264 is libavcodec's software decoder; it is offered here because DomD's
++ * libavcodec decodes it faster than the guest's software decoder does.
++ */
++typedef struct DecCodec {
++    const char *name;      /* in decoder= */
++    uint32_t fourcc;
++    const char *desc;      /* ENUM_FMT */
++    const char *av_name;   /* avcodec_find_decoder_by_name */
++    bool hwaccel;          /* try the v4l2request hwaccel (rpi-hevc-dec) */
++} DecCodec;
++
++static const DecCodec dec_codecs[] = {
++    { "hevc", V4L2_PIX_FMT_HEVC, "HEVC", "hevc", true },
++    { "h264", V4L2_PIX_FMT_H264, "H.264", "h264", false },
++};
+ /*
+  * RGBA, NOT NV12, AND THAT IS NOT A PREFERENCE.
+  *
+@@ -260,6 +281,7 @@ typedef struct DecGpuHeld {
+ #define DEC_MAX_BACKLOG_BYTES (16 * 1024 * 1024)
+ 
+ struct VirtIOMediaDec {
++    const DecCodec *codec;          /* the OUTPUT format (S_FMT picks it) */
+     /* Negotiated formats. */
+     uint32_t coded_w, coded_h;      /* what the CAPTURE format currently says */
+     uint32_t visible_w, visible_h;  /* the stream's cropping rectangle */
+@@ -445,7 +467,7 @@ static void dec_fill_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+     pix->num_planes = 1;
+ 
+     if (out) {
+-        pix->pixelformat = DEC_OUT_FOURCC;
++        pix->pixelformat = d->codec->fourcc;
+         pix->width = d->coded_w;
+         pix->height = d->coded_h;
+         pix->plane_fmt[0].sizeimage = d->out_sizeimage;
+@@ -1021,6 +1043,21 @@ static bool dec_ds_starved(VirtIOMediaDec *d, int r)
+     return true;
+ }
+ 
++/*
++ * q11-dec-h264: a frame libavcodec could not decode (AVERROR_INVALIDDATA: a
++ * damaged or truncated slice, frequent in streamed H.264) is that frame lost,
++ * not the stream: it used to end the session with EIO.
++ */
++static bool dec_bad_data(int r)
++{
++    if (r != AVERROR_INVALIDDATA) {
++        return false;
++    }
++    warn_report_once("virtio-media/dec: libavcodec could not decode a frame "
++                     "(invalid data); skipping it");
++    return true;
++}
++
+ /* Keep hardware frames as DRM_PRIME for dec_gpu_write instead of downloading. */
+ static bool dec_gpu_wanted(VirtIOMediaSession *s)
+ {
+@@ -1481,6 +1518,37 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+     return true;
+ }
+ 
++/*
++ * q11-dec-h264: libavcodec's send, receive and flush. avctx is NULL only when
++ * dec_codec_switch could not open a decoder again.
++ */
++/* avcodec_send_packet; pkt NULL starts a drain. */
++static int dec_av_send(VirtIOMediaDec *d, const AVPacket *pkt)
++{
++    if (!d->avctx) {
++        return AVERROR(ENODEV);
++    }
++    return avcodec_send_packet(d->avctx, pkt);
++}
++
++/* avcodec_receive_frame. */
++static int dec_av_receive(VirtIOMediaDec *d, AVFrame *frame)
++{
++    if (!d->avctx) {
++        return AVERROR(ENODEV);
++    }
++    return avcodec_receive_frame(d->avctx, frame);
++}
++
++/* avcodec_flush_buffers. */
++static void dec_av_flush(VirtIOMediaDec *d)
++{
++    if (!d->avctx) {
++        return;
++    }
++    avcodec_flush_buffers(d->avctx);
++}
++
+ /*
+  * THE INPUT BACKLOG EXISTS BECAUSE VIDIOC_QBUF MUST NOT FAIL.
+  *
+@@ -1545,7 +1613,7 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+ {
+     while (!g_queue_is_empty(d->backlog)) {
+         AVPacket *p = g_queue_peek_head(d->backlog);
+-        int r = avcodec_send_packet(d->avctx, p);
++        int r = dec_av_send(d, p);
+ 
+         if (r == AVERROR(EAGAIN)) {
+             return;
+@@ -1553,7 +1621,8 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+         g_queue_pop_head(d->backlog);
+         d->backlog_bytes -= (size_t)p->size;
+         av_packet_free(&p);
+-        if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r)) {
++        if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r) &&
++            !dec_bad_data(r)) {
+             error_report_once("virtio-media/dec: backlog send_packet: %d", r);
+             dec_backlog_clear(d);
+             return;
+@@ -1613,7 +1682,7 @@ static void dec_pump(VirtIOMediaSession *s)
+             return;
+         }
+ 
+-        r = avcodec_receive_frame(d->avctx, d->frame);
++        r = dec_av_receive(d, d->frame);
+         if (r == AVERROR(EAGAIN)) {
+             return;
+         }
+@@ -1639,7 +1708,7 @@ static void dec_pump(VirtIOMediaSession *s)
+             return;
+         }
+         if (r < 0) {
+-            if (dec_ds_starved(d, r)) {
++            if (dec_ds_starved(d, r) || dec_bad_data(r)) {
+                 continue;
+             }
+             error_report_once("virtio-media/dec: avcodec_receive_frame: %d", r);
+@@ -1778,18 +1847,70 @@ static void dec_pump(VirtIOMediaSession *s)
+ /* open / close                                                              */
+ /* ------------------------------------------------------------------------- */
+ 
++/* Is c among the codecs decoder= names? */
++static bool dec_codec_on(const VirtIOMedia *vm, const DecCodec *c)
++{
++    g_auto(GStrv) names = g_strsplit(vm->decoder, "+", -1);
++
++    return g_strv_contains((const gchar * const *)names, c->name);
++}
++
++/* The index-th codec this device offers, or NULL. */
++static const DecCodec *dec_codec_nth(const VirtIOMedia *vm, uint32_t index)
++{
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(dec_codecs); i++) {
++        if (dec_codec_on(vm, &dec_codecs[i]) && index-- == 0) {
++            return &dec_codecs[i];
++        }
++    }
++    return NULL;
++}
++
++static const DecCodec *dec_codec_by_fourcc(const VirtIOMedia *vm,
++                                           uint32_t fourcc)
++{
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(dec_codecs); i++) {
++        if (dec_codecs[i].fourcc == fourcc && dec_codec_on(vm, &dec_codecs[i])) {
++            return &dec_codecs[i];
++        }
++    }
++    return NULL;
++}
++
+ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
+ {
++    g_auto(GStrv) names = NULL;
++    size_t i, j;
++
+     if (!vm->decoder) {
+         return true;
+     }
+-    if (strcmp(vm->decoder, "hevc") != 0) {
+-        error_setg(errp, "virtio-media: decoder='%s' is not supported "
+-                   "(only 'hevc')", vm->decoder);
+-        return false;
++    names = g_strsplit(vm->decoder, "+", -1);
++    for (i = 0; names[i]; i++) {
++        for (j = 0; j < ARRAY_SIZE(dec_codecs); j++) {
++            if (!strcmp(names[i], dec_codecs[j].name)) {
++                break;
++            }
++        }
++        if (j == ARRAY_SIZE(dec_codecs)) {
++            error_setg(errp, "virtio-media: decoder='%s': '%s' is not "
++                       "supported ('hevc', 'h264', joined by '+')",
++                       vm->decoder, names[i]);
++            return false;
++        }
++        if (!avcodec_find_decoder_by_name(dec_codecs[j].av_name)) {
++            error_setg(errp, "virtio-media: libavcodec has no %s decoder",
++                       dec_codecs[j].desc);
++            return false;
++        }
+     }
+-    if (!avcodec_find_decoder(AV_CODEC_ID_HEVC)) {
+-        error_setg(errp, "virtio-media: libavcodec has no HEVC decoder");
++    if (!dec_codec_nth(vm, 0)) {
++        error_setg(errp, "virtio-media: decoder='%s' names no codec",
++                   vm->decoder);
+         return false;
+     }
+     /*
+@@ -1831,32 +1952,21 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+     return fmts[0];
+ }
+ 
+-int virtio_media_dec_open(VirtIOMediaSession *s)
++/*
++ * Set up libavcodec for d->codec. At open with the device's first codec, and
++ * again when S_FMT(OUTPUT) picks another one (before any OUTPUT buffer, so
++ * nothing of the old stream is in flight).
++ */
++static int dec_codec_open(VirtIOMediaDec *d)
+ {
+-    VirtIOMediaDec *d;
+-    const AVCodec *codec;
++    const AVCodec *codec = avcodec_find_decoder_by_name(d->codec->av_name);
+ 
+-    codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+     if (!codec) {
+         return ENODEV;
+     }
+-
+-    d = g_new0(VirtIOMediaDec, 1);
+-    d->backlog = g_queue_new();
+-    d->coded_w = DEC_MIN_W;
+-    d->coded_h = DEC_MIN_H;
+-    d->visible_w = DEC_MIN_W;
+-    d->visible_h = DEC_MIN_H;
+-    d->out_sizeimage = DEC_MAX_OUT_SIZE;
+-    d->sws_src_fmt = AV_PIX_FMT_NONE;
+-    d->sws_src_w = -1;
+-    d->sws_src_h = -1;
+-
+     d->avctx = avcodec_alloc_context3(codec);
+-    d->pkt = av_packet_alloc();
+-    d->frame = av_frame_alloc();
+-    if (!d->avctx || !d->pkt || !d->frame) {
+-        goto fail;
++    if (!d->avctx) {
++        return ENOMEM;
+     }
+     /*
+      * One thread. Frame-threaded decoding would reorder completions relative
+@@ -1875,21 +1985,80 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+      * av_hwdevice_ctx_create() with a NULL device lets the /dev/mediaN discovery
+      * in the fork choose, which is what the CLI does; naming a node here would
+      * hard-code a number that udev is free to move.
++     *
++     * q11-dec-h264: H.264 has no hwaccel on this SoC (rpi-hevc-dec is HEVC
++     * only), so it is decoded in software from the start.
+      */
+-    d->swframe = av_frame_alloc();
+-    if (!d->swframe) {
+-        goto fail;
++    if (d->codec->hwaccel && !d->hwdev &&
++        av_hwdevice_ctx_create(&d->hwdev, AV_HWDEVICE_TYPE_DRM,
++                               NULL, NULL, 0) < 0) {
++        warn_report("virtio-media/dec: no DRM device for the v4l2request "
++                    "hwaccel; decoding %s in software", d->codec->desc);
+     }
+-    if (av_hwdevice_ctx_create(&d->hwdev, AV_HWDEVICE_TYPE_DRM,
+-                               NULL, NULL, 0) == 0) {
++    if (d->codec->hwaccel && d->hwdev) {
+         d->avctx->hw_device_ctx = av_buffer_ref(d->hwdev);
+         d->avctx->get_format = dec_get_format;
+-    } else {
+-        warn_report("virtio-media/dec: no DRM device for the v4l2request "
+-                    "hwaccel; decoding HEVC in software");
+     }
+-
+     if (avcodec_open2(d->avctx, codec, NULL) < 0) {
++        avcodec_free_context(&d->avctx);
++        return ENOMEM;
++    }
++    return 0;
++}
++
++/* S_FMT(OUTPUT) with another bitstream: decode that one from now on. */
++static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
++{
++    VirtIOMediaDec *d = s->dec;
++    const DecCodec *old = d->codec;
++
++    if (c == d->codec && d->avctx) {
++        return 0;
++    }
++    if (s->queues[0].num_bufs || s->queues[0].streaming ||
++        s->queues[1].streaming) {
++        return EBUSY;
++    }
++    dec_gpu_reset(d);
++    dec_backlog_clear(d);
++    av_frame_free(&d->held);
++    avcodec_free_context(&d->avctx);
++    d->stream_fmt_known = false;
++    d->awaiting_reconfig = false;
++    d->draining = false;
++    d->drain_done = false;
++    d->hw_logged = false;
++    d->gpu_logged = false;
++    d->codec = c;
++    if (dec_codec_open(d) == 0) {
++        return 0;
++    }
++    /* keep a working decoder: the old one */
++    d->codec = old;
++    return dec_codec_open(d) == 0 ? EINVAL : ENODEV;
++}
++
++int virtio_media_dec_open(VirtIOMediaSession *s)
++{
++    VirtIOMediaDec *d;
++
++    d = g_new0(VirtIOMediaDec, 1);
++    d->codec = dec_codec_nth(s->vm, 0);
++    d->backlog = g_queue_new();
++    d->coded_w = DEC_MIN_W;
++    d->coded_h = DEC_MIN_H;
++    d->visible_w = DEC_MIN_W;
++    d->visible_h = DEC_MIN_H;
++    d->out_sizeimage = DEC_MAX_OUT_SIZE;
++    d->sws_src_fmt = AV_PIX_FMT_NONE;
++    d->sws_src_w = -1;
++    d->sws_src_h = -1;
++
++    d->pkt = av_packet_alloc();
++    d->frame = av_frame_alloc();
++    d->swframe = av_frame_alloc();
++    if (!d->codec || !d->pkt || !d->frame || !d->swframe ||
++        dec_codec_open(d)) {
+         goto fail;
+     }
+ 
+@@ -1943,7 +2112,7 @@ static int dec_querycap(struct v4l2_capability *cap)
+ {
+     memset(cap, 0, sizeof(*cap));
+     pstrcpy((char *)cap->driver, sizeof(cap->driver), "virtio-media");
+-    pstrcpy((char *)cap->card, sizeof(cap->card), "virtio-media HEVC decoder");
++    pstrcpy((char *)cap->card, sizeof(cap->card), "virtio-media decoder");
+     pstrcpy((char *)cap->bus_info, sizeof(cap->bus_info), "platform:virtio");
+     /* Any non-zero value; nothing in this path keys off the number. */
+     cap->version = (6 << 16) | (18 << 8);
+@@ -1952,17 +2121,19 @@ static int dec_querycap(struct v4l2_capability *cap)
+     return 0;
+ }
+ 
+-static int dec_enum_fmt(struct v4l2_fmtdesc *f)
++static int dec_enum_fmt(VirtIOMedia *vm, struct v4l2_fmtdesc *f)
+ {
+     bool out = V4L2_TYPE_IS_OUTPUT(f->type);
++    const DecCodec *c = out ? dec_codec_nth(vm, f->index) : NULL;
+ 
+-    if (f->index != 0) {
+-        return EINVAL;   /* exactly one format per queue */
++    /* each codec decoder= names on OUTPUT, one format on CAPTURE */
++    if (out ? !c : f->index != 0) {
++        return EINVAL;
+     }
+     f->flags = out ? V4L2_FMT_FLAG_COMPRESSED : 0;
+-    f->pixelformat = out ? DEC_OUT_FOURCC : DEC_CAP_FOURCC;
++    f->pixelformat = out ? c->fourcc : DEC_CAP_FOURCC;
+     pstrcpy((char *)f->description, sizeof(f->description),
+-            out ? "HEVC" : "RGBA");
++            out ? c->desc : "RGBA");
+     memset(f->reserved, 0, sizeof(f->reserved));
+     return 0;
+ }
+@@ -1973,9 +2144,10 @@ static int dec_s_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+ 
+     if (V4L2_TYPE_IS_OUTPUT(f->type)) {
+         /*
+-         * The guest picks the compressed buffer size; the pixel format is not
+-         * negotiable (this is an HEVC decoder). Answering with our format
+-         * rather than failing is what V4L2 asks of S_FMT.
++         * The guest picks the compressed buffer size. The bitstream is chosen
++         * before this, in virtio_media_dec_ioctl (S_FMT only: TRY_FMT runs on
++         * a copy); a format this device does not take is answered with the
++         * current one, as V4L2 asks of S_FMT.
+          */
+         if (pix->num_planes >= 1 && pix->plane_fmt[0].sizeimage) {
+             uint32_t sz = pix->plane_fmt[0].sizeimage;
+@@ -2020,12 +2192,12 @@ static int dec_s_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+     return 0;
+ }
+ 
+-static int dec_enum_framesizes(struct v4l2_frmsizeenum *fs)
++static int dec_enum_framesizes(VirtIOMedia *vm, struct v4l2_frmsizeenum *fs)
+ {
+     if (fs->index != 0) {
+         return EINVAL;
+     }
+-    if (fs->pixel_format != DEC_OUT_FOURCC &&
++    if (!dec_codec_by_fourcc(vm, fs->pixel_format) &&
+         fs->pixel_format != DEC_CAP_FOURCC) {
+         return EINVAL;
+     }
+@@ -2263,7 +2435,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+             if (!d->draining) {
+                 d->draining = true;
+                 d->drain_done = false;
+-                avcodec_send_packet(d->avctx, NULL);
++                dec_av_send(d, NULL);
+             }
+             dec_complete_buffer(s, 0, b->index, 0, 0, DEC_IN_PTS(b));
+             dec_pump(s);
+@@ -2317,7 +2489,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+          */
+         r = (d->awaiting_reconfig || !g_queue_is_empty(d->backlog))
+                 ? AVERROR(EAGAIN)
+-                : avcodec_send_packet(d->avctx, d->pkt);
++                : dec_av_send(d, d->pkt);
+         /*
+          * NOTE: EAGAIN MEANS THE PACKET WAS NOT CONSUMED, SO IT MUST BE RESENT.
+          *
+@@ -2337,7 +2509,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+             dec_pump(s);
+             /* dec_pump() may have emptied the backlog; if it did not, queue. */
+             if (!d->awaiting_reconfig && g_queue_is_empty(d->backlog)) {
+-                r = avcodec_send_packet(d->avctx, d->pkt);
++                r = dec_av_send(d, d->pkt);
+             }
+         }
+         /*
+@@ -2360,7 +2532,8 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+             return EAGAIN;
+         }
+         /* the packet was taken even so: that frame is lost, not the stream */
+-        if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r)) {
++        if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r) &&
++            !dec_bad_data(r)) {
+             error_report_once("virtio-media/dec: avcodec_send_packet: %d", r);
+             gb->queued = false;
+             return EIO;
+@@ -2397,7 +2570,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+         }
+         if (qi == 0) {
+             /* Input stopped: the decoder's state is no longer meaningful. */
+-            avcodec_flush_buffers(d->avctx);
++            dec_av_flush(d);
+             av_frame_free(&d->held);
+             dec_backlog_clear(d);
+             dec_gpu_reset(d);
+@@ -2458,7 +2631,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+         if (!d->draining) {
+             d->draining = true;
+             d->drain_done = false;
+-            avcodec_send_packet(d->avctx, NULL);   /* flush packet */
++            dec_av_send(d, NULL);   /* flush packet */
+         }
+         dec_pump(s);
+     } else {
+@@ -2469,7 +2642,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+          * corruption from the next frame on.
+          */
+         if (d->draining) {
+-            avcodec_flush_buffers(d->avctx);
++            dec_av_flush(d);
+             av_frame_free(&d->held);
+             dec_backlog_clear(d);
+             d->draining = false;
+@@ -2498,7 +2671,7 @@ int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
+         return dec_querycap((struct v4l2_capability *)payload);
+ 
+     case VIDIOC_ENUM_FMT:
+-        return dec_enum_fmt((struct v4l2_fmtdesc *)payload);
++        return dec_enum_fmt(s->vm, (struct v4l2_fmtdesc *)payload);
+ 
+     case VIDIOC_G_FMT:
+         dec_fill_fmt(d, (struct v4l2_format *)payload);
+@@ -2512,12 +2685,30 @@ int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
+          */
+         if (code == VIDIOC_TRY_FMT) {
+             VirtIOMediaDec tmp = *d;
+-            return dec_s_fmt(&tmp, (struct v4l2_format *)payload);
++            struct v4l2_format *f = (struct v4l2_format *)payload;
++            const DecCodec *c = dec_codec_by_fourcc(s->vm,
++                                                    f->fmt.pix_mp.pixelformat);
++
++            if (V4L2_TYPE_IS_OUTPUT(f->type) && c) {
++                tmp.codec = c;
++            }
++            return dec_s_fmt(&tmp, f);
++        }
++        if (V4L2_TYPE_IS_OUTPUT(((struct v4l2_format *)payload)->type)) {
++            const DecCodec *c = dec_codec_by_fourcc(s->vm,
++                ((struct v4l2_format *)payload)->fmt.pix_mp.pixelformat);
++
++            if (c) {
++                ret = dec_codec_switch(s, c);
++                if (ret) {
++                    return ret;
++                }
++            }
+         }
+         return dec_s_fmt(d, (struct v4l2_format *)payload);
+ 
+     case VIDIOC_ENUM_FRAMESIZES:
+-        return dec_enum_framesizes((struct v4l2_frmsizeenum *)payload);
++        return dec_enum_framesizes(s->vm, (struct v4l2_frmsizeenum *)payload);
+ 
+     case VIDIOC_G_SELECTION:
+         return dec_g_selection(d, (struct v4l2_selection *)payload);
+@@ -2562,7 +2753,7 @@ int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
+ 
+     case VIDIOC_S_EXT_CTRLS:
+     case VIDIOC_TRY_EXT_CTRLS:
+-        /* No writable controls: a stateful HEVC decoder needs none. */
++        /* No writable controls: a stateful decoder needs none. */
+         return EINVAL;
+ 
+     case VIDIOC_SUBSCRIBE_EVENT: {
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index b7e3b2946..e7acc7bed 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -3294,9 +3294,10 @@ static const VMStateDescription vmstate_virtio_media = {
+ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
+     /*
+-     * decoder=hevc turns this into a stateful HEVC decoder backed by
+-     * libavcodec instead of a proxy for a host V4L2 node. Mutually exclusive
+-     * with v4l2-device in practice: nothing reads it in decoder mode.
++     * decoder=hevc (h264, hevc+h264) turns this into a stateful decoder of
++     * those bitstreams backed by libavcodec instead of a proxy for a host V4L2
++     * node. Mutually exclusive with v4l2-device in practice: nothing reads it
++     * in decoder mode.
+      */
+     DEFINE_PROP_STRING("decoder", VirtIOMedia, decoder),
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 2db633c01..1495874c5 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -346,9 +346,10 @@ struct VirtIOMedia {
+     /* Properties. */
+     char *v4l2_device;            /* host /dev/videoN to proxy */
+     /*
+-     * "hevc" selects decoder mode: no host V4L2 device is opened and the guest
+-     * is offered a STATEFUL HEVC decoder backed by libavcodec. Unset (the
+-     * default) keeps the original proxy behaviour byte for byte.
++     * "hevc", "h264" or "hevc+h264" selects decoder mode: no host V4L2 device
++     * is opened and the guest is offered a STATEFUL decoder of those
++     * bitstreams backed by libavcodec. Unset (the default) keeps the original
++     * proxy behaviour byte for byte.
+      *
+      * WHY A SECOND MODE RATHER THAN A SECOND DEVICE. The protocol handling --
+      * sessions, the SG serialisation, the event queue, the ioctl table -- is
