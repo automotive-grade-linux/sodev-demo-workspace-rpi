@@ -1,0 +1,119 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 2 Oct 2026 04:14:25 +0900
+Subject: [PATCH] v3dv: build the signal fence once per submit, skip idle queues
+
+v3dv_queue_driver_submit() signals each semaphore/fence of a submit by
+merging the last-job syncobj of all four kernel queues (CL, TFU, CSD,
+CPU) into it, and does that separately for every signal: four sync_file
+exports, three SYNC_IOC_MERGEs, one import and the closes, per signal.
+
+On the RPi4 (Venus host for an AAOS WebView, 2026-10-01) the WebView's
+submits signal about four syncs each, so one SUBMIT_CL cost some thirty
+syscalls (8 per signal, not counting the closes) on the venus ring
+thread, and the other ring of the same context spun in
+spin_wait_for_sync_file() until they were done. Measured with strace
+over 10 s: SYNC_IOC_MERGE 4563 -> 26, spin iterations 1883 -> 474, and
+the ring thread got 44% more SUBMIT_CLs through in the same time.
+
+Build the merged fence once and import it into every signal. Leave out a
+kernel queue whose last job has already completed: it contributes
+nothing, and a zero-timeout wait on it is one ioctl where merging it is
+three syscalls. These syncobjs always carry a fence, so that wait cannot
+fail for want of one.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/broadcom/vulkan/v3dv_queue.c
++++ b/src/broadcom/vulkan/v3dv_queue.c
+@@ -1020,12 +1020,17 @@
+    }
+ }
+ 
+-/* Merges an array of syncobj handles into a single target syncobj */
++/* Merges an array of syncobj handles into every target syncobj.
++ *
++ * The merged fence is built once and imported into each target: building it per
++ * target repeated the same exports and SYNC_IOC_MERGEs for every signal of a submit.
++ */
+ static VkResult
+ merge_syncobjs(struct v3dv_device *device,
+                     const uint32_t *src_syncobjs,
+                     uint32_t src_count,
+-                    uint32_t dst_syncobj)
++                    const uint32_t *dst_syncobjs,
++                    uint32_t dst_count)
+ {
+    int drm_fd = device->pdevice->render_fd;
+    int accum_fd = -1;
+@@ -1034,7 +1039,7 @@
+       /* If there are no jobs and no wait dependencies, the signal semaphores/fences
+        * must trigger immediately to satisfy the Vulkan spec.
+        */
+-      drmSyncobjSignal(drm_fd, &dst_syncobj, 1);
++      drmSyncobjSignal(drm_fd, dst_syncobjs, dst_count);
+       return VK_SUCCESS;
+    }
+ 
+@@ -1057,10 +1062,12 @@
+       }
+    }
+ 
+-   /* Import the final accumulated fence fd back into the destination syncobj */
++   /* Import the final accumulated fence fd into every destination syncobj */
+    assert(accum_fd != -1);
+-   if (drmSyncobjImportSyncFile(drm_fd, dst_syncobj, accum_fd) != 0)
+-      goto ioctl_error;
++   for (uint32_t i = 0; i < dst_count; i++) {
++      if (drmSyncobjImportSyncFile(drm_fd, dst_syncobjs[i], accum_fd) != 0)
++         goto ioctl_error;
++   }
+ 
+    close(accum_fd);
+ 
+@@ -1163,8 +1170,18 @@
+       uint32_t src_syncobjs[V3DV_QUEUE_COUNT + submit->wait_count];
+       uint32_t src_count = 0;
+ 
+-      for (int i = 0; i < V3DV_QUEUE_COUNT; i++)
+-         src_syncobjs[src_count++] = queue->last_job_syncs.syncs[i];
++      const int drm_fd = queue->device->pdevice->render_fd;
++      for (int i = 0; i < V3DV_QUEUE_COUNT; i++) {
++         uint32_t last = queue->last_job_syncs.syncs[i];
++         /* A kernel queue whose last job has already completed adds nothing to
++          * the merged fence, so leave it out (a zero-timeout wait is one ioctl;
++          * merging it is an export, a merge and a close). These syncobjs always
++          * carry a fence, so the wait cannot fail for want of one.
++          */
++         if (drmSyncobjWait(drm_fd, &last, 1, 0, 0, NULL) == 0)
++            continue;
++         src_syncobjs[src_count++] = last;
++      }
+ 
+       /* If we didn't submit any jobs, we need to merge wait dependencies */
+       if (!has_jobs && submit->wait_count > 0) {
+@@ -1172,14 +1189,15 @@
+             src_syncobjs[src_count++] = vk_sync_as_drm_syncobj(submit->waits[i].sync)->syncobj;
+       }
+ 
+-      /* Merge the accumulated syncobjs into each Vulkan signal semaphore */
+-      for (uint32_t i = 0; i < submit->signal_count; i++) {
+-         uint32_t dst_syncobj = vk_sync_as_drm_syncobj(submit->signals[i].sync)->syncobj;
+-
+-         result = merge_syncobjs(queue->device, src_syncobjs, src_count, dst_syncobj);
+-         if (result != VK_SUCCESS)
+-            return result;
+-      }
++      /* Merge the accumulated syncobjs into every Vulkan signal semaphore */
++      uint32_t dst_syncobjs[submit->signal_count];
++      for (uint32_t i = 0; i < submit->signal_count; i++)
++         dst_syncobjs[i] = vk_sync_as_drm_syncobj(submit->signals[i].sync)->syncobj;
++
++      result = merge_syncobjs(queue->device, src_syncobjs, src_count,
++                              dst_syncobjs, submit->signal_count);
++      if (result != VK_SUCCESS)
++         return result;
+    }
+ 
+    return VK_SUCCESS;

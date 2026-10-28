@@ -338,9 +338,10 @@ identical and what this port changes:
   the 24.2.7 recipes. DomD's Mesa is pinned again now, ahead of wrynose, to
   26.2.4: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
   `meta-xt-driver-domain`'s `mesa.bbappend` carries the pin (in both `--gpu`
-  lanes), glvnd, and two source patches of its own: egl/wayland allocating a
-  client's scanout buffers on the display device, and v3d filling its tiled blit
-  temporary with the TFU.
+  lanes), glvnd, and three source patches of its own: egl/wayland allocating a
+  client's scanout buffers on the display device, v3d filling its tiled blit
+  temporary with the TFU, and v3dv building a submit's signal fence once instead
+  of once per signal.
 
 ## DomD compositor startup and rootfs (V4H-aligned)
 
