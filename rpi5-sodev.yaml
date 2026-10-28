@@ -63,7 +63,6 @@ variables:
   # --- DomD / DomU build dirs + machines + image names (copied from rpi5.yaml) ---
   DOMU_MACHINE: "virtio-armv8-xt"
   XT_XEN_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen.dtbo"
-  XT_DOMD_DTB_NAME: "%{SOC_FAMILY}-%{MACHINE}-domd.dtb"
   XEN_DT_SCMI_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen-scmi"
   # meta-xt-rpi5 own host overlay that publishes the TF-A SCMI server to Xen.
   # Distinct from XEN_DT_SCMI_NAME above (the meta-xt-driver-domain / EPAM one,

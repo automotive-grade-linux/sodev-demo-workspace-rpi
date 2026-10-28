@@ -9,8 +9,9 @@
 # objects -- $CONF_DIR, hostapd.conf, the hostapd binary -- so a second domain would
 # need a duplicate of every rule in doma_shadow_ap.te for no gain, and inventing a
 # domain is where the neverallow risk lives.
-# Attribution stays useful because the two run at different times: doma_shadow_ap is
-# oneshot at bring-up, doma_wifi_relay is the long-lived loop.
+# Both therefore run as doma_shadow_ap and their avc lines name the same domain; tell
+# them apart by pid (doma-shadow-ap is the oneshot at bring-up, doma-wifi-relay the
+# long-lived loop).
 /vendor/bin/doma-wifi-relay      u:object_r:doma_shadow_ap_exec:s0
 
 # /data/vendor/wifi/shadow holds the generated hostapd.conf, the AP list

@@ -184,7 +184,7 @@ brcmfmac_generic_fw_names() {
 }
 # Only with the firmware installed; without it there is nothing to link.
 ROOTFS_POSTPROCESS_COMMAND:append:raspberrypi5 = \
-    "${@' brcmfmac_generic_fw_names;' if d.getVar('DOMD_WIFI_FW') else ''}"
+    "${@' brcmfmac_generic_fw_names' if d.getVar('DOMD_WIFI_FW') else ''}"
 
 # ---------------------------------------------------------------------------
 # HEVC hardware decode in DomD (codec@800000, driver rpi-hevc-dec).

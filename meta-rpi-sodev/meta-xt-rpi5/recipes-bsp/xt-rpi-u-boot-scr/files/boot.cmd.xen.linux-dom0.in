@@ -506,8 +506,9 @@ fdt set /chosen/dom0 reg <0x0 0x4000000 0x0 0x${filesize}>
 # ------------------------------------------------------------------
 # Load the DomD Image (linux-domd-vc4) and the DomD partial DT as multiboot modules.
 # Set xen,direct-map + xen,static-mem on /chosen/domD to force 1:1 mapping.
-# DomD memory range: host phys 0x100000000-0x140000000 (1 GiB, high address).
-# Since it is direct-map, the guest gfn is the same 0x100000000-0x140000000 = mfn.
+# DomD memory: the overlay's xen,static-mem banks -- five, 4 GiB in all on the 16g SKU;
+# on 8g the board_ram block above sets four (3 GiB). Since it is direct-map, every
+# bank's guest gfn is the same as its mfn.
 
 # First-boot graceful handling.
 # If the DomD kernel / DTB are not yet placed on the SD boot partition (mmcblk0p1
@@ -546,7 +547,7 @@ fdt set /chosen/dom0 reg <0x0 0x4000000 0x0 0x${filesize}>
 # are permitted). It works, but not with a direct-mapped GPU domain, which this
 # board needs.
 # The overlay's (bcm2712-raspberrypi5-xen.dtbo) /chosen/domD already has `direct-map;`
-# + xen,static-mem (3 banks, 1 GB total) + memory/cpus/vpl011/xen,enhanced, so here we
+# + xen,static-mem (the banks above) + memory/cpus/vpl011/xen,enhanced, so here we
 # add only module@0/1/2 + bootargs + domain-id (leave direct-map/static-mem to the
 # overlay = do not hand-write the `xen,direct-map` prefix spelling that is invalid on xt0.2).
 # Rootfs in this flavour: the thin Linux Dom0 is the hardware domain and keeps the
@@ -648,36 +649,12 @@ fi
 # ------------------------------------------------------------------
 
 # ------------------------------------------------------------------
-# DomU = AGL Cluster IC (dom0less + xen,enhanced)
+# DomU = AGL Cluster IC
 # ------------------------------------------------------------------
-# The node follows the same pattern as DomD's in the Xen DT overlay, including
-# xen,enhanced = "enabled" (which turns on the dom0less xenstore and virtio paths)
-# and xen,domain-p2m-iommu. Memory is given in KB, so <0x0 0x80000> is 512 MB.
-#
-# The DomU payload is a combined kernel + initramfs image.
-# Load target: 0x40000000 (does not collide with DomD kernel 0xc000000 nor its dtb
-# 0xa000000; 0x10000000, the old DomD initramfs slot, is now unused)
-# Network: xen-netfront -> 192.168.10.12/24 via Dom0 xenbr0
-#
-# DomU is graceful: if the binary is absent, skip DomU startup and the rest (Dom0+DomD) still runs
-#
-# The DomU image load address is load-bearing. At 0x40000000 the image (326 MiB)
-# runs to 0x5468b008 and overlaps DomD's xen,static-mem bank1
-# (0x50000000-0x68000000) by 70.5 MiB. Xen's add_boot_module then fails
-# check_reserved_regions_overlap, the module is not registered, create_domUs panics
-# and the board hangs silently with no message.
-#
-# 0xa0000000 is used instead: it starts immediately after DomD's last static-mem
-# bank below 4 GiB (0x68000000-0xa0000000), ends at 0xb468b008 which is below the
-# 4 GB boundary U-Boot can address, and overlaps none of DomD's banks
-# (0x50000000-0x68000000, 0x20000000-0x28000000, 0x68000000-0xa0000000).
-#
 # DomU and DomA are created by the toolstack (`xl create`) rather than as dom0less
 # domains: the dom0less path cannot be completed here because the qemu xenpvh
 # backend attach needs Xen event-channel routing and a dom0less console pty in
 # xenconsoled, and neither is available.
-# (The dom0less DomU node construction that used to live here is removed: the
-#  toolstack creates DomU, so the block was unreachable by construction.)
 
 # ------------------------------------------------------------------
 # Linux Dom0 bootargs:
@@ -711,8 +688,8 @@ fdt set /chosen/dom0 bootargs "console=hvc0 earlycon=xen earlyprintk=xen rdinit=
 # on SD p1 as initramfs-xt-dom0-thin.cpio.gz.
 #
 # It loads at 0xa0000000. 0x8000000 does not work: the initramfs is large enough to
-# run past 0xc000000 and into the DomD/DomU reserved range (0xc000000-0x40000000),
-# and fatload then refuses with "Reading file would overwrite reserved memory".
+# run past 0xc000000, the DomD kernel's load address, into the range reserved from
+# there, and fatload then refuses with "Reading file would overwrite reserved memory".
 # 0xa0000000 is below the 4 GB boundary U-Boot can address.
 fatload mmc 0 0xa0000000 initramfs-xt-dom0-thin.cpio.gz
 setenv dom0_initramfs_size ${filesize}
