@@ -1,0 +1,104 @@
+From a95809ff6927217f30579c883e89b36cc83c1337 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 28 Oct 2026 11:38:08 +0900
+Subject: [PATCH] storage: DomA's block read-ahead at 512 KiB
+
+init.xenvm-readahead.rc writes 512 to read_ahead_kb of vda and of the dm
+devices (dm-0 to dm-15; init's write takes no wildcard, this board has
+had up to dm-9, and one that does not exist fails harmlessly) instead of
+the 8192 KiB they come up with on this board. It writes them at
+post-fs-data, after late-fs, because /data sits on a dm device of its
+own (metadata encryption) that mount_all --late creates. The product
+makefile installs it, and README.md lists it.
+
+DomA's disk is virtio-blk served by qemu in DomD, and without ioeventfd
+the device model maps each request's guest memory on its main loop with
+the BQL held: one 8 MiB read-ahead request took about 20 ms there,
+longer than a frame, and qemu's time budget for virtio-blk cannot split
+a single request. Measured on this board with the value set at run time
+(2026-10-25): the virtio-blk holds over the frame time went away under a
+cold read of the disk, and in the 580 s runs of a WebView's 720p60
+H.264 the main loop held the BQL for a vsync or more only with single
+GPU commands. That init writes it from this rc has not been run on the
+board yet. The Raspberry Pi 5 product keeps the kernel's default.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ README.md                                     |  1 +
+ aosp_xenvm_trout_rpi4_arm64.mk                |  5 +++
+ .../init.xenvm-readahead.rc                   | 36 +++++++++++++++++++
+ 3 files changed, 42 insertions(+)
+ create mode 100644 xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc
+
+diff --git a/README.md b/README.md
+index c798cf3..42e9dad 100644
+--- a/README.md
++++ b/README.md
+@@ -46,6 +46,7 @@ reuse object files built for the other CPU.
+ | `DomaWifiRelay/` | The framework half of that relay: a platform app that, while the Settings Wi-Fi toggle is on, reads the passphrase the user typed and asks the vendor half to use it. It also cycles Wi-Fi once the bring-up has made the radios, and enables again a network AAOS disabled for no internet while DomD has it |
+ | `DomaWifiOverlay/` | A product RRO on the Wi-Fi resources: a network disabled for no internet is tried again after 10 minutes instead of never |
+ | `xenvm_trout_rpi4_arm64/init.xenvm-webview.rc` | Writes the WebView's command line (its video as a layer of its own); works only while the product boots permissive |
++| `xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc` | Sets DomA's block read-ahead to 512 KiB (vda and the dm devices), so that one virtio-blk request does not hold DomD's device-model main loop for longer than a frame |
+ | `DomaNoSafeAreaRRO/` | Product RRO on CarSystemUI: no per-display safe area and toolbar, so a full-screen app covers the display and a WebView's video can go on a plane (the same as the Raspberry Pi 5 product's) |
+ | `xenvm_trout_rpi4_arm64/media_codecs_c2.xml` | Describes the vendor C2 decoder to the media framework: decoders only, H.264 only, 1080p max |
+ | `xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy` | The extended seccomp policy the C2 service needs for its V4L2 ioctls |
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 62129bb..cde8e78 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -218,6 +218,11 @@ PRODUCT_PACKAGES += DomaNoSafeAreaRRO
+ PRODUCT_COPY_FILES += \
+     device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/init.xenvm-webview.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-webview.rc
+ 
++# DomA's block read-ahead at 512 KiB, so that no single virtio-blk request holds DomD's
++# device-model main loop for longer than a frame (see the .rc).
++PRODUCT_COPY_FILES += \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-readahead.rc
++
+ # Start the interface rename that minradio's data call depends on. cuttlefish already
+ # ships the service and a trigger for it, but trout sets ro.vendor.disable_rename_eth0
+ # so that trigger never fires; overriding that is deliberate and argued in the .rc.
+diff --git a/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc b/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc
+new file mode 100644
+index 0000000..bddb675
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# DomA's block read-ahead at 512 KiB instead of the 8192 KiB this board's virtio-blk
++# disk and its dm devices come up with.
++#
++# DomA's disk is virtio-blk served by qemu in DomD, and without ioeventfd (Xen) the
++# device model maps each request's guest memory on its main loop with the BQL held: one
++# 8 MiB read-ahead request took about 20 ms there, longer than a frame, and qemu's time
++# budget for virtio-blk cannot split a single request. Measured on this board
++# (2026-10-25, set at run time on vda and dm-*): the virtio-blk holds over the frame
++# time went away under a cold read of the disk, and in the 580 s runs of a WebView's
++# 720p60 H.264 the main loop held the BQL for a vsync or more only with single GPU
++# commands. The Raspberry Pi 5 product keeps the kernel's default.
++#
++# Written at post-fs-data, after late-fs has mounted /data: /data sits on a dm device
++# of its own (metadata encryption) that mount_all --late creates, after post-fs. init's
++# write takes no wildcard, so the dm devices are named; this board has had up to dm-9,
++# and dm-0 to dm-15 leave room. One that does not exist fails harmlessly.
++on post-fs-data
++    write /sys/block/vda/queue/read_ahead_kb 512
++    write /sys/block/dm-0/queue/read_ahead_kb 512
++    write /sys/block/dm-1/queue/read_ahead_kb 512
++    write /sys/block/dm-2/queue/read_ahead_kb 512
++    write /sys/block/dm-3/queue/read_ahead_kb 512
++    write /sys/block/dm-4/queue/read_ahead_kb 512
++    write /sys/block/dm-5/queue/read_ahead_kb 512
++    write /sys/block/dm-6/queue/read_ahead_kb 512
++    write /sys/block/dm-7/queue/read_ahead_kb 512
++    write /sys/block/dm-8/queue/read_ahead_kb 512
++    write /sys/block/dm-9/queue/read_ahead_kb 512
++    write /sys/block/dm-10/queue/read_ahead_kb 512
++    write /sys/block/dm-11/queue/read_ahead_kb 512
++    write /sys/block/dm-12/queue/read_ahead_kb 512
++    write /sys/block/dm-13/queue/read_ahead_kb 512
++    write /sys/block/dm-14/queue/read_ahead_kb 512
++    write /sys/block/dm-15/queue/read_ahead_kb 512

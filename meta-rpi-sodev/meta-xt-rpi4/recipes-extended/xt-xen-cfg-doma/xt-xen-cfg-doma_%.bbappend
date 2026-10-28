@@ -5,7 +5,8 @@
 # xt-xen-cfg-doma lives in meta-xt-common because DomA's xl configuration is
 # board-independent apart from its size, and this port keeps that layer's doma.cfg
 # byte-identical. Only the memory size, the virtio-gpu resolution, the
-# virtio-media backend's host-max-width and the HDMI audio card change here.
+# virtio-media backend's host-max-width and host-sand, DomA's overlay planes and
+# their scaling, the HDMI audio card and the sound card's tx-no-bql change here.
 #
 # WHY 2560 MiB
 # The 8 GiB Pi 4 has to fit four domains into what is left after the boot-time
@@ -199,3 +200,47 @@ rpi4_doma_hdmi_audio_card() {
 }
 
 do_install[vardeps] += "RPI4_DOMA_AUDIO_DEV_FROM RPI4_DOMA_AUDIO_DEV"
+
+# DomA's sound card writes its buffers out without the BQL (q11-092, the TX thread of
+# tx-poll-us), as on the Raspberry Pi 5: the main loop of DomA's device model holds the
+# BQL for the video's GPU work, and the thread waited behind it while the ALSA output ran
+# dry. tx-no-bql needs the ALSA audiodev with the mixing engine off, which also needs the
+# fixed frequency, channels and format gone (qemu refuses them without the mixing
+# engine). The ALSA buffer stays at 60 ms here: the Raspberry Pi 5's 100 ms with a 60 ms
+# start was not measured on this board. Measured on this board (2026-10-26, a WebView's
+# 720p60 H.264 full screen and beside the HMI, five 580 s runs with each of two builds of
+# the main loop's time budgets, the second with q11-104): no ALSA under-run, PCM restart
+# or HAL shortfall in any run. 0 leaves both lines as they are; qemu 10.0.2 and 7.0.0 have
+# no tx-no-bql, so the default is 0 there.
+RPI4_DOMA_SND_TX_NO_BQL ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+RPI4_DOMA_AUDIO_FIXED ?= "out.frequency=48000,out.channels=2,out.format=s16,"
+do_install[postfuncs] += "rpi4_doma_snd_tx_no_bql"
+do_install[vardeps] += "RPI4_DOMA_SND_TX_NO_BQL RPI4_DOMA_AUDIO_FIXED"
+
+rpi4_doma_snd_tx_no_bql:raspberrypi4-64() {
+    [ "${RPI4_DOMA_SND_TX_NO_BQL}" = 1 ] || return 0
+    case "${XT_DM_QEMU_VERSION}" in
+    11.*) ;;
+    *) bbfatal "RPI4_DOMA_SND_TX_NO_BQL=1 needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
+    esac
+    cfg="${D}${sysconfdir}/xen/doma.cfg"
+    [ -f "$cfg" ] || bbfatal "xt-xen-cfg-doma.bbappend (rpi4): $cfg not installed"
+    a=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "${RPI4_DOMA_AUDIO_FIXED}" || true)
+    v=$(grep "^[[:space:]]*'-device', 'virtio-sound-pci," "$cfg" | grep -cF -- "tx-poll-us=10000," || true)
+    if [ "$a" != "1" ] || [ "$v" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): expected one '-audiodev' line with '${RPI4_DOMA_AUDIO_FIXED}' ($a) and one virtio-sound-pci line with tx-poll-us=10000, ($v) in $cfg"
+    fi
+    sed -i -e "/^[[:space:]]*'-audiodev',/s|${RPI4_DOMA_AUDIO_FIXED}|out.mixing-engine=off,|" \
+           -e "/^[[:space:]]*'-device', 'virtio-sound-pci,/s|tx-poll-us=10000,|tx-poll-us=10000,tx-no-bql=on,|" "$cfg"
+    a=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "out.mixing-engine=off," || true)
+    v=$(grep "^[[:space:]]*'-device', 'virtio-sound-pci," "$cfg" | grep -cF -- "tx-poll-us=10000,tx-no-bql=on," || true)
+    if [ "$a" != "1" ] || [ "$v" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): the tx-no-bql rewrite did not apply cleanly to $cfg"
+    fi
+    bbnote "xt-xen-cfg-doma.bbappend (rpi4): DomA's sound card writes without the BQL (tx-no-bql)"
+}
+
+# The default is a no-op, as for this file's other postfuncs.
+rpi4_doma_snd_tx_no_bql() {
+    :
+}
