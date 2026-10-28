@@ -100,7 +100,7 @@ PACKAGECONFIG[glusterfs] = ""
 
 # The q11 patches apply in the order listed here, which is not their numbers' order: they
 # are grouped by the series that brings them (qemu 11.1.2 itself, the display path,
-# HEVC, H.264), and the numbers follow the order they were written in.
+# HEVC, H.264, 4K60), and the numbers follow the order they were written in.
 #
 # qemu 11.1.2 itself.
 # q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one).
@@ -234,3 +234,11 @@ SRC_URI:append:class-target = " file://q11-076-virtio-media-decoder-mode-scale-w
 SRC_URI:append:class-target = " file://q11-077-virtio-media-decoder-mode-report-a-failed-stream-through-V4L2.patch"
 SRC_URI:append:class-target = " file://q11-079-virtio-media-decoder-mode-decode-H.264-on-two-frame-threads.patch"
 SRC_URI:append:class-target = " file://q11-080-virtio-media-decoder-mode-decode-H.264-straight-into-dma-bufs.patch"
+#
+# 4K60 in decoder mode.
+# q11-082: decoder mode offers frames scaled for host-max-width too (/run/qemu-sand-scaled)
+#   and keeps up to 384 MiB of frames referenced for the display.
+# q11-083: decoder mode decodes the hwaccel (HEVC) on the decode thread too, off the main
+#   loop (the thread q11-074 added for H.264).
+SRC_URI:append:class-target = " file://q11-082-virtio-media-decoder-mode-offer-scaled-frames-keep-more-of-them.patch"
+SRC_URI:append:class-target = " file://q11-083-virtio-media-decoder-mode-decode-the-hwaccel-on-the-decode-thread.patch"

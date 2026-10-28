@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 14:26:45 +0900
+Subject: [PATCH] virtio-media: raise the shadow buffer to 256 KiB for 4K
+
+A 4K RGBA decoder output could not be queued: QBUF's SG entry array
+did not fit the 64 KiB shadow buffer (RPi5 DomA, HEVC 3840x2160, a
+33,177,600-byte AB24 plane):
+
+    virtio-media: 5911 SG entries (94576 bytes) do not fit the
+                  remaining 65536 bytes of the shadow buffer
+    V4L2Device: (CAPTURE_MPLANE)VIDIOC_QBUF failed
+
+A fully fragmented 4K plane needs 8100 entries, 129,600 bytes. Make
+the buffer 256 KiB, the size of qemu's command buffer
+(VIRTIO_MEDIA_CMD_BUF_SIZE), and update the two comments that said 4K
+does not fit. The buffer stays kmalloc'd: it has to be physically
+contiguous for one descriptor, so the allocation becomes order-6, once
+per open session, on every board that runs this driver.
+
+Change-Id: I90efc5bab420784faccf3e29502b3b4048dad48a
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/driver/session.h
++++ b/driver/session.h
+@@ -18,30 +18,31 @@
+ #define VIRTIO_MEDIA_LAST_QUEUE (V4L2_BUF_TYPE_META_OUTPUT)
+ 
+ /*
+- * Size of the per-session virtio shadow and event buffers.
++ * Size of the per-session virtio shadow buffer.
+  *
+- * 64 KiB, because a 1080p RGBA frame does not fit in 16 KiB. The output is
+- * RGBA when the guest's GL has no GL_EXT_YUV_target (an NV12 EGLImage then
+- * cannot be used as a texture), and RGBA at 1920x1088 is 8,355,840 B =
+- * 2040 pages. Measured on RPi4, 2026-09-04:
++ * 256 KiB, because a 4K RGBA frame's SG entry array has to fit. The output
++ * is RGBA when the guest's GL has no GL_EXT_YUV_target (an NV12 EGLImage
++ * then cannot be used as a texture). Each page of a plane is one 16-byte
++ * virtio_media_sg_entry unless the exporter coalesces contiguous pages:
+  *
+- *     virtio-media: 2033 SG entries (32528 bytes) do not fit the
+- *                   remaining 16384 bytes of the shadow buffer
++ *   1920x1088 RGBA   8,355,840 B   2040 pages    32,640 B of entries
++ *   3840x2160 RGBA  33,177,600 B   8100 pages   129,600 B of entries
+  *
+- * At 64 KiB those entries (16 B x 2033 = 32,528 B) fit alongside the
+- * staging of the command structure and its payload. 4K RGBA
+- * (3840x2160x4 = 33,177,600 B = 8100 pages = 129,600 B of entries) does not
+- * fit; that needs the entry array split across several descriptors, which
+- * is not implemented.
++ * Measured: 1080p needed 2033 entries (RPi4, 2026-09-04: "do not fit the
++ * remaining 16384 bytes"), 4K 5911 entries = 94,576 B (RPi5, 2026-10-15:
++ * "do not fit the remaining 65536 bytes"). 256 KiB holds a fully
++ * fragmented 4K plane with room for the command and its payload, and is
++ * the size of qemu's command buffer (VIRTIO_MEDIA_CMD_BUF_SIZE), so a
++ * larger one could not be sent anyway.
+  *
+  * kmalloc returns physically contiguous memory, so the SG entry array placed
+  * in the shadow buffer is still describable by one descriptor. That
+  * assumption is required -- scatterlist_builder.c takes virt_to_page +
+- * offset and looks only at the first page -- and it holds at 64 KiB too.
+- * The allocation is order-4, so on failure the session cannot be opened
+- * (err_shadow_buf).
++ * offset and looks only at the first page -- which rules out kvmalloc. The
++ * allocation is order-6, made once per open session, so on failure the
++ * session cannot be opened (err_shadow_buf).
+  */
+-#define VIRTIO_SHADOW_BUF_SIZE 0x10000
++#define VIRTIO_SHADOW_BUF_SIZE 0x40000
+ 
+ /**
+  * struct virtio_media_dmabuf - Cached import of one V4L2_MEMORY_DMABUF plane.
+--- a/driver/scatterlist_builder.c
++++ b/driver/scatterlist_builder.c
+@@ -702,12 +702,10 @@
+ 		 * entry array -- at 16 bytes per virtio_media_sg_entry.
+ 		 *
+ 		 * A guest GL without GL_EXT_YUV_target makes the decoder
+-		 * output RGBA. A 1920x1088 RGBA frame is 8,355,840 bytes =
+-		 * 2040 pages, and its sg_table measured 2033 entries =
+-		 * 32,528 bytes (RPi4, 2026-09-04), which fits. 4K RGBA
+-		 * (33,177,600 bytes = 8100 pages = 129,600 bytes of entries)
+-		 * does not fit and needs the entry array split across
+-		 * descriptors, which is not done here.
++		 * output RGBA: 129,600 bytes of entries for a fully
++		 * fragmented 4K frame, which the 256 KiB buffer holds (see
++		 * session.h). An array larger than the buffer would have to
++		 * be split across descriptors, which is not done here.
+ 		 *
+ 		 * A fully fragmented 1080p NV12 plane is 3110400 bytes = 760
+ 		 * 4 KiB pages, which fits with margin (and contiguous runs

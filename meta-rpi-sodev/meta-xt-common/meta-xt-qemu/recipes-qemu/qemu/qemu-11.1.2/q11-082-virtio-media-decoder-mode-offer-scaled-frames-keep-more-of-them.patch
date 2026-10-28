@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 19 Oct 2026 21:24:05 +0900
+Subject: [PATCH] virtio-media: decoder mode: offer scaled frames, keep more of
+ them
+
+The decoder mode offers its SAND frames to the display (q11-071) only
+when the frame is the guest buffer's size: a stream wider than
+host-max-width (q11-076), 4K into DomA's 1080p buffers, was converted
+by the GPU on every frame, scaling as it went.
+
+With /run/qemu-sand-scaled such a frame is offered too, at its own
+size, with the guest buffer's size as the texture area it fills
+(DirectScanout.src_w/src_h), and the display hands it to weston, whose
+HVS plane scales it (q11-081, or SDL's viewport when it is shown alone
+full screen). That is what the Raspberry Pi 4's proxy does with the
+codec's buffers.
+
+The references kept for the display are bounded by 384 MiB instead of
+128. A WebView playing a 4K60 stream shows a frame some 21-24 frames
+after its decode; a frame shown after its reference went is converted
+late, which delays the next ones further. With 256 MiB (21 frames of
+12.4 MB) the frames shown a second swung between 25.6 and 42.4 from run
+to run, with 900-1400 late conversions in the bad runs; with 384 MiB the
+pool's own bound (24 frames here) decides, and eight runs gave
+41.8-43.9, full screen and among the HMI, with 16-28 late. The pool
+shares DomD's CMA, which the rpi5 layer raises to 640 MiB with this;
+CmaFree's lowest was 23-49 MB in those runs, and 56 kB in an earlier
+run of a test build with the same bound. The Raspberry Pi 5's Linux
+Dom0 flavour gives DomA no virtio-media decoder (XT_DOMA_HWDEC_VULKAN
+is false there), so this does not apply to it.
+
+When the decoder lets the display's entries go (input stopped, a new
+pool, another size, a full import cache, the GPU path failing, close),
+the conversions it skipped are made first, from the references still
+held, instead of leaving those guest buffers stale; that waits for the
+GPU on the main loop, at most once per 12 conversions. The stop's
+statistics line no longer counts conversions still skipped, which is
+now always 0.
+
+Measured on a 16 GB Raspberry Pi 5 running the 8g image (2026-10-19),
+codec -T of a 4K60 HEVC stream alone full screen: 49.3 fps, V3D render
+92% before (CMA 384 MiB, DomA's scanout buffers not linear) against
+59.6 fps, 41% with this, CMA 640 MiB and linear buffers,
+weston's GPU time 38% -> under 2%, the whole picture on the panel
+(checked with a camera). The WebView figures are in q11-081.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 61 ++++++++++++++++++++++++--------
+ 1 file changed, 46 insertions(+), 15 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 673b7cd..986311b 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -198,16 +198,23 @@ typedef struct DecGpuEntry {
+  * bounded as a share of the CMA the pool lives in: at most this many bytes'
+  * worth, between 2 and DEC_DS_REFS_MAX frames; beyond that one goes
+  * (dec_ds_keep says which), and that frame is shown from the guest's copy
+- * instead.
++ * instead. 384 MiB lets the pool's bound decide (ds_refs_cap; for frames of
++ * 12 MB or less it is the tighter one -- a 4K frame is 12.4 MB, and the
++ * Raspberry Pi 5 kept 24 of them): a WebView playing a 4K60 stream
++ * shows a frame some 21-24 frames after its decode, and with 256 MiB (21 frames)
++ * it showed 25.6-42.4 frames a second, swinging between runs -- each frame
++ * shown after its reference went needs the late conversion, which delays the
++ * next ones further -- against 41.8-43.9 in eight runs with 384, full screen
++ * and among the HMI (CMA 640 MiB, CmaFree's lowest 23-49 MB, 2026-10-19).
+  */
+-#define DEC_DS_REFS_BYTES (128u << 20)
++#define DEC_DS_REFS_BYTES (384u << 20)
+ #define DEC_DS_REFS_MAX 32
+ /*
+  * The references cost the pool's CMA, so they are kept only while the display
+  * takes the buffers: after a start, or once it stopped taking them, for
+- * DEC_DS_PROBE_MS, and then again every DEC_DS_RETRY_MS (a video that is not
+- * full screen, or not the window's size -- a 4K one in a 1080p window -- is
+- * never taken).
++ * DEC_DS_PROBE_MS, and then again every DEC_DS_RETRY_MS (a video that is
++ * neither full screen nor, with /run/qemu-plane-sand, on a plane the display
++ * hands to the compositor is never taken).
+  *
+  * The limits of that probe: the pool keeps every buffer it allocated until the
+  * stream stops (v4l2request never frees one), so a probe that grew it leaves
+@@ -826,8 +833,9 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
+  * guest buffer it was converted into, so that weston puts a full-screen frame
+  * on an HVS plane; this is the same for the decoder's (v4l2request) buffers.
+  * The display (ui/sdl2-gl.c, sdl2-wl-scanout.c) takes the buffer instead of the
+- * guest's copy only when the guest scans that copy out full screen and alone
+- * (/run/qemu-isp-scanout); otherwise the copy is shown as before.
++ * guest's copy when the guest scans that copy out full screen and alone
++ * (/run/qemu-isp-scanout), or on one of the planes it hands to the compositor
++ * (/run/qemu-plane-sand); otherwise the copy is shown as before.
+  *
+  * Unlike the proxy's, the pixels live in libavcodec's pool, not in a buffer the
+  * guest queues: a frame stays showable while a reference to it is kept, and the
+@@ -864,6 +872,20 @@ static bool dec_ds_skip_on(void)
+     return dec_ds_file_on("/run/qemu-sand-skip-isp", &checked, &on);
+ }
+ 
++/*
++ * q11-dec-sand-scaled: /run/qemu-sand-scaled offers a frame host-max-width
++ * scaled for the guest too (a 4K stream into a 1080p buffer). The display gets
++ * the decoder's buffer at the frame's size and the compositor scales it, on the
++ * HVS, as the RPi4's proxy does with the codec's buffers.
++ */
++static bool dec_ds_scaled_on(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++
++    return dec_ds_file_on("/run/qemu-sand-scaled", &checked, &on);
++}
++
+ static uint64_t dec_ds_epochs;
+ 
+ static bool dec_ds_current(void *owner, uint32_t slot, uint64_t seq)
+@@ -1146,13 +1168,21 @@ static void dec_ds_drop(VirtIOMediaDec *d)
+         direct_scanout_forget(d);
+         d->ds_epoch = 0;
+     }
++    /*
++     * q11-dec-sand-scanout: the guest buffers whose conversion was skipped get it
++     * now, while the references are still here, or they keep stale content once
++     * the display stops taking this owner's buffers. Each pass of up to
++     * DEC_DS_CATCH_MAX waits for its GPU work, here on the main loop.
++     */
++    while (d->ds_pend_n) {
++        dec_ds_catch_up(d);
++    }
+     if (d->ds_pub_n) {
+         info_report("virtio-media/dec: sand-scanout: %" PRIu64 " offered, %"
+                     PRIu64 " conversions skipped, %" PRIu64 " made late, %"
+-                    PRIu64 " lost, %u still skipped at the stop, %" PRIu64
+-                    " let go before their release, %" PRIu64 " evicted on "
+-                    "screen, %" PRIu64 " pool waits given up", d->ds_pub_n,
+-                    d->ds_skip_n, d->ds_catch_n, d->ds_lost_n, d->ds_pend_n,
++                    PRIu64 " lost, %" PRIu64 " let go before their release, %"
++                    PRIu64 " evicted on screen, %" PRIu64 " pool waits given up",
++                    d->ds_pub_n, d->ds_skip_n, d->ds_catch_n, d->ds_lost_n,
+                     d->ds_evict_release_n, d->ds_evict_held_n, d->ds_starved_n);
+         d->ds_pub_n = d->ds_skip_n = d->ds_catch_n = d->ds_lost_n = 0;
+         d->ds_evict_held_n = d->ds_starved_n = d->ds_evict_release_n = 0;
+@@ -1411,9 +1441,9 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
+     assert(!d->thr_on);   /* avctx below: a hwaccel codec has no decode thread */
+     tex = virtio_media_gpu_res_tex(gb->virgl_res);
+-    /* q11-dec-scale: the display shows a buffer 1:1, so not a scaled one */
+-    show = !scaled && tex && dec_ds_on() && direct_scanout_sand_usable() &&
+-           dec_ds_wanted(d);
++    /* q11-dec-sand-scaled: a scaled frame too, at its size (the display scales) */
++    show = (!scaled || dec_ds_scaled_on()) && tex && dec_ds_on() &&
++           direct_scanout_sand_usable() && dec_ds_wanted(d);
+     if (show && e->show_fd < 0) {
+         e->show_fd = fcntl(desc->objects[0].fd, F_DUPFD_CLOEXEC, 0);
+     }
+@@ -1442,7 +1472,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     if (show) {
+         DirectScanout ds = {
+             .owner = d, .epoch = d->ds_epoch ? d->ds_epoch : ++dec_ds_epochs,
+-            .fd = e->show_fd, .width = w, .height = h,
++            .fd = e->show_fd, .width = fw, .height = fh, /* the frame's size */
++            .src_w = w, .src_h = h, .res = gb->virgl_res,
+             .stride = (uint32_t)l->planes[0].pitch,
+             .fourcc = l->format, .modifier = mod,
+             .offset1 = uv_offset, .pitch1 = (uint32_t)l->planes[1].pitch,
