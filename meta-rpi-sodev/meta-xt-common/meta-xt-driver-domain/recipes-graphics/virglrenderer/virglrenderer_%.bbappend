@@ -118,9 +118,10 @@ SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 #  2. There is no configuration left that wants it. The global gbm is switched on
 #     per device model by VIRGL_EXTERNAL_GBM, and only DomA's qemu_envs sets it
 #     (doma.cfg) -- DomU never initialises gbm, so DomU's GL compositor never pays
-#     the linear penalty. DomA composites with Vulkan in the default configuration,
-#     where 1. applies; and in the --gpu=gl configuration DomA's device model does
-#     not set VIRGL_EXTERNAL_GBM either.
+#     the linear penalty. Both boards' AAOS products composite with GL in the default
+#     configuration, so 1. would apply only to a DomA set back to Vulkan
+#     compositing; and in the --gpu=gl configuration DomA's device model does not
+#     set VIRGL_EXTERNAL_GBM either.
 #  3. It does not apply alongside 0017. 0017's vrend_renderer.c hunk sits in the
 #     resource path MR 1561/1654 rewrote, so with the backport applied first 0017
 #     fails do_patch at fuzz=0 -- i.e. the knob could not be turned on without

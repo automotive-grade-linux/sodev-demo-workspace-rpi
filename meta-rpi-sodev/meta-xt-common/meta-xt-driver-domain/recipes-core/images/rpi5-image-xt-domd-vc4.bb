@@ -374,7 +374,8 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 #                           and answer ISR reads, on a dedicated ioreq thread instead of
 #                           waiting for the main loop.
 #   /etc/qemu-gbm-layout    virglrenderer 1.3.0: back guest resources with GBM dma-bufs, which
-#                           a Vulkan (Venus) DomA needs.
+#                           a Vulkan (Venus) DomA needs. It costs the GL path (RPi4: a local
+#                           WebView 1080p fullscreen video stops, HMI 52-56 -> 35-41 fps).
 #   /etc/qemu-lat-diag      qemu 11 (q11-057/058): log display-command latencies.
 [ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
 [ -f /etc/qemu-gbm-layout ] && export VIRGL_GBM_LAYOUT_ENABLE=1

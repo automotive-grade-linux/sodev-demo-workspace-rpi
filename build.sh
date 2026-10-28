@@ -124,12 +124,12 @@ Domain options:
       --gpu=<stack>      vulkan (DEFAULT) | gl -- which graphics stack the guests get.
                            vulkan: DomA and DomU render with Vulkan through Venus. The
                              device model is qemu 11.1.2 on both boards (the venus=
-                             property needs >= 9.2),
-                             virglrenderer keeps its venus backend and gains
-                             render-server + minigbm_allocation, hostmem/blob/venus go on
-                             the guests' virtio-gpu-gl, the DomD/DomU Vulkan runtime is
-                             installed, DomA composites with SkiaVk and DomU's cluster
-                             runs the Vulkan (Impeller) embedder.
+                             property needs >= 9.2), virglrenderer keeps its venus
+                             backend and gains render-server + minigbm_allocation,
+                             hostmem/blob/venus go on the guests' virtio-gpu-gl, the
+                             DomD/DomU Vulkan runtime is installed, DomA composites with
+                             GL (both products; Vulkan compositing would need gbm-layout)
+                             and DomU's cluster runs the Vulkan (Impeller) embedder.
                            gl: the pre-Venus OpenGL stack -- qemu 7.0.0-xt with its six
                              device-model patches, virglrenderer without venus, no blob
                              window, the pre-Venus memory split (rpi4 4g SKU only --
@@ -473,11 +473,10 @@ if [ "$GPU" = gl ]; then
   echo ">>       virglrenderer without the venus backend, no blob/hostmem window on the"
   echo ">>       guests' virtio-gpu-gl, the pre-Venus memory split (rpi4 4g SKU only),"
   echo ">>       and the OpenGL embedder for the DomU cluster."
-  echo ">>       NOTE: DomA's AOSP-side settings (the Venus ICD, SkiaVk"
-  echo ">>       compositing) come from this tree whatever --gpu says, so a"
-  echo ">>       DomA built here still asks for Vulkan on a device model that"
-  echo ">>       has no venus. That pairing is not measured; a pre-Venus DomA"
-  echo ">>       needs those settings reverted."
+  echo ">>       NOTE: DomA's AOSP-side settings (the Venus ICD) come from this"
+  echo ">>       tree whatever --gpu says, so a DomA built here still has the"
+  echo ">>       ICD on a device model that has no venus. That pairing is not measured;"
+  echo ">>       a pre-Venus DomA needs those settings reverted."
   echo ">>       See docs/VULKAN-VENUS.md."
 fi
 # The arm64-host fixes for the AGL guest are in meta-agl-venus, which --gpu=gl

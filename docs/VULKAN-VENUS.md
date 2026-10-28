@@ -30,9 +30,9 @@ lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits fr
 (section 7e), so splitting the host GL/Vulkan driver by lane would mean shipping two
 of them for no gain. And **DomA's AOSP-side Vulkan settings do not follow the
 lane**: this tree applies them to the AOSP tree whatever `--gpu` says (section 6),
-so a DomA built here still asks for Vulkan compositing on a `--gpu=gl` DomD, whose
-device model has no venus. That pairing has not been measured; a pre-Venus DomA
-needs those settings reverted. (Its hardware-decode settings do follow the lane,
+so a DomA built here still gets the Venus ICD on a `--gpu=gl` DomD, whose device
+model has no venus (both products composite with GL). That pairing has not been
+measured; a pre-Venus DomA needs those settings reverted. (Its hardware-decode settings do follow the lane,
 through `XT_DOMA_HWDEC`, as the table says.)
 
 The diagnostics this work was done with are one more switch away,
@@ -58,7 +58,7 @@ overturns. Those are marked *Superseded* where they sit. The standing summary:
 6. The **fallback in section 8 is not the current plan** -- it is what the state
    of the board was before the p2m work.
 7. On the RPi5, DomA was verified compositing with Vulkan (SkiaVk) on 2026-09-24
-   (8 GB SKU), after the p2m work. The DomA measurements in section 7g are the
+   (8 GB SKU), after the p2m work; the product now composites with GL. The DomA measurements in section 7g are the
    RPi4's.
 
 In the `gl` lane DomU (AGL-IC) and DomA (AAOS) render through virtio-gpu + virgl, which
@@ -99,7 +99,7 @@ and one was a hard blocker; the table is written from that starting point, and t
 |---|---|---|---|
 | mesa | 26.0.5 in oe-core; **this series pins DomD's to 26.2.4** (ungated, so both lanes) -- section 7e | **V3DV already built AND already installed** | meta-raspberrypi `mesa.bbappend` appends `vulkan broadcom` for `rpi`, so `VULKAN_DRIVERS` gains `broadcom` → `libvulkan_broadcom.so` in `mesa-vulkan-drivers`. And it is already in the shipping rootfs: weston's `vulkan-renderer.so` links `libvulkan.so.1`, so weston RDEPENDS on vulkan-loader, whose `RRECOMMENDS virtual-vulkan-icd` resolves to `mesa-vulkan-drivers` |
 | weston | 15.0.0 (oe-core); a 16.0.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_weston` selects it (both board yamls pin `15.%`, and both boards' `vulkan` lanes select `16.%`) | **Vulkan renderer already built** | `PACKAGECONFIG` filters `vulkan` from `DISTRO_FEATURES` → `-Drenderer-vulkan=true` |
-| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off |
+| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off. On 1.3.0 a guest resource gets a GBM dma-buf only with `VIRGL_GBM_LAYOUT_ENABLE`, which a Venus-compositing DomA needs and which costs the GL path; the DomD qemu wrapper exports it for DomA's device model when `/etc/qemu-gbm-layout` exists, and the image does not create that file. |
 | qemu | **11.1.2** (`qemu_11.1.2.bb`) on both boards, **10.0.2** (xen-troops fork, `meta-xt-qemu`) selectable; **7.0.0** with `--gpu=gl` | was the blocker | `virtio-gpu-gl` grew `venus=` in QEMU **9.2.0**, so the 7.0.0 the tree used to ship has no such property. Raising the device model is what this work turned into the default |
 
 So the host-side work was: raise QEMU, keep virglrenderer's venus backend, install
@@ -113,7 +113,11 @@ so without a pin its newer recipe would win, and `DEFAULT_PREFERENCE` cannot han
 choice back to poky. A board that wants the newer one sets the variable again, as
 both boards' `vulkan` lanes do (weston 16.0.0 and virglrenderer 1.3.0, with
 qemu 11.1.2 built against that virglrenderer; a qemu built against 1.3.0 does not
-start with the 1.2 library).
+start with the 1.2 library). On virglrenderer 1.3.0 a Venus-compositing DomA needs
+`/etc/qemu-gbm-layout` in DomD (the table above), which costs GL compositing. Both
+products composite with GL (`debug.renderengine.backend=skiaglthreaded`,
+`debug.hwui.renderer=skiagl` in each AAOS device), so the image does not create the
+file.
 
 `CONFIG_UDMABUF` needs nothing: the Raspberry Pi kernel's own
 `arch/arm64/configs/bcm2712_defconfig` already sets `CONFIG_UDMABUF=y` (line 1489
@@ -1453,13 +1457,13 @@ ahead of poky by this series (section 7e).
 
 Three changes live in the AOSP tree rather than in the Yocto layers, and this
 tree carries all three. They apply whatever `--gpu` says, so a `--gpu=gl` image
-still gets a DomA that asks for Vulkan compositing:
+still gets a DomA with the Venus ICD (both products composite with GL):
 
 | change | where this tree carries it |
 |---|---|
 | `BOARD_MESA3D_VULKAN_DRIVERS := virtio`, `PRODUCT_PACKAGES += vulkan.virtio`, `ro.hardware.vulkan=virtio`, `TARGET_VULKAN_SUPPORT := false` | each board's AAOS device: the RPi4's `device/sodev/xenvm-cf`, patched from `meta-xt-doma/aosp-patches/device/sodev/xenvm-cf/`, and the RPi5's `meta-xt-doma/aosp-device/agl/xenvm-trout-rpi5`, which `stage-aosp-device.sh` copies into the AOSP tree |
 | `VN_SET_CORE_VALUE(feats, protectedMemory, false)` | `meta-xt-doma/aosp-patches/vendor/epam/mesa3d_upstream/`, against the guest Venus ICD; without it SurfaceFlinger's blur preallocation kills it in a loop |
-| `debug.renderengine.backend=skiavkthreaded`, `debug.hwui.renderer=skiavk` | each board's AAOS device, as in the first row; what actually turns Vulkan compositing on |
+| `debug.renderengine.backend=skiaglthreaded`, `debug.hwui.renderer=skiagl` | each board's AAOS device, as in the first row: both products composite with GL. `skiavkthreaded` and `skiavk` are what would turn Vulkan compositing on (with `/etc/qemu-gbm-layout` in DomD on virglrenderer 1.3.0) |
 
 `apply-aosp-patches.sh` applies the patch sets after the AOSP fetch (source
 mode); a prebuilt bundle carries whatever DomA it was built with.
@@ -2689,7 +2693,8 @@ DomD 1440 / DomA 2048), and the `VKR_DEVICE_HEAP_MIB` and
 reasoning for the split.
 
 The Pi 5, which shares all of this code, was verified afterwards: DomA
-compositing with Vulkan (SkiaVk) on the 8 GB SKU, 2026-09-24. The two boards
+compositing with Vulkan (SkiaVk) on the 8 GB SKU, 2026-09-24 (the Pi 5
+product now composites with GL). The two boards
 differ in the memory map and in their board-specific Xen patches and config
 fragments (`4.22-0002` for RP1 MSI routing, `xen-scmi.cfg`, and `CONFIG_TEE`/
 `CONFIG_OPTEE` in `xen-hyp-config.cfg`, which the Pi 4 drops, on the Pi 5;
