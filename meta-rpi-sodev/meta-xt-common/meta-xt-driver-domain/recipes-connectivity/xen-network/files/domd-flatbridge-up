@@ -171,6 +171,43 @@ if command -v iptables >/dev/null 2>&1; then
     ipt_add -I FORWARD -i "$UPLINK_WIFI_IF" -o xenbr0 \
         -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT \
         || log "note: stateful return rule skipped (no xt_conntrack); FORWARD policy is $(iptables -S FORWARD | sed -n 's/^-P FORWARD //p')"
+    # Cap the MSS of forwarded TCP SYNs at 1360, both ways. The suspected failure (the
+    #   hypothesis recorded for a public AP on the RPi4, where DomD itself was online --
+    #   it synchronised its clock over NTP -- while DomA stayed "connected, no internet"
+    #   on six boots): an upstream path with an MTU below 1500 that drops the ICMP
+    #   path-MTU discovery needs. Small UDP (DNS, NTP) gets through such a path; TCP
+    #   with a 1460-byte MSS does not, so DomA's TLS handshakes and Android's network
+    #   validation hang. --clamp-mss-to-pmtu would not help: it clamps to DomD's own
+    #   route MTU, which is 1500 on xenbr0 and wlan0. --set-mss only ever lowers the
+    #   MSS, so a connection that already asks for less is untouched; 1360 leaves room
+    #   for PPPoE and common tunnels at the cost of ~7% payload per full segment. In the
+    #   filter table's FORWARD chain, which TCPMSS accepts, so no mangle table is needed.
+    #   OPTIONAL like the conntrack rule: it needs xt_TCPMSS and the tcp match (xt_tcpudp),
+    #   both in modules-load.d/domd-nat.conf; without them the rule is skipped with the
+    #   error iptables printed.
+    for _dir in "-o $UPLINK_WIFI_IF" "-i $UPLINK_WIFI_IF"; do
+        # shellcheck disable=SC2086
+        ipt_add -I FORWARD $_dir -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss 1360 \
+            || log "note: MSS cap ($_dir) skipped (needs xt_TCPMSS and xt_tcpudp)"
+    done
+    # DomA's emulated cellular data link. minradio (the AAOS radio HAL) puts
+    #   192.168.97.2/30 on DomA's buried_eth0 with .1 as the gateway and 8.8.8.8 as the
+    #   DNS server (its RadioData.cpp; meta-xt-doma's init.xenvm-buried-eth0.rc says how
+    #   the interface comes to exist); buried_eth0 is bridged onto xenbr0 like DomA's
+    #   other NIC. DomD answers as .1 and NATs the /30 out of its Wi-Fi, and out of
+    #   xenbr0 for a wired upstream on the bridge (whose network knows nothing of the
+    #   /30), so DomA has a way out while its own Wi-Fi is off. Before this was here it
+    #   was only ever set up by hand and lost at every boot.
+    CELL_GW=192.168.97.1/30
+    if ! ip -4 addr show dev xenbr0 | grep -q " ${CELL_GW%%/*}/"; then
+        ip addr add "$CELL_GW" dev xenbr0 2>/dev/null \
+            || log "WARNING: cannot add $CELL_GW to xenbr0"
+    fi
+    ipt_add -t nat -A POSTROUTING -s 192.168.97.0/30 -o "$UPLINK_WIFI_IF" -j MASQUERADE \
+        && log "nat: MASQUERADE 192.168.97.0/30 -> $UPLINK_WIFI_IF"
+    ipt_add -t nat -A POSTROUTING -s 192.168.97.0/30 ! -d 192.168.97.0/30 -o xenbr0 \
+        -j MASQUERADE && log "nat: MASQUERADE 192.168.97.0/30 -> xenbr0"
     xsr "nat-installed net=$_net out=$UPLINK_WIFI_IF"
 else
     log "iptables not present; guests will have no route out through $UPLINK_WIFI_IF"

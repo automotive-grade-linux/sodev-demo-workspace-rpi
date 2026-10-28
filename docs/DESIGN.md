@@ -321,7 +321,9 @@ identical and what this port changes:
 - **Networking**: flat L2 bridge in DomD (`xenbr0` 192.168.10.10; DomU .10.12,
   DomA .10.13 via dnsmasq static leases) + a Dom0<->DomD p2p vif for routed
   Dom0 SSH (192.168.0.1, linux flavour). All reachable from the bench PC
-  through one NIC.
+  through one NIC. DomD also holds 192.168.97.1/30 on `xenbr0`: the gateway of
+  DomA's emulated cellular data link (DomA's `buried_eth0`, .2), NATed out of
+  `wlan0` and, for a wired upstream, onto `xenbr0`.
 - **Display routing**: DomD weston kiosk-shell routes qemu windows by app-id
   (WMCLASS). The window size propagates to the guest via virtio-gpu
   ui_info/EDID, so the panel mode defines the guest mode.

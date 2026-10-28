@@ -12,9 +12,9 @@
 //
 // WHY platform_apis AND NOT sdk_version: "system_current".
 //
-// Not the API surface: every member this app uses is @SystemApi (the
+// Not the API surface: every member this app uses is public or @SystemApi (the
 // NetworkSelectionStatus class of WifiConfiguration and SystemProperties.get()
-// and getBoolean()), and both sources compile against
+// among the latter), and both sources compile against
 // android_system_stubs_current.jar with 0 errors (measured on the PC). The
 // reason is the one recorded below next to system_ext_specific: soong refuses
 // platform_apis on a vendor/product module, this app is device-specific and

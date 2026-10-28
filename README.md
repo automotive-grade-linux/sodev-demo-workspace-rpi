@@ -205,6 +205,57 @@ still builds, but DomD has no Wi-Fi firmware and no `wlan0`, so DomA's shadow-AP
 Wi-Fi has nothing to relay. The Bluetooth firmware (`bluez-firmware-rpidistro`)
 declares no licence flag and is installed either way.
 
+### DomA's Wi-Fi
+
+DomD owns the only radio. DomA's Wi-Fi screen lists what DomD scans: DomD's
+Wi-Fi agent (`xt-doma-wifi-agent`) publishes the 20 strongest SSIDs over a
+virtio-serial port, and DomA's relay (`doma-wifi-relay.sh`) beacons each as a
+shadow access point on `mac80211_hwsim`. Joining one in AAOS makes DomD join the
+real one; DomA reaches the internet through DomD's NAT.
+
+- **Security.** Open, WPA/WPA2-Personal and WPA3-Personal (SAE, and the
+  WPA2/WPA3 transition mode) access points are listed. Enterprise-only (EAP), OWE,
+  WEP and the other kinds are not. An open one is listed without a lock and
+  joined with no passphrase; for the others the passphrase the user types is
+  forwarded to DomD, which joins with SAE where the access point offers it
+  (a 64-hex PSK joins a WPA2/WPA3 transition access point with WPA2).
+- **No sample access point.** The image ships no access point in the list; the
+  shadow AP starts with one hidden BSS (its beacon carries no SSID) that AAOS
+  does not list.
+- **Captive portals** are left to AAOS's NetworkStack, which offers its
+  standard sign-in screen for one (tried on the Raspberry Pi 5 with a test
+  portal: the notification, the sign-in screen and the consent worked).
+- **A network that goes away.** When DomD loses the network DomA is on, or
+  cannot join it for a reason other than its passphrase, DomA's relay takes
+  it off the list, so the screen does not keep showing it as connected; one
+  DomD could not join stays off the list for 5 minutes or until its access point
+  leaves DomD's scans and returns, and one DomD lost stays off it until the
+  access point is back (DomD rejoins it, or its scans see it again after losing
+  it) or 5 minutes have passed, rather than coming back
+  while DomD's scans still report the vanished access point. When DomD rejects the
+  passphrase, the network stays listed, as saved rather than connected. The
+  relay restarts its access points for a changed list at most once every 5
+  minutes and only while DomA is not connected, so a new network appears
+  within 5 minutes of DomA not being connected.
+- **"No internet" before DomD has joined.** DomA joins the shadow access point
+  at once, so AAOS may check it for internet access while DomD is still joining
+  the real one, and a network that has never passed that check would then not be
+  joined again on its own. While DomD reports it has joined, DomA enables
+  the saved network again; without that report, AAOS tries such a network again
+  after 10 minutes (longer after repeated failures) instead of never.
+- **MSS cap.** DomD caps the MSS of forwarded TCP at 1360, a mitigation for
+  upstream paths with a smaller MTU that drop the ICMP path-MTU discovery needs.
+- **Cellular link.** DomD answers as the gateway of DomA's emulated cellular
+  data link (192.168.97.0/30) and NATs it, so DomA has a way out with its own
+  Wi-Fi off.
+
+The passphrase crosses the virtio-serial port in clear (see *Security note*),
+and DomA keeps the passphrases typed for it in plain files under
+`/data/vendor/wifi/shadow/`: the shadow AP's hostapd needs them, and
+`learned.conf` keeps up to 64 so that a network joined before works again when
+its access point returns. A typed passphrase goes into `learned.conf` only once
+DomD has joined with it; one DomD's access point rejects is not kept.
+
 ## Build — details & options
 The *Quick start* above is the happy path (`./build.sh` → `full.img`); *Build
 configuration* lists the flags/flavours. This section covers the Docker build
@@ -390,7 +441,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — what this port changed relative 
 | DomD | **SSH** (primary): `ssh root@192.168.10.10` — DomD runs the toolstack, so `xl list` / `xl console <domU/domA>` run from here. **UART**: DomD is a dom0less **vpl011** domain (console → hypervisor ring), so `xl console 1` / `xu console 1` cannot attach it (no PV console ring/evtchn is allocated for dom0less vpl011). On the debug UART press `Ctrl-A` three times to cycle input to `DOM1` (`raspberrypi5-domd login:`); or read its log with `xl dmesg \| grep DOM1`. |
 | DomU (AGL) | `ssh root@192.168.10.12`; or `xl console 3` from the toolstack domain (`domu login:`) |
 | DomZ (Zephyr) | **`xl console DomZ`** from the toolstack domain (DomD in the zephyr flavour, Dom0 in the linux one) — Zephyr's Xen **PV console**, which is why the `xenvm` board is used rather than a vpl011 dom0less domain. `xenconsole` needs a tty, so over ssh use `ssh -tt root@192.168.10.10 'xl console DomZ'`. No network, no display: this console is the only interface. Exit with `Ctrl-]` |
-| DomA (AAOS) | `adb connect 192.168.10.13:5555` (Android has no sshd); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The `virtconsole` sockets in `doma.cfg` are **inert** — see the note below. |
+| DomA (AAOS) | `adb connect 192.168.10.13:5555` (Android has no sshd); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The shell is not on the `virtconsole` sockets in `doma.cfg`: two of them carry DomA's Wi-Fi and Bluetooth links and the rest are inert — see the note below. |
 
 
 See also:
@@ -515,12 +566,17 @@ not password-protected at all:
   can reach DomD's loopback has full control of that guest's device model, including
   the ability to terminate it. Bind it to a permission-restricted unix socket, or
   remove it, before any non-lab deployment.
-- **DomA console.** `doma.cfg` exposes six `virtconsole` backends as unauthenticated
-  UNIX sockets in DomD (`/run/android_vm_virtconsole*`). They currently carry no data
-  (the Xen PV console takes `hvc0` first — see *Serial console* (`docs/TROUBLESHOOTING.md`) above), so they are not
-  a live exposure today, but nothing authenticates a connection and the intended
-  mapping was an in-guest shell. Remove them, or move them to a permission-restricted
-  path, before any non-lab deployment. Note that DomA's actual shell — `xl console 2`,
+- **DomA virtio-serial ports.** `doma.cfg` exposes four `virtconsole` backends as
+  unauthenticated UNIX sockets in DomD (`/run/android_vm_virtconsole{1,2,4,5}`), and DomA's
+  Bluetooth HCI port connects to DomD's `/run/bt-hci.sock`. `virtconsole5` is DomA's
+  Wi-Fi link: it carries the passphrase the user types for an access point, in clear,
+  to DomD's Wi-Fi agent; nothing authenticates the client, so whatever connects to that
+  socket in DomD receives it and can send DomA an access-point list of its own. `bt-hci.sock` carries DomA's Bluetooth traffic
+  as raw HCI. The other virtconsoles carry no data (the Xen PV console takes `hvc0`
+  first — see *Serial console* (`docs/TROUBLESHOOTING.md`) above) and the intended
+  mapping was an in-guest shell. Move the sockets to a permission-restricted path, and
+  remove the unused ones (re-verifying DomA, as `doma.cfg` explains), before any
+  non-lab deployment. Note that DomA's actual shell — `xl console 2`,
   prompt `console:/ $` — is reachable by anything that can run the toolstack in DomD,
   and `adb` is open on `192.168.10.13:5555` with no authentication.
 

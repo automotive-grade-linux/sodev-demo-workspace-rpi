@@ -152,14 +152,14 @@ rpi5)
 		echo "ERROR: device/agl/common/overlay framework-res config.xml not staged." >&2; exit 1; }
 
 	# device/agl/doma-common holds the modules the product installs by
-	# MODULE name (DomaWifiRelay, DomaSettingsProviderRRO). soong rejects a
-	# duplicate module name across the whole tree, so there must be exactly
-	# one Android.bp defining each. The rpi4 does not stage this directory:
-	# its device repository carries its own copies of the modules it
-	# installs, kept identical to these by hand.
+	# MODULE name (DomaWifiRelay, DomaSettingsProviderRRO, DomaWifiOverlay).
+	# soong rejects a duplicate module name across the whole tree, so there
+	# must be exactly one Android.bp defining each. The rpi4 does not stage
+	# this directory: its device repository carries its own copies of the
+	# modules it installs, kept identical to these by hand.
 	rm -rf "$ROOT/device/agl/doma-common"
 	cp -a "$here/aosp-device/agl/doma-common" "$ROOT/device/agl/doma-common"
-	for m in DomaWifiRelay DomaSettingsProviderRRO; do
+	for m in DomaWifiRelay DomaSettingsProviderRRO DomaWifiOverlay; do
 		# --include=Android.bp: without it a comment in an .rc file that merely names
 		# the module would count as a second definition.
 		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)
