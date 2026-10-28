@@ -171,3 +171,23 @@ SRC_URI:append:class-target = " file://q11-068-virtio-gpu-virgl-retire-a-destroy
 # The display path: the guests' overlay planes.
 # q11-051: overlay planes (overlay-planes=N on virtio-gpu-gl).
 SRC_URI:append:class-target = " file://q11-051-virtio-gpu-gl-sdl2-gl-overlay-planes-overlay-planes-N.patch"
+#
+# The display path: direct scanout on weston planes, of the decoded video and of the
+# guest's planes. q11-063 checks q11-051's overlays; q11-064 and q11-066 extend the flush
+# q11-063 rewrote.
+# q11-059..062: host-sand, NV12_COL128 / SAND frames detiled on the GPU (x4).
+# q11-063: ISP / SAND direct scanout of the decoded video to weston planes; switched by
+#   files under /run, all off when absent.
+# q11-064: virtio-gpu SET_PRIMARY_RECT, a positioned / scaled primary plane; pairs with
+#   DomA's virtio_gpu.plane_scaling=1 (aosp-kernel-patches/common/0002).
+# q11-066: the guest display planes on weston subsurfaces in the HMI case
+#   (/run/qemu-plane-handoff, off when absent).
+# q11-067: reset and error handling for the overlay planes and the plane handoff.
+SRC_URI:append:class-target = " file://q11-059-virtio-media-decode-to-SAND-on-the-host-detiled-by-Mesa-opt.patch"
+SRC_URI:append:class-target = " file://q11-060-virtio-media-build-the-SAND-program-at-draw-time-report-SAND.patch"
+SRC_URI:append:class-target = " file://q11-061-virtio-media-host-sand-2-detiles-SAND-in-the-shader-from-a-l.patch"
+SRC_URI:append:class-target = " file://q11-062-virtio-media-size-the-host-sand-2-view-from-sizeimage-refuse.patch"
+SRC_URI:append:class-target = " file://q11-063-ui-virtio-media-scan-video-out-on-weston-planes-via-ISP-or-S.patch"
+SRC_URI:append:class-target = " file://q11-064-virtio-gpu-virgl-add-SET_PRIMARY_RECT-a-positioned-scaled-pr.patch"
+SRC_URI:append:class-target = " file://q11-066-ui-sdl2-hand-guest-display-planes-to-weston-subsurfaces-opt.patch"
+SRC_URI:append:class-target = " file://q11-067-virtio-gpu-clear-overlay-and-handed-off-plane-state-on-reset.patch"

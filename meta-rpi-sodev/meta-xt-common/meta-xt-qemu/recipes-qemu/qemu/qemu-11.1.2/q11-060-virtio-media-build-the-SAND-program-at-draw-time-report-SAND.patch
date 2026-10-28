@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 5 Oct 2026 12:03:35 +0900
+Subject: [PATCH] virtio-media: build the SAND program at draw time, report
+ SAND failures
+
+Three corrections to the host-sand path.
+
+The NV12 program was built only at import time, and only the variant
+(external SAND or plain 2D) of the buffer being imported. One queue can
+hold both kinds of buffers, because host-sand falls back to NV12 when
+the codec refuses SAND. So gpu_draw_nv12() now builds the program the
+buffer needs before it draws and returns -EIO if it cannot.
+
+When the GPU import of a SAND frame fails, the GPU path is turned off
+for the queue, and nothing else can read SAND. Every later frame is then
+dropped. Report that with error_report(), giving the error and the
+column height and telling the user to turn host-sand off, instead of
+only a diagnostic log line.
+
+A failing S_FMT/TRY_FMT ioctl may rewrite the format struct. The NV12
+retry now restores the format that was first sent before it changes the
+pixel format, and it decides whether to retry from that saved copy
+rather than from what the driver left behind.
+
+No new switch. This only matters with host-sand on (default off).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [fix-up of this layer's host-sand patch]
+---
+ hw/virtio/virtio-media-virgl.c |  9 +++++++++
+ hw/virtio/virtio-media.c       | 14 +++++++++++++-
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index b640c68de..0caf7f4f0 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -601,6 +601,15 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+     glDisable(GL_DEPTH_TEST);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+     glViewport(0, 0, b->width, b->height);
++    /*
++     * The program this buffer needs, built on first use: a queue can switch between SAND and
++     * linear NV12 (host-sand falls back when the codec refuses), and import only built the
++     * program of the buffer it imported.
++     */
++    if (!gpu_build_nv12_program(b->sand)) {
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        return -EIO;
++    }
+     {
+         GLenum target = b->sand ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+ 
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 9af507712..48971cd50 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -800,6 +800,15 @@ static void virtio_media_host_readable_body(void *opaque)
+                                     qemu_log("virtio-media-diag: gpu_xfer: "
+                                              "import failed (%d), GPU path "
+                                              "off for this queue\n", e);
++                                    if (q->sand) {
++                                        /* Nothing else can read SAND: say so loudly. */
++                                        error_report("virtio-media: host-sand: GPU "
++                                                     "import of a SAND frame failed "
++                                                     "(%d, column height %u); every "
++                                                     "frame of this queue is now "
++                                                     "dropped -- turn host-sand off",
++                                                     e, q->sand_col_height);
++                                    }
+                                 }
+                             }
+                         }
+@@ -1692,13 +1701,16 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+                 }
+             }
+         }
++        /* What the first attempt sends: a failing S_FMT/TRY_FMT may rewrite fields. */
++        struct v4l2_format sent = *f;
+         int fmt_rc = ioctl(s->fd, code, payload);
+ 
+         if (fmt_rc < 0 && want_rgba && code != VIDIOC_G_FMT &&
+-            virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12_COL128) {
++            virtio_media_fmt_pixelformat(&sent) == V4L2_PIX_FMT_NV12_COL128) {
+             /* host-sand: the codec does not do SAND here; plain host-nv12 instead. */
+             warn_report_once("virtio-media: host-sand: codec refused NV12_COL128, "
+                              "using NV12");
++            *f = sent;
+             virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
+             fmt_rc = ioctl(s->fd, code, payload);
+         }

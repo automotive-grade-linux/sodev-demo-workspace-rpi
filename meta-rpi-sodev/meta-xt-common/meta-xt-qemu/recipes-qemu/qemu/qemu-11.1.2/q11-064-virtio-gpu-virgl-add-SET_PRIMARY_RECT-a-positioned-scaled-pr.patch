@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 12 Oct 2026 20:08:18 +0900
+Subject: [PATCH] virtio-gpu-virgl: add SET_PRIMARY_RECT, a positioned/scaled
+ primary
+
+virtio-gpu has no way to say where on the output a guest primary plane
+is shown or at what size. A guest that wants its primary positioned or
+scaled, for example a scaled video under the HMI in a non-fullscreen
+WebView, has to let its compositor do the composition in software.
+
+Add a device-specific control command, VIRTIO_GPU_CMD_SET_PRIMARY_RECT
+(0x0121). It carries scanout_id, the destination x, y, w x h, and the
+crtc_w x crtc_h size of the output. virgl hands it to the console
+through a new optional dpy_gl_primary_rect listener hook. SDL2
+implements the hook: while a rectangle is set that does not simply fill
+the output, it clears the window to black and blits the guest's scanout
+source rectangle into that destination, scaled to the window. Overlay
+positions are then taken as output (CRTC) pixels, and direct scanout is
+not used. Disabling the scanout clears the rectangle; the guest sends it
+again.
+
+There is no device property. The command is sent only by a DomA kernel
+with virtio_gpu.plane_scaling=1 (default 0; this layer's
+aosp-kernel-patches/common/0002-drm-virtio-primary-plane-rect). In this
+layer that is XT_DOMA_PLANE_SCALING, default 0, which requires
+XT_DOMA_OVERLAY_PLANES > 0. Without the command nothing changes.
+
+Per the xt-xen-cfg-doma recipe comment, on the RPi4 with three overlay
+planes, the non-fullscreen WebView playing a video goes from all four
+layers CLIENT to all DEVICE, and local 720p60 from 40 to 52-55 fps.
+Fullscreen 1080p60 is unchanged.
+
+The handler accepts an all-zero rectangle (no rectangle) and otherwise
+sizes of 1..16384 and positions within +-16384; anything else is
+answered with VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER and leaves the
+rectangle as it was.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [non-standard virtio-gpu command; needs this layer's overlay-plane patches]
+---
+ hw/display/virtio-gpu-virgl.c  | 36 +++++++++++++++++++
+ include/hw/virtio/virtio-gpu.h | 13 +++++++
+ include/ui/console.h           |  7 ++++
+ include/ui/sdl2.h              |  6 ++++
+ ui/console.c                   | 18 ++++++++++
+ ui/sdl2-gl.c                   | 66 ++++++++++++++++++++++++++++++++--
+ ui/sdl2.c                      |  1 +
+ 7 files changed, 144 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 25d3156..bfea271 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -807,6 +807,36 @@ static void virgl_cmd_set_overlay_pos(VirtIOGPU *g,
+     }
+ }
+ 
++/* q11-primary-rect: where the guest wants its (scaled) primary plane */
++static void virgl_cmd_set_primary_rect(VirtIOGPU *g,
++                                       struct virtio_gpu_ctrl_command *cmd)
++{
++    VirtIOGPUBase *b = &g->parent_obj;
++    struct virtio_gpu_set_primary_rect pr;
++
++    VIRTIO_GPU_FILL_CMD(pr);
++    if (pr.scanout_id >= b->conf.max_outputs) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
++        return;
++    }
++    /*
++     * All zero clears the rectangle. Otherwise the guest's values must be sane
++     * sizes and positions: they end up in int and double arithmetic for GL and
++     * wayland coordinates, where an out-of-range value would be undefined.
++     */
++    if ((pr.x || pr.y || pr.w || pr.h || pr.crtc_w || pr.crtc_h) &&
++        (!pr.w || !pr.h || !pr.crtc_w || !pr.crtc_h ||
++         pr.w > 16384 || pr.h > 16384 || pr.crtc_w > 16384 || pr.crtc_h > 16384 ||
++         pr.x < -16384 || pr.x > 16384 || pr.y < -16384 || pr.y > 16384)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: invalid rectangle %d,%d %ux%u on %ux%u",
++                      __func__, pr.x, pr.y, pr.w, pr.h, pr.crtc_w, pr.crtc_h);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++        return;
++    }
++    qemu_console_gl_primary_rect(b->scanout[pr.scanout_id].con, pr.x, pr.y,
++                                 pr.w, pr.h, pr.crtc_w, pr.crtc_h);
++}
++
+ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+                                   struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -870,6 +900,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+     } else {
+         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
+         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
++        /* q11-primary-rect: a disabled primary has no position; the guest resends it */
++        qemu_console_gl_primary_rect(g->parent_obj.scanout[ss.scanout_id].con,
++                                     0, 0, 0, 0, 0, 0);
+     }
+     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+ }
+@@ -1368,6 +1401,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+     case VIRTIO_GPU_CMD_SET_OVERLAY_POS:
+         virgl_cmd_set_overlay_pos(g, cmd);
+         break;
++    case VIRTIO_GPU_CMD_SET_PRIMARY_RECT: /* q11-primary-rect */
++        virgl_cmd_set_primary_rect(g, cmd);
++        break;
+     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
+         virgl_cmd_resource_unref(g, cmd, &cmd_suspended);
+         break;
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 07d0401..4cb84c9 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -148,6 +148,19 @@ struct virtio_gpu_base_conf {
+  * scanout_id (one of the extra scanouts) at x, y on scanout 0.
+  */
+ #define VIRTIO_GPU_CMD_SET_OVERLAY_POS 0x0120
++/* q11-primary-rect: the primary of scanout_id at x, y, w x h of a crtc_w x crtc_h output */
++#define VIRTIO_GPU_CMD_SET_PRIMARY_RECT 0x0121
++struct virtio_gpu_set_primary_rect {
++    struct virtio_gpu_ctrl_hdr hdr;
++    uint32_t scanout_id;
++    int32_t x;
++    int32_t y;
++    uint32_t w;
++    uint32_t h;
++    uint32_t crtc_w;
++    uint32_t crtc_h;
++    uint32_t padding;
++};
+ struct virtio_gpu_set_overlay_pos {
+     struct virtio_gpu_ctrl_hdr hdr;
+     uint32_t scanout_id;
+diff --git a/include/ui/console.h b/include/ui/console.h
+index be5a94f..d47bc4c 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -234,6 +234,10 @@ typedef struct DisplayChangeListenerOps {
+                            bool on, uint32_t tex_id, bool y0_top,
+                            uint32_t tex_w, uint32_t tex_h,
+                            int32_t x, int32_t y);
++    /* optional (q11-primary-rect): the scanout shown at x, y, w x h of crtc_w x crtc_h */
++    void (*dpy_gl_primary_rect)(DisplayChangeListener *dcl, int32_t x, int32_t y,
++                                uint32_t w, uint32_t h, uint32_t crtc_w,
++                                uint32_t crtc_h);
+     /* optional */
+     void (*dpy_gl_release_dmabuf)(DisplayChangeListener *dcl,
+                                   QemuDmaBuf *dmabuf);
+@@ -317,6 +321,9 @@ void qemu_console_gl_cursor_position(QemuConsole *con,
+ void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
+                              uint32_t tex_id, bool y0_top, uint32_t tex_w,
+                              uint32_t tex_h, int32_t x, int32_t y);
++void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
++                                  uint32_t w, uint32_t h, uint32_t crtc_w,
++                                  uint32_t crtc_h); /* q11-primary-rect */
+ void qemu_console_gl_release_dmabuf(QemuConsole *con,
+                                     QemuDmaBuf *dmabuf);
+ void qemu_console_gl_update(QemuConsole *con,
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index 524024b..6c44a68 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -58,6 +58,9 @@ struct sdl2_console {
+         int32_t x, y;
+         bool y0_top, on;
+     } ovl[3];
++    /* q11-primary-rect: the scanout at prim_x, prim_y, prim_w x prim_h of prim_cw x prim_ch */
++    int32_t prim_x, prim_y;
++    uint32_t prim_w, prim_h, prim_cw, prim_ch;
+ #endif
+ };
+ 
+@@ -111,6 +114,9 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+ void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
+                      uint32_t tex_id, bool y0_top, uint32_t tex_w,
+                      uint32_t tex_h, int32_t x, int32_t y);
++void sdl2_gl_primary_rect(DisplayChangeListener *dcl, int32_t x, int32_t y,
++                          uint32_t w, uint32_t h, uint32_t crtc_w,
++                          uint32_t crtc_h); /* q11-primary-rect */
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+diff --git a/ui/console.c b/ui/console.c
+index c9b872f..7703655 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1019,6 +1019,24 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+     }
+ }
+ 
++/* q11-primary-rect */
++void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
++                                  uint32_t w, uint32_t h, uint32_t crtc_w,
++                                  uint32_t crtc_h)
++{
++    DisplayState *s = con->ds;
++    DisplayChangeListener *dcl;
++
++    QLIST_FOREACH(dcl, &s->listeners, next) {
++        if (con != dcl->con) {
++            continue;
++        }
++        if (dcl->ops->dpy_gl_primary_rect) {
++            dcl->ops->dpy_gl_primary_rect(dcl, x, y, w, h, crtc_w, crtc_h);
++        }
++    }
++}
++
+ void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
+                              uint32_t tex_id, bool y0_top, uint32_t tex_w,
+                              uint32_t tex_h, int32_t x, int32_t y)
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 8b00001..7eb5b95 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -233,6 +233,60 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                          backing_id, false);
+ }
+ 
++/* q11-primary-rect: the guest positioned (and maybe scaled) its primary plane */
++void sdl2_gl_primary_rect(DisplayChangeListener *dcl, int32_t x, int32_t y,
++                          uint32_t w, uint32_t h, uint32_t crtc_w,
++                          uint32_t crtc_h)
++{
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    scon->prim_x = x;
++    scon->prim_y = y;
++    scon->prim_w = w;
++    scon->prim_h = h;
++    scon->prim_cw = crtc_w;
++    scon->prim_ch = crtc_h;
++}
++
++/* q11-primary-rect: true when the primary does not simply fill the output */
++static bool sdl2_prim_rect_on(struct sdl2_console *scon)
++{
++    return scon->prim_w && scon->prim_h && scon->prim_cw && scon->prim_ch &&
++           (scon->prim_x || scon->prim_y || scon->prim_w != scon->prim_cw ||
++            scon->prim_h != scon->prim_ch);
++}
++
++/*
++ * q11-primary-rect: black output, then the guest's scanout rectangle scaled into
++ * the primary's destination (CRTC pixels, origin top-left; the window may be scaled).
++ */
++static void sdl2_gl_draw_primary_rect(struct sdl2_console *scon, int ww, int wh)
++{
++    double sx = (double)ww / scon->prim_cw, sy = (double)wh / scon->prim_ch;
++    GLint dx0 = scon->prim_x * sx, dx1 = (scon->prim_x + (int32_t)scon->prim_w) * sx;
++    GLint dy1 = wh - (GLint)(scon->prim_y * sy);
++    GLint dy0 = wh - (GLint)((scon->prim_y + (int32_t)scon->prim_h) * sy);
++    GLint x1 = scon->x, w = scon->w ? scon->w : scon->guest_fb.width;
++    GLint y1 = scon->y, h = scon->h ? scon->h : scon->guest_fb.height;
++    bool flip = !scon->y0_top;
++
++    if (scon->guest_fb.dmabuf) { /* the source rectangle egl_fb_blit() would use */
++        x1 = qemu_dmabuf_get_x(scon->guest_fb.dmabuf);
++        y1 = qemu_dmabuf_get_y(scon->guest_fb.dmabuf);
++        w = qemu_dmabuf_get_width(scon->guest_fb.dmabuf);
++        h = qemu_dmabuf_get_height(scon->guest_fb.dmabuf);
++    }
++
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scon->win_fb.framebuffer);
++    glViewport(0, 0, ww, wh);
++    glClearColor(0, 0, 0, 1);
++    glClear(GL_COLOR_BUFFER_BIT);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, scon->guest_fb.framebuffer);
++    /* the same source orientation as egl_fb_blit_rect() */
++    glBlitFramebuffer(x1, flip ? y1 + h : y1, x1 + w, flip ? y1 : y1 + h,
++                      dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++}
++
+ void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
+                      uint32_t tex_id, bool y0_top, uint32_t tex_w,
+                      uint32_t tex_h, int32_t x, int32_t y)
+@@ -262,8 +316,11 @@ void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
+  */
+ static void sdl2_gl_draw_overlays(struct sdl2_console *scon, int ww, int wh)
+ {
+-    double sx = scon->w ? (double)ww / scon->w : 1.0;
+-    double sy = scon->h ? (double)wh / scon->h : 1.0;
++    /* q11-primary-rect: overlay positions are CRTC pixels, not primary-source pixels */
++    uint32_t bw = sdl2_prim_rect_on(scon) ? scon->prim_cw : scon->w;
++    uint32_t bh = sdl2_prim_rect_on(scon) ? scon->prim_ch : scon->h;
++    double sx = bw ? (double)ww / bw : 1.0;
++    double sy = bh ? (double)wh / bh : 1.0;
+ 
+     for (int i = 0; i < ARRAY_SIZE(scon->ovl); i++) {
+         if (!scon->ovl[i].on || !scon->ovl[i].fb.texture) {
+@@ -341,6 +398,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+         DirectScanout d;
+         const char *why = scon->guest_fb.dmabuf ? "dmabuf scanout" :
+             scon->y0_top ? "y0_top" :
++            sdl2_prim_rect_on(scon) ? "dst" : /* q11-primary-rect */
+             (scon->x || scon->y || scon->w != ww || scon->h != wh) ? "rect" :
+             sdl2_overlays_on(scon) ? "overlays" :
+             !direct_scanout_has(scon->guest_fb.texture) ? "no entry" :
+@@ -366,7 +424,9 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+      * q11-scanout-rect: only the guest's scanout rectangle (1280x720 of a 1280x726
+      * video buffer): the rows below it are not part of the picture.
+      */
+-    if (!scon->guest_fb.dmabuf && scon->w && scon->h) {
++    if (sdl2_prim_rect_on(scon)) {
++        sdl2_gl_draw_primary_rect(scon, ww, wh); /* q11-primary-rect */
++    } else if (!scon->guest_fb.dmabuf && scon->w && scon->h) {
+         egl_fb_blit_rect(&scon->win_fb, &scon->guest_fb, !scon->y0_top,
+                          scon->x, scon->y, scon->w, scon->h);
+     } else {
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 4b0e1af..3717786 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -835,6 +835,7 @@ static const DisplayChangeListenerOps dcl_gl_ops = {
+     .dpy_gl_scanout_disable  = sdl2_gl_scanout_disable,
+     .dpy_gl_scanout_texture  = sdl2_gl_scanout_texture,
+     .dpy_gl_overlay          = sdl2_gl_overlay,
++    .dpy_gl_primary_rect     = sdl2_gl_primary_rect, /* q11-primary-rect */
+     .dpy_gl_update           = sdl2_gl_scanout_flush,
+ 
+ #ifdef CONFIG_GBM

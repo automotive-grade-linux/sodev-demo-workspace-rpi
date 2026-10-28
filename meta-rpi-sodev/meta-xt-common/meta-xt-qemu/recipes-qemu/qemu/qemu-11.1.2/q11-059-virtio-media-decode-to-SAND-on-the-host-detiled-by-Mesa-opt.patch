@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 5 Oct 2026 11:50:48 +0900
+Subject: [PATCH] virtio-media: decode to SAND on the host, detiled by Mesa
+ (opt-in)
+
+With host-nv12 the device model asks the RPi4 bcm2835-codec for linear
+NV12 and converts it to the RGBA the guest asked for on the GPU. The
+codec is faster when it writes its native NV12_COL128 (SAND,
+128-byte-wide columns) format: per the code comment, 1080p60 H.264
+decodes at 89 fps into SAND and at 66 fps into NV12 (measured
+2026-10-05).
+
+Add a host-sand property. When it is on, S_FMT/TRY_FMT for an RGBA
+CAPTURE queue ask the codec for NV12_COL128 instead of NV12. If the
+codec refuses, the request is retried with NV12 and the queue runs as
+plain host-nv12. For a SAND queue the device remembers the column height
+(which the codec reports in bytesperline). It then imports the Y and
+CbCr planes as EGL images with the
+DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT modifier. Mesa v3d accepts
+that modifier for R8/GR88 only as external textures and detiles them
+itself. A second copy of the NV12 shader samples them through
+samplerExternalOES. The visible luma rows are taken as col_height * 2 /
+3 (1620 -> 1080 for a 1080p frame).
+
+Only the GPU path can read SAND. When it is not available, the CPU copy
+path skips the frame and warns once instead of copying tiled bytes. A
+SAND import also needs EGL_EXT_image_dma_buf_import_modifiers.
+
+host-sand needs host-nv12 and gpu-xfer and defaults to off.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device and RPi4 codec]
+---
+ hw/virtio/virtio-media-virgl-stub.c    |   3 +-
+ hw/virtio/virtio-media-virgl.c         | 191 ++++++++++++++++++-------
+ hw/virtio/virtio-media.c               |  82 +++++++++--
+ include/hw/virtio/virtio-media-virgl.h |   6 +-
+ include/hw/virtio/virtio-media.h       |  13 ++
+ 5 files changed, 233 insertions(+), 62 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+index 64c8d81d3..08b4b2cb6 100644
+--- a/hw/virtio/virtio-media-virgl-stub.c
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -27,7 +27,8 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t src_height, uint32_t stride,
+                                    uint32_t uv_offset, uint32_t dst_width,
+                                    uint32_t dst_height, float scale,
+-                                   uint32_t len, int matrix, int *err)
++                                   uint32_t len, int matrix,
++                                   uint32_t sand_col_height, int *err)
+ {
+     close(dmabuf_fd);
+     if (err) {
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 72e53c31e..b640c68de 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -78,10 +78,21 @@ typedef struct VirtIOMediaGpuBuf {
+     float scale_x, scale_y;   /* source pixels per destination pixel */
+     GLuint tex_uv;
+     int matrix;
++    bool sand;                /* planes are SAND128 external textures (host-sand) */
+ } VirtIOMediaGpuBuf;
+ 
+ #define VM_DRM_FORMAT_R8    0x20203852u   /* 'R8  ' */
+ #define VM_DRM_FORMAT_GR88  0x38385247u   /* 'GR88': byte0 = R (Cb), byte1 = G (Cr) */
++/*
++ * DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(h) (drm_fourcc.h): vendor 0x07, the column height
++ * in lines in the parameter field (bits 8..55), mod 4. Mesa v3d accepts it for R8 and GR88
++ * planes, external-only, and detiles them into a tiled shadow with its sand8 blit.
++ */
++#define VM_DRM_FORMAT_MOD_SAND128_COL_HEIGHT(h) \
++    ((0x07ull << 56) | (((uint64_t)(h) & 0xffffffffffffull) << 8) | 4ull)
++#ifndef GL_TEXTURE_EXTERNAL_OES
++#define GL_TEXTURE_EXTERNAL_OES 0x8D65
++#endif
+ 
+ /*
+  * Context discipline. The display is SDL (gl=es) or egl-headless; either way
+@@ -102,6 +113,10 @@ static struct {
+     GLuint prog;
+     GLint u_y, u_uv, u_src_size, u_scale, u_yoff, u_yscale, u_coef;
+     bool prog_failed;
++    /* host-sand: the same program with samplerExternalOES (SAND imports are external-only). */
++    GLuint prog_ext;
++    GLint e_y, e_uv, e_src_size, e_scale, e_yoff, e_yscale, e_coef;
++    bool prog_ext_failed;
+ } gpu;
+ 
+ typedef struct GpuSaved {
+@@ -271,10 +286,12 @@ static void gpu_leave(const GpuSaved *sv)
+  */
+ static GLuint gpu_import_plane(int fd, uint32_t fourcc, uint32_t width,
+                                uint32_t height, uint32_t stride,
+-                               uint32_t offset, bool linear)
++                               uint32_t offset, bool linear,
++                               uint64_t modifier, bool external)
+ {
+     EGLImageKHR img;
+     GLuint tex = 0;
++    GLenum target = external ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+     EGLint attrs[] = {
+         EGL_WIDTH, width,
+         EGL_HEIGHT, height,
+@@ -282,12 +299,15 @@ static GLuint gpu_import_plane(int fd, uint32_t fourcc, uint32_t width,
+         EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+         EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset,
+         EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
+-        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(VM_DRM_FORMAT_MOD_LINEAR & 0xffffffffu),
+-        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(VM_DRM_FORMAT_MOD_LINEAR >> 32),
++        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier & 0xffffffffu),
++        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier >> 32),
+         EGL_NONE
+     };
+ 
+     if (!gpu_have_egl_ext(gpu.dpy, "EGL_EXT_image_dma_buf_import_modifiers")) {
++        if (modifier != VM_DRM_FORMAT_MOD_LINEAR) {
++            return 0;   /* a SAND buffer cannot be described without the modifier */
++        }
+         attrs[12] = EGL_NONE;
+     }
+     img = eglCreateImageKHR(gpu.dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+@@ -302,15 +322,15 @@ static GLuint gpu_import_plane(int fd, uint32_t fourcc, uint32_t width,
+         /* clear stale errors */
+     }
+     glGenTextures(1, &tex);
+-    glBindTexture(GL_TEXTURE_2D, tex);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
++    glBindTexture(target, tex);
++    glTexParameteri(target, GL_TEXTURE_MIN_FILTER,
+                     linear ? GL_LINEAR : GL_NEAREST);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
++    glTexParameteri(target, GL_TEXTURE_MAG_FILTER,
+                     linear ? GL_LINEAR : GL_NEAREST);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
+-    glBindTexture(GL_TEXTURE_2D, 0);
++    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glEGLImageTargetTexture2DOES(target, (GLeglImageOES)img);
++    glBindTexture(target, 0);
+     eglDestroyImageKHR(gpu.dpy, img);
+     if (glGetError() != GL_NO_ERROR) {
+         qemu_log("virtio-media-diag: gpu_xfer: glEGLImageTargetTexture2DOES "
+@@ -355,6 +375,28 @@ static const char *nv12_fs =
+     "  float b = y + u_coef.w * c.x;\n"
+     "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
+     "}\n";
++/* host-sand: identical maths; the planes are SAND128 imports, which Mesa only binds external. */
++static const char *nv12_fs_ext =
++    "#version 300 es\n"
++    "#extension GL_OES_EGL_image_external_essl3 : require\n"
++    "precision highp float;\n"
++    "uniform samplerExternalOES u_y;\n"
++    "uniform samplerExternalOES u_uv;\n"
++    "uniform vec2 u_src_size;\n"
++    "uniform vec2 u_scale;\n"
++    "uniform float u_yoff;\n"
++    "uniform float u_yscale;\n"
++    "uniform vec4 u_coef;\n"
++    "out vec4 o;\n"
++    "void main() {\n"
++    "  vec2 uv = gl_FragCoord.xy * u_scale / u_src_size;\n"
++    "  float y = (texture(u_y, uv).r - u_yoff) * u_yscale;\n"
++    "  vec2 c = texture(u_uv, uv).rg - vec2(0.5);\n"
++    "  float r = y + u_coef.x * c.y;\n"
++    "  float g = y + u_coef.y * c.x + u_coef.z * c.y;\n"
++    "  float b = y + u_coef.w * c.x;\n"
++    "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
++    "}\n";
+ 
+ static GLuint gpu_compile(GLenum type, const char *src)
+ {
+@@ -374,39 +416,77 @@ static GLuint gpu_compile(GLenum type, const char *src)
+     return sh;
+ }
+ 
+-static bool gpu_build_nv12_program(void)
++static GLuint gpu_link_nv12_program(const char *fs_src)
+ {
+-    GLuint vs, fs;
++    GLuint vs, fs, prog;
+     GLint ok = 0;
+ 
+-    if (gpu.prog) {
+-        return true;
+-    }
+-    if (gpu.prog_failed) {
+-        return false;
+-    }
+     vs = gpu_compile(GL_VERTEX_SHADER, nv12_vs);
+-    fs = gpu_compile(GL_FRAGMENT_SHADER, nv12_fs);
++    fs = gpu_compile(GL_FRAGMENT_SHADER, fs_src);
+     if (!vs || !fs) {
+-        gpu.prog_failed = true;
+-        return false;
++        if (vs) {
++            glDeleteShader(vs);
++        }
++        if (fs) {
++            glDeleteShader(fs);
++        }
++        return 0;
+     }
+-    gpu.prog = glCreateProgram();
+-    glAttachShader(gpu.prog, vs);
+-    glAttachShader(gpu.prog, fs);
+-    glLinkProgram(gpu.prog);
++    prog = glCreateProgram();
++    glAttachShader(prog, vs);
++    glAttachShader(prog, fs);
++    glLinkProgram(prog);
+     glDeleteShader(vs);
+     glDeleteShader(fs);
+-    glGetProgramiv(gpu.prog, GL_LINK_STATUS, &ok);
++    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+     if (!ok) {
+         char log[512] = "";
+-        glGetProgramInfoLog(gpu.prog, sizeof(log), NULL, log);
++        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+         qemu_log("virtio-media-diag: gpu_xfer: program link failed: %s\n", log);
+-        glDeleteProgram(gpu.prog);
+-        gpu.prog = 0;
++        glDeleteProgram(prog);
++        return 0;
++    }
++    return prog;
++}
++
++static bool gpu_build_nv12_program(bool ext)
++{
++    GLuint p;
++
++    if (ext) {
++        if (gpu.prog_ext) {
++            return true;
++        }
++        if (gpu.prog_ext_failed) {
++            return false;
++        }
++        p = gpu_link_nv12_program(nv12_fs_ext);
++        if (!p) {
++            gpu.prog_ext_failed = true;
++            return false;
++        }
++        gpu.prog_ext = p;
++        gpu.e_y = glGetUniformLocation(p, "u_y");
++        gpu.e_uv = glGetUniformLocation(p, "u_uv");
++        gpu.e_src_size = glGetUniformLocation(p, "u_src_size");
++        gpu.e_scale = glGetUniformLocation(p, "u_scale");
++        gpu.e_yoff = glGetUniformLocation(p, "u_yoff");
++        gpu.e_yscale = glGetUniformLocation(p, "u_yscale");
++        gpu.e_coef = glGetUniformLocation(p, "u_coef");
++        return true;
++    }
++    if (gpu.prog) {
++        return true;
++    }
++    if (gpu.prog_failed) {
++        return false;
++    }
++    p = gpu_link_nv12_program(nv12_fs);
++    if (!p) {
+         gpu.prog_failed = true;
+         return false;
+     }
++    gpu.prog = p;
+     gpu.u_y = glGetUniformLocation(gpu.prog, "u_y");
+     gpu.u_uv = glGetUniformLocation(gpu.prog, "u_uv");
+     gpu.u_src_size = glGetUniformLocation(gpu.prog, "u_src_size");
+@@ -421,11 +501,15 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t src_height, uint32_t stride,
+                                    uint32_t uv_offset, uint32_t dst_width,
+                                    uint32_t dst_height, float scale,
+-                                   uint32_t len, int matrix, int *err)
++                                   uint32_t len, int matrix,
++                                   uint32_t sand_col_height, int *err)
+ {
+     GpuSaved sv;
+     VirtIOMediaGpuBuf *b;
+     bool scaled = scale != 1.0f;
++    bool sand = sand_col_height != 0;
++    uint64_t mod = sand ? VM_DRM_FORMAT_MOD_SAND128_COL_HEIGHT(sand_col_height)
++                        : VM_DRM_FORMAT_MOD_LINEAR;
+ 
+     if (!gpu_enter(&sv)) {
+         close(dmabuf_fd);
+@@ -434,7 +518,7 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+         }
+         return NULL;
+     }
+-    if (!gpu_build_nv12_program()) {
++    if (!gpu_build_nv12_program(sand)) {
+         gpu_leave(&sv);
+         close(dmabuf_fd);
+         if (err) {
+@@ -455,11 +539,13 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+     b->stride = stride;
+     b->len = len;
+     b->matrix = matrix;
++    b->sand = sand;
+     b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, src_width,
+-                              src_height, stride, 0, scaled);
++                              src_height, stride, 0, scaled, mod, sand);
+     b->tex_uv = b->tex ? gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_GR88,
+                                           src_width / 2, src_height / 2,
+-                                          stride, uv_offset, scaled) : 0;
++                                          stride, uv_offset, scaled, mod,
++                                          sand) : 0;
+     if (!b->tex || !b->tex_uv) {
+         if (b->tex) {
+             glDeleteTextures(1, &b->tex);
+@@ -515,23 +601,28 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+     glDisable(GL_DEPTH_TEST);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+     glViewport(0, 0, b->width, b->height);
+-    glUseProgram(gpu.prog);
+-    glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, b->tex);
+-    glActiveTexture(GL_TEXTURE1);
+-    glBindTexture(GL_TEXTURE_2D, b->tex_uv);
+-    glUniform1i(gpu.u_y, 0);
+-    glUniform1i(gpu.u_uv, 1);
+-    glUniform2f(gpu.u_src_size, (float)b->src_width, (float)b->src_height);
+-    glUniform2f(gpu.u_scale, b->scale_x, b->scale_y);
+-    glUniform1f(gpu.u_yoff, yoff);
+-    glUniform1f(gpu.u_yscale, yscale);
+-    glUniform4fv(gpu.u_coef, 1, c);
+-    glBindVertexArray(0);
+-    glDrawArrays(GL_TRIANGLES, 0, 3);
+-    glBindTexture(GL_TEXTURE_2D, 0);
+-    glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, 0);
++    {
++        GLenum target = b->sand ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
++
++        glUseProgram(b->sand ? gpu.prog_ext : gpu.prog);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(target, b->tex);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(target, b->tex_uv);
++        glUniform1i(b->sand ? gpu.e_y : gpu.u_y, 0);
++        glUniform1i(b->sand ? gpu.e_uv : gpu.u_uv, 1);
++        glUniform2f(b->sand ? gpu.e_src_size : gpu.u_src_size,
++                    (float)b->src_width, (float)b->src_height);
++        glUniform2f(b->sand ? gpu.e_scale : gpu.u_scale, b->scale_x, b->scale_y);
++        glUniform1f(b->sand ? gpu.e_yoff : gpu.u_yoff, yoff);
++        glUniform1f(b->sand ? gpu.e_yscale : gpu.u_yscale, yscale);
++        glUniform4fv(b->sand ? gpu.e_coef : gpu.u_coef, 1, c);
++        glBindVertexArray(0);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glBindTexture(target, 0);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(target, 0);
++    }
+     glUseProgram(0);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+     return 0;
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 289ffb791..9af507712 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -180,6 +180,10 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+ /* host-nv12 helpers                                                         */
+ /* ------------------------------------------------------------------------- */
+ 
++#ifndef V4L2_PIX_FMT_NV12_COL128
++#define V4L2_PIX_FMT_NV12_COL128 v4l2_fourcc('N', 'C', '1', '2')
++#endif
++
+ static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
+ {
+     /* What bcm2835-codec answers for RGBA32: bytesperline_align 64. */
+@@ -255,6 +259,21 @@ static void virtio_media_fmt_set_size(struct v4l2_format *f, uint32_t w,
+     }
+ }
+ 
++/* Linear NV12 or, with host-sand, its SAND twin: both mean "host YUV, guest RGBA". */
++static inline bool virtio_media_pf_is_host_yuv(uint32_t pf)
++{
++    return pf == V4L2_PIX_FMT_NV12 || pf == V4L2_PIX_FMT_NV12_COL128;
++}
++
++/* host-sand: remember whether the host frame is SAND, and its column height. */
++static void virtio_media_note_sand(VirtIOMediaQueue *q, const struct v4l2_format *f)
++{
++    q->sand = virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12_COL128;
++    q->sand_col_height = !q->sand ? 0 :
++        (V4L2_TYPE_IS_MULTIPLANAR(f->type) ? f->fmt.pix_mp.plane_fmt[0].bytesperline
++                                           : f->fmt.pix.bytesperline);
++}
++
+ /*
+  * Rewrite a host NV12 v4l2_format into the RGBA one the guest asked for,
+  * with the bytesperline/sizeimage the codec would have given for RGBA, and
+@@ -718,7 +737,8 @@ static void virtio_media_host_readable_body(void *opaque)
+                     uint32_t dst_h = q->scaled_h ? q->scaled_h : q->height;
+                     bool geom_ok = q->width && q->height &&
+                                    dst_bpl >= dst_w * 4 &&
+-                                   (!q->nv12_host || q->bytesperline >= q->width);
++                                   (!q->nv12_host || q->sand ||
++                                    q->bytesperline >= q->width);
+ 
+                     if (vm->gpu_xfer && gb->virgl_res && p == 0 &&
+                         gb->num_planes == 1 && geom_ok && !q->gpu_failed) {
+@@ -747,14 +767,28 @@ static void virtio_media_host_readable_body(void *opaque)
+                                         ? (float)q->host_w / q->scaled_w
+                                         : 1.0f;
+ 
++                                    /*
++                                     * host-sand: a column is luma_rows lines of
++                                     * Y then luma_rows / 2 of CbCr, 128 bytes
++                                     * each, so luma_rows = col_height * 2 / 3
++                                     * (1620 -> 1080 for a 1088-line 1080p
++                                     * frame: the codec's SAND carries the
++                                     * visible rows only).
++                                     */
++                                    uint32_t luma_rows = q->sand
++                                        ? q->sand_col_height * 2 / 3 : q->height;
++
+                                     q->gpu_buf[idx] =
+                                         virtio_media_gpu_import_nv12(
+-                                            eb.fd, q->width, q->height,
+-                                            q->bytesperline,
+-                                            q->bytesperline * q->height,
++                                            eb.fd, q->width, luma_rows,
++                                            q->sand ? q->width : q->bytesperline,
++                                            q->sand ? luma_rows * 128
++                                                    : q->bytesperline * q->height,
+                                             dst_bpl / 4, dst_h, scale,
+                                             q->host_len[idx][p],
+-                                            q->matrix, &e);
++                                            q->matrix,
++                                            q->sand ? q->sand_col_height : 0,
++                                            &e);
+                                 } else {
+                                     q->gpu_buf[idx] = virtio_media_gpu_import(
+                                             eb.fd, q->bytesperline / 4,
+@@ -793,6 +827,12 @@ static void virtio_media_host_readable_body(void *opaque)
+                     void *src_map = q->host_map[evt.buffer.index][p];
+                     uint32_t src_bpl = q->bytesperline;
+ 
++                    if (q->nv12_host && q->sand) {
++                        /* SAND bytes: only the GPU path can read them. */
++                        warn_report_once("virtio-media: host-sand: GPU path "
++                                         "unavailable, frame not updated");
++                        continue;
++                    }
+                     if (q->nv12_host && q->scaled_w) {
+                         /*
+                          * host-max-width: only the GPU path scales. A host-size
+@@ -1244,10 +1284,13 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+              * now (a later S_FMT to something else would have cleared it).
+              */
+             if (q->nv12_host &&
+-                virtio_media_fmt_pixelformat(&fmt) == V4L2_PIX_FMT_NV12) {
++                virtio_media_pf_is_host_yuv(virtio_media_fmt_pixelformat(&fmt))) {
++                virtio_media_note_sand(q, &fmt);
+                 virtio_media_fmt_nv12_to_rgba(q, &fmt, s->vm->host_max_width);
+             } else {
+                 q->nv12_host = false;
++                q->sand = false;
++                q->sand_col_height = 0;
+                 q->scaled_w = q->scaled_h = 0;
+             }
+         }
+@@ -1636,7 +1679,9 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+                 want_rgba = q->nv12_host;
+             } else if (virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_RGBA32) {
+                 want_rgba = true;
+-                virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
++                virtio_media_fmt_set_pixelformat(f, s->vm->host_sand
++                                                 ? V4L2_PIX_FMT_NV12_COL128
++                                                 : V4L2_PIX_FMT_NV12);
+                 /*
+                  * host-max-width: the guest only knows the scaled size and
+                  * the codec cannot scale, so ask the codec for its own size.
+@@ -1647,7 +1692,17 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+                 }
+             }
+         }
+-        if (ioctl(s->fd, code, payload) < 0) {
++        int fmt_rc = ioctl(s->fd, code, payload);
++
++        if (fmt_rc < 0 && want_rgba && code != VIDIOC_G_FMT &&
++            virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12_COL128) {
++            /* host-sand: the codec does not do SAND here; plain host-nv12 instead. */
++            warn_report_once("virtio-media: host-sand: codec refused NV12_COL128, "
++                             "using NV12");
++            virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
++            fmt_rc = ioctl(s->fd, code, payload);
++        }
++        if (fmt_rc < 0) {
+             int err = errno;
+ 
+             if (want_rgba && code != VIDIOC_G_FMT) {
+@@ -1659,23 +1714,29 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+             }
+             return err;
+         }
+-        if (want_rgba && virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12) {
++        if (want_rgba && virtio_media_pf_is_host_yuv(virtio_media_fmt_pixelformat(f))) {
++            if (code != VIDIOC_TRY_FMT) {
++                virtio_media_note_sand(q, f);
++            }
+             virtio_media_fmt_nv12_to_rgba(code == VIDIOC_TRY_FMT ? NULL : q, f,
+                                           s->vm->host_max_width);
+             if (code == VIDIOC_S_FMT && !q->nv12_host) {
+                 q->nv12_host = true;
+-                qemu_log("virtio-media-diag: host_nv12: CAPTURE %ux%u runs NV12 "
++                qemu_log("virtio-media-diag: host_nv12: CAPTURE %ux%u runs %s "
+                          "on the host (guest sees RGBA bpl %u size %u, "
+                          "matrix %d)\n",
+                          V4L2_TYPE_IS_MULTIPLANAR(f->type) ? f->fmt.pix_mp.width
+                                                            : f->fmt.pix.width,
+                          V4L2_TYPE_IS_MULTIPLANAR(f->type) ? f->fmt.pix_mp.height
+                                                            : f->fmt.pix.height,
++                         q->sand ? "NV12_COL128 (SAND)" : "NV12",
+                          q->rgba_bytesperline, q->rgba_sizeimage, q->matrix);
+             }
+         } else if (code == VIDIOC_S_FMT && capture) {
+             /* The host ended up in some other format: no translation. */
+             q->nv12_host = false;
++            q->sand = false;
++            q->sand_col_height = 0;
+             q->scaled_w = q->scaled_h = 0;
+         }
+         return 0;
+@@ -2163,6 +2224,7 @@ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+     DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
+     DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
++    DEFINE_PROP_BOOL("host-sand", VirtIOMedia, host_sand, false),
+     DEFINE_PROP_UINT32("host-max-width", VirtIOMedia, host_max_width, 0),
+     DEFINE_PROP_BOOL("output-coherent", VirtIOMedia, output_coherent, false),
+     DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 5ff529be4..3552dbf0a 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -67,12 +67,16 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+  * padded to 16 pixels -- and the planes are sampled with GL_LINEAR.
+  * `matrix` selects the YCbCr -> RGB coefficients: 0 = BT.601 limited,
+  * 1 = BT.709 limited, 2 = BT.601 full, 3 = BT.709 full.
++ * `sand_col_height` != 0 (host-sand): the buffer is NV12_COL128 (SAND, 128-byte columns of that
++ * many lines, luma then chroma); `uv_offset` is then the chroma offset inside a column and
++ * `stride` only the nominal pitch. 0: linear NV12 as above.
+  */
+ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t src_height, uint32_t stride,
+                                    uint32_t uv_offset, uint32_t dst_width,
+                                    uint32_t dst_height, float scale,
+-                                   uint32_t len, int matrix, int *err);
++                                   uint32_t len, int matrix,
++                                   uint32_t sand_col_height, int *err);
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id);
+ int virtio_media_gpu_wait(void *handle);
+ /*
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index b5ac40365..0794b067c 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -217,6 +217,13 @@ typedef struct VirtIOMediaQueue {
+      * reply to the guest must say. matrix: see virtio_media_gpu_import_nv12.
+      */
+     bool nv12_host;
++    /*
++     * host-sand: the host CAPTURE is NV12_COL128 (SAND) rather than linear NV12. Then
++     * bytesperline above is the column height in lines (luma rows + chroma rows), not a
++     * row pitch, and only the GPU path can read the frames.
++     */
++    bool sand;
++    uint32_t sand_col_height;
+     uint32_t rgba_bytesperline;
+     uint32_t rgba_sizeimage;
+     uint32_t host_sizeimage;
+@@ -316,6 +323,12 @@ struct VirtIOMedia {
+      * cannot take the GPU path are converted on the CPU (slow, correct).
+      */
+     bool host_nv12;
++    /*
++     * host-sand (needs host-nv12 and gpu-xfer): ask the codec for NV12_COL128 instead of NV12
++     * and let Mesa detile it. RPi4 bcm2835-codec decodes 1080p60 H.264 at 89 fps into SAND and
++     * at 66 fps into NV12 (measured 2026-10-05). Falls back to NV12 if the codec refuses.
++     */
++    bool host_sand;
+     /*
+      * host-max-width (needs host-nv12): give the guest frames no wider than
+      * this, scaled down by the NV12 shader, and report that size in the

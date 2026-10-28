@@ -180,6 +180,17 @@ XT_DOMA_GPU_PROPS ??= "refresh_rate=60000,"
 # a device model without overlay-planes simply finds too few scanouts and falls back.
 XT_DOMA_OVERLAY_PLANES ??= "0"
 
+# [plane scaling] 1 = DomA's virtio_gpu.plane_scaling=1 (aosp-kernel-patches/common/
+# 0002-drm-virtio-primary-plane-rect): the primary plane may be positioned and scaled,
+# its destination going to the device in VIRTIO_GPU_CMD_SET_PRIMARY_RECT. Needs a device
+# model with the handler, which only qemu 11.1.2 has (its patch q11-064), so it
+# is off here and do_install refuses it with any other device model. Measured on
+# the RPi4 2026-10-12/13 with XT_DOMA_OVERLAY_PLANES = "3": the non-fullscreen WebView
+# ("HMI + video", the scaled video underlay on the primary) goes from all four layers
+# CLIENT to all DEVICE, local 720p60 40 -> 52-55 fps; fullscreen 1080p60 and Gallery
+# unchanged. Without overlays it does nothing useful, so it requires XT_DOMA_OVERLAY_PLANES > 0.
+XT_DOMA_PLANE_SCALING ??= "0"
+
 
 do_compile() {
     dtc -I dts -O dtb -o ${WORKDIR}/doma.dtb ${UNPACKDIR}/doma.dts
@@ -449,6 +460,24 @@ do_install() {
             bbfatal "doma.cfg: virtio_gpu.overlay_planes=$doma_overlays did not reach DomA's command line"
     fi
 
+    # [plane scaling] DomA's half only (the device model's half is qemu 11's q11-064).
+    case "${XT_DOMA_PLANE_SCALING}" in
+    0) ;;
+    1)
+        [ "$doma_overlays" != 0 ] || \
+            bbfatal "XT_DOMA_PLANE_SCALING=1 needs XT_DOMA_OVERLAY_PLANES > 0 (and not the qemu 7 lane)"
+        case "${XT_DM_QEMU_VERSION}" in
+        11.*) ;;
+        *) bbfatal "XT_DOMA_PLANE_SCALING=1 needs the qemu 11 device model (XT_DM_QEMU_VERSION='${XT_DM_QEMU_VERSION}')" ;;
+        esac
+        sed -i -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.plane_scaling=1\"/" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "^extra = \".* virtio_gpu.plane_scaling=1\"\$" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: virtio_gpu.plane_scaling=1 did not reach DomA's command line"
+        ;;
+    *) bbfatal "XT_DOMA_PLANE_SCALING='${XT_DOMA_PLANE_SCALING}': expected 0 or 1" ;;
+    esac
+
     # [qemu 10] Device-model argument fixups. Two of the options in doma.cfg are
     # 7.0.0-xt-only and qemu 10 EXITS on either one -- both measured on RPi5:
     #   virtio-snd-pci        -> "'virtio-snd-pci' is not a valid device model name"
@@ -525,7 +554,7 @@ do_install[vardeps] += "XT_DM_QEMU_VERSION"
 # lane's device, or the other board's backend argument.
 do_install[vardeps] += "XT_DOMA_HWDEC XT_DOMA_HWDEC_DEVARG"
 do_install[vardeps] += "XT_DOMA_GPU_PROPS"
-do_install[vardeps] += "XT_DOMA_OVERLAY_PLANES"
+do_install[vardeps] += "XT_DOMA_OVERLAY_PLANES XT_DOMA_PLANE_SCALING"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \

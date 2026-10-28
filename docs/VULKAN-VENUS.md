@@ -296,6 +296,18 @@ Dom0 writes the guest cfgs, in the syntax of the qemu it names. `doma.cfg`'s
 Bluetooth chardev then gets `reconnect-ms=1000` instead of `reconnect=1`, which
 qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
 
+- `XT_DOMA_PLANE_SCALING` (`xt-xen-cfg-doma`, `0` by default). `1` gives DomA
+  `virtio_gpu.plane_scaling=1` (DomA kernel patch `aosp-kernel-patches/common/0002`),
+  so the primary plane may be positioned and scaled through the device's
+  `SET_PRIMARY_RECT` (`q11-064`). It needs `XT_DOMA_OVERLAY_PLANES` > 0, and
+  `do_install` refuses it with any other device model. Both boards set `1` with
+  qemu 11.
+- The `/run/qemu-*` display-path switches `q11-063` and `q11-066` read, created at
+  boot by each board layer's `xt-qemu-display-toggles`: nine on the Raspberry Pi 4
+  (its ISP and SAND direct scanout among them), three on the Raspberry Pi 5 (the
+  plane handoff, `media-sg-rw` and `fb-invalidate`; the other five act only on a
+  buffer the Pi 4's proxy hands over, and the Pi 5 has no bcm2835 ISP for
+  `media-isp`).
 - `QEMU_XEN_MAPCACHE_MAX_MB`, which the DomD qemu wrapper exports for every
   device model it starts: it caps the foreign mapcache (`q11-053`) at
   `XT_QEMU_MAPCACHE_MAX_MB` from the DomD image recipe: 4608 on a Raspberry Pi 5

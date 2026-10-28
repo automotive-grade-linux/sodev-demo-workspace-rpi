@@ -1,0 +1,4161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 27 Oct 2026 22:42:21 +0900
+Subject: [PATCH] ui/virtio-media: scan video out on weston planes via ISP or
+ SAND
+
+On the Raspberry Pi 4 the DomA video path (virtio-media decoder in the
+DomD device model, NV12 converted to RGBA with a GL shader, then blitted
+by qemu and composited again by weston) does not hold 1080p60. The code
+comments state that the GL conversion (a TFU shadow copy of the
+1920x1088 NV12 frame plus the scaling draw) stretches every V3D job, the
+display blit included, from ~2.5 ms to 3-12 ms; the blit's GPU
+completion goes from 5.7 ms (720p) to 12 ms and weston's flips drop from
+60/s to ~33/s. The VPU itself decodes 1080p at 76 frames/s and runs the
+ISP at 72 frames/s at the same time.
+
+This patch moves the work off V3D in stages. Every stage of the new path
+is a run-time switch, a file under /run that qemu checks with access()
+at most once a second (so removing it turns the feature off without a
+restart); with the file absent that stage is not used. A few supporting
+changes, listed further below, are unconditional. There are no new
+device properties; the SAND parts only act when the existing
+virtio-media property host-sand (default 0) is set, and the GL import
+used by the SAND catch-up needs the existing gpu-xfer property (default
+on).
+
+Data path, from the decoder to the screen:
+
+  - Decoder CAPTURE buffer (CMA, NV12 or SAND NV12_COL128) is exported
+    with VIDIOC_EXPBUF.
+  - host-isp: the VideoCore ISP (bcm2835-codec-isp, /dev/video12)
+    converts it to RGBA into a ring of 24 ISP-owned MMAP buffers (CMA),
+    cropping the codec's 1088-line padding and composing into the
+    guest's visible rectangle. The ISP cannot write the guest's virgl
+    resource directly: vc_sm_cma needs physically contiguous dmabufs and
+    a v3d BO is not.
+  - Each converted frame is copied into the guest resource (a
+    same-format full-surface copy that Mesa v3d turns into one TFU job,
+    ~0.7 ms at 1280x720). The guest's DQBUF events are held in a FIFO,
+    in decode order, until the ISP has returned the codec buffer and the
+    copy is done.
+  - isp-scanout: the ring buffer is published in a direct-scanout
+    registry (ui/direct-scanout.c) keyed by the guest texture. At flush
+    time the SDL display looks the scanout texture up and, when the
+    entry is still current, attaches the dmabuf to the SDL window's
+    wl_surface through zwp_linux_dmabuf_v1 instead of blitting and
+    swapping, so weston can put it on a vc4 plane.
+  - isp-skip-copy: while the display keeps hitting, the copy into the
+    guest resource is skipped and only done (catch-up) when a flush
+    misses.
+  - sand-scanout / sand-skip-isp: the decoder's SAND buffer itself is
+    published as a two-plane NV12 buffer with the Broadcom SAND128
+    modifier, so weston scans it out without the ISP; the guest's QBUF
+    of a buffer still on screen is deferred until wl_buffer.release.
+
+Switches (/run/qemu-*) and their defaults when the file is absent:
+
+  - media-isp: use the ISP for NV12/SAND CAPTURE frames (off). Decided
+    once per decode session. A frame not back after 250 ms closes the
+    ISP and that session falls back to the GL path; a full ring sends
+    one frame the GL way.
+  - isp-scanout: present a published ring buffer directly on the window
+    surface (off). Falls back to the blit for a dmabuf scanout, y0_top,
+    a scanout rectangle that is not the whole window, or active overlay
+    planes. Commits are paced on wl_surface.frame.
+  - isp-scanout-depth: frames that may wait for the frame callback, 1..6
+    (default 4; older ones are dropped). The comment states 17% dropped
+    at 2 and the best flip rate at 4.
+  - isp-skip-copy: skip the copy into the guest resource while the last
+    30 flushes were direct and the last hit is fresher than 100 ms
+    (off). On a miss every skipped copy is made and waited for
+    before the display samples the texture; at most 12 copies are
+    pending.
+  - sand-scanout: publish the decoder's SAND buffer instead of the ISP
+    ring (off). Once weston refuses such a buffer it is not offered
+    again. At most 4 guest QBUFs are deferred; beyond that the buffer
+    goes to the decoder anyway.
+  - sand-skip-isp: with sand-scanout and skip-copy active, do not run
+    the ISP for a frame that goes straight to the screen (off). It
+    requires media-isp and an open ISP session, so the first frame of a
+    session always takes the ISP. The GL conversion is still imported so
+    a miss can fill the guest resource later.
+  - media-sg-rw: copy guest scatter-gather buffers with
+    dma_memory_read/write through the mapcache instead of mapping and
+    unmapping each entry (off).
+  - fb-invalidate: in egl_fb_blit(), invalidate a destination the blit
+    fully covers instead of clearing it, but only when v3d will draw the
+    blit (scaled or flipped) (off). This saves a separate clear job and
+    a full tile load in Mesa v3d.
+
+Other changes that are always on: the SAND luma rows are derived from
+the column height (1632 -> 1088 for 1080p, 1088 -> 720 for 720p) instead
+of col * 2 / 3; where a SAND column of ALIGN(h, 16) * 3 / 2 lines is not
+a multiple of 32 (720p), the codec is asked for a frame padded to
+ALIGN(luma, 64) rows (column 1152) and the guest still sees the
+picture's own height, else plain NV12; the SDL blit copies only the
+guest's scanout rectangle (1280x720 of a 1280x726 video buffer);
+egl_fb_blit_rect() is added; three latency counters are added to the
+existing QEMU_LAT_DIAG output (SDL blit, swap, ISP qbuf->dqbuf).
+
+Measured effects stated in the code comments: with the CMA buffer on a
+weston overlay plane, V3D load 0 and 60 fps; with a commit per flush the
+HDMI got 45 flips/s of ~57 guest frames, hence the frame-callback
+pacing; an 8-slot ring left about half the frames stale (49% direct), 16
+slots still ~1.4% stale at depth 4, hence 24; SAND output costs the VPU
+11.2 ms per 1080p frame against 15 ms with the firmware's NV12
+conversion.
+
+Adds ui/linux-dmabuf-unstable-v1-protocol.c and
+ui/linux-dmabuf-unstable-v1-client-protocol.h, generated with
+wayland-scanner 1.24.0. They are built only when wayland-client is
+found; without it the direct scanout functions are stubs.
+
+Left for later (2026-10-27, Raspberry Pi 4): the CAPTURE ring is
+allocated whole (24 frames, about 88 MB of CMA at 720p) on the main
+loop with the BQL held whenever a capture session starts, and a
+session also starts when a WebView's player switches quality;
+43 ms (480p) and 72 ms (720p) holds were seen there, inferred from the
+log order. Allocate it lazily or off the main loop (a comment at
+VIRTIO_MEDIA_ISP_RING says the same).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [Raspberry Pi 4 specific (bcm2835 ISP, SAND, vc4 planes), run-time experiment switches]
+---
+ hw/display/virtio-gpu.c                       |    2 +
+ hw/virtio/meson.build                         |    2 +-
+ hw/virtio/virtio-media-isp.c                  |  342 ++++++
+ hw/virtio/virtio-media-virgl-stub.c           |    5 +
+ hw/virtio/virtio-media-virgl.c                |   12 +
+ hw/virtio/virtio-media.c                      | 1040 +++++++++++++++-
+ include/hw/virtio/virtio-gpu.h                |    3 +-
+ include/hw/virtio/virtio-media-isp.h          |   51 +
+ include/hw/virtio/virtio-media-virgl.h        |    2 +
+ include/hw/virtio/virtio-media.h              |   64 +
+ include/ui/direct-scanout.h                   |   57 +
+ include/ui/egl-helpers.h                      |    3 +
+ include/ui/sdl2.h                             |    7 +
+ ui/direct-scanout.c                           |  125 ++
+ ui/egl-helpers.c                              |   85 +-
+ ui/linux-dmabuf-unstable-v1-client-protocol.h | 1084 +++++++++++++++++
+ ui/linux-dmabuf-unstable-v1-protocol.c        |  120 ++
+ ui/meson.build                                |    6 +-
+ ui/sdl2-gl.c                                  |   75 +-
+ ui/sdl2-wl-scanout.c                          |  558 +++++++++
+ 20 files changed, 3623 insertions(+), 20 deletions(-)
+ create mode 100644 hw/virtio/virtio-media-isp.c
+ create mode 100644 include/hw/virtio/virtio-media-isp.h
+ create mode 100644 include/ui/direct-scanout.h
+ create mode 100644 ui/direct-scanout.c
+ create mode 100644 ui/linux-dmabuf-unstable-v1-client-protocol.h
+ create mode 100644 ui/linux-dmabuf-unstable-v1-protocol.c
+ create mode 100644 ui/sdl2-wl-scanout.c
+
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index ac3593b25..31a1b453a 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -185,6 +185,8 @@ void qemu_lat_diag_add(int kind, int64_t ns)
+         "gpu FLUSH fenced (pop->resp)", "gpu SET_SCANOUT* (pop->resp)",
+         "gpu SUBMIT_3D queue (pop->start)", "gpu SUBMIT_3D (pop->resp)",
+         "gpu process_cmdq run", "media drain",
++        "sdl blit (+overlays)", "sdl swap",
++        "media isp (qbuf->dqbuf)",
+     };
+     int64_t now;
+     int k;
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index 0ecc6d4d9..4c88c28a9 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -96,7 +96,7 @@ virtio_pci_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media-pci.
+ system_virtio_ss.add_all(when: 'CONFIG_VIRTIO_PCI', if_true: virtio_pci_ss)
+ 
+ system_ss.add_all(when: 'CONFIG_VIRTIO', if_true: system_virtio_ss)
+-system_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media.c'))
++system_ss.add(when: 'CONFIG_VIRTIO_MEDIA', if_true: files('virtio-media.c', 'virtio-media-isp.c'))
+ # Decoder mode links libavcodec/libavutil/libswscale. The file is compiled
+ # unconditionally and stubs itself out when CONFIG_VIRTIO_MEDIA_DECODER is unset,
+ # so virtio-media.c needs no #ifdef and a build without ffmpeg still links.
+diff --git a/hw/virtio/virtio-media-isp.c b/hw/virtio/virtio-media-isp.c
+new file mode 100644
+index 000000000..ebf6ade43
+--- /dev/null
++++ b/hw/virtio/virtio-media-isp.c
+@@ -0,0 +1,342 @@
++/*
++ * virtio-media: host-isp -- convert the codec's NV12 CAPTURE frames to RGBA with the
++ * VideoCore ISP (bcm2835-codec-isp, an M2M device) instead of the GL shader, so V3D
++ * only has a same-format RGBA copy left per frame.
++ *
++ * Why (RPi4): at 1080p60 the GL conversion (TFU shadow copy of the 1920x1088
++ * NV12 frame plus the scaling draw) stretches every V3D job, the display blit included,
++ * from ~2.5 ms to 3-12 ms; the blit's GPU completion goes from 5.7 ms (720p) to 12 ms
++ * and weston's flips drop from 60/s to ~33/s. Measured on DomD, the VPU decodes 1080p
++ * and runs the ISP at the same time at 76 and 72 frames/s.
++ *
++ * The ISP cannot write the guest's virgl resource directly: bcm2835-codec imports
++ * dmabufs through vc_sm_cma and needs them physically contiguous, and a v3d BO is not
++ * ("contiguous chunk is too small 3670016/3717120", vc_sm_cma_import_dmabuf -12).
++ * So the OUTPUT queue takes the codec's CAPTURE buffer (CMA, exported with
++ * VIDIOC_EXPBUF) as a dmabuf, and the CAPTURE queue is a small ring of the ISP's own
++ * MMAP buffers (CMA), exported once so the caller can import them into GL and copy
++ * each converted frame into the guest resource (a full-surface same-format copy, which
++ * Mesa v3d turns into one TFU job, ~0.7 ms at 1280x720).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++
++#include <sys/ioctl.h>
++#include <linux/videodev2.h>
++
++#include "qemu/log.h"
++#include "hw/virtio/virtio-media-isp.h"
++
++#define ISP_DEV "/dev/video12"
++
++struct VirtIOMediaIsp {
++    int fd;
++    uint32_t nsrc;
++    uint32_t nring;
++    uint32_t dst_len;
++    int dst_fd[VIRTIO_MEDIA_ISP_MAX_RING];
++    /*
++     * The two queues complete independently (bcm2835-codec: buffered, ignore_cap_streaming,
++     * separate ip/op buffer callbacks), so each keeps its own count.
++     */
++    uint32_t cap_in_flight;
++    uint32_t src_in_flight;
++};
++
++/* CmaFree from /proc/meminfo in kB, or -1: the ring is 4-6 x 3.7 MB of the CMA pool */
++static long isp_cma_free_kb(void)
++{
++    g_autofree char *mi = NULL;
++    const char *p;
++
++    if (!g_file_get_contents("/proc/meminfo", &mi, NULL, NULL)) {
++        return -1;
++    }
++    p = strstr(mi, "CmaFree:");
++    return p ? strtol(p + 8, NULL, 10) : -1;
++}
++
++static int isp_set_fmt(int fd, uint32_t type, uint32_t fourcc, uint32_t w, uint32_t h,
++                       uint32_t bpl, uint32_t sizeimage, int matrix, bool rgb,
++                       uint32_t *bpl_out, uint32_t *size_out)
++{
++    struct v4l2_format f = { .type = type };
++
++    f.fmt.pix_mp.width = w;
++    f.fmt.pix_mp.height = h;
++    f.fmt.pix_mp.pixelformat = fourcc;
++    f.fmt.pix_mp.field = V4L2_FIELD_NONE;
++    f.fmt.pix_mp.num_planes = 1;
++    f.fmt.pix_mp.plane_fmt[0].bytesperline = bpl;
++    f.fmt.pix_mp.plane_fmt[0].sizeimage = sizeimage;
++    if (rgb) {
++        f.fmt.pix_mp.colorspace = V4L2_COLORSPACE_SRGB;
++        f.fmt.pix_mp.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++    } else {
++        /* matrix: bit 0 = BT.709 (else BT.601), bit 1 = full range */
++        f.fmt.pix_mp.colorspace = (matrix & 1) ? V4L2_COLORSPACE_REC709
++                                               : V4L2_COLORSPACE_SMPTE170M;
++        f.fmt.pix_mp.ycbcr_enc = (matrix & 1) ? V4L2_YCBCR_ENC_709
++                                              : V4L2_YCBCR_ENC_601;
++        f.fmt.pix_mp.quantization = (matrix & 2) ? V4L2_QUANTIZATION_FULL_RANGE
++                                                 : V4L2_QUANTIZATION_LIM_RANGE;
++    }
++    if (ioctl(fd, VIDIOC_S_FMT, &f) < 0) {
++        return -errno;
++    }
++    if (f.fmt.pix_mp.width != w || f.fmt.pix_mp.height != h ||
++        f.fmt.pix_mp.pixelformat != fourcc) {
++        return -EINVAL;
++    }
++    *bpl_out = f.fmt.pix_mp.plane_fmt[0].bytesperline;
++    *size_out = f.fmt.pix_mp.plane_fmt[0].sizeimage;
++    return 0;
++}
++
++/* S_SELECTION target on queue type, rect (0, 0, w, h). 0 or -errno. */
++static int isp_set_sel(int fd, uint32_t type, uint32_t target, uint32_t w, uint32_t h)
++{
++    struct v4l2_selection sel = { .type = type, .target = target };
++
++    sel.r.width = w;
++    sel.r.height = h;
++    if (ioctl(fd, VIDIOC_S_SELECTION, &sel) < 0) {
++        return -errno;
++    }
++    return sel.r.width == w && sel.r.height == h ? 0 : -EINVAL;
++}
++
++static int isp_reqbufs(int fd, uint32_t type, uint32_t memory, uint32_t count)
++{
++    struct v4l2_requestbuffers rb = { .count = count, .type = type, .memory = memory };
++
++    if (ioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
++        return -errno;
++    }
++    return rb.count >= count || count == 0 ? 0 : -ENOBUFS;
++}
++
++VirtIOMediaIsp *virtio_media_isp_open(uint32_t src_fourcc, uint32_t src_w, uint32_t src_h,
++                                      uint32_t src_bpl,
++                                      uint32_t src_len, uint32_t dst_w, uint32_t dst_h,
++                                      uint32_t dst_bpl, uint32_t crop_w, uint32_t crop_h,
++                                      uint32_t comp_w, uint32_t comp_h, int matrix,
++                                      uint32_t nsrc, uint32_t nring, int *err)
++{
++    VirtIOMediaIsp *isp;
++    uint32_t bpl = 0, size = 0, type, k;
++    int fd, r;
++
++    if (nring == 0 || nring > VIRTIO_MEDIA_ISP_MAX_RING) {
++        *err = -EINVAL;
++        return NULL;
++    }
++    fd = open(ISP_DEV, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    if (fd < 0) {
++        *err = -errno;
++        return NULL;
++    }
++    isp = g_new0(VirtIOMediaIsp, 1);
++    isp->fd = fd;
++    isp->nsrc = nsrc;
++    isp->nring = nring;
++    for (k = 0; k < VIRTIO_MEDIA_ISP_MAX_RING; k++) {
++        isp->dst_fd[k] = -1;
++    }
++    /*
++     * NV12, or NV12_COL128 (SAND, the codec's native output: 11.2 ms per 1080p frame on the
++     * VPU instead of 15 ms with the firmware's NV12 conversion). For SAND, bytesperline is
++     * the column height in lines and must be at least height * 3 / 2, so the caller passes
++     * the visible luma rows (1080 for a 1620-line column), not the padded 1088.
++     */
++    r = isp_set_fmt(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, src_fourcc, src_w,
++                    src_h, src_bpl, src_len, matrix, false, &bpl, &size);
++    if (!r && bpl != src_bpl) {
++        r = -EINVAL;
++    }
++    if (!r) {
++        r = isp_set_fmt(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_PIX_FMT_RGBA32,
++                        dst_w, dst_h, dst_bpl, dst_bpl * dst_h, matrix, true, &bpl, &size);
++        if (!r && bpl != dst_bpl) {
++            /* the GL copy into the guest resource is same-pitch: insist on it */
++            r = -EINVAL;
++        }
++        isp->dst_len = size;
++    }
++    /*
++     * Only the visible part of the frame: the codec pads 1080p to 1088 lines, and those 8
++     * lines (uninitialised in SAND) were scaled into the bottom of the picture as block
++     * noise (2026-10-07). Crop the input to the visible rectangle and compose the output
++     * into the guest's visible rectangle, which makes 1080 -> 720 an exact 1.5; the rows
++     * below it stay as allocated (zero, black). Both are set before REQBUFS, when the
++     * driver applies them to the component.
++     */
++    if (!r && crop_w && crop_h && (crop_w != src_w || crop_h != src_h)) {
++        r = isp_set_sel(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT, V4L2_SEL_TGT_CROP, crop_w, crop_h);
++    }
++    if (!r && comp_w && comp_h && (comp_w != dst_w || comp_h != dst_h)) {
++        r = isp_set_sel(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_SEL_TGT_COMPOSE, comp_w, comp_h);
++    }
++    if (!r) {
++        r = isp_reqbufs(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_MEMORY_DMABUF, nsrc);
++    }
++    if (!r) {
++        r = isp_reqbufs(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_MEMORY_MMAP, nring);
++    }
++    for (k = 0; !r && k < nring; k++) {
++        struct v4l2_exportbuffer eb = {
++            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .index = k, .plane = 0,
++            .flags = O_RDONLY | O_CLOEXEC,
++        };
++
++        if (ioctl(fd, VIDIOC_EXPBUF, &eb) < 0) {
++            r = -errno;
++        } else {
++            isp->dst_fd[k] = eb.fd;
++        }
++    }
++    if (!r) {
++        type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
++            r = -errno;
++        }
++    }
++    if (!r) {
++        type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
++            r = -errno;
++        }
++    }
++    if (r) {
++        qemu_log("virtio-media-diag: host_isp: open %ux%u %s bpl %u -> %ux%u bpl %u "
++                 "failed (%d, ISP bpl %u, CmaFree %ld kB)\n", src_w, src_h,
++                 src_fourcc == V4L2_PIX_FMT_NV12_COL128 ? "NC12" : "NV12", src_bpl,
++                 dst_w, dst_h, dst_bpl, r, bpl, isp_cma_free_kb());
++        virtio_media_isp_close(isp);
++        *err = r;
++        return NULL;
++    }
++    qemu_log("virtio-media-diag: host_isp: %ux%u %s (bpl %u, crop %ux%u) -> %ux%u RGBA "
++             "(bpl %u, %u bytes, compose %ux%u), %u codec buffers, ring of %u, matrix %d, "
++             "CmaFree %ld kB\n",
++             src_w, src_h, src_fourcc == V4L2_PIX_FMT_NV12_COL128 ? "NC12" : "NV12",
++             src_bpl, crop_w, crop_h, dst_w, dst_h, dst_bpl, isp->dst_len, comp_w, comp_h,
++             nsrc, nring, matrix, isp_cma_free_kb());
++    return isp;
++}
++
++int virtio_media_isp_fd(VirtIOMediaIsp *isp)
++{
++    return isp->fd;
++}
++
++uint32_t virtio_media_isp_in_flight(VirtIOMediaIsp *isp)
++{
++    return isp->cap_in_flight + isp->src_in_flight;
++}
++
++uint32_t virtio_media_isp_ring_size(VirtIOMediaIsp *isp)
++{
++    return isp->nring;
++}
++
++int virtio_media_isp_ring_fd(VirtIOMediaIsp *isp, uint32_t k, uint32_t *len)
++{
++    if (k >= isp->nring || isp->dst_fd[k] < 0) {
++        return -EINVAL;
++    }
++    *len = isp->dst_len;
++    return isp->dst_fd[k];
++}
++
++int virtio_media_isp_submit(VirtIOMediaIsp *isp, uint32_t src_index, int src_fd,
++                            uint32_t src_len, uint32_t src_used, uint32_t ring_index)
++{
++    struct v4l2_plane dpl = { .length = isp->dst_len };
++    struct v4l2_buffer db = {
++        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .memory = V4L2_MEMORY_MMAP,
++        .index = ring_index, .length = 1, .m.planes = &dpl,
++    };
++    struct v4l2_plane spl = { .length = src_len, .bytesused = src_used, .m.fd = src_fd };
++    struct v4l2_buffer sb = {
++        .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_DMABUF,
++        .index = src_index, .length = 1, .m.planes = &spl,
++    };
++
++    if (src_index >= isp->nsrc || ring_index >= isp->nring) {
++        return -EINVAL;
++    }
++    if (ioctl(isp->fd, VIDIOC_QBUF, &db) < 0) {
++        return -errno;
++    }
++    if (ioctl(isp->fd, VIDIOC_QBUF, &sb) < 0) {
++        /*
++         * The ring buffer stays queued with no input to pair with. It is not counted, so
++         * the caller can close the ISP (which takes it back) without waiting for it.
++         */
++        return -errno;
++    }
++    isp->cap_in_flight++;
++    isp->src_in_flight++;
++    return 0;
++}
++
++int virtio_media_isp_reap(VirtIOMediaIsp *isp, uint32_t *ring_index)
++{
++    struct v4l2_plane pl = { 0 };
++    struct v4l2_buffer b = {
++        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .memory = V4L2_MEMORY_MMAP,
++        .length = 1, .m.planes = &pl,
++    };
++
++    if (ioctl(isp->fd, VIDIOC_DQBUF, &b) < 0) {
++        return -errno;
++    }
++    *ring_index = b.index;
++    if (isp->cap_in_flight) {
++        isp->cap_in_flight--;
++    }
++    return (b.flags & V4L2_BUF_FLAG_ERROR) ? -EIO : 0;
++}
++
++int virtio_media_isp_reap_src(VirtIOMediaIsp *isp, uint32_t *src_index)
++{
++    struct v4l2_plane pl = { 0 };
++    struct v4l2_buffer b = {
++        .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_DMABUF,
++        .length = 1, .m.planes = &pl,
++    };
++
++    if (ioctl(isp->fd, VIDIOC_DQBUF, &b) < 0) {
++        return -errno;
++    }
++    *src_index = b.index;
++    if (isp->src_in_flight) {
++        isp->src_in_flight--;
++    }
++    return 0;
++}
++
++void virtio_media_isp_close(VirtIOMediaIsp *isp)
++{
++    uint32_t type, k;
++
++    if (!isp) {
++        return;
++    }
++    type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    ioctl(isp->fd, VIDIOC_STREAMOFF, &type);
++    type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++    ioctl(isp->fd, VIDIOC_STREAMOFF, &type);
++    for (k = 0; k < VIRTIO_MEDIA_ISP_MAX_RING; k++) {
++        if (isp->dst_fd[k] >= 0) {
++            close(isp->dst_fd[k]);
++        }
++    }
++    isp_reqbufs(isp->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_MEMORY_MMAP, 0);
++    isp_reqbufs(isp->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_MEMORY_DMABUF, 0);
++    close(isp->fd);
++    g_free(isp);
++}
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+index 307a4fafc..d8326d7cf 100644
+--- a/hw/virtio/virtio-media-virgl-stub.c
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -50,6 +50,11 @@ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
+     return NULL;
+ }
+ 
++uint32_t virtio_media_gpu_res_tex(uint32_t res_id)
++{
++    return 0;
++}
++
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+ {
+     return -ENOTSUP;
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 6baf08ce4..fa9096583 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -888,6 +888,18 @@ out_fail:
+     return NULL;
+ }
+ 
++uint32_t virtio_media_gpu_res_tex(uint32_t res_id)
++{
++    struct virgl_renderer_resource_info info;
++
++    memset(&info, 0, sizeof(info));
++    if (!virtio_gpu_virgl_ready ||
++        virgl_renderer_resource_get_info(res_id, &info) != 0) {
++        return 0;
++    }
++    return info.tex_id;
++}
++
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+ {
+     VirtIOMediaGpuBuf *b = handle;
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index f6c590ae6..e4f52002b 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -25,6 +25,10 @@
+ #include "hw/virtio/virtio-media.h"
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-media-virgl.h"
++#include "hw/virtio/virtio-media-isp.h"
++#include "ui/direct-scanout.h"
++
++static void virtio_media_isp_teardown(VirtIOMediaQueue *q);
+ #include "standard-headers/linux/virtio_ids.h"
+ #include "system/dma.h"
+ 
+@@ -171,6 +175,9 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+     q->num_host_planes = 0;
+     q->streaming = false;
+     q->gpu_failed = false;
++    virtio_media_isp_teardown(q);
++    q->isp_checked = false;
++    q->isp_failed = false;
+     g_free(q->conv_scratch);
+     q->conv_scratch = NULL;
+     q->conv_scratch_len = 0;
+@@ -266,6 +273,23 @@ static inline bool virtio_media_pf_is_host_yuv(uint32_t pf)
+ }
+ 
+ /* host-sand: remember whether the host frame is SAND, and its column height. */
++/*
++ * The luma rows of a SAND column of col lines: the codec stores ALIGN(h, 16) luma lines
++ * then ALIGN(that / 2, 16) chroma lines (1632 = 1088 + 544, 1088 = 720 + 368), so the
++ * chroma starts at the Y with Y + ALIGN(Y / 2, 16) == col. col * 2 / 3 when nothing fits.
++ * (2026-10-08: 720p still showed noise with 720 rows, so the firmware's own rule is
++ * not confirmed.)
++ */
++static uint32_t virtio_media_sand_luma_rows(uint32_t col)
++{
++    for (uint32_t y = (col * 2 / 3) & ~15u; y >= 16; y -= 16) {
++        if (y + ((y / 2 + 15) & ~15u) == col) {
++            return y;
++        }
++    }
++    return col * 2 / 3;
++}
++
+ static void virtio_media_note_sand(VirtIOMediaQueue *q, const struct v4l2_format *f)
+ {
+     q->sand = virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12_COL128;
+@@ -421,12 +445,48 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
+  * because one QEMU serves every DomA virtio device, would take the guest's
+  * rootfs disk down with it.
+  */
++/* q11-sg-rw: copy through the mapcache's buckets, no map/unmap per call */
++static bool virtio_media_sg_rw_on(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now - checked >= 1000) {
++        checked = now;
++        on = access("/run/qemu-media-sg-rw", F_OK) == 0;
++    }
++    return on;
++}
++
+ bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
+                           void *host, size_t host_len, bool to_guest)
+ {
+     size_t done = 0;
+     uint32_t i;
+ 
++    if (virtio_media_sg_rw_on()) {
++        for (i = 0; i < sg->nents && done < host_len; i++) {
++            size_t n = MIN((size_t)sg->ents[i].len, host_len - done);
++            MemTxResult r;
++
++            if (to_guest) {
++                r = dma_memory_write(&address_space_memory, sg->ents[i].start,
++                                     (uint8_t *)host + done, n, MEMTXATTRS_UNSPECIFIED);
++            } else {
++                r = dma_memory_read(&address_space_memory, sg->ents[i].start,
++                                    (uint8_t *)host + done, n, MEMTXATTRS_UNSPECIFIED);
++            }
++            if (r != MEMTX_OK) {
++                error_report("virtio-media: cannot %s guest 0x%" HWADDR_PRIx " (%zu bytes)",
++                             to_guest ? "write" : "read", (hwaddr)sg->ents[i].start, n);
++                return false;
++            }
++            done += n;
++        }
++        return true;
++    }
++
+     for (i = 0; i < sg->nents && done < host_len; i++) {
+         hwaddr gpa = sg->ents[i].start;
+         size_t remaining = sg->ents[i].len;
+@@ -518,6 +578,843 @@ void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
+  * first frame with nothing in the log to say why.
+  */
+ /* Called only when POLLPRI is set. Drains every pending V4L2 event. */
++/* ------------------------------------------------------------------------- */
++/* host-isp (virtio-media-isp.c)                                             */
++/* ------------------------------------------------------------------------- */
++
++/*
++ * ISP CAPTURE ring: 24 x 3.7 MB of CMA at 1280x726 (DomD reserves 336 MiB). With
++ * isp-scanout the display presents a ring buffer only while it still holds that frame
++ * (seq), but the guest shows a frame up to ~11 frames (its CAPTURE backlog, ~180 ms at
++ * 60 fps) after we hand it out: with 8 slots about half were already reused (49% direct,
++ * 2026-10-07). With 16, slot k is reused only after ~13 newer frames, which needs more
++ * CAPTURE buffers than the guest has (11): the guest has shown or dropped its frame by then.
++ * 24: the display also holds the frames waiting for its frame callback (depth 4..6) and
++ * the 2 it has attached; at 16 that made ~1.4% stale again at depth 4.
++ *
++ * Left for later (Raspberry Pi 4, 2026-10-27): the ring is allocated whole when a capture
++ * session starts, on the main loop with the BQL held -- 24 frames, about 88 MB of CMA at
++ * 1280x720. A session also starts when a WebView's player switches quality (854x480
++ * -> 1280x720): the main loop was held 43 ms (480p) and 72 ms (720p) there, the longest
++ * holds of the HMI runs (inferred from the log order, not timed directly), long enough
++ * to starve virtio-snd. With sand-skip-isp on, the ring is mostly unused. Allocate it a
++ * few slots at a time as frames need them, or off the main loop.
++ */
++#define VIRTIO_MEDIA_ISP_RING 24
++QEMU_BUILD_BUG_ON(VIRTIO_MEDIA_ISP_RING > VIRTIO_MEDIA_ISP_MAX_RING);
++QEMU_BUILD_BUG_ON(ARRAY_SIZE(((VirtIOMediaQueue *)0)->isp_gpu) < VIRTIO_MEDIA_ISP_MAX_RING);
++
++/* a held frame whose ISP side has not gone ready by then is given up (see _frame) */
++#define VIRTIO_MEDIA_ISP_STALL_NS (250 * SCALE_MS)
++
++/*
++ * A held guest event. The guest may only get the codec buffer back once the ISP has
++ * returned it (src) and the converted frame is in the guest resource (cap_done); the two
++ * complete independently.
++ */
++typedef struct VirtIOMediaIspEvt {
++    struct virtio_media_event_dqbuf evt;
++    uint32_t ring;
++    uint32_t src;
++    int64_t t;
++    bool cap_done;
++    bool ready;
++} VirtIOMediaIspEvt;
++
++static void virtio_media_isp_stalled(void *opaque);
++
++/*
++ * isp-scanout: the display may scan a ring buffer out directly. It asks
++ * whether slot still holds content seq (published at reap) ...
++ */
++static bool virtio_media_isp_scan_current(void *owner, uint32_t slot, uint64_t seq)
++{
++    VirtIOMediaQueue *q = owner;
++
++    if (!q->isp || slot >= VIRTIO_MEDIA_ISP_RING) {
++        q->isp_scan_off++;
++        return false;
++    }
++    if (q->isp_ring_seq[slot] != seq || q->isp_ring_busy[slot]) {
++        q->isp_scan_stale++; /* reused for a newer frame before the guest showed this one */
++        return false;
++    }
++    return true;
++}
++
++/* ... and tells us when it starts and stops scanning it out (wl_buffer.release) */
++static void virtio_media_isp_scan_hold(void *owner, uint32_t slot, bool held)
++{
++    VirtIOMediaQueue *q = owner;
++
++    if (slot < VIRTIO_MEDIA_ISP_RING) {
++        q->isp_ring_held[slot] = held;
++    }
++}
++
++/*
++ * q11-sand-scanout: the decoder's SAND buffer on screen. The display
++ * asks whether decoder buffer idx still holds generation seq (not given back to the decoder) ...
++ */
++#define VIRTIO_MEDIA_SAND_DEFER_MAX 4
++#define VM_SAND128_COL_HEIGHT(h) ((0x07ULL << 56) | (((uint64_t)(h) & 0xffffffffffffULL) << 8) | 4)
++
++static void virtio_media_update_fd_handler(VirtIOMediaSession *s);
++
++static bool virtio_media_sand_on(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now - checked >= 1000) {
++        checked = now;
++        on = access("/run/qemu-sand-scanout", F_OK) == 0;
++    }
++    return on;
++}
++
++static bool virtio_media_sand_scan_current(void *owner, uint32_t slot, uint64_t seq)
++{
++    VirtIOMediaQueue *q = owner;
++
++    if (!q->isp || slot >= VIRTIO_MEDIA_MAX_BUFFERS) {
++        q->isp_scan_off++;
++        return false;
++    }
++    if (q->sand_seq[slot] != seq || q->sand_hostq[slot]) {
++        q->isp_scan_stale++;
++        return false;
++    }
++    return true;
++}
++
++/* give a deferred buffer to the decoder now */
++static void virtio_media_sand_qbuf(VirtIOMediaQueue *q, uint32_t idx)
++{
++    VirtIOMediaSession *s = q->sand_sess;
++    struct v4l2_buffer hb = q->sand_hb[idx];
++
++    q->sand_defer[idx] = false;
++    q->sand_defer_n--;
++    if (!s) {
++        return;
++    }
++    if (V4L2_TYPE_IS_MULTIPLANAR(hb.type)) {
++        hb.m.planes = q->sand_hp[idx];
++    }
++    if (ioctl(s->fd, VIDIOC_QBUF, &hb) < 0) {
++        q->sand_qbuf_err++;
++        warn_report_once("virtio-media: sand-scanout: deferred QBUF %u failed (%d)", idx, errno);
++        return;
++    }
++    q->sand_hostq[idx] = true;
++    if (s->fd_parked) {
++        s->fd_parked = false;
++        virtio_media_update_fd_handler(s);
++    }
++}
++
++/* ... and tells us when it starts / stops scanning it out (wl_buffer.release) */
++static void virtio_media_sand_scan_hold(void *owner, uint32_t slot, bool held)
++{
++    VirtIOMediaQueue *q = owner;
++
++    if (slot >= VIRTIO_MEDIA_MAX_BUFFERS) {
++        return;
++    }
++    q->sand_held[slot] = held;
++    if (!held && q->sand_defer[slot]) {
++        virtio_media_sand_qbuf(q, slot);
++    }
++}
++
++/* the guest queued decoder buffer idx: keep it from the decoder while the display holds it */
++static bool virtio_media_sand_defer(VirtIOMediaQueue *q, uint32_t idx, const struct v4l2_buffer *hb,
++                                    const struct v4l2_plane *planes)
++{
++    if (idx >= VIRTIO_MEDIA_MAX_BUFFERS || !q->sand_held[idx]) {
++        return false;
++    }
++    if (q->sand_defer_n >= VIRTIO_MEDIA_SAND_DEFER_MAX) {
++        q->sand_defer_forced++; /* the decoder must not starve: queue it anyway */
++        return false;
++    }
++    q->sand_hb[idx] = *hb;
++    if (V4L2_TYPE_IS_MULTIPLANAR(hb->type) && planes) {
++        memcpy(q->sand_hp[idx], planes, sizeof(q->sand_hp[idx]));
++    }
++    q->sand_defer[idx] = true;
++    q->sand_defer_n++;
++    q->sand_defer_tot++;
++    return true;
++}
++
++/* the session or the stream goes: queue (qbuf) or forget every deferred buffer */
++static void virtio_media_sand_drop(VirtIOMediaQueue *q, bool qbuf)
++{
++    uint32_t i;
++
++    if (q->sand_pub_n || q->sand_defer_tot || q->sand_skip_n) { /* q11-sand-skip-isp */
++        qemu_log("virtio-media-diag: sand-scanout: %" PRIu64 " published, %" PRIu64
++                 " QBUF deferred, %" PRIu64 " forced, %" PRIu64 " deferred QBUF errors, %u pending, "
++                 "%" PRIu64 " frames without the ISP, %" PRIu64 " caught up, %" PRIu64 " lost\n",
++                 q->sand_pub_n, q->sand_defer_tot, q->sand_defer_forced, q->sand_qbuf_err,
++                 q->sand_defer_n, q->sand_skip_n, q->sand_catch_n, q->sand_catch_lost);
++    }
++    for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
++        q->sand_held[i] = false;
++        if (q->sand_defer[i]) {
++            if (qbuf) {
++                virtio_media_sand_qbuf(q, i);
++            } else {
++                q->sand_defer[i] = false;
++            }
++        }
++    }
++    q->sand_defer_n = 0;
++    q->sand_pub_n = q->sand_defer_tot = q->sand_defer_forced = q->sand_qbuf_err = 0;
++    q->sand_skip_n = q->sand_catch_n = q->sand_catch_lost = 0;
++    memset(q->sand_cpend, 0, sizeof(q->sand_cpend));
++    q->sand_import_failed = false;
++}
++
++/* publish decoder buffer idx for texture tex; false: not possible (use the ring) */
++static bool virtio_media_sand_publish_idx(VirtIOMediaQueue *q, uint32_t tex, uint32_t idx)
++{
++    uint32_t luma_rows;
++
++    if (!virtio_media_sand_on() || !direct_scanout_sand_usable() || !q->sand ||
++        !q->sand_col_height || idx >= VIRTIO_MEDIA_MAX_BUFFERS || !q->isp_src_fd[idx] ||
++        q->sand_hostq[idx]) {
++        return false;
++    }
++    luma_rows = q->sand_luma ? q->sand_luma : virtio_media_sand_luma_rows(q->sand_col_height);
++    {
++        DirectScanout d = {
++            .owner = q, .epoch = q->isp_epoch, .fd = q->isp_src_fd[idx] - 1,
++            .width = q->host_vis_w ? q->host_vis_w : q->width,
++            .height = q->host_vis_h ? q->host_vis_h : luma_rows,
++            .stride = q->width,
++            .fourcc = 0x3231564e /* NV12 */, .modifier = VM_SAND128_COL_HEIGHT(q->sand_col_height),
++            .offset1 = luma_rows * 128, .pitch1 = q->width,
++            .slot = idx, .seq = q->sand_seq[idx],
++            .current = virtio_media_sand_scan_current, .hold = virtio_media_sand_scan_hold,
++        };
++
++        direct_scanout_publish(tex, &d);
++    }
++    q->sand_pub_n++;
++    return true;
++}
++
++/* publish the decoder buffer of ring slot k for texture tex instead of the ring */
++static bool virtio_media_sand_publish(VirtIOMediaQueue *q, uint32_t tex, uint32_t k)
++{
++    return virtio_media_sand_publish_idx(q, tex, q->isp_ring_src[k]);
++}
++
++/* q11-sand-skip-isp: the experiment toggle */
++static bool virtio_media_sand_skip_on(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now - checked >= 1000) {
++        checked = now;
++        on = access("/run/qemu-sand-skip-isp", F_OK) == 0;
++    }
++    return on;
++}
++
++static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_t except);
++static void virtio_media_isp_catch_up(void *owner);
++
++/*
++ * q11-sand-catchup: the GL path's import of decoder buffer idx (as in host_readable_body), so a
++ * skipped frame can still be converted into its resource later. true when q->gpu_buf[idx] exists.
++ */
++static bool virtio_media_sand_gpu_import(VirtIOMediaSession *s, VirtIOMediaQueue *q, uint32_t idx)
++{
++    struct v4l2_exportbuffer eb = {
++        .type = q->type, .index = idx, .plane = 0, .flags = O_RDONLY | O_CLOEXEC,
++    };
++    uint32_t dst_bpl = q->nv12_host ? q->rgba_bytesperline : q->bytesperline;
++    uint32_t dst_h = q->scaled_h ? q->scaled_h : q->height;
++    float scale = q->scaled_w && q->host_w ? (float)q->host_w / q->scaled_w : 1.0f;
++    uint32_t luma_rows;
++    int e = 0;
++
++    if (q->gpu_buf[idx]) {
++        return true;
++    }
++    if (!s->vm->gpu_xfer || q->gpu_failed || q->sand_import_failed || !q->nv12_host || !q->sand) {
++        return false;
++    }
++    if (ioctl(s->fd, VIDIOC_EXPBUF, &eb) < 0) {
++        return false;
++    }
++    luma_rows = q->sand_luma ? q->sand_luma : virtio_media_sand_luma_rows(q->sand_col_height);
++    if (s->vm->host_sand == 2) {
++        q->gpu_buf[idx] = virtio_media_gpu_import_sand_linear(
++            eb.fd, q->width, luma_rows, q->sand_col_height, dst_bpl / 4, dst_h, scale,
++            q->host_sizeimage && q->host_sizeimage <= q->host_len[idx][0] ? q->host_sizeimage : 0,
++            q->matrix, &e);
++    } else {
++        q->gpu_buf[idx] = virtio_media_gpu_import_nv12(
++            eb.fd, q->width, luma_rows, q->width, luma_rows * 128, dst_bpl / 4, dst_h, scale,
++            q->host_len[idx][0], q->matrix, q->sand_col_height, &e);
++    }
++    if (!q->gpu_buf[idx]) {
++        /* the import closed eb.fd itself; a hard failure stops further attempts */
++        if (e != -EAGAIN) {
++            q->sand_import_failed = true;
++        }
++        warn_report_once("virtio-media: sand-catchup: GL import of buffer %u failed (%d)", idx, e);
++        return false;
++    }
++    return true;
++}
++
++/*
++ * q11-sand-skip-isp: decoder buffer idx just came back for guest resource res. While the display
++ * presents directly, put the decoder buffer itself on screen and skip the ISP (true); the caller then
++ * completes the frame like any other. false: convert it as before.
++ */
++static bool virtio_media_sand_skip(VirtIOMediaSession *s, VirtIOMediaQueue *q, uint32_t idx,
++                                  uint32_t res)
++{
++    uint32_t tex;
++
++    if (!virtio_media_sand_skip_on() || !virtio_media_sand_on() || !q->isp ||
++        idx >= VIRTIO_MEDIA_MAX_BUFFERS || !q->isp_src_fd[idx] || q->isp_src_busy[idx] ||
++        !direct_scanout_skip_copy()) {
++        return false;
++    }
++    tex = virtio_media_gpu_res_tex(res);
++    if (!tex || !virtio_media_sand_gpu_import(s, q, idx)) {
++        return false; /* q11-sand-catchup: no later conversion possible -> no skip */
++    }
++    q->sand_seq[idx]++;
++    q->sand_hostq[idx] = false;
++    q->sand_sess = s;
++    if (!virtio_media_sand_publish_idx(q, tex, idx)) {
++        return false;
++    }
++    virtio_media_isp_drop_res(q, res, UINT32_MAX); /* an older pending ring copy into res is moot */
++    q->sand_cpend[idx] = true;   /* q11-sand-catchup: res should show idx / this generation */
++    q->sand_cres[idx] = res;
++    q->sand_cseq[idx] = q->sand_seq[idx];
++    direct_scanout_set_catch_up(q, virtio_media_isp_catch_up);
++    q->sand_skip_n++;
++    return true;
++}
++
++/*
++ * q11-isp-skip-copy: a pending slot k still holds the
++ * frame its resource isp_ring_res[k] should show. It is released without a copy when
++ * the guest queues that buffer again or a newer frame targets the same resource, and
++ * copied when the display misses.
++ */
++#define VIRTIO_MEDIA_ISP_PENDING_MAX 12
++
++static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_t except)
++{
++    uint32_t j;
++
++    /* q11-sand-catchup: newer content reaches res, an older skipped frame for it is moot */
++    for (j = 0; res && j < VIRTIO_MEDIA_MAX_BUFFERS; j++) {
++        if (q->sand_cpend[j] && q->sand_cres[j] == res) {
++            q->sand_cpend[j] = false;
++        }
++    }
++    if (!q->isp_pending_n || !res) {
++        return;
++    }
++    for (j = 0; j < VIRTIO_MEDIA_ISP_RING; j++) {
++        if (j != except && q->isp_ring_pending[j] && q->isp_ring_res[j] == res) {
++            q->isp_ring_pending[j] = false;
++            q->isp_pending_n--;
++            q->isp_rel_n++;
++        }
++    }
++}
++
++static bool virtio_media_isp_skip(VirtIOMediaQueue *q)
++{
++    if (!direct_scanout_skip_copy()) {
++        return false;
++    }
++    if (q->isp_pending_n >= VIRTIO_MEDIA_ISP_PENDING_MAX) {
++        q->isp_skip_cap_n++;
++        return false;
++    }
++    return true;
++}
++
++/* the display missed: make every skipped copy, and wait for it, before it samples */
++static void virtio_media_isp_catch_up(void *owner)
++{
++    VirtIOMediaQueue *q = owner;
++    uint32_t j;
++    bool blitted[VIRTIO_MEDIA_MAX_BUFFERS] = { false };
++
++    /* q11-sand-catchup: frames shown without the ISP get their guest content now */
++    for (j = 0; j < VIRTIO_MEDIA_MAX_BUFFERS; j++) {
++        if (!q->sand_cpend[j]) {
++            continue;
++        }
++        q->sand_cpend[j] = false;
++        if (q->gpu_buf[j] && q->sand_seq[j] == q->sand_cseq[j] && !q->sand_hostq[j] &&
++            virtio_media_gpu_blit(q->gpu_buf[j], q->sand_cres[j]) == 0) {
++            blitted[j] = true;
++            q->sand_catch_n++;
++        } else {
++            q->sand_catch_lost++; /* the decoder has the buffer again: a stale frame */
++        }
++    }
++    for (j = 0; j < VIRTIO_MEDIA_MAX_BUFFERS; j++) {
++        if (blitted[j]) {
++            virtio_media_gpu_wait(q->gpu_buf[j]);
++        }
++    }
++    if (!q->isp_pending_n) {
++        return;
++    }
++    for (j = 0; j < VIRTIO_MEDIA_ISP_RING; j++) {
++        if (q->isp_ring_pending[j]) {
++            int br = virtio_media_gpu_blit(q->isp_gpu[j], q->isp_ring_res[j]);
++
++            if (br) {
++                warn_report_once("virtio-media: host_isp: late copy into res %u failed (%d)",
++                                 q->isp_ring_res[j], br);
++            }
++        }
++    }
++    for (j = 0; j < VIRTIO_MEDIA_ISP_RING; j++) {
++        if (q->isp_ring_pending[j]) {
++            virtio_media_gpu_wait(q->isp_gpu[j]);
++            q->isp_ring_pending[j] = false;
++            q->isp_lazy_n++;
++        }
++    }
++    q->isp_pending_n = 0;
++}
++
++static void virtio_media_isp_mark_ready(VirtIOMediaQueue *q)
++{
++    GList *l;
++
++    for (l = q->isp_fifo.head; l; l = l->next) {
++        VirtIOMediaIspEvt *e = l->data;
++
++        if (!e->ready && e->cap_done && !q->isp_src_busy[e->src]) {
++            e->ready = true;
++        }
++    }
++}
++
++/* decided once per CAPTURE queue (i.e. per decode session), at its first frame */
++static bool virtio_media_isp_wanted(VirtIOMediaQueue *q)
++{
++    if (!q->isp_checked) {
++        q->isp_checked = true;
++        q->isp_on = access("/run/qemu-media-isp", F_OK) == 0;
++        if (q->isp_on) {
++            qemu_log("virtio-media-diag: host_isp: requested for this session\n");
++        }
++    }
++    return q->isp_on && !q->isp_failed;
++}
++
++/* Drop the ISP, its fds and any held events (STREAMOFF / buffer release / failure). */
++static void virtio_media_isp_teardown(VirtIOMediaQueue *q)
++{
++    VirtIOMediaIspEvt *e;
++    int i;
++
++    /* the display stops using our ring before it goes (it keeps what it still holds) */
++    direct_scanout_forget(q);
++    virtio_media_sand_drop(q, true); /* q11-sand-scanout: no release will come any more */
++    if (q->isp) {
++        qemu_log("virtio-media-diag: host_isp: closing after %" PRIu64 " frames "
++                 "(%" PRIu64 " sent to GL with the ring full; scanout misses: %" PRIu64
++                 " stale, %" PRIu64 " off)\n", q->isp_frames, q->isp_ring_full,
++                 q->isp_scan_stale, q->isp_scan_off);
++        qemu_log("virtio-media-diag: host_isp: skip-copy: %" PRIu64 " skipped, %" PRIu64
++                 " copied late, %" PRIu64 " released, %" PRIu64 " over the cap\n",
++                 q->isp_skip_n, q->isp_lazy_n, q->isp_rel_n, q->isp_skip_cap_n);
++        qemu_set_fd_handler(virtio_media_isp_fd(q->isp), NULL, NULL, NULL);
++    }
++    for (i = 0; i < VIRTIO_MEDIA_ISP_MAX_RING; i++) {
++        if (q->isp_gpu[i]) {
++            /* waits for a copy still reading the ring buffer, closes our dup */
++            virtio_media_gpu_release(q->isp_gpu[i]);
++            q->isp_gpu[i] = NULL;
++        }
++        q->isp_ring_busy[i] = false;
++        q->isp_ring_held[i] = false;
++        q->isp_ring_pending[i] = false;
++        q->isp_ring_seq[i] = 0;
++        q->isp_ring_res[i] = 0;
++    }
++    if (q->isp) {
++        virtio_media_isp_close(q->isp);
++        q->isp = NULL;
++    }
++    for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
++        if (q->isp_src_fd[i]) {
++            close(q->isp_src_fd[i] - 1);
++            q->isp_src_fd[i] = 0;
++        }
++        q->isp_src_busy[i] = false;
++    }
++    if (q->isp_timer) {
++        timer_free(q->isp_timer);
++        q->isp_timer = NULL;
++    }
++    while ((e = g_queue_pop_head(&q->isp_fifo))) {
++        g_free(e);
++    }
++    q->isp_ring_next = 0;
++    q->isp_frames = q->isp_ring_full = 0;
++    q->isp_pending_n = 0;
++    q->isp_skip_n = q->isp_lazy_n = q->isp_rel_n = q->isp_skip_cap_n = 0;
++}
++
++/* Send the held events whose frames are done, oldest first, stopping at the first not done. */
++static void virtio_media_isp_flush(VirtIOMediaSession *s, VirtIOMediaQueue *q)
++{
++    VirtIOMediaIspEvt *e;
++
++    while ((e = g_queue_peek_head(&q->isp_fifo)) && e->ready) {
++        g_queue_pop_head(&q->isp_fifo);
++        virtio_media_send_event(s->vm, &e->evt, sizeof(e->evt));
++        g_free(e);
++    }
++}
++
++static void virtio_media_isp_readable(void *opaque)
++{
++    VirtIOMediaSession *s = opaque;
++    VirtIOMediaQueue *q = &s->queues[1];
++    uint32_t k;
++    int r;
++
++    if (!q->isp) {
++        return;
++    }
++    /* codec buffers the ISP has finished reading (they complete apart from the frames) */
++    while (virtio_media_isp_reap_src(q->isp, &k) == 0) {
++        if (k < VIRTIO_MEDIA_MAX_BUFFERS) {
++            q->isp_src_busy[k] = false;
++        }
++    }
++    while ((r = virtio_media_isp_reap(q->isp, &k)) != -EAGAIN) {
++        GList *l;
++
++        if (r && r != -EIO) {
++            /* not a completed frame (e.g. the queue is going away): stop here */
++            warn_report_once("virtio-media: host_isp: DQBUF failed (%d)", r);
++            break;
++        }
++        if (k >= VIRTIO_MEDIA_ISP_RING) {
++            warn_report_once("virtio-media: host_isp: ring index %u out of range", k);
++            continue;
++        }
++        if (r) {
++            warn_report_once("virtio-media: host_isp: the ISP reported a frame error (%d)", r);
++        } else {
++            /*
++             * The same-format copy into the guest resource. Its fence is armed and
++             * flushed, so virgl's later draws from the resource order behind it; the
++             * ring buffer is not handed to the ISP again before the copy is done.
++             */
++            int br;
++
++            /* q11-isp-skip-copy: an older pending copy into this resource is moot */
++            virtio_media_isp_drop_res(q, q->isp_ring_res[k], k);
++            if (virtio_media_isp_skip(q)) {
++                q->isp_ring_pending[k] = true;
++                q->isp_pending_n++;
++                q->isp_skip_n++;
++                br = 0;
++            } else {
++                br = virtio_media_gpu_blit(q->isp_gpu[k], q->isp_ring_res[k]);
++            }
++
++            if (br) {
++                warn_report_once("virtio-media: host_isp: copy into res %u failed (%d)",
++                                 q->isp_ring_res[k], br);
++            } else {
++                /* isp-scanout: the guest resource now shows ring buffer k */
++                uint32_t tex = virtio_media_gpu_res_tex(q->isp_ring_res[k]);
++                uint32_t len = 0;
++                int fd = virtio_media_isp_ring_fd(q->isp, k, &len);
++
++                if (tex && fd >= 0) {
++                    DirectScanout d = {
++                        .owner = q, .epoch = q->isp_epoch, .fd = fd,
++                        .width = q->isp_dst_bpl / 4, .height = q->isp_dst_h,
++                        .stride = q->isp_dst_bpl, .slot = k, .seq = q->isp_ring_seq[k],
++                        .current = virtio_media_isp_scan_current,
++                        .hold = virtio_media_isp_scan_hold,
++                    };
++
++                    direct_scanout_set_catch_up(q, virtio_media_isp_catch_up);
++                    if (!virtio_media_sand_publish(q, tex, k)) { /* q11-sand-scanout */
++                        direct_scanout_publish(tex, &d);
++                    }
++                }
++            }
++        }
++        if (q->isp_t[k] && qemu_lat_diag()) {
++            qemu_lat_diag_add(LAT_MEDIA_ISP,
++                              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - q->isp_t[k]);
++        }
++        q->isp_ring_busy[k] = false;
++        for (l = q->isp_fifo.head; l; l = l->next) {
++            VirtIOMediaIspEvt *e = l->data;
++
++            if (!e->cap_done && !e->ready && e->ring == k) {
++                e->cap_done = true;
++                break;
++            }
++        }
++        q->isp_frames++;
++        if (q->isp_frames % 1800 == 0 && (q->isp_skip_n || q->isp_skip_cap_n)) {
++            qemu_log("virtio-media-diag: host_isp: skip-copy: %" PRIu64 " of %" PRIu64
++                     " frames skipped, %" PRIu64 " copied late, %" PRIu64 " released, %"
++                     PRIu64 " over the cap, %u pending\n", q->isp_skip_n, q->isp_frames,
++                     q->isp_lazy_n, q->isp_rel_n, q->isp_skip_cap_n, q->isp_pending_n);
++        }
++    }
++    virtio_media_isp_mark_ready(q);
++    if (!virtio_media_isp_in_flight(q->isp)) {
++        /*
++         * An M2M fd with nothing queued on either side polls EPOLLERR (v4l2_m2m_poll_for_data):
++         * only watch it while the ISP holds a buffer.
++         */
++        qemu_set_fd_handler(virtio_media_isp_fd(q->isp), NULL, NULL, NULL);
++    }
++    virtio_media_isp_flush(s, q);
++    if (q->isp_failed && !virtio_media_isp_in_flight(q->isp)) {
++        /* turned off with frames in flight (virtio_media_isp_frame): now all are back */
++        virtio_media_isp_teardown(q);
++        return;
++    }
++    if (g_queue_is_empty(&q->isp_fifo)) {
++        timer_del(q->isp_timer);
++    } else {
++        /* the stall check re-arms itself for the oldest frame still held */
++        virtio_media_isp_stalled(s);
++    }
++}
++
++/*
++ * A held frame has waited VIRTIO_MEDIA_ISP_STALL_NS. bcm2835-codec only logs a failed
++ * submit (device_run) and keeps the buffer until STREAMOFF, so without this the guest
++ * would wait for that codec buffer forever -- and with all of them held, no new frame
++ * would come to notice. Close the ISP (STREAMOFF: it lets go of every buffer), release
++ * the held events as they are (stale frames) and use GL from now on.
++ */
++static void virtio_media_isp_stalled(void *opaque)
++{
++    VirtIOMediaSession *s = opaque;
++    VirtIOMediaQueue *q = &s->queues[1];
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    VirtIOMediaIspEvt *old = NULL;
++    GList *l;
++
++    if (!q->isp) {
++        return;
++    }
++    for (l = q->isp_fifo.head; l && !old; l = l->next) {
++        VirtIOMediaIspEvt *e = l->data;
++
++        if (!e->ready) {
++            old = e;
++        }
++    }
++    if (!old) {
++        return;
++    }
++    if (now - old->t < VIRTIO_MEDIA_ISP_STALL_NS) {
++        timer_mod(q->isp_timer, old->t + VIRTIO_MEDIA_ISP_STALL_NS);
++        return;
++    }
++    qemu_log("virtio-media-diag: host_isp: frame (ring %u, codec buffer %u) not back after "
++             "%" PRId64 " ms (cap_done %d, src_busy %d): ISP off, GL path instead\n",
++             old->ring, old->src, (now - old->t) / SCALE_MS, old->cap_done,
++             q->isp_src_busy[old->src]);
++    q->isp_failed = true;
++    qemu_set_fd_handler(virtio_media_isp_fd(q->isp), NULL, NULL, NULL);
++    virtio_media_isp_close(q->isp);
++    q->isp = NULL;
++    for (l = q->isp_fifo.head; l; l = l->next) {
++        ((VirtIOMediaIspEvt *)l->data)->ready = true;
++    }
++    virtio_media_isp_flush(s, q);
++    virtio_media_isp_teardown(q);
++}
++
++/* Open the ISP and import its ring into GL. 0, -EAGAIN (GL not up yet: retry), <0. */
++static int virtio_media_isp_start(VirtIOMediaSession *s, VirtIOMediaQueue *q,
++                                  uint32_t src_used, uint32_t dst_w, uint32_t dst_h,
++                                  uint32_t dst_bpl)
++{
++    uint32_t k;
++    int e = 0;
++
++    static uint64_t epochs;
++
++    if (!q->isp_timer) {
++        q->isp_timer = timer_new_ns(QEMU_CLOCK_REALTIME, virtio_media_isp_stalled, s);
++    }
++    q->isp_epoch = ++epochs;
++    q->isp_dst_h = dst_h;
++    q->isp_dst_bpl = dst_bpl;
++    /*
++     * host-sand: the codec's SAND column holds sand_col_height lines (luma then chroma,
++     * 1632 = 1088 + 544 for 1080p); the ISP takes that as its bytesperline and the luma
++     * rows (where the chroma starts) as its height. A padded column (q11-sand-stride,
++     * 720p: 1152) keeps the stream's luma rows (720) in q->sand_luma.
++     */
++    q->isp = virtio_media_isp_open(q->sand ? V4L2_PIX_FMT_NV12_COL128 : V4L2_PIX_FMT_NV12,
++                                   q->width,
++                                   q->sand ? (q->sand_luma ? q->sand_luma
++                                              : virtio_media_sand_luma_rows(q->sand_col_height))
++                                           : q->height,
++                                   q->sand ? q->sand_col_height : q->bytesperline, src_used,
++                                   dst_w, dst_h, dst_bpl,
++                                   q->host_vis_w, q->host_vis_h, q->guest_vis_w,
++                                   q->guest_vis_h, q->matrix, q->num_bufs,
++                                   VIRTIO_MEDIA_ISP_RING, &e);
++    if (!q->isp) {
++        return e ? e : -EIO;
++    }
++    for (k = 0; k < VIRTIO_MEDIA_ISP_RING; k++) {
++        uint32_t len = 0;
++        int fd = virtio_media_isp_ring_fd(q->isp, k, &len);
++
++        if (fd >= 0) {
++            fd = fcntl(fd, F_DUPFD_CLOEXEC, 0); /* the import owns its fd */
++        }
++        if (fd < 0) {
++            return -EBADF;
++        }
++        /* the guest resource is dst_bpl / 4 wide (padded), as the blit requires */
++        q->isp_gpu[k] = virtio_media_gpu_import(fd, dst_bpl / 4, dst_h, dst_bpl, len, &e);
++        if (!q->isp_gpu[k]) {
++            return e ? e : -EIO;
++        }
++    }
++    return 0;
++}
++
++/*
++ * Queue CAPTURE frame idx to the ISP. 0: queued, *held is the guest event's FIFO entry
++ * to fill in; <0: use GL for this frame (-EBUSY: ring full, -EAGAIN: no GL yet; both
++ * leave the ISP on).
++ */
++static int virtio_media_isp_frame(VirtIOMediaSession *s, VirtIOMediaQueue *q, uint32_t idx,
++                                  uint32_t res, uint32_t dst_w, uint32_t dst_h,
++                                  uint32_t dst_bpl, VirtIOMediaIspEvt **held)
++{
++    uint32_t src_used = q->host_sizeimage ? q->host_sizeimage
++                                          : q->bytesperline * q->height * 3 / 2;
++    uint32_t k;
++    int64_t now;
++    bool idle;
++    int r;
++
++    if (idx >= VIRTIO_MEDIA_MAX_BUFFERS || src_used > q->host_len[idx][0]) {
++        r = -EINVAL;
++        goto fail;
++    }
++    if (!q->isp) {
++        r = virtio_media_isp_start(s, q, src_used, dst_w, dst_h, dst_bpl);
++        if (r == -EAGAIN) {
++            /* no GL context yet: this frame takes the GL path, try again next frame */
++            virtio_media_isp_teardown(q);
++            return r;
++        }
++        if (r) {
++            goto fail;
++        }
++    }
++    /* the next ring buffer that neither the ISP nor the display (isp-scanout) holds */
++    for (k = q->isp_ring_next, r = 0; r < VIRTIO_MEDIA_ISP_RING;
++         r++, k = (k + 1) % VIRTIO_MEDIA_ISP_RING) {
++        if (!q->isp_ring_busy[k] && !q->isp_ring_held[k] && !q->isp_ring_pending[k]) {
++            break;
++        }
++    }
++    if (r == VIRTIO_MEDIA_ISP_RING) {
++        /* all with the ISP or on screen: this one frame goes the GL way */
++        q->isp_ring_full++;
++        return -EBUSY;
++    }
++    if (!q->isp_src_fd[idx]) {
++        struct v4l2_exportbuffer eb = {
++            .type = q->type, .index = idx, .plane = 0, .flags = O_RDONLY | O_CLOEXEC,
++        };
++
++        if (ioctl(s->fd, VIDIOC_EXPBUF, &eb) < 0) {
++            r = -errno;
++            goto fail;
++        }
++        q->isp_src_fd[idx] = eb.fd + 1;
++    }
++    /* the ISP must not overwrite ring buffer k while the last copy from it may run */
++    virtio_media_gpu_wait(q->isp_gpu[k]);
++    if (q->isp_src_busy[idx]) {
++        /* cannot happen (its event is held until the ISP returns it): be safe anyway */
++        return -EBUSY;
++    }
++    idle = virtio_media_isp_in_flight(q->isp) == 0;
++    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    q->isp_t[k] = qemu_lat_diag() ? now : 0;
++    r = virtio_media_isp_submit(q->isp, idx, q->isp_src_fd[idx] - 1, q->host_len[idx][0],
++                                src_used, k);
++    if (r) {
++        goto fail;
++    }
++    q->isp_ring_busy[k] = true;
++    q->isp_ring_seq[k] = ++q->isp_seq; /* an older publication of k is stale from now */
++    q->isp_ring_res[k] = res;
++    q->isp_ring_src[k] = idx;    /* q11-sand-scanout */
++    q->sand_seq[idx]++;
++    q->sand_hostq[idx] = false;
++    q->sand_sess = s;
++    q->isp_src_busy[idx] = true;
++    q->isp_ring_next = (k + 1) % VIRTIO_MEDIA_ISP_RING;
++    *held = g_new0(VirtIOMediaIspEvt, 1);
++    (*held)->ring = k;
++    (*held)->src = idx;
++    (*held)->t = now;
++    if (idle) {
++        /* POLLIN: a converted frame; POLLOUT: a codec buffer the ISP is done with */
++        qemu_set_fd_handler(virtio_media_isp_fd(q->isp), virtio_media_isp_readable,
++                            virtio_media_isp_readable, s);
++    }
++    if (!timer_pending(q->isp_timer)) {
++        timer_mod(q->isp_timer, now + VIRTIO_MEDIA_ISP_STALL_NS);
++    }
++    return 0;
++
++fail:
++    qemu_log("virtio-media-diag: host_isp: off for this queue (%d), GL path instead\n", r);
++    q->isp_failed = true;
++    if (!q->isp || virtio_media_isp_in_flight(q->isp) == 0) {
++        /* nothing in flight, so every held event is ready: send them before the FIFO goes */
++        virtio_media_isp_flush(s, q);
++        virtio_media_isp_teardown(q);
++    }
++    return r;
++}
++
+ static void virtio_media_drain_events(VirtIOMediaSession *s)
+ {
+     for (;;) {
+@@ -703,6 +1600,8 @@ static void virtio_media_host_readable_body(void *opaque)
+              * copied into the guest pages the guest gave us at QBUF time
+              * before the guest is told the buffer is done.
+              */
++            VirtIOMediaIspEvt *isp_held = NULL;
++
+             if (i == 1) {
+                 for (p = 0; p < gb->num_planes; p++) {
+                     size_t used = q->mplane ? evt.planes[p].bytesused
+@@ -740,6 +1639,29 @@ static void virtio_media_host_readable_body(void *opaque)
+                                    (!q->nv12_host || q->sand ||
+                                     q->bytesperline >= q->width);
+ 
++                    /*
++                     * host-isp first: the ISP converts the frame, and the guest's
++                     * event waits for it (virtio_media_isp_readable).
++                     */
++                    if (q->nv12_host && q->sand && q->sand_col_height &&
++                        gb->virgl_res && p == 0 && gb->num_planes == 1 && geom_ok &&
++                        virtio_media_sand_skip(s, q, evt.buffer.index, gb->virgl_res)) {
++                        continue; /* q11-sand-skip-isp: on screen as decoded, no ISP */
++                    }
++                    if (q->nv12_host && (!q->sand || q->sand_col_height) &&
++                        gb->virgl_res && p == 0 &&
++                        gb->num_planes == 1 && geom_ok &&
++                        virtio_media_isp_wanted(q) &&
++                        virtio_media_isp_frame(s, q, evt.buffer.index,
++                                               gb->virgl_res, dst_w, dst_h,
++                                               dst_bpl, &isp_held) == 0) {
++                        continue;
++                    }
++                    if (gb->virgl_res && p == 0) {
++                        virtio_media_isp_drop_res(q, gb->virgl_res, UINT32_MAX);
++                        direct_scanout_forget_tex(
++                            virtio_media_gpu_res_tex(gb->virgl_res));
++                    }
+                     if (vm->gpu_xfer && gb->virgl_res && p == 0 &&
+                         gb->num_planes == 1 && geom_ok && !q->gpu_failed) {
+                         uint32_t idx = evt.buffer.index;
+@@ -769,14 +1691,15 @@ static void virtio_media_host_readable_body(void *opaque)
+ 
+                                     /*
+                                      * host-sand: a column is luma_rows lines of
+-                                     * Y then luma_rows / 2 of CbCr, 128 bytes
+-                                     * each, so luma_rows = col_height * 2 / 3
+-                                     * (1620 -> 1080 for a 1088-line 1080p
+-                                     * frame: the codec's SAND carries the
+-                                     * visible rows only).
++                                     * Y then the CbCr lines, 128 bytes each;
++                                     * luma_rows comes from the column height
++                                     * (virtio_media_sand_luma_rows: 1632 ->
++                                     * 1088 for 1080p, 1088 -> 720 for 720p).
+                                      */
+                                     uint32_t luma_rows = q->sand
+-                                        ? q->sand_col_height * 2 / 3 : q->height;
++                                        ? (q->sand_luma ? q->sand_luma
++                                           : virtio_media_sand_luma_rows(q->sand_col_height))
++                                        : q->height;
+ 
+                                     if (q->sand && vm->host_sand == 2) {
+                                         q->gpu_buf[idx] =
+@@ -956,6 +1879,20 @@ static void virtio_media_host_readable_body(void *opaque)
+                     memset(&evt.planes[p].m, 0, sizeof(evt.planes[p].m));
+                 }
+             }
++            /*
++             * host-isp: a held frame, or any frame behind one, waits in the FIFO
++             * so the guest sees completions in decode order.
++             */
++            if (i == 1 && (isp_held || !g_queue_is_empty(&q->isp_fifo))) {
++                VirtIOMediaIspEvt *he = isp_held ? isp_held
++                                                 : g_new0(VirtIOMediaIspEvt, 1);
++
++                he->evt = evt;
++                he->ready = !isp_held;
++                g_queue_push_tail(&q->isp_fifo, he);
++                virtio_media_isp_flush(s, q);
++                continue;
++            }
+             virtio_media_send_event(vm, &evt, sizeof(evt));
+         }
+     }
+@@ -1306,6 +2243,9 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+                 q->height = fmt.fmt.pix.height;
+                 q->bytesperline = fmt.fmt.pix.bytesperline;
+             }
++            if (q->sand_luma && q->height == ((q->sand_luma + 63) & ~63u)) {
++                q->height = q->sand_luma; /* q11-sand-stride: padded SAND */
++            }
+             /*
+              * host-nv12 is armed by S_FMT; confirm the host really is NV12
+              * now (a later S_FMT to something else would have cleared it).
+@@ -1516,6 +2456,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+         return ret;
+     }
+     nplanes = gb->num_planes;
++    if (virtio_media_queue_index(b->type) == 1 && gb->virgl_res) {
++        virtio_media_isp_drop_res(q, gb->virgl_res, UINT32_MAX); /* q11-isp-skip-copy */
++    }
++    if (virtio_media_queue_index(b->type) == 1 && b->index < VIRTIO_MEDIA_MAX_BUFFERS) {
++        q->sand_cpend[b->index] = false; /* q11-sand-catchup */
++    }
+ 
+     /*
+      * An output buffer carries the bitstream the guest just wrote, so it has to
+@@ -1568,13 +2514,22 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+             hb.m.offset = 0;
+             hb.length = q->host_len[b->index][0];
+         }
++        if (virtio_media_queue_index(b->type) == 1 &&
++            virtio_media_sand_defer(q, b->index, &hb, host_planes)) {
++            goto queued; /* q11-sand-scanout: goes to the decoder at wl_buffer.release */
++        }
+         if (ioctl(s->fd, VIDIOC_QBUF, &hb) < 0) {
+             int err = errno;
+             virtio_media_free_buffer_sgl(gb);
+             return err;
+         }
++        if (virtio_media_queue_index(b->type) == 1 && b->index < VIRTIO_MEDIA_MAX_BUFFERS) {
++            q->sand_hostq[b->index] = true;
++        }
+     }
+ 
++queued:
++
+     gb->queued = true;
+ 
+     /* A queue got a buffer: the fd can become readable again, re-arm it. */
+@@ -1717,6 +2672,29 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+                     virtio_media_fmt_get_size(f, &guest_w, &guest_h);
+                     virtio_media_fmt_set_size(f, q->host_w, q->host_h);
+                 }
++                /*
++                 * host-sand: the codec writes SAND columns of ALIGN(h, 16) * 3 / 2
++                 * lines but bytesperline is aligned to 32; where those differ (720p:
++                 * 1080 vs 1088) ask for a frame padded to ALIGN(luma, 64) rows (its
++                 * column is then a multiple of 32: 768 -> 1152), else plain NV12.
++                 */
++                if (s->vm->host_sand) {
++                    uint32_t fw = 0, fh = 0, luma;
++
++                    virtio_media_fmt_get_size(f, &fw, &fh);
++                    luma = (fh + 15) & ~15u;
++                    if (code == VIDIOC_S_FMT) {
++                        q->sand_luma = 0;
++                    }
++                    if ((luma * 3 / 2) % 32) {
++                        if (code == VIDIOC_S_FMT && fw > 64) {
++                            q->sand_luma = luma;
++                            virtio_media_fmt_set_size(f, fw, (luma + 63) & ~63u);
++                        } else {
++                            virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
++                        }
++                    }
++                }
+             }
+         }
+         /* What the first attempt sends: a failing S_FMT/TRY_FMT may rewrite fields. */
+@@ -1732,6 +2710,38 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+             virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
+             fmt_rc = ioctl(s->fd, code, payload);
+         }
++        if (fmt_rc == 0 && code == VIDIOC_S_FMT && want_rgba && q->sand_luma) {
++            uint32_t rw = 0, rh = 0;
++            uint32_t rb = V4L2_TYPE_IS_MULTIPLANAR(f->type)
++                          ? f->fmt.pix_mp.plane_fmt[0].bytesperline : f->fmt.pix.bytesperline;
++
++            virtio_media_fmt_get_size(f, &rw, &rh);
++            if (virtio_media_fmt_pixelformat(f) != V4L2_PIX_FMT_NV12_COL128 ||
++                rh != ((q->sand_luma + 63) & ~63u) || rb % 32 || rb < rh * 3 / 2) {
++                warn_report_once("virtio-media: host-sand: padded SAND %ux%u not taken "
++                                 "(%ux%u bpl %u), using NV12", rw, (q->sand_luma + 63) & ~63u,
++                                 rw, rh, rb);
++                *f = sent;
++                virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
++                virtio_media_fmt_set_size(f, rw, q->sand_luma);
++                q->sand_luma = 0;
++                fmt_rc = ioctl(s->fd, code, payload);
++            } else {
++                qemu_log("virtio-media-diag: host-sand: %ux%u padded to %u rows "
++                         "(SAND column %u lines, chroma at row %u)\n",
++                         rw, q->sand_luma, rh, rb, q->sand_luma);
++            }
++        }
++        /* the guest sees the picture's own height, not the padding */
++        if (fmt_rc == 0 && want_rgba && q->sand_luma &&
++            virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12_COL128) {
++            uint32_t rw = 0, rh = 0;
++
++            virtio_media_fmt_get_size(f, &rw, &rh);
++            if (rh == ((q->sand_luma + 63) & ~63u)) {
++                virtio_media_fmt_set_size(f, rw, q->sand_luma);
++            }
++        }
+         if (fmt_rc < 0) {
+             int err = errno;
+ 
+@@ -1785,6 +2795,15 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+         struct v4l2_rect *r = &sel->r;
+ 
+         q = &s->queues[virtio_media_queue_index(sel->type)];
++        /* host-isp: the codec's visible rectangle, before scaling (host pixels) */
++        bool isp_vis = virtio_media_queue_index(sel->type) == 1 &&
++                       (sel->target == V4L2_SEL_TGT_COMPOSE ||
++                        sel->target == V4L2_SEL_TGT_COMPOSE_DEFAULT);
++
++        if (isp_vis) {
++            q->host_vis_w = r->width;
++            q->host_vis_h = r->height;
++        }
+         if (q->nv12_host && q->scaled_w && q->host_w && q->host_h) {
+             r->left = virtio_media_scale_coord(r->left, q->scaled_w, q->host_w);
+             r->top = virtio_media_scale_coord(r->top, q->scaled_w, q->host_w);
+@@ -1793,6 +2812,10 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+             r->height = virtio_media_scale_coord(r->height, q->scaled_w,
+                                                  q->host_w);
+         }
++        if (isp_vis) {
++            q->guest_vis_w = r->width;
++            q->guest_vis_h = r->height;
++        }
+     }
+ 
+     if (!ret && code == VIDIOC_QUERYBUF) {
+@@ -1825,6 +2848,11 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+             for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
+                 q->guest[i].queued = false;
+             }
++            /* host-isp: held events are for buffers the guest no longer owns */
++            virtio_media_sand_drop(q, false); /* q11-sand-scanout */
++            virtio_media_isp_teardown(q);
++            q->isp_checked = false;
++            q->isp_failed = false;
+         }
+         virtio_media_update_fd_handler(s);
+     }
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 7970bdb12..07d0401c4 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -176,7 +176,8 @@ bool qemu_lat_diag(void);
+ void qemu_lat_diag_add(int kind, int64_t ns);
+ enum {
+     LAT_GPU_FLUSH_Q, LAT_GPU_FLUSH, LAT_GPU_FLUSH_FENCED, LAT_GPU_SCANOUT,
+-    LAT_GPU_SUBMIT_Q, LAT_GPU_SUBMIT, LAT_GPU_CMDQ_RUN, LAT_MEDIA_DRAIN, LAT_N
++    LAT_GPU_SUBMIT_Q, LAT_GPU_SUBMIT, LAT_GPU_CMDQ_RUN, LAT_MEDIA_DRAIN,
++    LAT_SDL_BLIT, LAT_SDL_SWAP, LAT_MEDIA_ISP, LAT_N
+ };
+ 
+ struct VirtIOGPUBase {
+diff --git a/include/hw/virtio/virtio-media-isp.h b/include/hw/virtio/virtio-media-isp.h
+new file mode 100644
+index 000000000..e638b8ab6
+--- /dev/null
++++ b/include/hw/virtio/virtio-media-isp.h
+@@ -0,0 +1,51 @@
++/*
++ * virtio-media: host-isp, see hw/virtio/virtio-media-isp.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_VIRTIO_MEDIA_ISP_H
++#define HW_VIRTIO_MEDIA_ISP_H
++
++/* Raspberry Pi SAND (YUVUV128); not in the generic kernel headers (same as virtio-media.c) */
++#ifndef V4L2_PIX_FMT_NV12_COL128
++#define V4L2_PIX_FMT_NV12_COL128 v4l2_fourcc('N', 'C', '1', '2')
++#endif
++
++/* ISP CAPTURE ring size limit: 6 x 3.7 MB of CMA at 1280x726 RGBA */
++#define VIRTIO_MEDIA_ISP_MAX_RING 24
++
++typedef struct VirtIOMediaIsp VirtIOMediaIsp;
++
++/*
++ * NV12 or NV12_COL128 (src_fourcc; nsrc DMABUF indices = the codec's CAPTURE buffers) ->
++ * RGBA32 'AB24' (dst, a ring of nring MMAP buffers owned by the ISP). For NV12_COL128,
++ * src_bpl is the column height in lines and src_h the luma rows of a column.
++ * crop_* (input: the codec's visible rectangle) and comp_* (output: the guest's visible
++ * rectangle) are applied when non-zero and different from the full frame.
++ */
++VirtIOMediaIsp *virtio_media_isp_open(uint32_t src_fourcc, uint32_t src_w, uint32_t src_h,
++                                      uint32_t src_bpl,
++                                      uint32_t src_len, uint32_t dst_w, uint32_t dst_h,
++                                      uint32_t dst_bpl, uint32_t crop_w, uint32_t crop_h,
++                                      uint32_t comp_w, uint32_t comp_h, int matrix,
++                                      uint32_t nsrc, uint32_t nring, int *err);
++int virtio_media_isp_fd(VirtIOMediaIsp *isp);
++uint32_t virtio_media_isp_in_flight(VirtIOMediaIsp *isp);
++uint32_t virtio_media_isp_ring_size(VirtIOMediaIsp *isp);
++/* the dmabuf of ring buffer k (owned by the ISP: dup() it to keep it) and its length */
++int virtio_media_isp_ring_fd(VirtIOMediaIsp *isp, uint32_t k, uint32_t *len);
++/* convert codec buffer src_index (dmabuf src_fd) into ring buffer ring_index */
++int virtio_media_isp_submit(VirtIOMediaIsp *isp, uint32_t src_index, int src_fd,
++                            uint32_t src_len, uint32_t src_used, uint32_t ring_index);
++/*
++ * The two sides complete independently (no pairing in bcm2835-codec):
++ * reap: one converted frame (CAPTURE): 0 (ring_index set), -EIO (set, frame flagged),
++ *   -EAGAIN, -errno.
++ * reap_src: one codec buffer the ISP has finished reading (OUTPUT): 0, -EAGAIN, -errno.
++ * in_flight counts both, so 0 means the ISP holds no buffer of either kind.
++ */
++int virtio_media_isp_reap(VirtIOMediaIsp *isp, uint32_t *ring_index);
++int virtio_media_isp_reap_src(VirtIOMediaIsp *isp, uint32_t *src_index);
++void virtio_media_isp_close(VirtIOMediaIsp *isp);
++
++#endif
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 23a7a647c..701595d1e 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -89,6 +89,8 @@ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
+                                           float scale, uint32_t len, int matrix,
+                                           int *err);
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id);
++/* q11-isp-scanout: the GL texture of virgl resource res_id (0: none) */
++uint32_t virtio_media_gpu_res_tex(uint32_t res_id);
+ int virtio_media_gpu_wait(void *handle);
+ /*
+  * gpu-fence-fd: track the GPU copy with an EGL_ANDROID_native_fence_sync fd so
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index b050ca0de..2db633c01 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -224,6 +224,12 @@ typedef struct VirtIOMediaQueue {
+      */
+     bool sand;
+     uint32_t sand_col_height;
++    /*
++     * q11-sand-stride: the luma rows (= chroma start) of a padded SAND column, when
++     * the codec was asked for a taller frame so its column stride is a multiple of
++     * 32 (720p: luma 720, column 1152); 0 when not padded.
++     */
++    uint32_t sand_luma;
+     uint32_t rgba_bytesperline;
+     uint32_t rgba_sizeimage;
+     uint32_t host_sizeimage;
+@@ -242,6 +248,64 @@ typedef struct VirtIOMediaQueue {
+     uint8_t *conv_scratch;
+     size_t conv_scratch_len;
+     uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
++    /*
++     * host-isp (virtio-media-isp.c): the VideoCore ISP converts this CAPTURE
++     * queue's NV12 frames into a ring of its own RGBA buffers (isp_gpu: their GL
++     * imports), each then copied into the guest resource. isp_src_fd is the
++     * codec buffer's dmabuf, stored + 1 (0 = none); isp_src_busy: the ISP still
++     * holds it. isp_fifo holds the guest DQBUF events (VirtIOMediaIspEvt) in
++     * decode order until their frame is done; isp_timer gives up on a stuck one.
++     */
++    struct VirtIOMediaIsp *isp;
++    bool isp_checked;
++    bool isp_on;
++    bool isp_failed;
++    int isp_src_fd[VIRTIO_MEDIA_MAX_BUFFERS];
++    bool isp_src_busy[VIRTIO_MEDIA_MAX_BUFFERS];
++    QEMUTimer *isp_timer;
++    void *isp_gpu[24];
++    bool isp_ring_busy[24];
++    uint32_t isp_ring_res[24];
++    int64_t isp_t[24];
++    uint32_t isp_ring_next;
++    GQueue isp_fifo;
++    uint64_t isp_frames;
++    uint64_t isp_ring_full;
++    /* isp-scanout: the display holds the buffer / content generation per slot */
++    bool isp_ring_held[24];
++    uint64_t isp_ring_seq[24];
++    uint64_t isp_seq;
++    uint64_t isp_epoch;
++    uint32_t isp_dst_h, isp_dst_bpl;
++    uint64_t isp_scan_stale, isp_scan_off;
++    /* q11-isp-skip-copy: slots whose copy into isp_ring_res was skipped (kept for it) */
++    bool isp_ring_pending[24];
++    uint32_t isp_pending_n;
++    uint64_t isp_skip_n, isp_lazy_n, isp_rel_n, isp_skip_cap_n;
++    /*
++     * q11-sand-scanout: the decoder buffer a ring slot was converted from; per decoder buffer the
++     * content generation, whether the host decoder has it (QBUF), whether the display holds it,
++     * and the guest's QBUF deferred until the display lets go
++     */
++    uint32_t isp_ring_src[24];
++    uint64_t sand_seq[VIRTIO_MEDIA_MAX_BUFFERS];
++    bool sand_hostq[VIRTIO_MEDIA_MAX_BUFFERS];
++    bool sand_held[VIRTIO_MEDIA_MAX_BUFFERS];
++    bool sand_defer[VIRTIO_MEDIA_MAX_BUFFERS];
++    struct v4l2_buffer sand_hb[VIRTIO_MEDIA_MAX_BUFFERS];
++    struct v4l2_plane sand_hp[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
++    void *sand_sess;
++    uint32_t sand_defer_n;
++    uint64_t sand_pub_n, sand_defer_tot, sand_defer_forced, sand_qbuf_err;
++    uint64_t sand_skip_n; /* q11-sand-skip-isp: frames shown without the ISP */
++    /* q11-sand-catchup: resource sand_cres[idx] should show idx, generation sand_cseq[idx] */
++    bool sand_cpend[VIRTIO_MEDIA_MAX_BUFFERS];
++    uint32_t sand_cres[VIRTIO_MEDIA_MAX_BUFFERS];
++    uint64_t sand_cseq[VIRTIO_MEDIA_MAX_BUFFERS];
++    uint64_t sand_catch_n, sand_catch_lost;
++    bool sand_import_failed;
++    /* the codec's visible (compose) rectangle, host and guest pixels (G_SELECTION) */
++    uint32_t host_vis_w, host_vis_h, guest_vis_w, guest_vis_h;
+     /* Guest buffers by index, mirrored onto the host buffer of the same index. */
+     VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
+ } VirtIOMediaQueue;
+diff --git a/include/ui/direct-scanout.h b/include/ui/direct-scanout.h
+new file mode 100644
+index 000000000..577835ffa
+--- /dev/null
++++ b/include/ui/direct-scanout.h
+@@ -0,0 +1,57 @@
++/*
++ * Direct scanout registry (q11-isp-scanout): a device that produced the content
++ * of a guest scanout texture in a dmabuf the display can scan out directly (host-isp's
++ * CMA ring) publishes it here; the display looks the texture up at flush time and, when
++ * the entry is still current, presents the dmabuf instead of blitting the texture.
++ * Main loop only.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef UI_DIRECT_SCANOUT_H
++#define UI_DIRECT_SCANOUT_H
++
++typedef struct DirectScanout {
++    void *owner;             /* the producer (forgotten with direct_scanout_forget) */
++    uint64_t epoch;          /* the producer's session: a reopened producer gets a new one */
++    int fd;                  /* dmabuf, owned by the producer */
++    uint32_t width, height;  /* of the buffer (>= the scanout rectangle) */
++    uint32_t stride;
++    /* q11-sand-scanout: 0 = one ABGR8888 LINEAR plane (the ISP ring); else a DRM fourcc with */
++    uint32_t fourcc;         /* modifier on every plane and a second plane at offset1/pitch1 */
++    uint64_t modifier;
++    uint32_t offset1, pitch1;
++    uint32_t slot;           /* the producer's buffer index */
++    uint64_t seq;            /* the producer's content generation for slot */
++    /* true while slot still holds content seq (not requeued, not rewritten) */
++    bool (*current)(void *owner, uint32_t slot, uint64_t seq);
++    /* the display started (true) / stopped (false) scanning slot out */
++    void (*hold)(void *owner, uint32_t slot, bool held);
++} DirectScanout;
++
++/* the content of texture tex_id is now that of d (replaces an older entry) */
++void direct_scanout_publish(uint32_t tex_id, const DirectScanout *d);
++/* the entry for tex_id if there is one and it is still current (copied to *d) */
++bool direct_scanout_lookup(uint32_t tex_id, DirectScanout *d);
++/* is there an entry for tex_id at all (current or not): miss statistics */
++bool direct_scanout_has(uint32_t tex_id);
++/* the texture got content from elsewhere (another path wrote it): forget its entry */
++void direct_scanout_forget_tex(uint32_t tex_id);
++/* drop every entry of owner; later hold() calls for it are not made */
++void direct_scanout_forget(void *owner);
++/* the owner's current epoch (0: forgotten); buffers of another epoch are stale */
++uint64_t direct_scanout_owner_epoch(void *owner);
++/* q11-sand-scanout: false once the compositor refused a multi-plane (fourcc) buffer */
++bool direct_scanout_sand_usable(void);
++void direct_scanout_sand_set_failed(void);
++
++/*
++ * q11-isp-skip-copy: the display reports each flush (hit = presented a dmabuf
++ * directly). A miss first runs the producer's catch-up, which must leave every guest
++ * texture it skipped filling complete before the display samples one.
++ */
++void direct_scanout_note_flush(bool hit);
++/* /run/qemu-isp-skip-copy is present and the recent flushes all hit */
++bool direct_scanout_skip_copy(void);
++void direct_scanout_set_catch_up(void *owner, void (*fn)(void *owner));
++
++#endif
+diff --git a/include/ui/egl-helpers.h b/include/ui/egl-helpers.h
+index 405ddd912..aef572896 100644
+--- a/include/ui/egl-helpers.h
++++ b/include/ui/egl-helpers.h
+@@ -33,6 +33,9 @@ void egl_fb_setup_for_tex(egl_fb *fb, int width, int height,
+                           GLuint texture, bool delete);
+ void egl_fb_setup_new_tex(egl_fb *fb, int width, int height);
+ void egl_fb_blit(egl_fb *dst, egl_fb *src, bool flip);
++/* the same, from the source rectangle (sx, sy, sw, sh) (texel rows in memory order) */
++void egl_fb_blit_rect(egl_fb *dst, egl_fb *src, bool flip, uint32_t sx, uint32_t sy,
++                      uint32_t sw, uint32_t sh);
+ void egl_fb_read(DisplaySurface *dst, egl_fb *src);
+ void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int h);
+ 
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index 6509ef967..524024b33 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -85,6 +85,13 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
+                     DisplaySurface *new_surface);
+ void sdl2_gl_refresh(DisplayChangeListener *dcl);
+ void sdl2_gl_redraw(struct sdl2_console *scon);
++/* q11-isp-scanout (ui/sdl2-wl-scanout.c) */
++typedef struct DirectScanout DirectScanout;
++void sdl2_wl_scanout_dispatch(void);
++void sdl2_wl_scanout_miss(const char *why);
++void sdl2_wl_scanout_off(void);
++bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t w,
++                     uint32_t h);
+ 
+ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+                                      QEMUGLParams *params);
+diff --git a/ui/direct-scanout.c b/ui/direct-scanout.c
+new file mode 100644
+index 000000000..188141c79
+--- /dev/null
++++ b/ui/direct-scanout.c
+@@ -0,0 +1,125 @@
++/*
++ * Direct scanout registry, see include/ui/direct-scanout.h.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include "ui/direct-scanout.h"
++
++static GHashTable *entries;  /* tex_id -> DirectScanout* */
++static GHashTable *owners;   /* owner -> its current epoch (alive set) */
++
++void direct_scanout_publish(uint32_t tex_id, const DirectScanout *d)
++{
++    if (!entries) {
++        entries = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
++        owners = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
++    }
++    g_hash_table_replace(entries, GUINT_TO_POINTER(tex_id), g_memdup2(d, sizeof(*d)));
++    g_hash_table_insert(owners, d->owner, g_memdup2(&d->epoch, sizeof(d->epoch)));
++}
++
++bool direct_scanout_lookup(uint32_t tex_id, DirectScanout *d)
++{
++    DirectScanout *e = entries ? g_hash_table_lookup(entries, GUINT_TO_POINTER(tex_id))
++                               : NULL;
++
++    if (!e || !e->current || !e->current(e->owner, e->slot, e->seq)) {
++        return false;
++    }
++    *d = *e;
++    return true;
++}
++
++bool direct_scanout_has(uint32_t tex_id)
++{
++    return entries && g_hash_table_contains(entries, GUINT_TO_POINTER(tex_id));
++}
++
++void direct_scanout_forget_tex(uint32_t tex_id)
++{
++    if (entries && tex_id) {
++        g_hash_table_remove(entries, GUINT_TO_POINTER(tex_id));
++    }
++}
++
++static gboolean of_owner(gpointer key, gpointer value, gpointer owner)
++{
++    return ((DirectScanout *)value)->owner == owner;
++}
++
++/* q11-isp-skip-copy */
++#define DIRECT_SCANOUT_STREAK 30
++#define DIRECT_SCANOUT_FRESH_MS 100
++static uint32_t streak;
++static int64_t last_hit_ms;
++static void *catch_up_owner;
++static void (*catch_up_fn)(void *owner);
++
++void direct_scanout_set_catch_up(void *owner, void (*fn)(void *owner))
++{
++    catch_up_owner = owner;
++    catch_up_fn = fn;
++}
++
++void direct_scanout_note_flush(bool hit)
++{
++    if (hit) {
++        if (streak < UINT32_MAX) {
++            streak++;
++        }
++        last_hit_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++        return;
++    }
++    streak = 0;
++    if (catch_up_fn) {
++        catch_up_fn(catch_up_owner);
++    }
++}
++
++bool direct_scanout_skip_copy(void)
++{
++    static int64_t checked = -1000000;
++    static bool on;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now - checked >= 1000) {
++        checked = now;
++        on = access("/run/qemu-isp-skip-copy", F_OK) == 0;
++    }
++    return on && streak >= DIRECT_SCANOUT_STREAK &&
++           now - last_hit_ms < DIRECT_SCANOUT_FRESH_MS;
++}
++
++void direct_scanout_forget(void *owner)
++{
++    if (catch_up_owner == owner) {
++        catch_up_owner = NULL;
++        catch_up_fn = NULL;
++    }
++    if (entries) {
++        g_hash_table_foreach_remove(entries, of_owner, owner);
++        g_hash_table_remove(owners, owner);
++    }
++}
++
++uint64_t direct_scanout_owner_epoch(void *owner)
++{
++    uint64_t *e = owners ? g_hash_table_lookup(owners, owner) : NULL;
++
++    return e ? *e : 0;
++}
++
++/* q11-sand-scanout: the compositor refused a fourcc buffer once: stop offering them */
++static bool sand_failed;
++
++bool direct_scanout_sand_usable(void)
++{
++    return !sand_failed;
++}
++
++void direct_scanout_sand_set_failed(void)
++{
++    sand_failed = true;
++}
+diff --git a/ui/egl-helpers.c b/ui/egl-helpers.c
+index d689f187c..5e7eb5bdf 100644
+--- a/ui/egl-helpers.c
++++ b/ui/egl-helpers.c
+@@ -138,29 +138,94 @@ void egl_fb_setup_new_tex(egl_fb *fb, int width, int height)
+     egl_fb_setup_for_tex(fb, width, height, texture, true);
+ }
+ 
++/*
++ * q11-fb-invalidate: with /run/qemu-fb-invalidate present, egl_fb_blit() invalidates a
++ * destination it fully covers instead of clearing it (see the patch header).
++ */
++static bool egl_fb_invalidate_on(void)
++{
++    static int64_t last;
++    static bool checked, on;
++    int64_t now = g_get_monotonic_time();
++
++    if (!checked || now - last >= G_USEC_PER_SEC) {
++        bool was = on;
++
++        checked = true;
++        last = now;
++        on = access("/run/qemu-fb-invalidate", F_OK) == 0;
++        if (on != was) {
++            info_report("egl: fb-invalidate %s", on ? "on" : "off");
++        }
++    }
++    return on;
++}
++
++static bool egl_fb_can_invalidate(void)
++{
++    static int ok = -1;
++
++    if (ok < 0) {
++        ok = epoxy_is_desktop_gl()
++            ? (epoxy_gl_version() >= 43 ||
++               epoxy_has_gl_extension("GL_ARB_invalidate_subdata"))
++            : epoxy_gl_version() >= 30;
++    }
++    return ok;
++}
++
+ void egl_fb_blit(egl_fb *dst, egl_fb *src, bool flip)
+ {
+-    GLuint x1 = 0;
+-    GLuint y1 = 0;
++    if (src->dmabuf) {
++        egl_fb_blit_rect(dst, src, flip, qemu_dmabuf_get_x(src->dmabuf),
++                         qemu_dmabuf_get_y(src->dmabuf),
++                         qemu_dmabuf_get_width(src->dmabuf),
++                         qemu_dmabuf_get_height(src->dmabuf));
++    } else {
++        egl_fb_blit_rect(dst, src, flip, 0, 0, src->width, src->height);
++    }
++}
++
++void egl_fb_blit_rect(egl_fb *dst, egl_fb *src, bool flip, uint32_t sx, uint32_t sy,
++                      uint32_t sw, uint32_t sh)
++{
++    GLuint x1 = sx;
++    GLuint y1 = sy;
+     GLuint x2, y2;
+-    GLuint w = src->width;
+-    GLuint h = src->height;
++    GLuint w = sw;
++    GLuint h = sh;
+ 
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, src->framebuffer);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->framebuffer);
+     glViewport(0, 0, dst->width, dst->height);
+-    glClear(GL_COLOR_BUFFER_BIT);
+ 
+-    if (src->dmabuf) {
+-        x1 = qemu_dmabuf_get_x(src->dmabuf);
+-        y1 = qemu_dmabuf_get_y(src->dmabuf);
+-        w = qemu_dmabuf_get_width(src->dmabuf);
+-        h = qemu_dmabuf_get_height(src->dmabuf);
++    if (x1 >= (GLuint)src->width || y1 >= (GLuint)src->height || !w || !h) {
++        /* a rectangle outside the texture: the whole of it, as before */
++        x1 = y1 = 0;
++        w = src->width;
++        h = src->height;
+     }
+ 
+     w = (x1 + w) > src->width ? src->width - x1 : w;
+     h = (y1 + h) > src->height ? src->height - y1 : h;
+ 
++    /*
++     * The blit below stretches the source over all of dst, so clearing first only
++     * costs a separate clear job plus a full tile load in the blit's job (Mesa v3d).
++     * Invalidate instead -- but only when v3d will draw the blit (scaled or
++     * flipped): an unscaled, unflipped blit may take the TFU/TLB path, which leaves
++     * the invalidation for the next draw (the overlays) to skip loading its result.
++     */
++    if (dst->x == 0 && dst->y == 0 &&
++        (flip || w != (GLuint)dst->width || h != (GLuint)dst->height) &&
++        egl_fb_invalidate_on() && egl_fb_can_invalidate()) {
++        GLenum att = dst->framebuffer ? GL_COLOR_ATTACHMENT0 : GL_COLOR;
++
++        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &att);
++    } else {
++        glClear(GL_COLOR_BUFFER_BIT);
++    }
++
+     y2 = flip ? y1 : h + y1;
+     y1 = flip ? h + y1 : y1;
+     x2 = x1 + w;
+diff --git a/ui/linux-dmabuf-unstable-v1-client-protocol.h b/ui/linux-dmabuf-unstable-v1-client-protocol.h
+new file mode 100644
+index 000000000..88bcc1110
+--- /dev/null
++++ b/ui/linux-dmabuf-unstable-v1-client-protocol.h
+@@ -0,0 +1,1084 @@
++/* Generated by wayland-scanner 1.24.0 */
++
++#ifndef LINUX_DMABUF_UNSTABLE_V1_CLIENT_PROTOCOL_H
++#define LINUX_DMABUF_UNSTABLE_V1_CLIENT_PROTOCOL_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include "wayland-client.h"
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @page page_linux_dmabuf_unstable_v1 The linux_dmabuf_unstable_v1 protocol
++ * @section page_ifaces_linux_dmabuf_unstable_v1 Interfaces
++ * - @subpage page_iface_zwp_linux_dmabuf_v1 - factory for creating dmabuf-based wl_buffers
++ * - @subpage page_iface_zwp_linux_buffer_params_v1 - parameters for creating a dmabuf-based wl_buffer
++ * - @subpage page_iface_zwp_linux_dmabuf_feedback_v1 - dmabuf feedback
++ * @section page_copyright_linux_dmabuf_unstable_v1 Copyright
++ * <pre>
++ *
++ * Copyright © 2014, 2015 Collabora, Ltd.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ * </pre>
++ */
++struct wl_buffer;
++struct wl_surface;
++struct zwp_linux_buffer_params_v1;
++struct zwp_linux_dmabuf_feedback_v1;
++struct zwp_linux_dmabuf_v1;
++
++#ifndef ZWP_LINUX_DMABUF_V1_INTERFACE
++#define ZWP_LINUX_DMABUF_V1_INTERFACE
++/**
++ * @page page_iface_zwp_linux_dmabuf_v1 zwp_linux_dmabuf_v1
++ * @section page_iface_zwp_linux_dmabuf_v1_desc Description
++ *
++ * Following the interfaces from:
++ * https://www.khronos.org/registry/egl/extensions/EXT/EGL_EXT_image_dma_buf_import.txt
++ * https://www.khronos.org/registry/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import_modifiers.txt
++ * and the Linux DRM sub-system's AddFb2 ioctl.
++ *
++ * This interface offers ways to create generic dmabuf-based wl_buffers.
++ *
++ * Clients can use the get_surface_feedback request to get dmabuf feedback
++ * for a particular surface. If the client wants to retrieve feedback not
++ * tied to a surface, they can use the get_default_feedback request.
++ *
++ * The following are required from clients:
++ *
++ * - Clients must ensure that either all data in the dma-buf is
++ * coherent for all subsequent read access or that coherency is
++ * correctly handled by the underlying kernel-side dma-buf
++ * implementation.
++ *
++ * - Don't make any more attachments after sending the buffer to the
++ * compositor. Making more attachments later increases the risk of
++ * the compositor not being able to use (re-import) an existing
++ * dmabuf-based wl_buffer.
++ *
++ * The underlying graphics stack must ensure the following:
++ *
++ * - The dmabuf file descriptors relayed to the server will stay valid
++ * for the whole lifetime of the wl_buffer. This means the server may
++ * at any time use those fds to import the dmabuf into any kernel
++ * sub-system that might accept it.
++ *
++ * However, when the underlying graphics stack fails to deliver the
++ * promise, because of e.g. a device hot-unplug which raises internal
++ * errors, after the wl_buffer has been successfully created the
++ * compositor must not raise protocol errors to the client when dmabuf
++ * import later fails.
++ *
++ * To create a wl_buffer from one or more dmabufs, a client creates a
++ * zwp_linux_dmabuf_params_v1 object with a zwp_linux_dmabuf_v1.create_params
++ * request. All planes required by the intended format are added with
++ * the 'add' request. Finally, a 'create' or 'create_immed' request is
++ * issued, which has the following outcome depending on the import success.
++ *
++ * The 'create' request,
++ * - on success, triggers a 'created' event which provides the final
++ * wl_buffer to the client.
++ * - on failure, triggers a 'failed' event to convey that the server
++ * cannot use the dmabufs received from the client.
++ *
++ * For the 'create_immed' request,
++ * - on success, the server immediately imports the added dmabufs to
++ * create a wl_buffer. No event is sent from the server in this case.
++ * - on failure, the server can choose to either:
++ * - terminate the client by raising a fatal error.
++ * - mark the wl_buffer as failed, and send a 'failed' event to the
++ * client. If the client uses a failed wl_buffer as an argument to any
++ * request, the behaviour is compositor implementation-defined.
++ *
++ * For all DRM formats and unless specified in another protocol extension,
++ * pre-multiplied alpha is used for pixel values.
++ *
++ * Unless specified otherwise in another protocol extension, implicit
++ * synchronization is used. In other words, compositors and clients must
++ * wait and signal fences implicitly passed via the DMA-BUF's reservation
++ * mechanism.
++ *
++ * Disclaimer: This protocol extension has been marked stable. This copy is
++ * no longer used and only retained for backwards compatibility. The
++ * canonical version can be found in the stable/ directory.
++ * @section page_iface_zwp_linux_dmabuf_v1_api API
++ * See @ref iface_zwp_linux_dmabuf_v1.
++ */
++/**
++ * @defgroup iface_zwp_linux_dmabuf_v1 The zwp_linux_dmabuf_v1 interface
++ *
++ * Following the interfaces from:
++ * https://www.khronos.org/registry/egl/extensions/EXT/EGL_EXT_image_dma_buf_import.txt
++ * https://www.khronos.org/registry/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import_modifiers.txt
++ * and the Linux DRM sub-system's AddFb2 ioctl.
++ *
++ * This interface offers ways to create generic dmabuf-based wl_buffers.
++ *
++ * Clients can use the get_surface_feedback request to get dmabuf feedback
++ * for a particular surface. If the client wants to retrieve feedback not
++ * tied to a surface, they can use the get_default_feedback request.
++ *
++ * The following are required from clients:
++ *
++ * - Clients must ensure that either all data in the dma-buf is
++ * coherent for all subsequent read access or that coherency is
++ * correctly handled by the underlying kernel-side dma-buf
++ * implementation.
++ *
++ * - Don't make any more attachments after sending the buffer to the
++ * compositor. Making more attachments later increases the risk of
++ * the compositor not being able to use (re-import) an existing
++ * dmabuf-based wl_buffer.
++ *
++ * The underlying graphics stack must ensure the following:
++ *
++ * - The dmabuf file descriptors relayed to the server will stay valid
++ * for the whole lifetime of the wl_buffer. This means the server may
++ * at any time use those fds to import the dmabuf into any kernel
++ * sub-system that might accept it.
++ *
++ * However, when the underlying graphics stack fails to deliver the
++ * promise, because of e.g. a device hot-unplug which raises internal
++ * errors, after the wl_buffer has been successfully created the
++ * compositor must not raise protocol errors to the client when dmabuf
++ * import later fails.
++ *
++ * To create a wl_buffer from one or more dmabufs, a client creates a
++ * zwp_linux_dmabuf_params_v1 object with a zwp_linux_dmabuf_v1.create_params
++ * request. All planes required by the intended format are added with
++ * the 'add' request. Finally, a 'create' or 'create_immed' request is
++ * issued, which has the following outcome depending on the import success.
++ *
++ * The 'create' request,
++ * - on success, triggers a 'created' event which provides the final
++ * wl_buffer to the client.
++ * - on failure, triggers a 'failed' event to convey that the server
++ * cannot use the dmabufs received from the client.
++ *
++ * For the 'create_immed' request,
++ * - on success, the server immediately imports the added dmabufs to
++ * create a wl_buffer. No event is sent from the server in this case.
++ * - on failure, the server can choose to either:
++ * - terminate the client by raising a fatal error.
++ * - mark the wl_buffer as failed, and send a 'failed' event to the
++ * client. If the client uses a failed wl_buffer as an argument to any
++ * request, the behaviour is compositor implementation-defined.
++ *
++ * For all DRM formats and unless specified in another protocol extension,
++ * pre-multiplied alpha is used for pixel values.
++ *
++ * Unless specified otherwise in another protocol extension, implicit
++ * synchronization is used. In other words, compositors and clients must
++ * wait and signal fences implicitly passed via the DMA-BUF's reservation
++ * mechanism.
++ *
++ * Disclaimer: This protocol extension has been marked stable. This copy is
++ * no longer used and only retained for backwards compatibility. The
++ * canonical version can be found in the stable/ directory.
++ */
++extern const struct wl_interface zwp_linux_dmabuf_v1_interface;
++#endif
++#ifndef ZWP_LINUX_BUFFER_PARAMS_V1_INTERFACE
++#define ZWP_LINUX_BUFFER_PARAMS_V1_INTERFACE
++/**
++ * @page page_iface_zwp_linux_buffer_params_v1 zwp_linux_buffer_params_v1
++ * @section page_iface_zwp_linux_buffer_params_v1_desc Description
++ *
++ * This temporary object is a collection of dmabufs and other
++ * parameters that together form a single logical buffer. The temporary
++ * object may eventually create one wl_buffer unless cancelled by
++ * destroying it before requesting 'create'.
++ *
++ * Single-planar formats only require one dmabuf, however
++ * multi-planar formats may require more than one dmabuf. For all
++ * formats, an 'add' request must be called once per plane (even if the
++ * underlying dmabuf fd is identical).
++ *
++ * You must use consecutive plane indices ('plane_idx' argument for 'add')
++ * from zero to the number of planes used by the drm_fourcc format code.
++ * All planes required by the format must be given exactly once, but can
++ * be given in any order. Each plane index can be set only once.
++ * @section page_iface_zwp_linux_buffer_params_v1_api API
++ * See @ref iface_zwp_linux_buffer_params_v1.
++ */
++/**
++ * @defgroup iface_zwp_linux_buffer_params_v1 The zwp_linux_buffer_params_v1 interface
++ *
++ * This temporary object is a collection of dmabufs and other
++ * parameters that together form a single logical buffer. The temporary
++ * object may eventually create one wl_buffer unless cancelled by
++ * destroying it before requesting 'create'.
++ *
++ * Single-planar formats only require one dmabuf, however
++ * multi-planar formats may require more than one dmabuf. For all
++ * formats, an 'add' request must be called once per plane (even if the
++ * underlying dmabuf fd is identical).
++ *
++ * You must use consecutive plane indices ('plane_idx' argument for 'add')
++ * from zero to the number of planes used by the drm_fourcc format code.
++ * All planes required by the format must be given exactly once, but can
++ * be given in any order. Each plane index can be set only once.
++ */
++extern const struct wl_interface zwp_linux_buffer_params_v1_interface;
++#endif
++#ifndef ZWP_LINUX_DMABUF_FEEDBACK_V1_INTERFACE
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_INTERFACE
++/**
++ * @page page_iface_zwp_linux_dmabuf_feedback_v1 zwp_linux_dmabuf_feedback_v1
++ * @section page_iface_zwp_linux_dmabuf_feedback_v1_desc Description
++ *
++ * This object advertises dmabuf parameters feedback. This includes the
++ * preferred devices and the supported formats/modifiers.
++ *
++ * The parameters are sent once when this object is created and whenever they
++ * change. The done event is always sent once after all parameters have been
++ * sent. When a single parameter changes, all parameters are re-sent by the
++ * compositor.
++ *
++ * Compositors can re-send the parameters when the current client buffer
++ * allocations are sub-optimal. Compositors should not re-send the
++ * parameters if re-allocating the buffers would not result in a more optimal
++ * configuration. In particular, compositors should avoid sending the exact
++ * same parameters multiple times in a row.
++ *
++ * The tranche_target_device and tranche_formats events are grouped by
++ * tranches of preference. For each tranche, a tranche_target_device, one
++ * tranche_flags and one or more tranche_formats events are sent, followed
++ * by a tranche_done event finishing the list. The tranches are sent in
++ * descending order of preference. All formats and modifiers in the same
++ * tranche have the same preference.
++ *
++ * To send parameters, the compositor sends one main_device event, tranches
++ * (each consisting of one tranche_target_device event, one tranche_flags
++ * event, tranche_formats events and then a tranche_done event), then one
++ * done event.
++ * @section page_iface_zwp_linux_dmabuf_feedback_v1_api API
++ * See @ref iface_zwp_linux_dmabuf_feedback_v1.
++ */
++/**
++ * @defgroup iface_zwp_linux_dmabuf_feedback_v1 The zwp_linux_dmabuf_feedback_v1 interface
++ *
++ * This object advertises dmabuf parameters feedback. This includes the
++ * preferred devices and the supported formats/modifiers.
++ *
++ * The parameters are sent once when this object is created and whenever they
++ * change. The done event is always sent once after all parameters have been
++ * sent. When a single parameter changes, all parameters are re-sent by the
++ * compositor.
++ *
++ * Compositors can re-send the parameters when the current client buffer
++ * allocations are sub-optimal. Compositors should not re-send the
++ * parameters if re-allocating the buffers would not result in a more optimal
++ * configuration. In particular, compositors should avoid sending the exact
++ * same parameters multiple times in a row.
++ *
++ * The tranche_target_device and tranche_formats events are grouped by
++ * tranches of preference. For each tranche, a tranche_target_device, one
++ * tranche_flags and one or more tranche_formats events are sent, followed
++ * by a tranche_done event finishing the list. The tranches are sent in
++ * descending order of preference. All formats and modifiers in the same
++ * tranche have the same preference.
++ *
++ * To send parameters, the compositor sends one main_device event, tranches
++ * (each consisting of one tranche_target_device event, one tranche_flags
++ * event, tranche_formats events and then a tranche_done event), then one
++ * done event.
++ */
++extern const struct wl_interface zwp_linux_dmabuf_feedback_v1_interface;
++#endif
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ * @struct zwp_linux_dmabuf_v1_listener
++ */
++struct zwp_linux_dmabuf_v1_listener {
++	/**
++	 * supported buffer format
++	 *
++	 * This event advertises one buffer format that the server
++	 * supports. All the supported formats are advertised once when the
++	 * client binds to this interface. A roundtrip after binding
++	 * guarantees that the client has received all supported formats.
++	 *
++	 * For the definition of the format codes, see the
++	 * zwp_linux_buffer_params_v1::create request.
++	 *
++	 * Starting version 4, the format event is deprecated and must not
++	 * be sent by compositors. Instead, use get_default_feedback or
++	 * get_surface_feedback.
++	 * @param format DRM_FORMAT code
++	 */
++	void (*format)(void *data,
++		       struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1,
++		       uint32_t format);
++	/**
++	 * supported buffer format modifier
++	 *
++	 * This event advertises the formats that the server supports,
++	 * along with the modifiers supported for each format. All the
++	 * supported modifiers for all the supported formats are advertised
++	 * once when the client binds to this interface. A roundtrip after
++	 * binding guarantees that the client has received all supported
++	 * format-modifier pairs.
++	 *
++	 * For legacy support, DRM_FORMAT_MOD_INVALID (that is, modifier_hi
++	 * == 0x00ffffff and modifier_lo == 0xffffffff) is allowed in this
++	 * event. It indicates that the server can support the format with
++	 * an implicit modifier. When a plane has DRM_FORMAT_MOD_INVALID as
++	 * its modifier, it is as if no explicit modifier is specified. The
++	 * effective modifier will be derived from the dmabuf.
++	 *
++	 * A compositor that sends valid modifiers and
++	 * DRM_FORMAT_MOD_INVALID for a given format supports both explicit
++	 * modifiers and implicit modifiers.
++	 *
++	 * For the definition of the format and modifier codes, see the
++	 * zwp_linux_buffer_params_v1::create and
++	 * zwp_linux_buffer_params_v1::add requests.
++	 *
++	 * Starting version 4, the modifier event is deprecated and must
++	 * not be sent by compositors. Instead, use get_default_feedback or
++	 * get_surface_feedback.
++	 * @param format DRM_FORMAT code
++	 * @param modifier_hi high 32 bits of layout modifier
++	 * @param modifier_lo low 32 bits of layout modifier
++	 * @since 3
++	 */
++	void (*modifier)(void *data,
++			 struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1,
++			 uint32_t format,
++			 uint32_t modifier_hi,
++			 uint32_t modifier_lo);
++};
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++static inline int
++zwp_linux_dmabuf_v1_add_listener(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1,
++				 const struct zwp_linux_dmabuf_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zwp_linux_dmabuf_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZWP_LINUX_DMABUF_V1_DESTROY 0
++#define ZWP_LINUX_DMABUF_V1_CREATE_PARAMS 1
++#define ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK 2
++#define ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK 3
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++#define ZWP_LINUX_DMABUF_V1_FORMAT_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++#define ZWP_LINUX_DMABUF_V1_MODIFIER_SINCE_VERSION 3
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++#define ZWP_LINUX_DMABUF_V1_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++#define ZWP_LINUX_DMABUF_V1_CREATE_PARAMS_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++#define ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION 4
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ */
++#define ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK_SINCE_VERSION 4
++
++/** @ingroup iface_zwp_linux_dmabuf_v1 */
++static inline void
++zwp_linux_dmabuf_v1_set_user_data(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_linux_dmabuf_v1, user_data);
++}
++
++/** @ingroup iface_zwp_linux_dmabuf_v1 */
++static inline void *
++zwp_linux_dmabuf_v1_get_user_data(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_linux_dmabuf_v1);
++}
++
++static inline uint32_t
++zwp_linux_dmabuf_v1_get_version(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_v1);
++}
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ *
++ * Objects created through this interface, especially wl_buffers, will
++ * remain valid.
++ */
++static inline void
++zwp_linux_dmabuf_v1_destroy(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_dmabuf_v1,
++			 ZWP_LINUX_DMABUF_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ *
++ * This temporary object is used to collect multiple dmabuf handles into
++ * a single batch to create a wl_buffer. It can only be used once and
++ * should be destroyed after a 'created' or 'failed' event has been
++ * received.
++ */
++static inline struct zwp_linux_buffer_params_v1 *
++zwp_linux_dmabuf_v1_create_params(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1)
++{
++	struct wl_proxy *params_id;
++
++	params_id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_dmabuf_v1,
++			 ZWP_LINUX_DMABUF_V1_CREATE_PARAMS, &zwp_linux_buffer_params_v1_interface, wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_v1), 0, NULL);
++
++	return (struct zwp_linux_buffer_params_v1 *) params_id;
++}
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ *
++ * This request creates a new wp_linux_dmabuf_feedback object not bound
++ * to a particular surface. This object will deliver feedback about dmabuf
++ * parameters to use if the client doesn't support per-surface feedback
++ * (see get_surface_feedback).
++ */
++static inline struct zwp_linux_dmabuf_feedback_v1 *
++zwp_linux_dmabuf_v1_get_default_feedback(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_dmabuf_v1,
++			 ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK, &zwp_linux_dmabuf_feedback_v1_interface, wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_v1), 0, NULL);
++
++	return (struct zwp_linux_dmabuf_feedback_v1 *) id;
++}
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_v1
++ *
++ * This request creates a new wp_linux_dmabuf_feedback object for the
++ * specified wl_surface. This object will deliver feedback about dmabuf
++ * parameters to use for buffers attached to this surface.
++ *
++ * If the surface is destroyed before the wp_linux_dmabuf_feedback object,
++ * the feedback object becomes inert.
++ */
++static inline struct zwp_linux_dmabuf_feedback_v1 *
++zwp_linux_dmabuf_v1_get_surface_feedback(struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1, struct wl_surface *surface)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_dmabuf_v1,
++			 ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK, &zwp_linux_dmabuf_feedback_v1_interface, wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_v1), 0, NULL, surface);
++
++	return (struct zwp_linux_dmabuf_feedback_v1 *) id;
++}
++
++#ifndef ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ENUM
++#define ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ENUM
++enum zwp_linux_buffer_params_v1_error {
++	/**
++	 * the dmabuf_batch object has already been used to create a wl_buffer
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ALREADY_USED = 0,
++	/**
++	 * plane index out of bounds
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_IDX = 1,
++	/**
++	 * the plane index was already set
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_SET = 2,
++	/**
++	 * missing or too many planes to create a buffer
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INCOMPLETE = 3,
++	/**
++	 * format not supported
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT = 4,
++	/**
++	 * invalid width or height
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS = 5,
++	/**
++	 * offset + stride * height goes out of dmabuf bounds
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS = 6,
++	/**
++	 * invalid wl_buffer resulted from importing dmabufs via                the create_immed request on given buffer_params
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER = 7,
++};
++#endif /* ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ENUM */
++
++#ifndef ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_ENUM
++#define ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_ENUM
++enum zwp_linux_buffer_params_v1_flags {
++	/**
++	 * contents are y-inverted
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_Y_INVERT = 1,
++	/**
++	 * content is interlaced
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_INTERLACED = 2,
++	/**
++	 * bottom field first
++	 */
++	ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_BOTTOM_FIRST = 4,
++};
++#endif /* ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_ENUM */
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ * @struct zwp_linux_buffer_params_v1_listener
++ */
++struct zwp_linux_buffer_params_v1_listener {
++	/**
++	 * buffer creation succeeded
++	 *
++	 * This event indicates that the attempted buffer creation was
++	 * successful. It provides the new wl_buffer referencing the
++	 * dmabuf(s).
++	 *
++	 * Upon receiving this event, the client should destroy the
++	 * zwp_linux_buffer_params_v1 object.
++	 * @param buffer the newly created wl_buffer
++	 */
++	void (*created)(void *data,
++			struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1,
++			struct wl_buffer *buffer);
++	/**
++	 * buffer creation failed
++	 *
++	 * This event indicates that the attempted buffer creation has
++	 * failed. It usually means that one of the dmabuf constraints has
++	 * not been fulfilled.
++	 *
++	 * Upon receiving this event, the client should destroy the
++	 * zwp_linux_buffer_params_v1 object.
++	 */
++	void (*failed)(void *data,
++		       struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1);
++};
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++static inline int
++zwp_linux_buffer_params_v1_add_listener(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1,
++					const struct zwp_linux_buffer_params_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zwp_linux_buffer_params_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZWP_LINUX_BUFFER_PARAMS_V1_DESTROY 0
++#define ZWP_LINUX_BUFFER_PARAMS_V1_ADD 1
++#define ZWP_LINUX_BUFFER_PARAMS_V1_CREATE 2
++#define ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_IMMED 3
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++#define ZWP_LINUX_BUFFER_PARAMS_V1_CREATED_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++#define ZWP_LINUX_BUFFER_PARAMS_V1_FAILED_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++#define ZWP_LINUX_BUFFER_PARAMS_V1_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++#define ZWP_LINUX_BUFFER_PARAMS_V1_ADD_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++#define ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ */
++#define ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_IMMED_SINCE_VERSION 2
++
++/** @ingroup iface_zwp_linux_buffer_params_v1 */
++static inline void
++zwp_linux_buffer_params_v1_set_user_data(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_linux_buffer_params_v1, user_data);
++}
++
++/** @ingroup iface_zwp_linux_buffer_params_v1 */
++static inline void *
++zwp_linux_buffer_params_v1_get_user_data(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_linux_buffer_params_v1);
++}
++
++static inline uint32_t
++zwp_linux_buffer_params_v1_get_version(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_linux_buffer_params_v1);
++}
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ *
++ * Cleans up the temporary data sent to the server for dmabuf-based
++ * wl_buffer creation.
++ */
++static inline void
++zwp_linux_buffer_params_v1_destroy(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_buffer_params_v1,
++			 ZWP_LINUX_BUFFER_PARAMS_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_linux_buffer_params_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ *
++ * This request adds one dmabuf to the set in this
++ * zwp_linux_buffer_params_v1.
++ *
++ * The 64-bit unsigned value combined from modifier_hi and modifier_lo
++ * is the dmabuf layout modifier. DRM AddFB2 ioctl calls this the
++ * fb modifier, which is defined in drm_mode.h of Linux UAPI.
++ * This is an opaque token. Drivers use this token to express tiling,
++ * compression, etc. driver-specific modifications to the base format
++ * defined by the DRM fourcc code.
++ *
++ * Starting from version 4, the invalid_format protocol error is sent if
++ * the format + modifier pair was not advertised as supported.
++ *
++ * Starting from version 5, the invalid_format protocol error is sent if
++ * all planes don't use the same modifier.
++ *
++ * This request raises the PLANE_IDX error if plane_idx is too large.
++ * The error PLANE_SET is raised if attempting to set a plane that
++ * was already set.
++ */
++static inline void
++zwp_linux_buffer_params_v1_add(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1, int32_t fd, uint32_t plane_idx, uint32_t offset, uint32_t stride, uint32_t modifier_hi, uint32_t modifier_lo)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_buffer_params_v1,
++			 ZWP_LINUX_BUFFER_PARAMS_V1_ADD, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_linux_buffer_params_v1), 0, fd, plane_idx, offset, stride, modifier_hi, modifier_lo);
++}
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ *
++ * This asks for creation of a wl_buffer from the added dmabuf
++ * buffers. The wl_buffer is not created immediately but returned via
++ * the 'created' event if the dmabuf sharing succeeds. The sharing
++ * may fail at runtime for reasons a client cannot predict, in
++ * which case the 'failed' event is triggered.
++ *
++ * The 'format' argument is a DRM_FORMAT code, as defined by the
++ * libdrm's drm_fourcc.h. The Linux kernel's DRM sub-system is the
++ * authoritative source on how the format codes should work.
++ *
++ * The 'flags' is a bitfield of the flags defined in enum "flags".
++ * 'y_invert' means the that the image needs to be y-flipped.
++ *
++ * Flag 'interlaced' means that the frame in the buffer is not
++ * progressive as usual, but interlaced. An interlaced buffer as
++ * supported here must always contain both top and bottom fields.
++ * The top field always begins on the first pixel row. The temporal
++ * ordering between the two fields is top field first, unless
++ * 'bottom_first' is specified. It is undefined whether 'bottom_first'
++ * is ignored if 'interlaced' is not set.
++ *
++ * This protocol does not convey any information about field rate,
++ * duration, or timing, other than the relative ordering between the
++ * two fields in one buffer. A compositor may have to estimate the
++ * intended field rate from the incoming buffer rate. It is undefined
++ * whether the time of receiving wl_surface.commit with a new buffer
++ * attached, applying the wl_surface state, wl_surface.frame callback
++ * trigger, presentation, or any other point in the compositor cycle
++ * is used to measure the frame or field times. There is no support
++ * for detecting missed or late frames/fields/buffers either, and
++ * there is no support whatsoever for cooperating with interlaced
++ * compositor output.
++ *
++ * The composited image quality resulting from the use of interlaced
++ * buffers is explicitly undefined. A compositor may use elaborate
++ * hardware features or software to deinterlace and create progressive
++ * output frames from a sequence of interlaced input buffers, or it
++ * may produce substandard image quality. However, compositors that
++ * cannot guarantee reasonable image quality in all cases are recommended
++ * to just reject all interlaced buffers.
++ *
++ * Any argument errors, including non-positive width or height,
++ * mismatch between the number of planes and the format, bad
++ * format, bad offset or stride, may be indicated by fatal protocol
++ * errors: INCOMPLETE, INVALID_FORMAT, INVALID_DIMENSIONS,
++ * OUT_OF_BOUNDS.
++ *
++ * Dmabuf import errors in the server that are not obvious client
++ * bugs are returned via the 'failed' event as non-fatal. This
++ * allows attempting dmabuf sharing and falling back in the client
++ * if it fails.
++ *
++ * This request can be sent only once in the object's lifetime, after
++ * which the only legal request is destroy. This object should be
++ * destroyed after issuing a 'create' request. Attempting to use this
++ * object after issuing 'create' raises ALREADY_USED protocol error.
++ *
++ * It is not mandatory to issue 'create'. If a client wants to
++ * cancel the buffer creation, it can just destroy this object.
++ */
++static inline void
++zwp_linux_buffer_params_v1_create(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1, int32_t width, int32_t height, uint32_t format, uint32_t flags)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_buffer_params_v1,
++			 ZWP_LINUX_BUFFER_PARAMS_V1_CREATE, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_linux_buffer_params_v1), 0, width, height, format, flags);
++}
++
++/**
++ * @ingroup iface_zwp_linux_buffer_params_v1
++ *
++ * This asks for immediate creation of a wl_buffer by importing the
++ * added dmabufs.
++ *
++ * In case of import success, no event is sent from the server, and the
++ * wl_buffer is ready to be used by the client.
++ *
++ * Upon import failure, either of the following may happen, as seen fit
++ * by the implementation:
++ * - the client is terminated with one of the following fatal protocol
++ * errors:
++ * - INCOMPLETE, INVALID_FORMAT, INVALID_DIMENSIONS, OUT_OF_BOUNDS,
++ * in case of argument errors such as mismatch between the number
++ * of planes and the format, bad format, non-positive width or
++ * height, or bad offset or stride.
++ * - INVALID_WL_BUFFER, in case the cause for failure is unknown or
++ * platform specific.
++ * - the server creates an invalid wl_buffer, marks it as failed and
++ * sends a 'failed' event to the client. The result of using this
++ * invalid wl_buffer as an argument in any request by the client is
++ * defined by the compositor implementation.
++ *
++ * This takes the same arguments as a 'create' request, and obeys the
++ * same restrictions.
++ */
++static inline struct wl_buffer *
++zwp_linux_buffer_params_v1_create_immed(struct zwp_linux_buffer_params_v1 *zwp_linux_buffer_params_v1, int32_t width, int32_t height, uint32_t format, uint32_t flags)
++{
++	struct wl_proxy *buffer_id;
++
++	buffer_id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_buffer_params_v1,
++			 ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_IMMED, &wl_buffer_interface, wl_proxy_get_version((struct wl_proxy *) zwp_linux_buffer_params_v1), 0, NULL, width, height, format, flags);
++
++	return (struct wl_buffer *) buffer_id;
++}
++
++#ifndef ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_ENUM
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_ENUM
++enum zwp_linux_dmabuf_feedback_v1_tranche_flags {
++	/**
++	 * direct scan-out tranche
++	 */
++	ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT = 1,
++};
++#endif /* ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_ENUM */
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ * @struct zwp_linux_dmabuf_feedback_v1_listener
++ */
++struct zwp_linux_dmabuf_feedback_v1_listener {
++	/**
++	 * all feedback has been sent
++	 *
++	 * This event is sent after all parameters of a
++	 * wp_linux_dmabuf_feedback object have been sent.
++	 *
++	 * This allows changes to the wp_linux_dmabuf_feedback parameters
++	 * to be seen as atomic, even if they happen via multiple events.
++	 */
++	void (*done)(void *data,
++		     struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1);
++	/**
++	 * format and modifier table
++	 *
++	 * This event provides a file descriptor which can be
++	 * memory-mapped to access the format and modifier table.
++	 *
++	 * The table contains a tightly packed array of consecutive format
++	 * + modifier pairs. Each pair is 16 bytes wide. It contains a
++	 * format as a 32-bit unsigned integer, followed by 4 bytes of
++	 * unused padding, and a modifier as a 64-bit unsigned integer. The
++	 * native endianness is used.
++	 *
++	 * The client must map the file descriptor in read-only private
++	 * mode.
++	 *
++	 * Compositors are not allowed to mutate the table file contents
++	 * once this event has been sent. Instead, compositors must create
++	 * a new, separate table file and re-send feedback parameters.
++	 * Compositors are allowed to store duplicate format + modifier
++	 * pairs in the table.
++	 * @param fd table file descriptor
++	 * @param size table size, in bytes
++	 */
++	void (*format_table)(void *data,
++			     struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1,
++			     int32_t fd,
++			     uint32_t size);
++	/**
++	 * preferred main device
++	 *
++	 * This event advertises the main device that the server prefers
++	 * to use when direct scan-out to the target device isn't possible.
++	 * The advertised main device may be different for each
++	 * wp_linux_dmabuf_feedback object, and may change over time.
++	 *
++	 * There is exactly one main device. The compositor must send at
++	 * least one preference tranche with tranche_target_device equal to
++	 * main_device.
++	 *
++	 * Clients need to create buffers that the main device can import
++	 * and read from, otherwise creating the dmabuf wl_buffer will fail
++	 * (see the wp_linux_buffer_params.create and create_immed requests
++	 * for details). The main device will also likely be kept active by
++	 * the compositor, so clients can use it instead of waking up
++	 * another device for power savings.
++	 *
++	 * In general the device is a DRM node. The DRM node type (primary
++	 * vs. render) is unspecified. Clients must not rely on the
++	 * compositor sending a particular node type. Clients cannot check
++	 * two devices for equality by comparing the dev_t value.
++	 *
++	 * If explicit modifiers are not supported and the client performs
++	 * buffer allocations on a different device than the main device,
++	 * then the client must force the buffer to have a linear layout.
++	 * @param device device dev_t value
++	 */
++	void (*main_device)(void *data,
++			    struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1,
++			    struct wl_array *device);
++	/**
++	 * a preference tranche has been sent
++	 *
++	 * This event splits tranche_target_device and tranche_formats
++	 * events in preference tranches. It is sent after a set of
++	 * tranche_target_device and tranche_formats events; it represents
++	 * the end of a tranche. The next tranche will have a lower
++	 * preference.
++	 */
++	void (*tranche_done)(void *data,
++			     struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1);
++	/**
++	 * target device
++	 *
++	 * This event advertises the target device that the server
++	 * prefers to use for a buffer created given this tranche. The
++	 * advertised target device may be different for each preference
++	 * tranche, and may change over time.
++	 *
++	 * There is exactly one target device per tranche.
++	 *
++	 * The target device may be a scan-out device, for example if the
++	 * compositor prefers to directly scan-out a buffer created given
++	 * this tranche. The target device may be a rendering device, for
++	 * example if the compositor prefers to texture from said buffer.
++	 *
++	 * The client can use this hint to allocate the buffer in a way
++	 * that makes it accessible from the target device, ideally
++	 * directly. The buffer must still be accessible from the main
++	 * device, either through direct import or through a potentially
++	 * more expensive fallback path. If the buffer can't be directly
++	 * imported from the main device then clients must be prepared for
++	 * the compositor changing the tranche priority or making wl_buffer
++	 * creation fail (see the wp_linux_buffer_params.create and
++	 * create_immed requests for details).
++	 *
++	 * If the device is a DRM node, the DRM node type (primary vs.
++	 * render) is unspecified. Clients must not rely on the compositor
++	 * sending a particular node type. Clients cannot check two devices
++	 * for equality by comparing the dev_t value.
++	 *
++	 * This event is tied to a preference tranche, see the tranche_done
++	 * event.
++	 * @param device device dev_t value
++	 */
++	void (*tranche_target_device)(void *data,
++				      struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1,
++				      struct wl_array *device);
++	/**
++	 * supported buffer format modifier
++	 *
++	 * This event advertises the format + modifier combinations that
++	 * the compositor supports.
++	 *
++	 * It carries an array of indices, each referring to a format +
++	 * modifier pair in the last received format table (see the
++	 * format_table event). Each index is a 16-bit unsigned integer in
++	 * native endianness.
++	 *
++	 * For legacy support, DRM_FORMAT_MOD_INVALID is an allowed
++	 * modifier. It indicates that the server can support the format
++	 * with an implicit modifier. When a buffer has
++	 * DRM_FORMAT_MOD_INVALID as its modifier, it is as if no explicit
++	 * modifier is specified. The effective modifier will be derived
++	 * from the dmabuf.
++	 *
++	 * A compositor that sends valid modifiers and
++	 * DRM_FORMAT_MOD_INVALID for a given format supports both explicit
++	 * modifiers and implicit modifiers.
++	 *
++	 * Compositors must not send duplicate format + modifier pairs
++	 * within the same tranche or across two different tranches with
++	 * the same target device and flags.
++	 *
++	 * This event is tied to a preference tranche, see the tranche_done
++	 * event.
++	 *
++	 * For the definition of the format and modifier codes, see the
++	 * wp_linux_buffer_params.create request.
++	 * @param indices array of 16-bit indexes
++	 */
++	void (*tranche_formats)(void *data,
++				struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1,
++				struct wl_array *indices);
++	/**
++	 * tranche flags
++	 *
++	 * This event sets tranche-specific flags.
++	 *
++	 * The scanout flag is a hint that direct scan-out may be attempted
++	 * by the compositor on the target device if the client
++	 * appropriately allocates a buffer. How to allocate a buffer that
++	 * can be scanned out on the target device is
++	 * implementation-defined.
++	 *
++	 * This event is tied to a preference tranche, see the tranche_done
++	 * event.
++	 * @param flags tranche flags
++	 */
++	void (*tranche_flags)(void *data,
++			      struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1,
++			      uint32_t flags);
++};
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++static inline int
++zwp_linux_dmabuf_feedback_v1_add_listener(struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1,
++					  const struct zwp_linux_dmabuf_feedback_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zwp_linux_dmabuf_feedback_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_DESTROY 0
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_DONE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_FORMAT_TABLE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_MAIN_DEVICE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_DONE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_TARGET_DEVICE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FORMATS_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ */
++#define ZWP_LINUX_DMABUF_FEEDBACK_V1_DESTROY_SINCE_VERSION 1
++
++/** @ingroup iface_zwp_linux_dmabuf_feedback_v1 */
++static inline void
++zwp_linux_dmabuf_feedback_v1_set_user_data(struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_linux_dmabuf_feedback_v1, user_data);
++}
++
++/** @ingroup iface_zwp_linux_dmabuf_feedback_v1 */
++static inline void *
++zwp_linux_dmabuf_feedback_v1_get_user_data(struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_linux_dmabuf_feedback_v1);
++}
++
++static inline uint32_t
++zwp_linux_dmabuf_feedback_v1_get_version(struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_feedback_v1);
++}
++
++/**
++ * @ingroup iface_zwp_linux_dmabuf_feedback_v1
++ *
++ * Using this request a client can tell the server that it is not going to
++ * use the wp_linux_dmabuf_feedback object anymore.
++ */
++static inline void
++zwp_linux_dmabuf_feedback_v1_destroy(struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_linux_dmabuf_feedback_v1,
++			 ZWP_LINUX_DMABUF_FEEDBACK_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_linux_dmabuf_feedback_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif
+diff --git a/ui/linux-dmabuf-unstable-v1-protocol.c b/ui/linux-dmabuf-unstable-v1-protocol.c
+new file mode 100644
+index 000000000..d03908384
+--- /dev/null
++++ b/ui/linux-dmabuf-unstable-v1-protocol.c
+@@ -0,0 +1,120 @@
++/* Generated by wayland-scanner 1.24.0 */
++
++/*
++ * Copyright © 2014, 2015 Collabora, Ltd.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include "wayland-util.h"
++
++#ifndef __has_attribute
++# define __has_attribute(x) 0  /* Compatibility with non-clang compilers. */
++#endif
++
++#if (__has_attribute(visibility) || defined(__GNUC__) && __GNUC__ >= 4)
++#define WL_PRIVATE __attribute__ ((visibility("hidden")))
++#else
++#define WL_PRIVATE
++#endif
++
++extern const struct wl_interface wl_buffer_interface;
++extern const struct wl_interface wl_surface_interface;
++extern const struct wl_interface zwp_linux_buffer_params_v1_interface;
++extern const struct wl_interface zwp_linux_dmabuf_feedback_v1_interface;
++
++static const struct wl_interface *linux_dmabuf_unstable_v1_types[] = {
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	&zwp_linux_buffer_params_v1_interface,
++	&zwp_linux_dmabuf_feedback_v1_interface,
++	&zwp_linux_dmabuf_feedback_v1_interface,
++	&wl_surface_interface,
++	&wl_buffer_interface,
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	&wl_buffer_interface,
++};
++
++static const struct wl_message zwp_linux_dmabuf_v1_requests[] = {
++	{ "destroy", "", linux_dmabuf_unstable_v1_types + 0 },
++	{ "create_params", "n", linux_dmabuf_unstable_v1_types + 6 },
++	{ "get_default_feedback", "4n", linux_dmabuf_unstable_v1_types + 7 },
++	{ "get_surface_feedback", "4no", linux_dmabuf_unstable_v1_types + 8 },
++};
++
++static const struct wl_message zwp_linux_dmabuf_v1_events[] = {
++	{ "format", "u", linux_dmabuf_unstable_v1_types + 0 },
++	{ "modifier", "3uuu", linux_dmabuf_unstable_v1_types + 0 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_linux_dmabuf_v1_interface = {
++	"zwp_linux_dmabuf_v1", 5,
++	4, zwp_linux_dmabuf_v1_requests,
++	2, zwp_linux_dmabuf_v1_events,
++};
++
++static const struct wl_message zwp_linux_buffer_params_v1_requests[] = {
++	{ "destroy", "", linux_dmabuf_unstable_v1_types + 0 },
++	{ "add", "huuuuu", linux_dmabuf_unstable_v1_types + 0 },
++	{ "create", "iiuu", linux_dmabuf_unstable_v1_types + 0 },
++	{ "create_immed", "2niiuu", linux_dmabuf_unstable_v1_types + 10 },
++};
++
++static const struct wl_message zwp_linux_buffer_params_v1_events[] = {
++	{ "created", "n", linux_dmabuf_unstable_v1_types + 15 },
++	{ "failed", "", linux_dmabuf_unstable_v1_types + 0 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_linux_buffer_params_v1_interface = {
++	"zwp_linux_buffer_params_v1", 5,
++	4, zwp_linux_buffer_params_v1_requests,
++	2, zwp_linux_buffer_params_v1_events,
++};
++
++static const struct wl_message zwp_linux_dmabuf_feedback_v1_requests[] = {
++	{ "destroy", "", linux_dmabuf_unstable_v1_types + 0 },
++};
++
++static const struct wl_message zwp_linux_dmabuf_feedback_v1_events[] = {
++	{ "done", "", linux_dmabuf_unstable_v1_types + 0 },
++	{ "format_table", "hu", linux_dmabuf_unstable_v1_types + 0 },
++	{ "main_device", "a", linux_dmabuf_unstable_v1_types + 0 },
++	{ "tranche_done", "", linux_dmabuf_unstable_v1_types + 0 },
++	{ "tranche_target_device", "a", linux_dmabuf_unstable_v1_types + 0 },
++	{ "tranche_formats", "a", linux_dmabuf_unstable_v1_types + 0 },
++	{ "tranche_flags", "u", linux_dmabuf_unstable_v1_types + 0 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_linux_dmabuf_feedback_v1_interface = {
++	"zwp_linux_dmabuf_feedback_v1", 5,
++	1, zwp_linux_dmabuf_feedback_v1_requests,
++	7, zwp_linux_dmabuf_feedback_v1_events,
++};
++
+diff --git a/ui/meson.build b/ui/meson.build
+index d345f6c70..eba6602cd 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -59,6 +59,7 @@ system_ss.add(files(
+   'ui-hmp-cmds.c',
+   'ui-qmp-cmds.c',
+   'util.c',
++  'direct-scanout.c',
+ ))
+ system_ss.add(ui)
+ system_ss.add(when: pixman, if_true: files('console-vc.c'), if_false: files('console-vc-stubs.c'))
+@@ -168,7 +169,10 @@ if sdl.found()
+     'sdl2-input.c',
+     'sdl2.c',
+   ))
+-  sdl_ss.add(when: opengl, if_true: files('sdl2-gl.c'))
++  sdl_ss.add(when: opengl, if_true: files('sdl2-gl.c', 'sdl2-wl-scanout.c'))
++  sdl_wayland = dependency('wayland-client', required: false)
++  sdl_ss.add(when: [opengl, sdl_wayland],
++             if_true: [sdl_wayland, files('linux-dmabuf-unstable-v1-protocol.c')])
+   sdl_ss.add(when: x11, if_true: files('x_keymap.c'))
+   ui_modules += {'sdl' : sdl_ss}
+ endif
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 62a65dcaf..8b00001c3 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -31,6 +31,8 @@
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "ui/sdl2.h"
++#include "hw/virtio/virtio-gpu.h"
++#include "ui/direct-scanout.h"
+ 
+ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
+ {
+@@ -121,6 +123,7 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
+         sdl2_gl_render_surface(scon);
+     }
+     sdl2_poll_events(scon);
++    sdl2_wl_scanout_dispatch();
+ }
+ 
+ void sdl2_gl_redraw(struct sdl2_console *scon)
+@@ -287,6 +290,30 @@ static void sdl2_gl_draw_overlays(struct sdl2_console *scon, int ww, int wh)
+     }
+ }
+ 
++/* q11-isp-scanout: /run/qemu-isp-scanout, looked up at most once a second */
++static bool sdl2_isp_scanout_on(void)
++{
++    static int64_t last = -1000000;
++    static bool on;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (now - last >= 1000) {
++        last = now;
++        on = access("/run/qemu-isp-scanout", F_OK) == 0;
++    }
++    return on;
++}
++
++static bool sdl2_overlays_on(struct sdl2_console *scon)
++{
++    for (int i = 0; i < ARRAY_SIZE(scon->ovl); i++) {
++        if (scon->ovl[i].on) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+@@ -303,11 +330,57 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+ 
++    int64_t t0 = qemu_lat_diag() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+     SDL_GetWindowSize(scon->real_window, &ww, &wh);
++    /*
++     * q11-isp-scanout: the scanout texture is a guest resource host-isp just filled
++     * from a CMA ring buffer -- give weston that buffer and skip the blit and the swap.
++     */
++    sdl2_wl_scanout_dispatch();
++    if (sdl2_isp_scanout_on()) {
++        DirectScanout d;
++        const char *why = scon->guest_fb.dmabuf ? "dmabuf scanout" :
++            scon->y0_top ? "y0_top" :
++            (scon->x || scon->y || scon->w != ww || scon->h != wh) ? "rect" :
++            sdl2_overlays_on(scon) ? "overlays" :
++            !direct_scanout_has(scon->guest_fb.texture) ? "no entry" :
++            !direct_scanout_lookup(scon->guest_fb.texture, &d) ? "stale" :
++            !sdl2_wl_scanout(scon, &d, ww, wh) ? "wayland" : NULL;
++
++        if (!why) {
++            direct_scanout_note_flush(true); /* q11-isp-skip-copy */
++            if (t0) {
++                qemu_lat_diag_add(LAT_SDL_BLIT,
++                                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0);
++            }
++            return;
++        }
++        sdl2_wl_scanout_miss(why);
++    } else {
++        sdl2_wl_scanout_off(); /* no waiting direct frame may follow this one */
++    }
++    /* q11-isp-skip-copy: the guest textures sampled below must be complete */
++    direct_scanout_note_flush(false);
+     egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
+-    egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++    /*
++     * q11-scanout-rect: only the guest's scanout rectangle (1280x720 of a 1280x726
++     * video buffer): the rows below it are not part of the picture.
++     */
++    if (!scon->guest_fb.dmabuf && scon->w && scon->h) {
++        egl_fb_blit_rect(&scon->win_fb, &scon->guest_fb, !scon->y0_top,
++                         scon->x, scon->y, scon->w, scon->h);
++    } else {
++        egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++    }
+     sdl2_gl_draw_overlays(scon, ww, wh);
+ 
++    if (t0) {
++        int64_t t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        qemu_lat_diag_add(LAT_SDL_BLIT, t1 - t0);
++        SDL_GL_SwapWindow(scon->real_window);
++        qemu_lat_diag_add(LAT_SDL_SWAP, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t1);
++        return;
++    }
+     SDL_GL_SwapWindow(scon->real_window);
+ }
+ 
+diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
+new file mode 100644
+index 000000000..79f106d09
+--- /dev/null
++++ b/ui/sdl2-wl-scanout.c
+@@ -0,0 +1,558 @@
++/*
++ * q11-isp-scanout: present a published dmabuf (host-isp's CMA ring)
++ * straight on the SDL window's wl_surface, so weston can put it on a vc4 plane instead of
++ * qemu blitting the guest texture with V3D and weston compositing qemu's window with V3D
++ * again (measured 2026-10-07: the CMA buffer went to an overlay plane, V3D 0, 60 fps).
++ *
++ * While in direct mode qemu does not call SDL_GL_SwapWindow; Mesa's wayland EGL only
++ * attaches its own buffer in eglSwapBuffers, so leaving the mode is just the next swap.
++ * Everything here runs on the main loop, with our own wl_event_queue on SDL's display.
++ *
++ * Pacing: the guest's flushes come in bunches (2 in one vblank, none in the next); weston
++ * shows only the last buffer committed before its repaint, so with a commit per flush the
++ * HDMI got 45 flips/s of ~57 guest frames (2026-10-07). A commit therefore waits for the
++ * previous one's wl_surface.frame done; up to 2 frames wait, the oldest is dropped.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/main-loop.h"
++#include "qemu/error-report.h"
++#include "qemu/timer.h"
++#include "ui/console.h"
++#include "ui/sdl2.h"
++#include "ui/direct-scanout.h"
++
++#if __has_include(<wayland-client.h>) && __has_include(<SDL_syswm.h>)
++#include <SDL_syswm.h>
++#include <wayland-client.h>
++#include "linux-dmabuf-unstable-v1-client-protocol.h"
++
++#define WL_DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' = V4L2 RGBA32 byte order */
++/*
++ * Frames that may wait for the frame callback: /run/qemu-isp-scanout-depth (1..6, read
++ * at most once a second), default 4 (bunches of 4 seen: 17% dropped at 2, best flips at
++ * 4). Each waiting frame holds a ring slot (24); the guest's own backlog needs ~11.
++ */
++#define WL_SCAN_QUEUE 6
++#ifndef WL_SCAN_QUEUE_DEFAULT /* the host test builds with others */
++#define WL_SCAN_QUEUE_DEFAULT 4
++#endif
++/* a frame callback weston never answers (window hidden): give up on it after this */
++#define WL_SCAN_FRAME_TIMEOUT_NS (50 * SCALE_MS)
++
++typedef struct WlScanBuf {
++    void *owner;
++    uint64_t epoch;
++    uint32_t slot;
++    int fd;
++    uint32_t w, h;
++    void (*hold)(void *owner, uint32_t slot, bool held);
++    struct wl_buffer *wb;
++    bool attached; /* committed, compositor has not released it yet */
++    bool queued;   /* waiting in wl.pending for the frame callback */
++    bool held;     /* the owner was told hold(true): attached || queued */
++    bool dead;     /* owner forgotten: destroy once released */
++    /* q11-sand-scanout: fourcc buffers are created asynchronously */
++    uint32_t fourcc;
++    bool ready;    /* wb exists */
++    bool failed;   /* the compositor refused it */
++} WlScanBuf;
++
++static struct {
++    bool tried, ok;
++    struct wl_display *dpy;
++    struct wl_surface *surf;
++    struct wl_surface *surf_q; /* wrapper of surf on our queue (for frame callbacks) */
++    struct wl_event_queue *queue;
++    struct zwp_linux_dmabuf_v1 *dmabuf;
++    GPtrArray *bufs;
++    struct wl_callback *frame_cb;
++    int64_t frame_t;
++    WlScanBuf *pending[WL_SCAN_QUEUE];
++    int npending;
++    WlScanBuf *last; /* last committed */
++    uint64_t frames, commits, dropped, fallbacks, timeouts;
++    /* per stats line: frame callbacks answered, commit -> done (ns) */
++    uint64_t dones, done_sum, done_max, done_late;
++} wl;
++
++/* q11-sand-scanout: what the compositor takes for NV12 (logged once at init) */
++#define WL_DRM_FORMAT_NV12 0x3231564e
++static GString *wl_nv12_mods;
++
++static void dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *d, uint32_t format)
++{
++}
++
++static void dmabuf_modifier(void *data, struct zwp_linux_dmabuf_v1 *d, uint32_t format,
++                            uint32_t hi, uint32_t lo)
++{
++    if (format == WL_DRM_FORMAT_NV12) {
++        if (!wl_nv12_mods) {
++            wl_nv12_mods = g_string_new(NULL);
++        }
++        g_string_append_printf(wl_nv12_mods, " 0x%08x%08x", hi, lo);
++    }
++}
++
++static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
++    dmabuf_format, dmabuf_modifier,
++};
++
++static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
++                       const char *iface, uint32_t ver)
++{
++    if (!strcmp(iface, zwp_linux_dmabuf_v1_interface.name) && ver >= 2) {
++        wl.dmabuf = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface,
++                                     ver < 3 ? ver : 3);
++        zwp_linux_dmabuf_v1_add_listener(wl.dmabuf, &dmabuf_listener, NULL);
++    }
++}
++
++static void reg_remove(void *data, struct wl_registry *reg, uint32_t name)
++{
++}
++
++static const struct wl_registry_listener reg_listener = { reg_global, reg_remove };
++
++static void wl_fd_read(void *opaque)
++{
++    sdl2_wl_scanout_dispatch();
++}
++
++static bool wl_init(SDL_Window *win)
++{
++    SDL_SysWMinfo info;
++    struct wl_display *wrapped;
++    struct wl_registry *reg;
++
++    if (wl.tried) {
++        return wl.ok;
++    }
++    wl.tried = true;
++    SDL_VERSION(&info.version);
++    if (!SDL_GetWindowWMInfo(win, &info) || info.subsystem != SDL_SYSWM_WAYLAND) {
++        warn_report("sdl2: isp-scanout: the window is not a wayland surface");
++        return false;
++    }
++    wl.dpy = info.info.wl.display;
++    wl.surf = info.info.wl.surface;
++    wl.queue = wl_display_create_queue(wl.dpy);
++    wrapped = wl_proxy_create_wrapper(wl.dpy);
++    wl_proxy_set_queue((struct wl_proxy *)wrapped, wl.queue);
++    reg = wl_display_get_registry(wrapped);
++    wl_proxy_wrapper_destroy(wrapped);
++    wl_registry_add_listener(reg, &reg_listener, NULL);
++    wl_display_roundtrip_queue(wl.dpy, wl.queue);
++    wl_display_roundtrip_queue(wl.dpy, wl.queue); /* q11-sand-scanout: the format events */
++    wl_registry_destroy(reg);
++    info_report("sdl2: isp-scanout: compositor NV12 modifiers:%s",
++                wl_nv12_mods ? wl_nv12_mods->str : " (none)");
++    if (!wl.dmabuf) {
++        warn_report("sdl2: isp-scanout: compositor has no zwp_linux_dmabuf_v1");
++        return false;
++    }
++    wl.surf_q = wl_proxy_create_wrapper(wl.surf);
++    wl_proxy_set_queue((struct wl_proxy *)wl.surf_q, wl.queue);
++    wl.bufs = g_ptr_array_new();
++    /* frame-done and release events also when no guest frame comes (SDL reads too) */
++    qemu_set_fd_handler(wl_display_get_fd(wl.dpy), wl_fd_read, NULL, NULL);
++    wl.ok = true;
++    info_report("sdl2: isp-scanout: ready (linux-dmabuf on the window surface, "
++                "frame-callback paced, queue up to %d)", WL_SCAN_QUEUE);
++    return true;
++}
++
++static void buf_free(WlScanBuf *b)
++{
++    if (b->wb) {
++        wl_buffer_destroy(b->wb);
++    }
++    g_ptr_array_remove_fast(wl.bufs, b);
++    if (wl.last == b) {
++        wl.last = NULL;
++    }
++    g_free(b);
++}
++
++/* tell the owner when the buffer is neither on screen nor waiting any more */
++static void buf_unhold(WlScanBuf *b)
++{
++    if (b->held && !b->attached && !b->queued) {
++        b->held = false;
++        if (!b->dead && direct_scanout_owner_epoch(b->owner) == b->epoch) {
++            b->hold(b->owner, b->slot, false);
++        }
++    }
++}
++
++static void buf_release(void *data, struct wl_buffer *wb)
++{
++    WlScanBuf *b = data;
++
++    b->attached = false;
++    buf_unhold(b);
++    if (b->dead && !b->queued) {
++        buf_free(b);
++    }
++}
++
++static const struct wl_buffer_listener buf_listener = { buf_release };
++
++/*
++ * A fourcc buffer whose asynchronous create has not been answered yet: its params
++ * listener still points at it, so it may be marked dead but only freed by
++ * params_created()/params_failed().
++ */
++static bool buf_creating(const WlScanBuf *b)
++{
++    return b->fourcc && !b->ready && !b->failed;
++}
++
++/* forgotten owners: mark their buffers dead, free the ones the compositor gave back */
++static void wl_gc(void)
++{
++    for (guint i = wl.bufs->len; i-- > 0;) {
++        WlScanBuf *b = g_ptr_array_index(wl.bufs, i);
++
++        if (!b->dead && direct_scanout_owner_epoch(b->owner) != b->epoch) {
++            b->dead = true;
++            b->held = false; /* the owner is gone: no hold(false) to send */
++        }
++        if (b->dead && !b->attached && !b->queued && !buf_creating(b)) {
++            buf_free(b);
++        }
++    }
++}
++
++/* q11-sand-scanout: the async create of a fourcc buffer */
++static void params_created(void *data, struct zwp_linux_buffer_params_v1 *params,
++                           struct wl_buffer *wb)
++{
++    WlScanBuf *b = data;
++
++    b->wb = wb;
++    wl_buffer_add_listener(b->wb, &buf_listener, b);
++    b->ready = true;
++    zwp_linux_buffer_params_v1_destroy(params);
++    if (b->dead) {
++        buf_free(b); /* the owner went away while the create was in flight */
++    }
++}
++
++static void params_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
++{
++    WlScanBuf *b = data;
++
++    b->failed = true;
++    zwp_linux_buffer_params_v1_destroy(params);
++    direct_scanout_sand_set_failed();
++    warn_report("sdl2: isp-scanout: the compositor refused a %.4s buffer %ux%u "
++                "(modifier 0x%016" PRIx64 "): direct SAND scanout off", (char *)&b->fourcc,
++                b->w, b->h, (uint64_t)0);
++    if (b->dead) {
++        buf_free(b);
++    }
++}
++
++static const struct zwp_linux_buffer_params_v1_listener params_listener = {
++    params_created, params_failed,
++};
++
++static WlScanBuf *wl_buf_for(const DirectScanout *d, uint32_t w, uint32_t h)
++{
++    struct zwp_linux_buffer_params_v1 *params;
++    WlScanBuf *b;
++
++    for (guint i = 0; i < wl.bufs->len; i++) {
++        b = g_ptr_array_index(wl.bufs, i);
++        if (!b->dead && b->owner == d->owner && b->epoch == d->epoch &&
++            b->slot == d->slot && b->fd == d->fd &&
++            b->w == (d->fourcc ? d->width : w) && b->h == (d->fourcc ? d->height : h)) {
++            return b;
++        }
++    }
++    b = g_new0(WlScanBuf, 1);
++    b->owner = d->owner;
++    b->epoch = d->epoch;
++    b->slot = d->slot;
++    b->fd = d->fd;
++    b->w = w;
++    b->h = h;
++    b->hold = d->hold;
++    b->fourcc = d->fourcc;
++    params = zwp_linux_dmabuf_v1_create_params(wl.dmabuf);
++    if (d->fourcc) {
++        /* q11-sand-scanout: two planes, the modifier on both, the whole visible picture */
++        uint32_t hi = d->modifier >> 32, lo = d->modifier & 0xffffffff;
++
++        b->w = d->width;
++        b->h = d->height;
++        zwp_linux_buffer_params_v1_add(params, d->fd, 0, 0, d->stride, hi, lo);
++        zwp_linux_buffer_params_v1_add(params, d->fd, 1, d->offset1, d->pitch1, hi, lo);
++        zwp_linux_buffer_params_v1_add_listener(params, &params_listener, b);
++        zwp_linux_buffer_params_v1_create(params, d->width, d->height, d->fourcc, 0);
++        wl_display_flush(wl.dpy);
++        g_ptr_array_add(wl.bufs, b);
++        return b;
++    }
++    b->ready = true;
++    /* the scanout rectangle only: rows below it (padding) are not part of the picture */
++    zwp_linux_buffer_params_v1_add(params, d->fd, 0, 0, d->stride, 0, 0); /* LINEAR */
++    b->wb = zwp_linux_buffer_params_v1_create_immed(params, w, h, WL_DRM_FORMAT_ABGR8888,
++                                                    0);
++    zwp_linux_buffer_params_v1_destroy(params);
++    wl_buffer_add_listener(b->wb, &buf_listener, b);
++    g_ptr_array_add(wl.bufs, b);
++    return b;
++}
++
++static int queue_depth(void)
++{
++    static int64_t last = INT64_MIN;
++    static int depth = WL_SCAN_QUEUE_DEFAULT;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    gchar *s = NULL;
++    int v;
++
++    if (last != INT64_MIN && now - last < NANOSECONDS_PER_SECOND) {
++        return depth;
++    }
++    last = now;
++    v = WL_SCAN_QUEUE_DEFAULT;
++    if (g_file_get_contents("/run/qemu-isp-scanout-depth", &s, NULL, NULL)) {
++        v = atoi(s);
++        g_free(s);
++    }
++    v = MAX(1, MIN(v, WL_SCAN_QUEUE));
++    if (v != depth) {
++        info_report("sdl2: isp-scanout: queue depth %d", v);
++        depth = v;
++    }
++    return depth;
++}
++
++static void frame_done(void *data, struct wl_callback *cb, uint32_t t);
++static const struct wl_callback_listener frame_listener = { frame_done };
++
++static void frame_cb_drop(void)
++{
++    if (wl.frame_cb) {
++        wl_callback_destroy(wl.frame_cb);
++        wl.frame_cb = NULL;
++    }
++}
++
++static void commit(WlScanBuf *b)
++{
++    frame_cb_drop();
++    wl.frame_cb = wl_surface_frame(wl.surf_q);
++    wl_callback_add_listener(wl.frame_cb, &frame_listener, NULL);
++    wl.frame_t = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    wl_surface_attach(wl.surf, b->wb, 0, 0);
++    wl_surface_damage(wl.surf, 0, 0, b->w, b->h);
++    wl_surface_commit(wl.surf);
++    wl_display_flush(wl.dpy);
++    b->attached = true;
++    wl.last = b;
++    wl.commits++;
++}
++
++/* the next waiting frame, if any, goes to the compositor */
++static void commit_next(void)
++{
++    WlScanBuf *b;
++
++    if (!wl.npending) {
++        return;
++    }
++    b = wl.pending[0];
++    memmove(&wl.pending[0], &wl.pending[1], --wl.npending * sizeof(wl.pending[0]));
++    b->queued = false;
++    if (b->dead) {
++        if (!b->attached) {
++            buf_free(b);
++        }
++        commit_next();
++        return;
++    }
++    commit(b);
++}
++
++static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
++{
++    if (cb == wl.frame_cb) {
++        uint64_t d = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - wl.frame_t;
++
++        wl.dones++;
++        wl.done_sum += d;
++        wl.done_max = MAX(wl.done_max, d);
++        wl.done_late += d > 20 * SCALE_MS; /* later than one vblank (+jitter) */
++        wl_callback_destroy(cb);
++        wl.frame_cb = NULL;
++        commit_next();
++    }
++}
++
++/* weston did not answer the frame callback in time (window hidden?): do not wait on it */
++static void frame_timeout_check(void)
++{
++    if (wl.frame_cb && wl.npending &&
++        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - wl.frame_t > WL_SCAN_FRAME_TIMEOUT_NS) {
++        wl.timeouts++;
++        frame_cb_drop();
++        commit_next();
++    }
++}
++
++/* leaving direct mode: nothing waiting may be committed over the GL path's frame */
++static void pending_drop(void)
++{
++    frame_cb_drop();
++    while (wl.npending) {
++        WlScanBuf *b = wl.pending[--wl.npending];
++
++        b->queued = false;
++        wl.dropped++;
++        buf_unhold(b);
++        if (b->dead && !b->attached) {
++            buf_free(b);
++        }
++    }
++}
++
++/*
++ * Read and dispatch our queue (buffer releases, frame callbacks). Nobody else reads the
++ * socket for us reliably: SDL pumps on its own timer and Mesa reads only in
++ * eglSwapBuffers, which direct mode skips. The documented multi-queue pattern, safe next
++ * to SDL's own reader; read_events does not block (the socket reads are MSG_DONTWAIT).
++ */
++void sdl2_wl_scanout_dispatch(void)
++{
++    if (!wl.ok) {
++        return;
++    }
++    while (wl_display_prepare_read_queue(wl.dpy, wl.queue) != 0) {
++        wl_display_dispatch_queue_pending(wl.dpy, wl.queue);
++    }
++    wl_display_flush(wl.dpy);
++    if (wl_display_read_events(wl.dpy) == 0) {
++        wl_display_dispatch_queue_pending(wl.dpy, wl.queue);
++    }
++    frame_timeout_check();
++    wl_gc();
++}
++
++void sdl2_wl_scanout_off(void)
++{
++    if (wl.ok) {
++        pending_drop();
++    }
++}
++
++/* why is a string literal of the caller: counted per pointer */
++void sdl2_wl_scanout_miss(const char *why)
++{
++    static struct { const char *why; uint64_t n; } m[8];
++    static uint64_t last_print;
++    GString *g;
++    int i;
++
++    if (wl.ok) {
++        pending_drop();
++    }
++    wl.fallbacks++;
++    for (i = 0; i < ARRAY_SIZE(m) && m[i].why && m[i].why != why; i++) {
++    }
++    if (i < ARRAY_SIZE(m)) {
++        m[i].why = why;
++        m[i].n++;
++    }
++    if (wl.fallbacks - last_print < 60 && last_print) {
++        return;
++    }
++    last_print = wl.fallbacks;
++    g = g_string_new(NULL);
++    for (i = 0; i < ARRAY_SIZE(m) && m[i].why; i++) {
++        g_string_append_printf(g, " %s %" PRIu64, m[i].why, m[i].n);
++    }
++    info_report("sdl2: isp-scanout: %" PRIu64 " direct, %" PRIu64 " not:%s", wl.frames,
++                wl.fallbacks, g->str);
++    g_string_free(g, true);
++}
++
++bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t w,
++                     uint32_t h)
++{
++    WlScanBuf *b;
++
++    if (!wl_init(scon->real_window) || d->width < w || d->height < h) {
++        return false; /* counted by the caller (sdl2_wl_scanout_miss) */
++    }
++    sdl2_wl_scanout_dispatch();
++    b = wl_buf_for(d, w, h);
++    if (!b->ready) {
++        return false; /* q11-sand-scanout: not created (yet) or refused: ring / GL this time */
++    }
++    wl.frames++;
++    if (b->queued || (b == wl.last && b->attached && !wl.npending)) {
++        return true; /* the same frame flushed again: already on its way */
++    }
++    if (!b->held) {
++        b->held = true;
++        b->hold(b->owner, b->slot, true);
++    }
++    if (!wl.frame_cb) {
++        commit(b);
++    } else {
++        int depth = queue_depth();
++
++        while (wl.npending >= depth) {
++            /* the oldest waiting frame is never shown */
++            WlScanBuf *o = wl.pending[0];
++
++            memmove(&wl.pending[0], &wl.pending[1],
++                    (wl.npending - 1) * sizeof(wl.pending[0]));
++            wl.npending--;
++            o->queued = false;
++            wl.dropped++;
++            buf_unhold(o);
++        }
++        b->queued = true;
++        wl.pending[wl.npending++] = b;
++    }
++    if ((wl.frames % 600) == 1) { /* ~10 s of 60 fps: one line per clip */
++        info_report("sdl2: isp-scanout: %" PRIu64 " frames direct, %" PRIu64 " commits, %"
++                    PRIu64 " dropped, %" PRIu64 " frame timeouts, %" PRIu64
++                    " fallbacks, %u wl_buffers; frame done %" PRIu64 " (commit->done "
++                    "mean %.1f max %.1f ms, >20ms %" PRIu64 ")", wl.frames, wl.commits,
++                    wl.dropped, wl.timeouts, wl.fallbacks, wl.bufs->len, wl.dones,
++                    wl.dones ? wl.done_sum / 1e6 / wl.dones : 0.0, wl.done_max / 1e6,
++                    wl.done_late);
++        wl.dones = wl.done_sum = wl.done_max = wl.done_late = 0;
++    }
++    return true;
++}
++
++#else
++
++void sdl2_wl_scanout_dispatch(void)
++{
++}
++
++void sdl2_wl_scanout_miss(const char *why)
++{
++}
++
++void sdl2_wl_scanout_off(void)
++{
++}
++
++bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t w,
++                     uint32_t h)
++{
++    return false;
++}
++
++#endif

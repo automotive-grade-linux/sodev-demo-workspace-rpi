@@ -1,0 +1,223 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 13 Oct 2026 07:52:29 +0900
+Subject: [PATCH] drm/virtio: optionally let the primary plane be positioned and scaled
+
+The virtio-gpu primary plane is checked with DRM_PLANE_NO_SCALING and
+may not be positioned, so it has to cover the whole CRTC at 1:1. A
+composer that wants to show a scaled layer on the primary (for example a
+video underlay in a window that is not fullscreen) is refused in
+atomic_check and falls back to GPU composition for it.
+
+With virtio_gpu.plane_scaling=1 (module parameter, default 0 = behaviour
+unchanged) the primary plane may be placed anywhere on the output and
+scaled from 1/8x to 8x. Its destination rectangle goes to the device in
+VIRTIO_GPU_CMD_SET_PRIMARY_RECT (0x0121, next to SET_OVERLAY_POS 0x0120
+from the overlay-plane patch): scanout id, x, y, w, h and the output
+size; the device scales the SET_SCANOUT source rectangle into it. This
+command is device-specific, so the parameter must only be set with a
+device model that handles it.
+
+The rectangle last sent is cached per output and the command is sent
+only when it changes, on a modeset, or after the plane was disabled.
+That decision is taken before the damage check: a plane that only moved
+has no damage but must still reach the device, and is then flushed in
+full. The old "no damage, return" exit becomes an explicit "not visible,
+return" followed by the damage check.
+
+Measured on the RPi4 with three overlay planes (recorded with the DomA
+configuration recipe that turns this on): a WebView that is not
+fullscreen, playing a video under the HMI, went from all four layers
+composited by the GPU to all four on planes, local 720p60 playback from
+40 to 52-55 fps; fullscreen 1080p60 was unchanged.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that is not in the virtio specification]
+---
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -184,6 +184,9 @@
+ 	int cur_x;
+ 	int cur_y;
+ 	bool needs_modeset;
++	/* virtio_gpu.plane_scaling: the primary rectangle last sent to the device */
++	struct drm_rect prim_rect;
++	bool prim_rect_valid;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+@@ -371,7 +374,30 @@
+ 	__le32 padding;
+ };
+ 
++/*
++ * Device-specific (qemu with the primary-rect handler): the primary plane of
++ * scanout_id is shown at x, y, w x h of a crtc_w x crtc_h output, scaled from its
++ * SET_SCANOUT source rectangle. Sent only with virtio_gpu.plane_scaling=1.
++ */
++#define VIRTIO_GPU_CMD_SET_PRIMARY_RECT 0x0121
++struct virtio_gpu_set_primary_rect {
++	struct virtio_gpu_ctrl_hdr hdr;
++	__le32 scanout_id;
++	__le32 x;
++	__le32 y;
++	__le32 w;
++	__le32 h;
++	__le32 crtc_w;
++	__le32 crtc_h;
++	__le32 padding;
++};
++
+ extern int virtio_gpu_overlay_planes;
++extern int virtio_gpu_plane_scaling;
++void virtio_gpu_cmd_set_primary_rect(struct virtio_gpu_device *vgdev,
++					     uint32_t scanout_id, int32_t x, int32_t y,
++					     uint32_t w, uint32_t h, uint32_t crtc_w,
++					     uint32_t crtc_h);
+ void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
+ 				    uint32_t scanout_id, int32_t x, int32_t y);
+ struct drm_plane *virtio_gpu_overlay_plane_init(struct virtio_gpu_device *vgdev,
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -57,6 +57,12 @@
+ 		 "(0..3, needs a device offering them, e.g. qemu overlay-planes=N)");
+ module_param_named(overlay_planes, virtio_gpu_overlay_planes, int, 0400);
+ 
++int virtio_gpu_plane_scaling;
++MODULE_PARM_DESC(plane_scaling,
++		 "Let the primary plane be positioned and scaled 1/8..8x, sent with "
++		 "SET_PRIMARY_RECT (needs a device that handles it); 0 = off");
++module_param_named(plane_scaling, virtio_gpu_plane_scaling, int, 0400);
++
+ static int virtio_gpu_pci_quirk(struct drm_device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -644,6 +644,29 @@
+ 		virtio_gpu_cleanup_object(bo);
+ }
+ 
++void virtio_gpu_cmd_set_primary_rect(struct virtio_gpu_device *vgdev,
++					     uint32_t scanout_id, int32_t x, int32_t y,
++					     uint32_t w, uint32_t h, uint32_t crtc_w,
++					     uint32_t crtc_h)
++{
++	struct virtio_gpu_set_primary_rect *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++
++	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
++	memset(cmd_p, 0, sizeof(*cmd_p));
++
++	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_SET_PRIMARY_RECT);
++	cmd_p->scanout_id = cpu_to_le32(scanout_id);
++	cmd_p->x = cpu_to_le32(x);
++	cmd_p->y = cpu_to_le32(y);
++	cmd_p->w = cpu_to_le32(w);
++	cmd_p->h = cpu_to_le32(h);
++	cmd_p->crtc_w = cpu_to_le32(crtc_w);
++	cmd_p->crtc_h = cpu_to_le32(crtc_h);
++
++	virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
++}
++
+ void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
+ 				    uint32_t scanout_id, int32_t x, int32_t y)
+ {
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -150,6 +150,9 @@
+ 	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state,
+ 										 plane);
+ 	bool is_cursor = plane->type == DRM_PLANE_TYPE_CURSOR;
++	/* virtio_gpu.plane_scaling: a positioned, scaled primary (SET_PRIMARY_RECT) */
++	bool scaled = virtio_gpu_plane_scaling &&
++		      plane->type == DRM_PLANE_TYPE_PRIMARY;
+ 	struct drm_crtc_state *crtc_state;
+ 	int ret;
+ 
+@@ -170,9 +173,11 @@
+ 		return PTR_ERR(crtc_state);
+ 
+ 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
+-						  DRM_PLANE_NO_SCALING,
+-						  DRM_PLANE_NO_SCALING,
+-						  is_cursor, true);
++						  scaled ? DRM_PLANE_NO_SCALING / 8 :
++							   DRM_PLANE_NO_SCALING,
++						  scaled ? DRM_PLANE_NO_SCALING * 8 :
++							   DRM_PLANE_NO_SCALING,
++						  is_cursor || scaled, true);
+ 	return ret;
+ }
+ 
+@@ -285,6 +290,7 @@
+ 	struct virtio_gpu_output *output = NULL;
+ 	struct virtio_gpu_object *bo;
+ 	struct drm_rect rect;
++	bool rect_changed;
+ 
+ 	if (plane->state->crtc)
+ 		output = drm_crtc_to_virtio_gpu_output(plane->state->crtc);
+@@ -295,6 +301,7 @@
+ 
+ 	if (!plane->state->fb || !output->crtc.state->active) {
+ 		DRM_DEBUG("nofb\n");
++		output->prim_rect_valid = false;
+ 		virtio_gpu_cmd_set_scanout(vgdev, output->index, 0,
+ 					   plane->state->src_w >> 16,
+ 					   plane->state->src_h >> 16,
+@@ -303,9 +310,34 @@
+ 		return;
+ 	}
+ 
+-	if (!drm_atomic_helper_damage_merged(old_state, plane->state, &rect))
++	/* fully clipped: nothing to show or flush (the old damage check returned here too) */
++	if (!plane->state->visible)
+ 		return;
+ 
++	/*
++	 * virtio_gpu.plane_scaling: SET_PRIMARY_RECT only when it differs from what
++	 * was last sent. Decided before the damage check: a plane that only moved has
++	 * no damage but must still reach the device, and then be redrawn in full.
++	 */
++	if (virtio_gpu_plane_scaling) {
++		struct drm_rect dst = DRM_RECT_INIT(plane->state->crtc_x,
++						    plane->state->crtc_y,
++						    plane->state->crtc_w,
++						    plane->state->crtc_h);
++
++		rect_changed = !output->prim_rect_valid || output->needs_modeset ||
++			       !drm_rect_equals(&dst, &output->prim_rect);
++		output->prim_rect = dst;
++	} else {
++		rect_changed = false;
++	}
++
++	if (!drm_atomic_helper_damage_merged(old_state, plane->state, &rect)) {
++		if (!rect_changed)
++			return;
++		drm_rect_fp_to_int(&rect, &plane->state->src);
++	}
++
+ 	bo = gem_to_virtio_gpu_obj(plane->state->fb->obj[0]);
+ 	if (bo->dumb)
+ 		virtio_gpu_update_dumb_bo(vgdev, plane->state, &rect);
+@@ -315,8 +347,17 @@
+ 	    plane->state->src_h != old_state->src_h ||
+ 	    plane->state->src_x != old_state->src_x ||
+ 	    plane->state->src_y != old_state->src_y ||
++	    rect_changed ||
+ 	    output->needs_modeset) {
+ 		output->needs_modeset = false;
++		if (rect_changed) {
++			output->prim_rect_valid = true;
++			virtio_gpu_cmd_set_primary_rect(vgdev, output->index,
++				plane->state->crtc_x, plane->state->crtc_y,
++				plane->state->crtc_w, plane->state->crtc_h,
++				output->crtc.state->mode.hdisplay,
++				output->crtc.state->mode.vdisplay);
++		}
+ 		DRM_DEBUG("handle 0x%x, crtc %dx%d+%d+%d, src %dx%d+%d+%d\n",
+ 			  bo->hw_res_handle,
+ 			  plane->state->crtc_w, plane->state->crtc_h,
