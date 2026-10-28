@@ -1,0 +1,100 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 20 Oct 2026 02:39:48 +0900
+Subject: [PATCH] impeller: destroy the image view of the embedder's onscreen
+ image
+
+GPUSurfaceVulkanImpeller::AcquireFrame wraps the VkImage the embedder
+hands it each frame (the path without a swapchain of its own,
+FlutterVulkanImage) in a WrappedTextureSourceVK with an image view it
+creates for it. The view was a plain vk::ImageView that nothing
+destroyed: the wrapper's destructor is empty and the image, which the
+embedder owns, is not destroyed either. So each frame left one
+VkImageView behind.
+
+The wrapper now owns the view as a vk::UniqueImageView
+(createImageViewUnique), so it is destroyed with the wrapper, once the
+frame's command buffers no longer hold the texture source. Upstream's
+current code does the same: the wrapper, now in
+impeller/renderer/backend/vulkan/texture_wrapper_vk.cc
+(WrapTextureSourceVK), keeps the view in a vk::UniqueImageView. Which
+upstream change made the view owned was not traced.
+
+Measured on a Raspberry Pi 5 with the AGL Flutter instrument cluster in
+a Xen DomU, drawing through Venus (virtio-gpu Vulkan), 2026-10-19/20. A
+census of the host renderer's live Vulkan objects (a diagnostic build of
+virglrenderer, not in this tree):
+
+    before: VK_OBJECT_TYPE_IMAGE_VIEW 3361 -> 28560 in 7 minutes, 60 a second
+            (one a frame), every other type flat; the host renderer's
+            anonymous memory grew about 1.76 MB a minute (about 500 bytes a
+            view) and ran DomD out of memory after about 14 hours once
+    after:  VK_OBJECT_TYPE_IMAGE_VIEW 35 and 863-868 objects in all, flat
+            for 75 minutes; the host renderer's anonymous memory stayed at
+            14916 kB over that time, against 1.76 MB a minute before
+
+The guest's flutter process grew much less (a view is a small handle
+there): 97.9 -> 99.1 MB in 5 minutes before, peaking at 99.7 (0.2-0.3 MB
+a minute), and 15-18 MB for the 75 minutes after, which is why the leak
+first looked like the host's.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [engine 3.32.5 only: upstream's current code
+ already owns this view (texture_wrapper_vk.cc in impeller's Vulkan backend)]
+---
+--- a/engine/src/flutter/shell/gpu/gpu_surface_vulkan_impeller.cc
++++ b/engine/src/flutter/shell/gpu/gpu_surface_vulkan_impeller.cc
+@@ -25,25 +25,29 @@
+ class WrappedTextureSourceVK : public impeller::TextureSourceVK {
+  public:
+   explicit WrappedTextureSourceVK(impeller::vk::Image image,
+-                                  impeller::vk::ImageView image_view,
++                                  impeller::vk::UniqueImageView image_view,
+                                   impeller::TextureDescriptor desc)
+-      : TextureSourceVK(desc), image_(image), image_view_(image_view) {}
++      : TextureSourceVK(desc),
++        image_(image),
++        image_view_(std::move(image_view)) {}
+ 
+   ~WrappedTextureSourceVK() {}
+ 
+  private:
+   impeller::vk::Image GetImage() const override { return image_; }
+ 
+-  impeller::vk::ImageView GetImageView() const override { return image_view_; }
++  impeller::vk::ImageView GetImageView() const override {
++    return image_view_.get();
++  }
+ 
+   impeller::vk::ImageView GetRenderTargetView() const override {
+-    return image_view_;
++    return image_view_.get();
+   }
+ 
+   bool IsSwapchainImage() const override { return true; }
+ 
+   impeller::vk::Image image_;
+-  impeller::vk::ImageView image_view_;
++  impeller::vk::UniqueImageView image_view_;
+ };
+ 
+ GPUSurfaceVulkanImpeller::GPUSurfaceVulkanImpeller(
+@@ -177,7 +181,7 @@
+     view_info.image = vk_image;
+ 
+     auto [result, image_view] =
+-        context_vk.GetDevice().createImageView(view_info);
++        context_vk.GetDevice().createImageViewUnique(view_info);
+     if (result != impeller::vk::Result::eSuccess) {
+       FML_LOG(ERROR) << "Failed to create image view for provided image: "
+                      << impeller::vk::to_string(result);
+@@ -191,7 +195,8 @@
+     }
+ 
+     auto wrapped_onscreen =
+-        std::make_shared<WrappedTextureSourceVK>(vk_image, image_view, desc);
++        std::make_shared<WrappedTextureSourceVK>(vk_image, std::move(image_view),
++                                                 desc);
+     auto surface = impeller::SurfaceVK::WrapSwapchainImage(
+         transients_, wrapped_onscreen, [&]() -> bool { return true; });
+     impeller::RenderTarget render_target = surface->GetRenderTarget();

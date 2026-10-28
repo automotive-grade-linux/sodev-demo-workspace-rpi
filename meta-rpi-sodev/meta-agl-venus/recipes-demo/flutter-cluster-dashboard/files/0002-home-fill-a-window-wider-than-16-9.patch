@@ -1,0 +1,32 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 13:13:20 +0900
+Subject: [PATCH] home: fill a window wider than 16:9
+
+The dashboard sizes everything from the window's height and lays it
+out in a 16:9 box. On the 1920x720 cluster output the box is 1280x720,
+so the gauges sit in the middle with black bars at both sides.
+
+When the window is wider than 16:9, keep its full width instead of
+cutting it to the box. The sizes still follow the height; the rows
+that place the gauges at both ends (spaceBetween) spread them over the
+width.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/lib/screen/home.dart
++++ b/lib/screen/home.dart
+@@ -99,9 +99,11 @@
+     double ratHeight = (windowWidth * 9) / 16;
+     double ratWidth = (windowHeight * 16) / 9;
+ 
++    // The sizes follow the height, so a window wider than 16:9 (the
++    // 1920x720 cluster) keeps its full width: the gauges move apart instead
++    // of leaving black bars at the sides.
+     if (ratWidth <= windowWidth) {
+       screenHeight = windowHeight;
+-      screenWidth = ratWidth;
+     } else {
+       screenHeight = ratHeight;
+       screenWidth = windowWidth;

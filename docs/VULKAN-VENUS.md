@@ -25,7 +25,7 @@ This is the authoritative list of what that means:
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
 | DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in the qemu 10.0.2 and 11.1.2 device models |
 | DomA overlay planes | `XT_DOMA_OVERLAY_PLANES` in `xt-xen-cfg-doma`: `0` (the default) to `3`, and a board may set its own; both boards set `3`. It sets both halves in `doma.cfg`, the device model's `overlay-planes=N` (qemu 10.0.2 patch `0250`, qemu 11.1.2 patch `q11-051`) and DomA's `virtio_gpu.overlay_planes=N` (DomA kernel patch `aosp-kernel-patches/common/0001`); drm_hwcomposer then puts the system bars on the overlays instead of SurfaceFlinger compositing them on the GPU | `0` whatever the variable says: qemu 7.0.0 has no `overlay-planes` |
-| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`; the Raspberry Pi 5 sets `1`. The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`), plus `VIRGL_EXTERNAL_GBM=1`, the gbm device a linear scanout buffer needs on the host to be a linear gbm bo (virglrenderer 1.3.0). With it, xdg-cluster-receiver's window goes on the overlay | none: the qemu 7 device model has no overlay planes |
+| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`; the Raspberry Pi 5 sets `1`. The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`), plus `VIRGL_EXTERNAL_GBM=1`, the gbm device a linear scanout buffer needs on the host to be a linear gbm bo (virglrenderer 1.3.0). With it, xdg-cluster-receiver's window goes on the overlay (section 7f, 2026-10-15) | none: the qemu 7 device model has no overlay planes |
 
 Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.4 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from
@@ -56,7 +56,9 @@ overturns. Those are marked *Superseded* where they sit. The standing summary:
    shipped. The defect-B subsection in section 7a opens with the pre-fix reading
    and carries the correction in a box at its top.
 5. The host GEM growth that made 0117 look unusable was **Impeller**
-   (flutter/flutter#183267), fixed by `meta-agl-venus`' flutter-engine `0001`.
+   (flutter/flutter#183267), fixed by `meta-agl-venus`' flutter-engine `0001`;
+   the image view Impeller left behind each frame on the same path is fixed by
+   `0003` (2026-10-20).
 6. The **fallback in section 8 is not the current plan** -- it is what the state
    of the board was before the p2m work.
 7. On the RPi5, DomA was verified compositing with Vulkan (SkiaVk) on 2026-09-24
@@ -2141,12 +2143,17 @@ pass was never evidence that the EGL path works.
 > `meta-xt-driver-domain/recipes-graphics/virglrenderer/files/0002-vrend-initialise-GBM-for-an-external-EGLDisplay-only-.patch`
 > (DomD's virglrenderer, not the AGL guest's -- `meta-agl-venus` has no
 > virglrenderer). gtk (upstream's documented venus display) is *not* the answer
-> here: it needs `GDK_GL=gles` on V3D and even then measures 18.0 fps. A
-> residual `IMAGE_VIEW` growth of ~28/s remains after the engine fix; it costs
-> no GPU memory, so it is recorded, not chased.
+> here: it needs `GDK_GL=gles` on V3D and even then measures 18.0 fps. The
+> `IMAGE_VIEW` growth that remained after the engine fix (one view a frame) was
+> the view `GPUSurfaceVulkanImpeller::AcquireFrame` created for the embedder's
+> onscreen image and never destroyed. It cost no GPU memory but host heap: the
+> renderer's anonymous memory grew about 1.76 MB a minute (2026-10-20) and had
+> run DomD out of memory after about 14 hours (2026-10-18). flutter-engine
+> `0003` destroys the view with the frame
+> (`meta-agl-venus/recipes-graphics/flutter-engine/`).
 
-It is **not** a one-line fix — two candidates were built, deployed and reverted on
-hardware:
+The gbm initialisation is **not** a one-line fix — two candidates were built, deployed
+and reverted on hardware:
 
 * handing virglrenderer qemu's own EGL display through the `get_egl_display` callback (by
   calling `egl_init()` when `qemu_egl_display` is unset): the display came up, but the
@@ -2697,6 +2704,9 @@ the guest kernel to find out, because **the LINEAR baseline is already 89.6 % GP
 against UIF's 77.0 % at 60.0: even a free compositing pass would not pay for the LINEAR
 swapchain. **Direct scanout is not worth pursuing on this stack; the thread is closed.**
 
+> **Superseded (2026-10-15, the update at the end of this section).** Direct scanout
+> was taken after all, with three fixes this paragraph did not have.
+
 One instrument lesson from that experiment, recorded because it is load-bearing: while the panel
 was black, total GPU read 62.1 % (from 77.0) and **fps min read 58 (from 36)** — every counter
 moved the right way. The frame-rate instrument counts the *client's* `wl_surface.commit` calls,
@@ -2734,9 +2744,53 @@ off the bottom. A `pixel_ratio` of 0.6667 in the bundle's `config.toml` was acce
 ivi-homescreen and did not help. Missing warning lamps and gear state are worse than a squashed
 picture, so both edits were reverted and verified on the board.
 
+> **Superseded (2026-10-15, the update at the end of this section).** 1920x720 ships,
+> with the dashboard and the receiver window fitted to it. The lamps and the gear were
+> most likely hidden by the receiver's window, which on 720 lines covers them, rather
+> than cut off; that was not checked at the time.
+
 The saving therefore depends on **application-side work: laying the dashboard
 out for 1920x720**. Done there, it fixes the aspect-ratio defect and the 13.1
 points together.
+
+### Update (2026-10-15): both savings are taken
+
+Measured on the Raspberry Pi 5 8GB with DomA idle, V3D render queue over 10 s.
+
+**1920x720.** `meta-agl-venus`' `weston-ini-conf.bbappend` gives Virtual-1 a 1920x720
+modeline at 59.86 Hz (a plain `mode=1920x720` picks qemu's 75 Hz EDID mode). The
+dashboard lays itself out in a 16:9 box, 1280x720 on this output; its `0002` keeps the
+full width, and the sizes follow the height, so nothing falls off the bottom. The
+receiver window (420x472 at y=290 in `AGL.conf.flutter`, between the clock box and the
+warning lamps of 1080 lines) cannot fit between them on 720 lines; `cluster-demo-config`
+makes it 356x400 at (782,141). On a test build earlier that day, with the window
+already 356x400, a DomD-side screenshot showed the clock, the stream, the warning lamps
+and P/R/N/D. V3D render 74% -> 57%.
+
+**Direct scanout.** The black panel above was not root-caused then, and three things
+stood in the way, each found on the board:
+- flutter-auto-vulkan rebuilt its swapchain only on a suboptimal *present*; Mesa 24.0's
+  WSI reports the compositor's scanout tranche only as a suboptimal *acquire*, so the
+  swapchain stayed UIF. Its `0002` acts on the acquire.
+- libweston 13 offers a modifier-less KMS device's planes only `DRM_FORMAT_MOD_INVALID`,
+  so the scanout tranche says INVALID, and then it refuses an INVALID buffer
+  (`fb.c:397`). `meta-agl-venus`' weston `0001` adds LINEAR.
+- With the cluster on the guest's primary, its scanout is a Venus blob, and qemu blitted
+  it into its window: V3D cannot sample linear, so Mesa converted it with the TFU on every
+  frame (40.7%, 331 jobs/s) -- likely the cost the LINEAR baseline above paid too, not
+  checked. qemu `q11-070` hands the blob to weston instead.
+
+With the three, and the receiver stopped, V3D render is 17.5% (60 jobs/s) and TFU 0.1%;
+both compositors scan out. The receiver needed its own work: its wl_shm window over the
+cluster made agl-compositor compose everything (54.0%, 198 jobs/s, idle). Its `0001`
+shows linear gbm buffers through zwp_linux_dmabuf (version 3, or the modifier is
+dropped), DomU gets one overlay plane (`XT_DOMU_OVERLAY_PLANES`), and the buffer stays
+linear on the host (mesa `0004`, virglrenderer `0024`, `VIRGL_EXTERNAL_GBM=1`). Then
+17.8% with the receiver idle and 17.5-17.7% while it receives a 30 fps MJPEG stream.
+agl-compositor reports plane-only composition, DomD's weston too (239 of 239 repaints in
+4 s, about 60 a second), with the cluster and the receiver on two vc4 planes; by fdinfo
+(a separate counter, over 10 s on a test build earlier the same day) DomU's Venus render
+server was the only DRM client above 0.05% of V3D's render engine.
 
 ## 7g. The Raspberry Pi 4 board run (2026-09-12)
 

@@ -52,7 +52,8 @@ SRC_URI += "file://0001-impeller-trim-thread-local-pool-caches-in-RenderToTarget
 # THE DECIDING MEASUREMENT. The numbers above were measured with an idle GPU, where the cluster
 # sits at the 60 fps ceiling either way and 1x could only show up as lower GPU time. The
 # deciding measurement added DomA compositing with Vulkan (SkiaVk) as a steady second load
-# -- the configuration this product actually targets -- four runs, order interleaved
+# -- the configuration targeted then (the Raspberry Pi 5 AAOS product now composites
+# with GL) -- four runs, order interleaved
 # (measured under concurrent DomA load):
 #   fps median        48.5 -> 52.5   (+8.2 %; under contention the headroom becomes frames)
 #   total GPU render  88.4 % -> 83.9 %  (-4.5 pt), bin 12.3 % -> 8.3 %
@@ -120,3 +121,10 @@ python flutter_engine_arm64_host_deps() {
     with open(os.path.normpath(os.path.join(d.getVar("S"), d.getVar("GN_DEPS_FILE"))), "w") as f:
         f.write(deps)
 }
+
+# The same embedder path creates an image view for the embedder's onscreen image each frame
+# and never destroys it: one VkImageView a frame, which over Venus became host heap (the
+# renderer's anonymous memory grew about 1.76 MB a minute, and DomD ran out of memory after
+# about 14 hours on the RPi5). 0003 makes the wrapper own the view, as upstream's current
+# code does. Unconditional for the same reason as 0001.
+SRC_URI += "file://0003-impeller-destroy-the-image-view-of-the-embedder-s-onscreen-image.patch"
