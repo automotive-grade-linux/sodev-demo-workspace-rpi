@@ -191,3 +191,11 @@ SRC_URI:append:class-target = " file://q11-063-ui-virtio-media-scan-video-out-on
 SRC_URI:append:class-target = " file://q11-064-virtio-gpu-virgl-add-SET_PRIMARY_RECT-a-positioned-scaled-pr.patch"
 SRC_URI:append:class-target = " file://q11-066-ui-sdl2-hand-guest-display-planes-to-weston-subsurfaces-opt.patch"
 SRC_URI:append:class-target = " file://q11-067-virtio-gpu-clear-overlay-and-handed-off-plane-state-on-reset.patch"
+#
+# The display path: a guest dma-buf scanout and DomA's whole output on weston's planes.
+# q11-070: the plane handoff also for a guest dma-buf scanout (SET_SCANOUT_BLOB): weston
+#   gets the guest's linear buffer instead of qemu blitting it through a TFU conversion.
+# q11-078: the plane handoff covers qemu's window (plane 0 opaque, a black backdrop under a
+#   scaled primary), so weston can put DomA's output on planes instead of the GPU.
+SRC_URI:append:class-target = " file://q11-070-ui-sdl2-hand-a-guest-dma-buf-scanout-to-weston-too.patch"
+SRC_URI:append:class-target = " file://q11-078-ui-sdl2-wl-scanout-cover-the-window-under-the-planes.patch"

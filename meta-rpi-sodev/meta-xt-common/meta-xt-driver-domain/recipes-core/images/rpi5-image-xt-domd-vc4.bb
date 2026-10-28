@@ -376,9 +376,13 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 #   /etc/qemu-gbm-layout    virglrenderer 1.3.0: back guest resources with GBM dma-bufs, which
 #                           a Vulkan (Venus) DomA needs. It costs the GL path (RPi4: a local
 #                           WebView 1080p fullscreen video stops, HMI 52-56 -> 35-41 fps).
+#                           DomA's device model only: DomU's qemu has a gbm device too when
+#                           it has overlay planes (VIRGL_EXTERNAL_GBM, xt-xen-cfg-domu), and
+#                           gbm-layout would put every shared resource of its GL compositor
+#                           on a linear gbm bo.
 #   /etc/qemu-lat-diag      qemu 11 (q11-057/058): log display-command latencies.
 [ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
-[ -f /etc/qemu-gbm-layout ] && export VIRGL_GBM_LAYOUT_ENABLE=1
+[ -f /etc/qemu-gbm-layout ] && [ "$wmclass" = DomA ] && export VIRGL_GBM_LAYOUT_ENABLE=1
 [ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
 exec "${REAL_QEMU}" "$@"
 EOF

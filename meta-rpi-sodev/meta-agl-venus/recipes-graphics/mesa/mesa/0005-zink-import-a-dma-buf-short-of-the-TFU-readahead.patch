@@ -1,0 +1,77 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 17 Oct 2026 05:07:37 +0900
+Subject: [PATCH] zink: import a dma-buf short of the TFU readahead
+
+zink allocates an imported dma-buf with the image's memory
+requirements. Mesa 26.x's V3DV adds the TFU's 64-byte readahead to the
+requirement of every TRANSFER_SRC image (24.0.7's did not), and zink
+gives its images that usage, while an exporter that allocated the
+image without it does not pad: in DomU on a Raspberry Pi 5 host, a
+1920x720 XRGB buffer from a Venus swapchain is 5529600 bytes and
+zink's image wants 5529664. The host's V3DV refuses an import bigger
+than the dma-buf (device_import_bo), and so does the guest's Venus
+for a mappable blob, so agl-compositor on zink took no client buffer
+("Error during import, and no known conversion for format XR24"),
+measured on 2026-10-17.
+
+When a single-plane image falls short of the dma-buf by no more than
+that padding, allocate what the dma-buf holds. The check does not
+look at the driver: any driver's import short by up to 64 bytes now
+goes through. The image is then bound to less memory than
+vkGetImageMemoryRequirements asked for
+(VUID-vkBindImageMemory-size-01049), which V3DV does not check at
+bind, and a TFU read of the whole image runs up to 64 bytes past the
+dma-buf and can raise a V3D MMU error.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -45,6 +45,9 @@
+ #include "util/u_memory.h"
+ #include "util/u_upload_mgr.h"
+ #include "util/os_file.h"
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #include "frontend/winsys_handle.h"
+ 
+ #if !defined(__APPLE__)
+@@ -53,6 +56,11 @@
+ 
+ #if defined(ZINK_USE_DMABUF) && !defined(_WIN32)
+ #include "drm-uapi/drm_fourcc.h"
++
++/* how far an imported dma-buf may fall short of the image's memory
++ * requirement: V3DV's TFU readahead padding (V3D_TFU_READAHEAD_SIZE)
++ */
++#define ZINK_IMPORT_PAD_MAX 64
+ #else
+ /* these won't actually be used */
+ #define DRM_FORMAT_MOD_INVALID 0
+@@ -1223,6 +1231,23 @@
+          goto fail1;
+       }
+ 
++      /* An import cannot be bigger than the dma-buf it comes from, but V3DV
++       * pads a TRANSFER_SRC image by the TFU's 64-byte readahead, which an
++       * exporter allocating the image without that usage (such as a Venus
++       * swapchain) does not, so a tightly sized dma-buf fails to import.
++       * Allocate what the dma-buf holds when a single-plane image falls
++       * short of it by no more than that padding.
++       */
++      if (external == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
++          obj->plane_count == 1 &&
++          util_format_get_num_planes(templ->format) == 1) {
++         off_t dmabuf_size = lseek(imfi.fd, 0, SEEK_END);
++         lseek(imfi.fd, 0, SEEK_SET);
++         if (dmabuf_size > 0 && (VkDeviceSize)dmabuf_size < reqs.size &&
++             reqs.size - (VkDeviceSize)dmabuf_size <= ZINK_IMPORT_PAD_MAX)
++            reqs.size = dmabuf_size;
++      }
++
+       imfi.pNext = mai.pNext;
+       mai.pNext = &imfi;
+    }

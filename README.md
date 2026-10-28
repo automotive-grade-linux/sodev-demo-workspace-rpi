@@ -328,7 +328,9 @@ See also:
 │   ├── meta-xt-rpi5/                # RPi5 BSP: u-boot/TFA/boot.scr, Xen 4.22 bbappend + patch series, xen dtso, kernel DT/cfg
 │   ├── meta-xt-rpi4/                # RPi4 BSP, the sibling of the above (BCM2711). Mutually exclusive with it
 │   ├── meta-agl-venus/              # the AGL guest's layer for the Vulkan lane (AGL build only):
-│   │                                #   its Mesa 24.0.7 patches and the Vulkan (Impeller) cluster
+│   │                                #   its Mesa 24.0.7 patches, the Vulkan (Impeller) cluster,
+│   │                                #   libweston's LINEAR scanout on virtio-gpu and the receiver's
+│   │                                #   dma-buf window
 │   ├── xt-prod-devel-rpi5-domd/     # vendored upstream DomD product layer
 │   ├── meta-rpi-sodev-devel/        # opt-in diagnostic/debug/prototype layer (NOT in the shipping build; p4-tool etc.)
 │   └── scripts/                     # helpers: guest-pin sync (sync-guest-pins)

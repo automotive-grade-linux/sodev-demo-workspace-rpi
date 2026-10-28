@@ -18,14 +18,14 @@ This is the authoritative list of what that means:
 |---|---|---|
 | DomD device model | qemu 11.1.2 on both boards (section 4); the fork's 10.0.2-xt (`meta-xt-qemu`, built with `gtk+` and `pixman`) remains selectable | qemu 7.0.0-xt, with its six 7.0.0-only device-model patches |
 | DomD rootfs | `mesa-vulkan-drivers`, `vulkan-loader` and `vulkan-tools` installed explicitly | no `vulkan-tools`; the V3DV ICD and the loader arrive only through weston's Vulkan renderer |
-| DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 8 product patches on 1.3.0 on both boards (0009 is upstream there and 0017 is replaced by its 1.3.0 port); 9 on 1.2.0 when 10.0.2 is selected; DomD's weston is 16.0.0 instead of poky's 15.0.0 | oe-core's stock build, no venus, no patches |
-| guest cfg (`domu.cfg`/`doma.cfg`) | `hostmem=256M,blob=true,venus=true` on `virtio-gpu-gl-pci`; in `doma.cfg` the Venus `qemu_envs` (`VIRGL_EXTERNAL_GBM`, `V3DV_MAX_BO_CACHE_SIZE`, `VKR_DEVICE_HEAP_MIB`, `VKR_RING_IDLE_WAIT_MS`, `VKR_RING_RELAX`), `VKR_RING_IDLE_WAIT_MS` and `VKR_RING_RELAX` in `domu.cfg`; the options and renames only the qemu 10 and 11 device models take | `VKR_RING_IDLE_WAIT_MS` and `VKR_RING_RELAX` in `domu.cfg` (unused without venus); none of the others |
+| DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 9 product patches on 1.3.0 on both boards (0009 is upstream there, 0017 is replaced by its 1.3.0 port, and 0024 is 1.3.0's only); 9 on 1.2.0 when 10.0.2 is selected; DomD's weston is 16.0.0 instead of poky's 15.0.0 | oe-core's stock build, no venus, no patches |
+| guest cfg (`domu.cfg`/`doma.cfg`) | `hostmem=256M,blob=true,venus=true` on `virtio-gpu-gl-pci`; in `doma.cfg` the Venus `qemu_envs` (`VIRGL_EXTERNAL_GBM`, `V3DV_MAX_BO_CACHE_SIZE`, `VKR_DEVICE_HEAP_MIB`, `VKR_RING_IDLE_WAIT_MS`, `VKR_RING_RELAX`), `VKR_RING_IDLE_WAIT_MS` and `VKR_RING_RELAX` in `domu.cfg`, and `VIRGL_EXTERNAL_GBM` there with DomU overlay planes; the options and renames only the qemu 10 and 11 device models take | `VKR_RING_IDLE_WAIT_MS` and `VKR_RING_RELAX` in `domu.cfg` (unused without venus); none of the others |
 | Xen + libxl | `4.22-0007/0008/0009/0010` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices, one SPI per virtio-pci slot); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
 | rpi4 4 GiB SKU memory | DomD 1440 MiB / DomA 2048 MiB | DomD 1056 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
 | DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in the qemu 10.0.2 and 11.1.2 device models |
 | DomA overlay planes | `XT_DOMA_OVERLAY_PLANES` in `xt-xen-cfg-doma`: `0` (the default) to `3`, and a board may set its own; both boards set `3`. It sets both halves in `doma.cfg`, the device model's `overlay-planes=N` (qemu 10.0.2 patch `0250`, qemu 11.1.2 patch `q11-051`) and DomA's `virtio_gpu.overlay_planes=N` (DomA kernel patch `aosp-kernel-patches/common/0001`); drm_hwcomposer then puts the system bars on the overlays instead of SurfaceFlinger compositing them on the GPU | `0` whatever the variable says: qemu 7.0.0 has no `overlay-planes` |
-| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`. The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`) | none: the qemu 7 device model has no overlay planes |
+| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`; the Raspberry Pi 5 sets `1`. The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`), plus `VIRGL_EXTERNAL_GBM=1`, the gbm device a linear scanout buffer needs on the host to be a linear gbm bo (virglrenderer 1.3.0). With it, xdg-cluster-receiver's window goes on the overlay | none: the qemu 7 device model has no overlay planes |
 
 Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.4 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from
@@ -101,7 +101,7 @@ and one was a hard blocker; the table is written from that starting point, and t
 |---|---|---|---|
 | mesa | 26.0.5 in oe-core; **this series pins DomD's to 26.2.4** (ungated, so both lanes) -- section 7e | **V3DV already built AND already installed** | meta-raspberrypi `mesa.bbappend` appends `vulkan broadcom` for `rpi`, so `VULKAN_DRIVERS` gains `broadcom` → `libvulkan_broadcom.so` in `mesa-vulkan-drivers`. And it is already in the shipping rootfs: weston's `vulkan-renderer.so` links `libvulkan.so.1`, so weston RDEPENDS on vulkan-loader, whose `RRECOMMENDS virtual-vulkan-icd` resolves to `mesa-vulkan-drivers` |
 | weston | 15.0.0 (oe-core); a 16.0.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_weston` selects it (both board yamls pin `15.%`, and both boards' `vulkan` lanes select `16.%`) | **Vulkan renderer already built** | `PACKAGECONFIG` filters `vulkan` from `DISTRO_FEATURES` → `-Drenderer-vulkan=true` |
-| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off. On 1.3.0 a guest resource gets a GBM dma-buf only with `VIRGL_GBM_LAYOUT_ENABLE`, which a Venus-compositing DomA needs and which costs the GL path; the DomD qemu wrapper exports it for DomA's device model when `/etc/qemu-gbm-layout` exists, and the image does not create that file. |
+| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off. On 1.3.0 a guest resource gets a GBM dma-buf only with `VIRGL_GBM_LAYOUT_ENABLE`, which a Venus-compositing DomA needs and which costs the GL path; the DomD qemu wrapper exports it for DomA's device model when `/etc/qemu-gbm-layout` exists, and the image does not create that file. (`0024` adds one exception: a linear scanout buffer gets a linear GBM bo whenever the device model has a gbm device, `VIRGL_EXTERNAL_GBM=1`.) |
 | qemu | **11.1.2** (`qemu_11.1.2.bb`) on both boards, **10.0.2** (xen-troops fork, `meta-xt-qemu`) selectable; **7.0.0** with `--gpu=gl` | was the blocker | `virtio-gpu-gl` grew `venus=` in QEMU **9.2.0**, so the 7.0.0 the tree used to ship has no such property. Raising the device model is what this work turned into the default |
 
 So the host-side work was: raise QEMU, keep virglrenderer's venus backend, install
@@ -1483,6 +1483,42 @@ still gets a DomA with the Venus ICD (both products composite with GL):
 
 `apply-aosp-patches.sh` applies the patch sets after the AOSP fetch (source
 mode); a prebuilt bundle carries whatever DomA it was built with.
+
+### Linear scanout buffers: when `vendor.minigbm.scanout_linear` is needed
+
+`meta-xt-doma/aosp-patches/external/minigbm/0003` adds the property. With it
+`true`, the virgl backend of DomA's minigbm asks the host for a linear resource
+(`VIRGL_BIND_LINEAR`) for every buffer allocated with `BO_USE_SCANOUT`
+(`GRALLOC_USAGE_HW_COMPOSER`: SurfaceFlinger's client target and the app layers
+the composer is handed) and not with `BO_USE_HW_VIDEO_DECODER`, so decoder output
+stays as the host allocates it. It is read once, when the gralloc library
+initialises, so it takes a restart of the graphics services to change. The
+Raspberry Pi 5 product sets it (`aosp_xenvm_trout_rpi5_arm64.mk`); the Raspberry
+Pi 4 product leaves it off. The bos are v3d's (system memory, which the Pi 5's HVS
+reaches through its IOMMU), so they take no CMA.
+
+On the host, virglrenderer `0024` (1.3.0 only) gives such a resource a linear GBM
+bo when the device model has a gbm device (`VIRGL_EXTERNAL_GBM=1`), and qemu
+11.1.2's plane handoff (`/run/qemu-plane-handoff`) passes it to weston as a
+subsurface. vc4's RGB planes take only LINEAR and T_TILED, so without the property
+the buffer is UIF, the plane rejects it, and weston composites DomA with the GPU
+("mixed") instead of putting it on a plane ("plane-only").
+
+| situation (Raspberry Pi 5, DomA composited with GL) | needed? | measured |
+|---|---|---|
+| HMI only | for plane-only, yes (the client target is a scanout buffer) | V3D 17.6 -> 17.0% (2026-10-15); weston's state not compared |
+| Vulkan composition with `/etc/qemu-gbm-layout` | redundant (gbm-layout makes DomA's resources linear already) | not measured |
+
+Where qemu 10.0.2 and virglrenderer 1.2.0 are selected instead (no `0024`, no
+plane handoff) it changes nothing.
+
+It is set where DomA should go to a plane: the Raspberry Pi 5 on qemu 11.1.2 and
+virglrenderer 1.3.0. The Raspberry Pi 4 has the same path (qemu 11.1.2,
+virglrenderer 1.3.0 and `0024`, the plane handoff) but is left off: its HVS has no
+IOMMU, so a linear v3d bo is not expected to go on a plane there and only the cost
+of a linear layout would remain (not measured). It is not needed with gbm-layout.
+The allocator cannot tell at allocation time whether the composer will put a buffer
+on a plane, so the property stays a global switch.
 
 ## 7. Phase 4-B — DomU (AGL-IC)
 

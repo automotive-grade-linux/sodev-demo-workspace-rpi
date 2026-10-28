@@ -1,7 +1,9 @@
-# Three patches for scarthgap's mesa 24.0.7 -- two to make Venus work at all and
-# one performance proof of concept. Each is measured, not assumed. 0001 and 0002
-# say below why wrynose's in-tree 26.x does not need them; 0003's defect is
-# still in 26.x.
+# Six patches for scarthgap's mesa 24.0.7 -- two to make Venus work at all, one
+# performance proof of concept, 0004 for the receiver window's plane, and 0005 and
+# 0006 for GL on zink. Each is measured, not assumed. 0001 and 0002 say below why
+# wrynose's in-tree 26.x does not need them; 0003's and 0004's defects are still
+# in 26.x, and 0005's and 0006's in DomD's 26.2.4 (0006 would have to be rewritten
+# there: 26.x rebuilt the usage checks it edits).
 #
 # The filename is mesa_%.bbappend, so it also attaches to any FUTURE mesa in
 # this AGL build. That is deliberate and is the same reasoning as the
@@ -50,3 +52,19 @@ SRC_URI += "file://0002-venus-do-not-suballocate-device-memory.patch"
 # The patch is a proof of concept: the modifier list should come from the host renderer, and
 # virgl has no way to ask (union virgl_caps has no modifier table). See the patch header.
 SRC_URI += "file://0003-virgl-enumerate-dma-buf-format-modifiers.patch"
+
+# 0004: a gbm SCANOUT | LINEAR buffer (xdg-cluster-receiver's window) reaches the host as
+# VIRGL_BIND_LINEAR, so virglrenderer's 0024 can give it a linear layout a display plane
+# takes. See the patch.
+SRC_URI += "file://0004-virgl-pass-PIPE_BIND_LINEAR-to-the-host.patch"
+
+# 0005 and 0006: GL on zink (MESA_LOADER_DRIVER_OVERRIDE=zink, i.e. on Venus) --
+# agl-compositor or a GL client run that way -- could not import the clients'
+# buffers. 0005: a host V3DV from mesa 26.x pads a TRANSFER_SRC image by the TFU's
+# 64-byte readahead, so zink asked more than a tightly sized dma-buf held and the
+# import was refused. 0006: V3DV takes no input attachment on a linear image, so
+# zink fell back to a tiled image for a linear dma-buf, which the clients' buffers
+# have been since they go to the display planes. Neither changes anything for a
+# process that does not load zink. See the patches.
+SRC_URI += "file://0005-zink-import-a-dma-buf-short-of-the-TFU-readahead.patch"
+SRC_URI += "file://0006-zink-keep-a-linear-image-linear-minus-input-usage.patch"

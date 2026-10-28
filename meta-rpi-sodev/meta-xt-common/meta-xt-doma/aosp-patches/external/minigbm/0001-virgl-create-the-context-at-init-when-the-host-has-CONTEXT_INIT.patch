@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 14 Oct 2026 22:27:44 +0900
+Subject: [PATCH] virgl: create the context at init when the host has CONTEXT_INIT
+
+qemu 9.0 and later advertise VIRTIO_GPU_F_CONTEXT_INIT whenever they
+link virglrenderer 1.x, and there is no property to turn it off. With
+the feature advertised the guest kernel no longer creates the context
+when a BO is opened, so an imported BO is never attached to the context:
+the context is created later, on the first ioctl that needs one. Every
+transfer on such a BO then fails on the host
+("vrend_renderer_transfer_iov: Illegal resource") and is dropped, while
+the ioctl returns 0. A reader of a buffer another process allocated --
+screencap reading SurfaceFlinger's screenshot, for one -- gets zeros.
+
+Create the context in virgl_init when the kernel has the feature, as the
+cross-domain backend already does, with no parameters: the kernel then
+sends the same context creation it would have sent lazily, so the host
+takes the path it took before qemu 9.0. EEXIST (the cross-domain backend
+created the context on this fd and then failed) is fine; any other
+failure is logged, since imported buffers may then not be attached.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -690,6 +690,31 @@ static int virgl_init(struct driver *drv)
+ 
+ 	virgl_init_params_and_caps(drv);
+ 
++	/*
++	 * On a kernel and host with VIRTIO_GPU_F_CONTEXT_INIT, create the context now.
++	 *
++	 * qemu >= 9.0 advertises the feature whenever it links virglrenderer 1.x, with no
++	 * property to turn it off. The guest kernel then no longer creates the context when a
++	 * BO is opened (virtio_gpu_gem_object_open), and does not attach a BO opened before
++	 * the context exists: it creates the context on the first ioctl that needs one, after
++	 * the import. The host then fails the context's lookup of the resource on every
++	 * transfer ("vrend_renderer_transfer_iov: Illegal resource") and drops it, while the
++	 * ioctl still returns 0. The cross-domain backend already creates its context at init
++	 * (virtgpu_cross_domain.c); the virgl backend did not need to before qemu 9.0.
++	 *
++	 * No parameters: the kernel then sends the same context creation it would have sent
++	 * lazily, so the host takes the path it took before. EEXIST means the context already
++	 * exists on this fd (the cross-domain backend's init failed after creating it).
++	 */
++	if (params[param_context_init].value) {
++		struct drm_virtgpu_context_init init = { 0 };
++
++		if (drmIoctl(drv->fd, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &init) && errno != EEXIST)
++			drv_loge("DRM_IOCTL_VIRTGPU_CONTEXT_INIT failed with %s; buffers imported "
++				 "from other processes may not be attached to this context\n",
++				 strerror(errno));
++	}
++
+ 	if (params[param_3d].value) {
+ 		/* This doesn't mean host can scanout everything, it just means host
+ 		 * hypervisor can show it. */

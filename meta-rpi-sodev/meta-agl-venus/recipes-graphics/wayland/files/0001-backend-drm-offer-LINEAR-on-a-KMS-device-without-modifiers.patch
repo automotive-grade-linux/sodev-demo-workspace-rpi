@@ -1,0 +1,43 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 08:26:38 +0900
+Subject: [PATCH] backend-drm: offer LINEAR on a KMS device without
+ modifiers
+
+On a KMS device without IN_FORMATS -- QEMU's virtio-gpu, whose driver
+takes no modifiers in AddFB2 -- each plane format gets only
+DRM_FORMAT_MOD_INVALID, and that is all the scanout tranche of the
+dma-buf feedback offers. But drm_fb_get_from_dmabuf() never puts an
+implicit-modifier buffer on a plane, so a client that reallocates from
+the scanout tranche is refused again ("couldn't get FB for view: 0x4",
+DMABUF_MODIFIER_INVALID) and its window stays composed by the GPU.
+
+Such a driver takes a linear buffer: drm_fb_addfb() imports it through
+the legacy AddFB2 when the device has no modifier support. Add LINEAR
+to the plane formats in that case, after INVALID, so the renderer's own
+gbm surface is allocated as before and a client can pick LINEAR from
+the scanout tranche.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/libweston/backend-drm/kms.c
++++ b/libweston/backend-drm/kms.c
+@@ -594,6 +594,17 @@
+ 		ret = weston_drm_format_add_modifier(fmt, DRM_FORMAT_MOD_INVALID);
+ 		if (ret < 0)
+ 			return -1;
++		/* A driver that takes no modifiers in AddFB2 takes a linear
++		 * buffer through the legacy entry point (drm_fb_addfb), so say
++		 * so: a client that reallocates from the scanout tranche can
++		 * then pick LINEAR, while an implicit-modifier buffer is never
++		 * scanned out (drm_fb_get_from_dmabuf). */
++		if (!use_modifiers) {
++			ret = weston_drm_format_add_modifier(fmt,
++							     DRM_FORMAT_MOD_LINEAR);
++			if (ret < 0)
++				return -1;
++		}
+ 	}
+ 	return 0;
+ }

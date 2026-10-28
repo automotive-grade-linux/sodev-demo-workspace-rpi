@@ -49,9 +49,19 @@ XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 # (xt-xen-cfg-doma's XT_DOMA_OVERLAY_PLANES): the device model's half is
 # overlay-planes=N on the virtio-gpu-gl -device line, DomU's half is
 # virtio_gpu.overlay_planes=N on its command line (linux-virtio-armv8's
-# 0002-drm-virtio-overlay-planes-on-output-0). The guest's compositor can then
-# hand a surface to the host as an overlay instead of composing it into the
-# primary plane.
+# 0002-drm-virtio-overlay-planes-on-output-0). The compositor can then scan a
+# window that sits over the cluster (xdg-cluster-receiver) out on an overlay
+# instead of composing both with the GPU.
+#
+# An overlay is a host GL texture, and a GL texture on the host's V3D is laid
+# out BROADCOM_UIF, which the Raspberry Pi 5's vc4 planes do not take (they
+# take LINEAR and T_TILED), so DomD's compositor would compose it with the GPU.
+# For a plane, the guest's linear scanout resource has to be a linear gbm buffer
+# object on the host, which needs a gbm device in the device model:
+# VIRGL_EXTERNAL_GBM=1 (virglrenderer 1.3.0). DomA's qemu already runs with it
+# (xt-xen-cfg-doma). On virglrenderer 1.2.0 (selected with qemu 10.0.2) the gbm
+# device would put every shared resource on a gbm bo, which halves a GL guest's
+# frame rate (see that bbappend): keep 0 there.
 #
 # 0 leaves domu.cfg as it is. The qemu 7 lane (--gpu=gl) has no overlay-planes
 # property, so it gets none whatever the value.
@@ -117,7 +127,8 @@ do_install() {
         ;;
     esac
 
-    # [overlay planes] both halves of XT_DOMU_OVERLAY_PLANES, or neither.
+    # [overlay planes] both halves of XT_DOMU_OVERLAY_PLANES and the host's gbm,
+    # or none of them.
     case "${XT_DOMU_OVERLAY_PLANES}" in
     0|1|2|3) ;;
     *) bbfatal "XT_DOMU_OVERLAY_PLANES='${XT_DOMU_OVERLAY_PLANES}': expected 0..3" ;;
@@ -129,11 +140,14 @@ do_install() {
     if [ "$domu_overlays" != 0 ]; then
         sed -i -e "s/'virtio-gpu-gl-pci,/&overlay-planes=$domu_overlays,/" \
                -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.overlay_planes=$domu_overlays\"/" \
+               -e "s/^    'SDL_VIDEO_WAYLAND_WMCLASS=qemu-system-aarch64-domu',\$/&\n    'VIRGL_EXTERNAL_GBM=1',/" \
             ${D}${sysconfdir}/xen/domu.cfg
         grep -q "'virtio-gpu-gl-pci,overlay-planes=$domu_overlays," ${D}${sysconfdir}/xen/domu.cfg || \
             bbfatal "domu.cfg: overlay-planes=$domu_overlays did not reach the virtio-gpu -device line"
         grep -q "^extra = \".* virtio_gpu.overlay_planes=$domu_overlays\"\$" ${D}${sysconfdir}/xen/domu.cfg || \
             bbfatal "domu.cfg: virtio_gpu.overlay_planes=$domu_overlays did not reach DomU's command line"
+        grep -qxF "    'VIRGL_EXTERNAL_GBM=1'," ${D}${sysconfdir}/xen/domu.cfg || \
+            bbfatal "domu.cfg: VIRGL_EXTERNAL_GBM=1 did not reach qemu_envs"
     fi
 
     install -d ${D}${systemd_system_unitdir}

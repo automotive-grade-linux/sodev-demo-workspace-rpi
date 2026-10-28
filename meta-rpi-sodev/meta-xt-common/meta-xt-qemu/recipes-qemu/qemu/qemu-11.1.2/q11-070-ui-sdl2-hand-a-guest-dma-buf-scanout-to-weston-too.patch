@@ -1,0 +1,406 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 18:32:48 +0900
+Subject: [PATCH] ui/sdl2: hand a guest dma-buf scanout to weston too
+
+q11-066 hands the guest's scanout to the host compositor as a plane
+when it is a GL texture. A SET_SCANOUT_BLOB scanout -- a Venus
+swapchain image, which is what the AGL cluster scans out once its
+window is on the guest's primary plane -- ended the handoff: qemu
+imported the dma-buf into GL and blitted it into its own window. V3D
+cannot sample a linear buffer, so Mesa converted it with the TFU on
+every frame: 40.7% of the TFU (331 jobs/s) on a Raspberry Pi 5 at
+1920x720 and 60 Hz.
+
+Give weston the guest's dma-buf instead, as a LINEAR
+zwp_linux_dmabuf buffer with the guest's stride, attached to the
+primary's subsurface. LINEAR is what the blit assumes already: the
+guest's framebuffer has no modifier (virtio-gpu has none), qemu
+imports the dma-buf with an implicit one, and V3D's driver takes that
+as linear. A scanout that starts inside the buffer (x, y != 0) is left
+to the blit. The buffer is created asynchronously (create, not
+create_immed, whose failure is a protocol error that would end qemu's
+window); until weston answers, the frame is blitted as before, and
+once weston refuses one, the blob handoff stays off.
+
+Buffers are cached by resource, dma-buf inode, size, format and
+stride. An entry weston has not answered for is never freed. One
+whose resource is gone is freed at once unless it is on screen or
+still waiting, and then when weston answers; the cache can grow past
+its size while every entry is on screen or waiting.
+
+sdl2_gl_scanout_texture() now also clears guest_fb.dmabuf, and
+sdl2_gl_release_dmabuf() clears it when it is the one released, as
+gtk.c does: a dma-buf left there stopped the texture handoff and gave
+the blit the old rectangle.
+
+Not covered: the guest is not held while weston shows its buffer, the
+same as for textures, so a guest that renders into the image on
+screen would tear. A refusal from weston is not retried, and a
+virtio-gpu reset does not empty the cache.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-virgl.c |   3 +
+ include/ui/sdl2.h             |   2 +
+ ui/sdl2-gl.c                  |  17 +++
+ ui/sdl2-wl-scanout.c          | 206 +++++++++++++++++++++++++++++++---
+ 4 files changed, 210 insertions(+), 18 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 54cafa6..203815d 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1360,6 +1360,9 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+     }
+ 
+     virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
++    if (ss.scanout_id == 0) {
++        q11_scanout0_resource_id = ss.resource_id; /* q11-blob-handoff */
++    }
+ }
+ #endif
+ 
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index cede5ff..26b2c85 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -61,6 +61,8 @@ struct sdl2_console {
+     /* q11-primary-rect: the scanout at prim_x, prim_y, prim_w x prim_h of prim_cw x prim_ch */
+     int32_t prim_x, prim_y;
+     uint32_t prim_w, prim_h, prim_cw, prim_ch;
++    /* q11-blob-handoff: the guest's scanout is this dma-buf (SET_SCANOUT_BLOB) */
++    QemuDmaBuf *blob;
+ #endif
+ };
+ 
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index aa91f59..24bcd58 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -205,6 +205,7 @@ void sdl2_gl_scanout_disable(DisplayChangeListener *dcl)
+     assert(scon->opengl);
+     scon->w = 0;
+     scon->h = 0;
++    scon->blob = NULL; /* q11-blob-handoff */
+     sdl2_set_scanout_mode(scon, false);
+ }
+ 
+@@ -225,6 +226,13 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+     scon->w = w;
+     scon->h = h;
+     scon->y0_top = backing_y_0_top;
++    scon->blob = NULL; /* q11-blob-handoff: sdl2_gl_scanout_dmabuf sets it again */
++    /*
++     * q11-blob-handoff: and the dma-buf a previous scanout left here, which would
++     * otherwise stop the plane handoff of this texture and give the blit the old
++     * rectangle (gtk.c clears it the same way). sdl2_gl_scanout_dmabuf sets it again.
++     */
++    scon->guest_fb.dmabuf = NULL;
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+ 
+@@ -480,6 +488,7 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+                             qemu_dmabuf_get_width(dmabuf),
+                             qemu_dmabuf_get_height(dmabuf),
+                             NULL);
++    scon->blob = dmabuf; /* q11-blob-handoff */
+ 
+     if (qemu_dmabuf_get_allow_fences(dmabuf)) {
+         scon->guest_fb.dmabuf = dmabuf;
+@@ -489,6 +498,14 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+ void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
+                             QemuDmaBuf *dmabuf)
+ {
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    if (scon->blob == dmabuf) { /* q11-blob-handoff */
++        scon->blob = NULL;
++    }
++    if (scon->guest_fb.dmabuf == dmabuf) { /* q11-blob-handoff: as gtk.c does */
++        scon->guest_fb.dmabuf = NULL;
++    }
+     egl_dmabuf_release_texture(dmabuf);
+ }
+ 
+diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
+index ae7c292..e7ae32e 100644
+--- a/ui/sdl2-wl-scanout.c
++++ b/ui/sdl2-wl-scanout.c
+@@ -578,6 +578,14 @@ typedef struct WlPlaneBuf {
+     uint32_t res; /* virtio resource (0 = unknown) */
+     struct wl_buffer *wb;
+     int64_t used;
++    /*
++     * q11-blob-handoff: a guest dma-buf (tex 0): its inode (0 once the resource is
++     * gone), layout, and weston's answer. pending = the create is not answered yet: the
++     * params listener's data is this entry, so it must not be freed until then.
++     */
++    ino_t ino;
++    uint32_t fourcc, stride;
++    bool ready, failed, pending;
+ } WlPlaneBuf;
+ 
+ static struct {
+@@ -590,6 +598,8 @@ static struct {
+     GPtrArray *cache;
+     uint64_t presents, exports, export_fail, evicted;
+     uint64_t geom, name_reuse, gone; /* per stats line */
++    uint64_t blobs; /* q11-blob-handoff: guest dma-bufs handed over */
++    bool blob_off;  /* q11-blob-handoff: weston refused one; blit them from now on */
+ } pl;
+ 
+ static bool planes_flag(void)
+@@ -615,6 +625,8 @@ static bool plane_in_use(WlPlaneBuf *b)
+     return false;
+ }
+ 
++static void pl_cache_add(WlPlaneBuf *b);
++
+ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+ {
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+@@ -673,6 +685,12 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+         info_report("sdl2: plane-handoff: texture %u %ux%u fourcc %.4s modifier 0x%016" PRIx64
+                     " planes %d", tex, w, h, (char *)&fourcc, (uint64_t)mod, np);
+     }
++    pl_cache_add(b);
++    return b;
++}
++
++static void pl_cache_add(WlPlaneBuf *b)
++{
+     if (pl.cache->len >= WL_PLANE_CACHE) { /* drop the least recently used, not on screen */
+         guint lru = 0;
+         int64_t t = INT64_MAX;
+@@ -680,33 +698,178 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+         for (guint i = 0; i < pl.cache->len; i++) {
+             WlPlaneBuf *o = g_ptr_array_index(pl.cache, i);
+ 
+-            if (o->used < t && !plane_in_use(o)) {
++            /*
++             * A guest dma-buf weston has not answered for yet is its listener's data.
++             * So the cache can grow past WL_PLANE_CACHE while every entry is on screen or
++             * waiting for weston; it shrinks again as they are answered.
++             */
++            if (o->used < t && !plane_in_use(o) && !o->pending) {
+                 t = o->used;
+                 lru = i;
+             }
+         }
+-        wl_buffer_destroy(((WlPlaneBuf *)g_ptr_array_index(pl.cache, lru))->wb);
+-        g_free(g_ptr_array_index(pl.cache, lru));
+-        g_ptr_array_remove_index_fast(pl.cache, lru);
+-        pl.evicted++;
++        if (t != INT64_MAX) {
++            WlPlaneBuf *o = g_ptr_array_index(pl.cache, lru);
++
++            if (o->wb) {
++                wl_buffer_destroy(o->wb);
++            }
++            g_free(o);
++            g_ptr_array_remove_index_fast(pl.cache, lru);
++            pl.evicted++;
++        }
+     }
+     g_ptr_array_add(pl.cache, b);
+-    return b;
+ }
+ 
+-/* the guest unref'd res (virtio-gpu-virgl.c): its buffers are never matched again */
++/*
++ * q11-blob-handoff (2026-10-15): the guest's scanout can be a dma-buf rather than a GL
++ * texture -- SET_SCANOUT_BLOB of a Venus swapchain image, which is what the AGL cluster
++ * scans out once its window is on the guest's primary plane. Blitting such a buffer
++ * into qemu's window imports it into GL: a linear buffer V3D cannot sample, so Mesa
++ * converts it with the TFU on every frame (RPi5, 1920x720 at 60 Hz: the TFU 40.7%
++ * busy, 331 jobs/s). Give weston the guest's dma-buf itself instead.
++ *
++ * LINEAR, the layout the blit already assumes: virtio-gpu has no modifiers, so the
++ * guest's framebuffer has none, and qemu makes the blob's dma-buf with an implicit one
++ * (virtio-gpu-udmabuf.c), which V3D's driver imports as linear. In DomU it is LINEAR
++ * indeed: libweston never makes a framebuffer of a buffer whose modifier is implicit
++ * or tiled. The stride is the guest's (SET_SCANOUT_BLOB, bounds-checked against the
++ * blob's size by virtio_gpu_scanout_blob_to_fb), the offset the one qemu gives the
++ * dma-buf; a scanout rectangle that starts inside it (x, y != 0) is left to the blit.
++ *
++ * weston's answer comes asynchronously (zwp_linux_buffer_params_v1.create, not
++ * create_immed, whose failure would be a protocol error that ends qemu's window): until
++ * a buffer is ready that frame is blitted as before, and once weston refuses one the
++ * blob handoff is off for good. The guest is not held: the same as for textures, its
++ * next frame goes into another of its swapchain images.
++ */
++/* weston answered for a guest dma-buf whose resource went meanwhile: free it now */
++static void blob_drop_if_gone(WlPlaneBuf *b)
++{
++    if (b->ino || b->tex || plane_in_use(b)) {
++        return;
++    }
++    if (b->wb) {
++        wl_buffer_destroy(b->wb);
++    }
++    g_ptr_array_remove_fast(pl.cache, b);
++    g_free(b);
++}
++
++static void blob_created(void *data, struct zwp_linux_buffer_params_v1 *params,
++                         struct wl_buffer *wb)
++{
++    WlPlaneBuf *b = data;
++
++    b->wb = wb;
++    b->ready = true;
++    b->pending = false;
++    zwp_linux_buffer_params_v1_destroy(params);
++    blob_drop_if_gone(b);
++}
++
++static void blob_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
++{
++    WlPlaneBuf *b = data;
++    uint32_t w = b->w, h = b->h; /* blob_drop_if_gone may free b */
++
++    b->failed = true;
++    b->pending = false;
++    zwp_linux_buffer_params_v1_destroy(params);
++    blob_drop_if_gone(b);
++    if (!pl.blob_off) {
++        pl.blob_off = true;
++        warn_report("sdl2: plane-handoff: the compositor refused a guest dma-buf %ux%u; "
++                    "blitting them from now on", w, h);
++    }
++}
++
++static const struct zwp_linux_buffer_params_v1_listener blob_listener = {
++    blob_created, blob_failed,
++};
++
++static WlPlaneBuf *blob_buf(QemuDmaBuf *dmabuf, uint32_t res)
++{
++    int nfds = 0, nstrides = 0, noffsets = 0;
++    const int *fds = qemu_dmabuf_get_fds(dmabuf, &nfds);
++    const uint32_t *strides = qemu_dmabuf_get_strides(dmabuf, &nstrides);
++    const uint32_t *offsets = qemu_dmabuf_get_offsets(dmabuf, &noffsets);
++    uint32_t w = qemu_dmabuf_get_width(dmabuf), h = qemu_dmabuf_get_height(dmabuf);
++    uint32_t fourcc = qemu_dmabuf_get_fourcc(dmabuf);
++    struct zwp_linux_buffer_params_v1 *params;
++    struct stat st;
++    WlPlaneBuf *b;
++
++    /*
++     * A scanout that starts inside the buffer (x, y != 0) is left to the blit, which
++     * honours them; the subsurface would show the buffer from its top left.
++     */
++    if (pl.blob_off || !fds || nfds < 1 || fds[0] < 0 || nstrides < 1 || noffsets < 1 ||
++        qemu_dmabuf_get_num_planes(dmabuf) != 1 || qemu_dmabuf_get_x(dmabuf) ||
++        qemu_dmabuf_get_y(dmabuf) || fstat(fds[0], &st) < 0) {
++        return NULL;
++    }
++    if (!pl.cache) {
++        pl.cache = g_ptr_array_new();
++    }
++    for (guint i = 0; i < pl.cache->len; i++) {
++        b = g_ptr_array_index(pl.cache, i);
++        if (b->ino == st.st_ino && b->w == w && b->h == h && b->fourcc == fourcc &&
++            b->stride == strides[0]) {
++            b->used = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++            return b->ready ? b : NULL;
++        }
++    }
++    b = g_new0(WlPlaneBuf, 1);
++    b->ino = st.st_ino;
++    b->w = w;
++    b->h = h;
++    b->fourcc = fourcc;
++    b->stride = strides[0];
++    b->pending = true;
++    b->res = res;
++    b->used = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    params = zwp_linux_dmabuf_v1_create_params(wl.dmabuf);
++    zwp_linux_buffer_params_v1_add(params, fds[0], 0, offsets[0], strides[0], 0, 0); /* LINEAR */
++    zwp_linux_buffer_params_v1_add_listener(params, &blob_listener, b);
++    zwp_linux_buffer_params_v1_create(params, w, h, fourcc, 0);
++    wl_display_flush(wl.dpy);
++    if (pl.blobs++ < 8) {
++        info_report("sdl2: plane-handoff: guest dma-buf res %u %ux%u fourcc %.4s stride %u "
++                    "offset %u, LINEAR", res, w, h, (char *)&fourcc, strides[0], offsets[0]);
++    }
++    pl_cache_add(b);
++    return NULL; /* blitted until weston answers */
++}
++
++/*
++ * The guest unref'd res (virtio-gpu-virgl.c): its buffers are never matched again. A
++ * guest dma-buf's is freed now unless it is on screen or weston has not answered yet,
++ * so that weston drops its import of the guest's memory; the rest wait for the LRU.
++ */
+ static void pl_resource_gone(uint32_t res)
+ {
+     if (!pl.cache) {
+         return;
+     }
+-    for (guint i = 0; i < pl.cache->len; i++) {
++    for (guint i = pl.cache->len; i-- > 0;) {
+         WlPlaneBuf *b = g_ptr_array_index(pl.cache, i);
+ 
+-        if (b->res == res && b->tex) {
+-            b->tex = 0; /* the LRU frees it once it is off screen */
+-            pl.gone++;
++        if (b->res != res || !(b->tex || b->ino)) {
++            continue;
+         }
++        pl.gone++;
++        if (b->ino && !plane_in_use(b) && !b->pending) {
++            if (b->wb) {
++                wl_buffer_destroy(b->wb);
++            }
++            g_free(b);
++            g_ptr_array_remove_index_fast(pl.cache, i);
++            continue;
++        }
++        b->tex = 0; /* the LRU frees it once it is off screen */
++        b->ino = 0;
+     }
+ }
+ 
+@@ -811,13 +974,20 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+     uint32_t ch = rect ? scon->prim_ch : (scon->h ? scon->h : (uint32_t)wh);
+     double fx = (double)ww / cw, fy = (double)wh / ch;
+ 
+-    if (!planes_flag() || scon->guest_fb.dmabuf || !scon->guest_fb.texture ||
++    /*
++     * A dma-buf scanout is a blob (q11-blob-handoff); guest_fb.dmabuf without one is a
++     * non-blob dma-buf the handoff does not take (sdl2_gl_scanout_texture clears a
++     * stale one).
++     */
++    if (!planes_flag() ||
++        (!scon->blob && (scon->guest_fb.dmabuf || !scon->guest_fb.texture)) ||
+         !wl_init(scon->real_window) || !planes_create()) {
+         return false;
+     }
+     sdl2_wl_scanout_dispatch();
+-    b[0] = plane_buf(scon->guest_fb.texture, scon->guest_fb.width, scon->guest_fb.height,
+-                     q11_scanout0_resource_id);
++    b[0] = scon->blob ? blob_buf(scon->blob, q11_scanout0_resource_id) /* q11-blob-handoff */
++                      : plane_buf(scon->guest_fb.texture, scon->guest_fb.width,
++                                  scon->guest_fb.height, q11_scanout0_resource_id);
+     if (!b[0]) {
+         return false;
+     }
+@@ -856,10 +1026,10 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+     pl.shown = true;
+     if ((pl.presents++ % 600) == 0) {
+         info_report("sdl2: plane-handoff: %" PRIu64 " presents, %" PRIu64 " exports (%"
+-                    PRIu64 " failed, %" PRIu64 " evicted), %u cached; geom %" PRIu64
+-                    ", name_reuse %" PRIu64 ", gone %" PRIu64, pl.presents, pl.exports,
+-                    pl.export_fail, pl.evicted, pl.cache ? pl.cache->len : 0, pl.geom,
+-                    pl.name_reuse, pl.gone);
++                    PRIu64 " failed, %" PRIu64 " evicted), %" PRIu64 " guest dma-bufs, %u "
++                    "cached; geom %" PRIu64 ", name_reuse %" PRIu64 ", gone %" PRIu64,
++                    pl.presents, pl.exports, pl.export_fail, pl.evicted, pl.blobs,
++                    pl.cache ? pl.cache->len : 0, pl.geom, pl.name_reuse, pl.gone);
+         pl.geom = pl.name_reuse = pl.gone = 0;
+     }
+     return true;

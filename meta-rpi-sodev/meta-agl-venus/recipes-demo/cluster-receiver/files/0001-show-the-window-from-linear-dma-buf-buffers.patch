@@ -1,0 +1,655 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 14:24:14 +0900
+Subject: [PATCH] show the window from linear dma-buf buffers
+
+The receiver's window was an XRGB8888 wl_shm buffer, redrawn black
+and committed on every frame, and the stream was shown by waylandsink
+in a surface of its own. On the AGL cluster in a QEMU guest none of
+that can go on a display plane: a shm buffer never does, and
+waylandsink only has shm to give the decoder. The window sits over the
+cluster, so agl-compositor composed both with the GPU on every frame.
+
+Allocate the window's three buffers with gbm on /dev/dri/card0
+(SCANOUT | LINEAR, XRGB8888) and hand them over with zwp_linux_dmabuf,
+version 3 so that the LINEAR modifier is not dropped (before it the
+compositor takes the buffer's modifier as implicit, and libweston
+never puts such a buffer on a plane). Without a gbm device, or if the
+compositor refuses the buffer, the window falls back to wl_shm.
+
+Draw black once when the window is configured and then only when a
+frame arrives: the stream ends in an appsink (BGRx, scaled to the
+window's size), whose callback wakes the main loop through an
+eventfd, and the main loop copies the frame, with the stride of the
+buffer's own video meta, into a free buffer. A second after the last
+frame the window shows black again instead of that frame; while no
+buffer is free for it, it tries again a frame later. Frames of
+another size are dropped, and said so once. The main loop also waits
+for a full Wayland socket to drain and exits with an error when the
+compositor goes away.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/app/main.cpp b/app/main.cpp
+index cb6218b..1090bc0 100644
+--- a/app/main.cpp
++++ b/app/main.cpp
+@@ -31,19 +31,26 @@
+ #include <cstring>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cerrno>
+ 
+ #include <signal.h>
+ #include <wayland-client.h>
+ #include <sys/mman.h>
++#include <sys/eventfd.h>
++#include <poll.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <assert.h>
+ #include <glib.h>
++#include <gbm.h>
+ 
+ #include "xdg-shell-client-protocol.h"
++#include "linux-dmabuf-unstable-v1-client-protocol.h"
+ #include "zalloc.h"
+ 
+ #include <gst/gst.h>
++#include <gst/app/gstappsink.h>
++#include <gst/video/video.h>
+ 
+ #include <gst/video/videooverlay.h>
+ #include <gst/wayland/wayland.h>
+@@ -88,12 +95,27 @@ struct display {
+ 	struct xdg_wm_base *wm_base;
+ 
+ 	int has_xrgb;
++
++	/*
++	 * The window's buffers are linear GBM buffers handed over as dma-bufs,
++	 * so the compositor can put the window on a plane instead of composing
++	 * it with the GPU; wl_shm when there is no GBM device or the compositor
++	 * refuses them.
++	 */
++	struct zwp_linux_dmabuf_v1 *dmabuf;
++	int drm_fd;
++	struct gbm_device *gbm;
+ };
+ 
++#define NUM_BUFFERS 3
++
+ struct buffer {
+ 	struct wl_buffer *buffer;
+ 	void *shm_data;
++	struct gbm_bo *bo;
++	int width, height;
+ 	int busy;
++	int failed;
+ };
+ 
+ struct window {
+@@ -110,8 +132,9 @@ struct window {
+ 
+ 	int fullscreen, maximized;
+ 
+-	struct buffer buffers[2];
++	struct buffer buffers[NUM_BUFFERS];
+ 	struct wl_callback *callback;
++	bool use_dmabuf;
+ };
+ 
+ 
+@@ -120,18 +143,17 @@ struct cluster_receiver_data {
+ 
+ 	GstElement *pipeline;
+ 	GstVideoOverlay *overlay;
++	GstAppSink *sink;
++	int frame_fd; /* eventfd: the sink has a frame */
++	bool showing_frame; /* a received frame, not black, is on screen */
++	gint64 last_frame_us; /* g_get_monotonic_time() of the last frame shown */
++	bool size_warned; /* a frame of another size was dropped, and said so */
+ };
+ 
+ static int running = 1;
+ 
+-static void
+-redraw(void *data, struct wl_callback *callback, uint32_t time);
+-
+-static void
+-paint_pixels(void *image, int width, int height)
+-{
+-	memset(image, 0x00, width * height * 4);
+-}
++static bool
++present(struct window *window, const uint8_t *src, int src_stride);
+ 
+ static void
+ buffer_release(void *data, struct wl_buffer *buffer)
+@@ -323,69 +345,186 @@ create_shm_buffer(struct display *display, struct buffer *buffer,
+ 	return 0;
+ }
+ 
++static void
++dmabuf_created(void *data, struct zwp_linux_buffer_params_v1 *params,
++	       struct wl_buffer *new_buffer)
++{
++	struct buffer *buffer = static_cast<struct buffer *>(data);
++
++	buffer->buffer = new_buffer;
++	wl_buffer_add_listener(buffer->buffer, &buffer_listener, buffer);
++	zwp_linux_buffer_params_v1_destroy(params);
++}
++
++static void
++dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
++{
++	struct buffer *buffer = static_cast<struct buffer *>(data);
++
++	buffer->failed = 1;
++	zwp_linux_buffer_params_v1_destroy(params);
++}
++
++static const struct zwp_linux_buffer_params_v1_listener params_listener = {
++	dmabuf_created,
++	dmabuf_failed,
++};
++
++/*
++ * A linear XRGB8888 GBM buffer, handed to the compositor as a dma-buf. The
++ * answer is waited for here, so a refusal turns into the wl_shm path rather
++ * than into a protocol error.
++ */
++static int
++create_dmabuf_buffer(struct display *display, struct buffer *buffer,
++		     int width, int height)
++{
++	struct zwp_linux_buffer_params_v1 *params;
++	int fd;
++
++	buffer->bo = gbm_bo_create(display->gbm, width, height, GBM_FORMAT_XRGB8888,
++				   GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
++	if (!buffer->bo)
++		return -1;
++
++	fd = gbm_bo_get_fd(buffer->bo);
++	if (fd < 0) {
++		gbm_bo_destroy(buffer->bo);
++		buffer->bo = NULL;
++		return -1;
++	}
++
++	params = zwp_linux_dmabuf_v1_create_params(display->dmabuf);
++	zwp_linux_buffer_params_v1_add(params, fd, 0, gbm_bo_get_offset(buffer->bo, 0),
++				       gbm_bo_get_stride(buffer->bo), 0, 0); /* LINEAR */
++	zwp_linux_buffer_params_v1_add_listener(params, &params_listener, buffer);
++	zwp_linux_buffer_params_v1_create(params, width, height, GBM_FORMAT_XRGB8888, 0);
++	wl_display_roundtrip(display->wl_display);
++	close(fd);
++
++	if (!buffer->buffer) {
++		gbm_bo_destroy(buffer->bo);
++		buffer->bo = NULL;
++		return -1;
++	}
++	return 0;
++}
++
++static void
++destroy_buffer(struct buffer *buffer)
++{
++	if (buffer->buffer)
++		wl_buffer_destroy(buffer->buffer);
++	if (buffer->bo)
++		gbm_bo_destroy(buffer->bo);
++	else if (buffer->shm_data)
++		munmap(buffer->shm_data, buffer->width * buffer->height * 4);
++	memset(buffer, 0, sizeof(*buffer));
++}
++
+ static struct buffer *
+ get_next_buffer(struct window *window)
+ {
+-	struct buffer *buffer;
++	struct buffer *buffer = NULL;
+ 	int ret = 0;
+ 
+-	if (!window->buffers[0].busy)
+-		buffer = &window->buffers[0];
+-	else if (!window->buffers[1].busy)
+-		buffer = &window->buffers[1];
+-	else
++	for (int i = 0; i < NUM_BUFFERS; i++) {
++		if (!window->buffers[i].busy) {
++			buffer = &window->buffers[i];
++			break;
++		}
++	}
++	if (!buffer)
+ 		return NULL;
+ 
++	if (buffer->buffer &&
++	    (buffer->width != window->width || buffer->height != window->height))
++		destroy_buffer(buffer);
++
+ 	if (!buffer->buffer) {
+ 		fprintf(stdout, "get_next_buffer() buffer is not set, setting with "
+-				"width %d, height %d\n", window->width, window->height);
+-		ret = create_shm_buffer(window->display, buffer, window->width,
+-					window->height, WL_SHM_FORMAT_XRGB8888);
++				"width %d, height %d (%s)\n", window->width, window->height,
++				window->use_dmabuf ? "linear dma-buf" : "wl_shm");
++		if (window->use_dmabuf) {
++			ret = create_dmabuf_buffer(window->display, buffer,
++						   window->width, window->height);
++			if (ret < 0) {
++				fprintf(stderr, "linear dma-buf buffers unavailable, "
++						"using wl_shm\n");
++				window->use_dmabuf = false;
++			}
++		}
++		if (!window->use_dmabuf)
++			ret = create_shm_buffer(window->display, buffer, window->width,
++						window->height, WL_SHM_FORMAT_XRGB8888);
+ 
+ 		if (ret < 0)
+ 			return NULL;
+-
+-		/* paint the padding */
+-		memset(buffer->shm_data, 0x00, window->width * window->height * 4);
++		buffer->width = window->width;
++		buffer->height = window->height;
+ 	}
+ 
+ 	return buffer;
+ }
+ 
+-
+-static const struct wl_callback_listener frame_listener = {
+-	redraw
+-};
+-
+-static void
+-redraw(void *data, struct wl_callback *callback, uint32_t time)
++/* Copy a frame into the buffer, or black when src is NULL. */
++static bool
++fill_buffer(struct buffer *buffer, const uint8_t *src, int src_stride)
+ {
+-        struct window *window = static_cast<struct window *>(data);
+-        struct buffer *buffer;
+-	(void) time;
+-
+-        buffer = get_next_buffer(window);
+-        if (!buffer) {
+-                fprintf(stderr,
+-                        !callback ? "Failed to create the first buffer.\n" :
+-                        "Both buffers busy at redraw(). Server bug?\n");
+-                abort();
+-        }
++	uint32_t stride = buffer->width * 4;
++	void *map_data = NULL;
++	uint8_t *dst;
++
++	if (buffer->bo) {
++		dst = static_cast<uint8_t *>(gbm_bo_map(buffer->bo, 0, 0, buffer->width,
++							buffer->height, GBM_BO_TRANSFER_WRITE,
++							&stride, &map_data));
++		if (!dst)
++			return false;
++	} else {
++		dst = static_cast<uint8_t *>(buffer->shm_data);
++	}
+ 
+-	// do the actual painting
+-	paint_pixels(buffer->shm_data, window->width, window->height);
++	for (int y = 0; y < buffer->height; y++) {
++		if (src)
++			memcpy(dst + y * stride, src + y * src_stride, buffer->width * 4);
++		else
++			memset(dst + y * stride, 0x00, buffer->width * 4);
++	}
+ 
+-        wl_surface_attach(window->surface, buffer->buffer, 0, 0);
+-        wl_surface_damage(window->surface, 0, 0, window->width, window->height);
++	if (buffer->bo)
++		gbm_bo_unmap(buffer->bo, map_data);
++	return true;
++}
+ 
+-        if (callback)
+-                wl_callback_destroy(callback);
++/*
++ * Show black, or a received frame. Nothing is redrawn between frames: an
++ * unchanged window needs no new buffer, and a commit per output frame would
++ * make the compositor repaint for nothing.
++ */
++static bool
++present(struct window *window, const uint8_t *src, int src_stride)
++{
++	struct buffer *buffer = get_next_buffer(window);
+ 
+-        window->callback = wl_surface_frame(window->surface);
+-        wl_callback_add_listener(window->callback, &frame_listener, window);
+-        wl_surface_commit(window->surface);
++	if (!buffer) {
++		static gint64 said_us;
++		gint64 now = g_get_monotonic_time();
+ 
+-        buffer->busy = 1;
++		if (now - said_us > G_USEC_PER_SEC) { /* at most once a second */
++			fprintf(stderr, "no free buffer, dropping a frame\n");
++			said_us = now;
++		}
++		return false;
++	}
++	if (!fill_buffer(buffer, src, src_stride))
++		return false;
++
++	wl_surface_attach(window->surface, buffer->buffer, 0, 0);
++	wl_surface_damage(window->surface, 0, 0, window->width, window->height);
++	wl_surface_commit(window->surface);
++	buffer->busy = 1;
++	return true;
+ }
+ 
+ static void
+@@ -491,7 +630,6 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t id,
+ 		       const char *interface, uint32_t version)
+ {
+ 	struct display *d = static_cast<struct display *>(data);
+-	(void) version;
+ 
+ 	if (strcmp(interface, "wl_compositor") == 0) {
+ 		d->wl_compositor =
+@@ -505,6 +643,10 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t id,
+ 		d->shm = static_cast<struct wl_shm *>(wl_registry_bind(registry,
+ 				id, &wl_shm_interface, 1));
+ 		wl_shm_add_listener(d->shm, &shm_listener, d);
++	} else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0 && version >= 3) {
++		/* version 3: before it, the compositor ignores the modifier */
++		d->dmabuf = static_cast<struct zwp_linux_dmabuf_v1 *>(wl_registry_bind(registry,
++				id, &zwp_linux_dmabuf_v1_interface, 3));
+ 	} else if (strcmp(interface, "wl_output") == 0) {
+ 		d->wl_output = static_cast<struct wl_output *>(wl_registry_bind(registry, id,
+ 					     &wl_output_interface, 1));
+@@ -594,6 +736,66 @@ drop:
+ 	return GST_BUS_DROP;
+ }
+ 
++/* No frame for this long: the stream has stopped. */
++#define STREAM_IDLE_MS 1000
++
++/* The sink's streaming thread: only wake the main loop, which owns Wayland. */
++static GstFlowReturn
++new_sample_cb(GstAppSink *sink, gpointer user_data)
++{
++	struct cluster_receiver_data *d =
++		static_cast<struct cluster_receiver_data *>(user_data);
++	uint64_t one = 1;
++	(void) sink;
++
++	if (write(d->frame_fd, &one, sizeof(one)) < 0 && errno != EAGAIN)
++		return GST_FLOW_ERROR;
++	return GST_FLOW_OK;
++}
++
++static void
++show_sample(struct cluster_receiver_data *d)
++{
++	uint64_t count;
++	GstSample *sample;
++	GstVideoInfo info;
++	GstVideoFrame frame;
++
++	if (read(d->frame_fd, &count, sizeof(count)) < 0)
++		return;
++	sample = gst_app_sink_try_pull_sample(d->sink, 0);
++	if (!sample)
++		return;
++
++	GstBuffer *gbuf = gst_sample_get_buffer(sample);
++	if (!gbuf || !gst_video_info_from_caps(&info, gst_sample_get_caps(sample))) {
++		gst_sample_unref(sample);
++		return;
++	}
++	if (GST_VIDEO_INFO_WIDTH(&info) != d->window->width ||
++	    GST_VIDEO_INFO_HEIGHT(&info) != d->window->height) {
++		if (!d->size_warned) {
++			fprintf(stderr, "dropping %dx%d frames: the window is %dx%d\n",
++				GST_VIDEO_INFO_WIDTH(&info), GST_VIDEO_INFO_HEIGHT(&info),
++				d->window->width, d->window->height);
++			d->size_warned = true;
++		}
++		gst_sample_unref(sample);
++		return;
++	}
++	/* the buffer's own layout (GstVideoMeta), which may be padded */
++	if (gst_video_frame_map(&frame, &info, gbuf, GST_MAP_READ)) {
++		if (present(d->window,
++			    static_cast<const uint8_t *>(GST_VIDEO_FRAME_PLANE_DATA(&frame, 0)),
++			    GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0))) {
++			d->showing_frame = true;
++			d->last_frame_us = g_get_monotonic_time();
++		}
++		gst_video_frame_unmap(&frame);
++	}
++	gst_sample_unref(sample);
++}
++
+ static void
+ handle_xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial)
+ {
+@@ -601,9 +803,10 @@ handle_xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t s
+ 
+ 	xdg_surface_ack_configure(surface, serial);
+ 
++	/* cleared first: present() makes buffers, whose roundtrip may dispatch another configure */
+ 	if (window->wait_for_configure) {
+-		redraw(window, NULL, 0);
+ 		window->wait_for_configure = false;
++		present(window, NULL, 0);
+ 	}
+ }
+ 
+@@ -712,6 +915,7 @@ create_window(struct display *display, int width, int height, const char *app_id
+ 
+ 	window->callback = NULL;
+ 	window->display = display;
++	window->use_dmabuf = display->dmabuf && display->gbm;
+ 	window->width = width;
+ 	window->height = height;
+ 	window->surface = wl_compositor_create_surface(display->wl_compositor);
+@@ -745,6 +949,9 @@ destroy_window(struct window *window)
+ 	if (window->callback)
+ 		wl_callback_destroy(window->callback);
+ 
++	for (int i = 0; i < NUM_BUFFERS; i++)
++		destroy_buffer(&window->buffers[i]);
++
+ 	if (window->xdg_toplevel)
+ 		xdg_toplevel_destroy(window->xdg_toplevel);
+ 
+@@ -799,6 +1006,15 @@ create_display(int argc, char *argv[])
+ 		return NULL;
+ 	}
+ 
++	display->drm_fd = -1;
++	if (display->dmabuf) {
++		display->drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
++		if (display->drm_fd >= 0)
++			display->gbm = gbm_create_device(display->drm_fd);
++		if (!display->gbm)
++			fprintf(stderr, "no GBM device on /dev/dri/card0, using wl_shm\n");
++	}
++
+ 	return display;
+ }
+ 
+@@ -811,6 +1027,13 @@ destroy_display(struct display *display)
+ 	if (display->wm_base)
+ 		xdg_wm_base_destroy(display->wm_base);
+ 
++	if (display->gbm)
++		gbm_device_destroy(display->gbm);
++	if (display->drm_fd >= 0)
++		close(display->drm_fd);
++	if (display->dmabuf)
++		zwp_linux_dmabuf_v1_destroy(display->dmabuf);
++
+ 	if (display->wl_compositor)
+ 		wl_compositor_destroy(display->wl_compositor);
+ 
+@@ -880,13 +1103,21 @@ int main(int argc, char *argv[])
+ 	gargv[0] = strdup(argv[0]);
+ 	gargv[1] = strdup("--gst-debug-level=2");
+ 
++	read_config();
++
++	/*
++	 * The frames end up in the window's own buffers (present()), not in a
++	 * waylandsink surface: waylandsink only has wl_shm to give the decoder,
++	 * which no compositor can put on a plane.
++	 */
+ 	std::string pipeline_str = \
+ 		"rtpbin name=rtpbin udpsrc "
+ 		"caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=JPEG,payload=26\" "
+ 		"port=5005 ! rtpbin.recv_rtp_sink_0 rtpbin. ! "
+-		"rtpjpegdepay ! jpegdec ! waylandsink";
+-
+-	read_config();
++		"rtpjpegdepay ! jpegdec ! videoconvert ! videoscale ! "
++		"video/x-raw,format=BGRx,width=" + std::to_string(g_window_width) +
++		",height=" + std::to_string(g_window_height) + " ! "
++		"appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true";
+ 
+ 	gst_init(&gargc, &gargv);
+ 
+@@ -919,7 +1150,7 @@ int main(int argc, char *argv[])
+ 			  window->width, window->height);
+ 
+ 	if (!window->wait_for_configure)
+-		redraw(window, NULL, 0);
++		present(window, NULL, 0);
+ 
+ 	GstElement *pipeline = gst_parse_launch(pipeline_str.c_str(), NULL);
+ 	if (!pipeline) {
+@@ -928,6 +1159,15 @@ int main(int argc, char *argv[])
+ 	}
+ 	receiver_data.pipeline = pipeline;
+ 
++	receiver_data.frame_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++	GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
++	if (!sink || receiver_data.frame_fd < 0) {
++		std::cerr << "gstreamer appsink set-up failed!" << std::endl;
++		exit(1);
++	}
++	receiver_data.sink = GST_APP_SINK(sink);
++	g_signal_connect(sink, "new-sample", G_CALLBACK(new_sample_cb), &receiver_data);
++
+ 	GstBus *bus = gst_element_get_bus(pipeline);
+ 	gst_bus_add_signal_watch(bus);
+ 
+@@ -938,15 +1178,64 @@ int main(int argc, char *argv[])
+ 	gst_element_set_state(pipeline, GST_STATE_PLAYING);
+ 	std::cout << "gstreamer pipeline running" << std::endl;
+ 
+-	// run the application
+-	while (running && ret != -1)
+-		ret = wl_display_dispatch(display->wl_display);
+-
+-	destroy_window(window);
+-	destroy_display(display);
++	// run the application: Wayland events, and the frames the sink signals
++	struct pollfd fds[2] = {
++		{ wl_display_get_fd(display->wl_display), POLLIN, 0 },
++		{ receiver_data.frame_fd, POLLIN, 0 },
++	};
++	while (running && ret != -1) {
++		while (wl_display_prepare_read(display->wl_display) != 0)
++			wl_display_dispatch_pending(display->wl_display);
++		/* a full socket: wait until it can take the rest */
++		fds[0].events = POLLIN;
++		if (wl_display_flush(display->wl_display) < 0 && errno == EAGAIN)
++			fds[0].events |= POLLOUT;
++		/* back to black STREAM_IDLE_MS after the last frame */
++		int timeout = -1;
++		if (receiver_data.showing_frame) {
++			gint64 left = receiver_data.last_frame_us +
++				STREAM_IDLE_MS * 1000 - g_get_monotonic_time();
++			timeout = left > 0 ? (int) ((left + 999) / 1000) : 0;
++		}
++		int n = poll(fds, 2, timeout);
++		if (n < 0) {
++			wl_display_cancel_read(display->wl_display);
++			if (errno == EINTR)
++				continue;
++			break;
++		}
++		if (n == 0) {
++			wl_display_cancel_read(display->wl_display);
++			if (present(window, NULL, 0))
++				receiver_data.showing_frame = false;
++			else /* no buffer free yet: try again in a frame's time */
++				receiver_data.last_frame_us = g_get_monotonic_time() -
++					(STREAM_IDLE_MS - 16) * 1000;
++			continue;
++		}
++		if (fds[0].revents & POLLIN) {
++			ret = wl_display_read_events(display->wl_display);
++		} else {
++			wl_display_cancel_read(display->wl_display);
++			/* the compositor went away, and there is nothing left to read */
++			if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
++				ret = -1;
++				break;
++			}
++		}
++		if (ret != -1)
++			ret = wl_display_dispatch_pending(display->wl_display);
++		if (fds[1].revents & POLLIN)
++			show_sample(&receiver_data);
++	}
+ 
+ 	gst_element_set_state(pipeline, GST_STATE_NULL);
++	gst_object_unref(sink);
+ 	gst_object_unref(pipeline);
++	close(receiver_data.frame_fd);
++
++	destroy_window(window);
++	destroy_display(display);
+ 	delete client;
+ 
+ 	return ret;
+diff --git a/app/meson.build b/app/meson.build
+index d0ea031..4a3827d 100644
+--- a/app/meson.build
++++ b/app/meson.build
+@@ -55,10 +55,12 @@ dir_wp_base = dep_wp.get_variable(pkgconfig: 'pkgdatadir')
+ 
+ cluster_receiver_dep = [
+     grpc_deps, deps_remoting, dep_wayland_client, cpp.find_library('gstwayland-1.0'),
++    dependency('gbm'),
+ ]
+ 
+ protocols = [
+   { 'name': 'xdg-shell', 'source': 'wp-stable' },
++  { 'name': 'linux-dmabuf', 'source': 'wp-unstable', 'version': 'v1' },
+ ]
+ 
+ foreach proto: protocols
+@@ -98,12 +100,14 @@ endforeach
+ cluster_receiver_src_headers = [
+   'AglShellGrpcClient.h',
+   xdg_shell_client_protocol_h,
++  linux_dmabuf_unstable_v1_client_protocol_h,
+ ]
+ 
+ cluster_receiver_src = [
+   'AglShellGrpcClient.cpp',
+   'main.cpp',
+   xdg_shell_protocol_c,
++  linux_dmabuf_unstable_v1_protocol_c,
+   generated_grpc_sources,
+   generated_protoc_sources,
+ ]
