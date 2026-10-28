@@ -97,8 +97,9 @@ DEPENDS:append:raspberrypi5 = " rpidistro-ffmpeg"
 PACKAGECONFIG:remove = "glusterfs"
 PACKAGECONFIG[glusterfs] = ""
 
-# The q11 patches apply in the order listed here; the numbers follow the order they were
-# written in.
+# The q11 patches apply in the order listed here, which is not their numbers' order: they
+# are grouped by the series that brings them (qemu 11.1.2 itself, the display path), and
+# the numbers follow the order they were written in.
 #
 # qemu 11.1.2 itself.
 # q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one).
@@ -166,3 +167,7 @@ SRC_URI:append:class-target = " file://q11-058-virtio-gpu-split-QEMU_LAT_DIAG-di
 # q11-068: retire a destroyed context's ring fences (an upstream 11.1.2 leak).
 SRC_URI:append:class-target = " file://q11-065-virtio-gpu-virgl-under-Xen-map-blobs-via-subregion-not-map_f.patch"
 SRC_URI:append:class-target = " file://q11-068-virtio-gpu-virgl-retire-a-destroyed-context-s-ring-fences.patch"
+#
+# The display path: the guests' overlay planes.
+# q11-051: overlay planes (overlay-planes=N on virtio-gpu-gl).
+SRC_URI:append:class-target = " file://q11-051-virtio-gpu-gl-sdl2-gl-overlay-planes-overlay-planes-N.patch"

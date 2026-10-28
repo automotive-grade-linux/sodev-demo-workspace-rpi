@@ -162,6 +162,24 @@ XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
 # boards' DomA panels are 60 Hz, so it is the default rather than a board override.
 XT_DOMA_GPU_PROPS ??= "refresh_rate=60000,"
 
+# [overlay planes] How many overlay planes DomA's display gets.
+# It is a pair, and both halves come from here: the device model's virtio-gpu
+# overlay-planes=N (qemu 10.0.2 patch 0250-v10-virtio-gpu-gl-sdl2-overlay-planes, q11-051)
+# and DomA's virtio_gpu.overlay_planes=N (aosp-kernel-patches/common/0001-drm-virtio-
+# overlay-planes-on-output-0). With them drm_hwcomposer scans the app out on the
+# primary plane and the system bars on the overlays, so SurfaceFlinger stops
+# compositing on the GPU. Measured on the RPi4 2026-10-02 (a 640x360 video playing
+# in a WebView): all three layers DEVICE, dropped frames 35% -> 25% (Vulkan HWUI) and
+# 21% -> 13.5% (GL HWUI).
+# 0 (the default here) turns both off; a board may set its own value in its
+# xt-xen-cfg-doma bbappend. The qemu 7.0.0 device model (GPU=gl lane) has no such property,
+# so that lane gets neither, whatever this says. Only the SDL GL display draws the
+# overlays; doma.cfg uses -display sdl,gl=es on both boards.
+# Keep the halves together: a guest kernel without the patch would treat the extra
+# scanouts as extra (disconnected) connectors; a kernel with it and
+# a device model without overlay-planes simply finds too few scanouts and falls back.
+XT_DOMA_OVERLAY_PLANES ??= "0"
+
 
 do_compile() {
     dtc -I dts -O dtb -o ${WORKDIR}/doma.dtb ${UNPACKDIR}/doma.dts
@@ -412,6 +430,25 @@ do_install() {
             bbfatal "doma.cfg: '$doma_gpu_props' did not reach the virtio-gpu -device line"
     fi
 
+    # [overlay planes] both halves of XT_DOMA_OVERLAY_PLANES, or neither.
+    case "${XT_DOMA_OVERLAY_PLANES}" in
+    0|1|2|3) ;;
+    *) bbfatal "XT_DOMA_OVERLAY_PLANES='${XT_DOMA_OVERLAY_PLANES}': expected 0..3" ;;
+    esac
+    case "${XT_DM_QEMU_VERSION}" in
+    7.*) doma_overlays=0 ;;
+    *)   doma_overlays="${XT_DOMA_OVERLAY_PLANES}" ;;
+    esac
+    if [ "$doma_overlays" != 0 ]; then
+        sed -i -e "s/'virtio-gpu-gl-pci,$doma_gpu_props/&overlay-planes=$doma_overlays,/" \
+               -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.overlay_planes=$doma_overlays\"/" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "virtio-gpu-gl-pci,${doma_gpu_props}overlay-planes=$doma_overlays," ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: overlay-planes=$doma_overlays did not reach the virtio-gpu -device line"
+        grep -q "^extra = \".* virtio_gpu.overlay_planes=$doma_overlays\"\$" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: virtio_gpu.overlay_planes=$doma_overlays did not reach DomA's command line"
+    fi
+
     # [qemu 10] Device-model argument fixups. Two of the options in doma.cfg are
     # 7.0.0-xt-only and qemu 10 EXITS on either one -- both measured on RPi5:
     #   virtio-snd-pci        -> "'virtio-snd-pci' is not a valid device model name"
@@ -488,6 +525,7 @@ do_install[vardeps] += "XT_DM_QEMU_VERSION"
 # lane's device, or the other board's backend argument.
 do_install[vardeps] += "XT_DOMA_HWDEC XT_DOMA_HWDEC_DEVARG"
 do_install[vardeps] += "XT_DOMA_GPU_PROPS"
+do_install[vardeps] += "XT_DOMA_OVERLAY_PLANES"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \

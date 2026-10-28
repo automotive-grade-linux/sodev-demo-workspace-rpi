@@ -24,6 +24,8 @@ This is the authoritative list of what that means:
 | rpi4 4 GiB SKU memory | DomD 1440 MiB / DomA 2048 MiB | DomD 1056 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
 | DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in the qemu 10.0.2 and 11.1.2 device models |
+| DomA overlay planes | `XT_DOMA_OVERLAY_PLANES` in `xt-xen-cfg-doma`: `0` (the default) to `3`, and a board may set its own; both boards set `3`. It sets both halves in `doma.cfg`, the device model's `overlay-planes=N` (qemu 10.0.2 patch `0250`, qemu 11.1.2 patch `q11-051`) and DomA's `virtio_gpu.overlay_planes=N` (DomA kernel patch `aosp-kernel-patches/common/0001`); drm_hwcomposer then puts the system bars on the overlays instead of SurfaceFlinger compositing them on the GPU | `0` whatever the variable says: qemu 7.0.0 has no `overlay-planes` |
+| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`. The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`) | none: the qemu 7 device model has no overlay planes |
 
 Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.4 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from

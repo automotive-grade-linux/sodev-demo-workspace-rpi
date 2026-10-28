@@ -45,6 +45,18 @@ XT_VENUS_GPU_OPTS ??= ""
 # fallback only ever applies to a bare `bitbake` in this tree's own conf.
 XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 
+# [overlay planes] How many overlay planes DomU's display gets, as for DomA
+# (xt-xen-cfg-doma's XT_DOMA_OVERLAY_PLANES): the device model's half is
+# overlay-planes=N on the virtio-gpu-gl -device line, DomU's half is
+# virtio_gpu.overlay_planes=N on its command line (linux-virtio-armv8's
+# 0002-drm-virtio-overlay-planes-on-output-0). The guest's compositor can then
+# hand a surface to the host as an overlay instead of composing it into the
+# primary plane.
+#
+# 0 leaves domu.cfg as it is. The qemu 7 lane (--gpu=gl) has no overlay-planes
+# property, so it gets none whatever the value.
+XT_DOMU_OVERLAY_PLANES ??= "0"
+
 
 inherit systemd
 
@@ -105,6 +117,25 @@ do_install() {
         ;;
     esac
 
+    # [overlay planes] both halves of XT_DOMU_OVERLAY_PLANES, or neither.
+    case "${XT_DOMU_OVERLAY_PLANES}" in
+    0|1|2|3) ;;
+    *) bbfatal "XT_DOMU_OVERLAY_PLANES='${XT_DOMU_OVERLAY_PLANES}': expected 0..3" ;;
+    esac
+    case "${XT_DM_QEMU_VERSION}" in
+    7.*) domu_overlays=0 ;;
+    *)   domu_overlays="${XT_DOMU_OVERLAY_PLANES}" ;;
+    esac
+    if [ "$domu_overlays" != 0 ]; then
+        sed -i -e "s/'virtio-gpu-gl-pci,/&overlay-planes=$domu_overlays,/" \
+               -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.overlay_planes=$domu_overlays\"/" \
+            ${D}${sysconfdir}/xen/domu.cfg
+        grep -q "'virtio-gpu-gl-pci,overlay-planes=$domu_overlays," ${D}${sysconfdir}/xen/domu.cfg || \
+            bbfatal "domu.cfg: overlay-planes=$domu_overlays did not reach the virtio-gpu -device line"
+        grep -q "^extra = \".* virtio_gpu.overlay_planes=$domu_overlays\"\$" ${D}${sysconfdir}/xen/domu.cfg || \
+            bbfatal "domu.cfg: virtio_gpu.overlay_planes=$domu_overlays did not reach DomU's command line"
+    fi
+
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${UNPACKDIR}/xl-create-domu.service ${D}${systemd_system_unitdir}/xl-create-domu.service
 }
@@ -114,6 +145,7 @@ do_install() {
 do_install[vardeps] += "XT_VENUS_GPU_OPTS"
 # Same reason for the device-model version that selects the argument fixups.
 do_install[vardeps] += "XT_DM_QEMU_VERSION"
+do_install[vardeps] += "XT_DOMU_OVERLAY_PLANES"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/domu.cfg \

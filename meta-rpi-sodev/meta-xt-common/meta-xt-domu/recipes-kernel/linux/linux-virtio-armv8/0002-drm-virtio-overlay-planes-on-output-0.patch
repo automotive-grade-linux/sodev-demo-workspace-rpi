@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 12:34:09 +0900
+Subject: [PATCH] drm/virtio: overlay planes on output 0 (overlay_planes=N)
+
+virtio_gpu.overlay_planes=N (0..3, default 0 = unchanged): when the
+device offers at least N+1 scanouts (qemu virtio-gpu-gl
+...,overlay-planes=N), the last N are not outputs but overlay planes of
+output 0, zpos 1..N above the primary's 0, and the cursor gets N+1 (DRM
+wants a zpos on every plane once one has it). An overlay update binds
+the framebuffer with SET_SCANOUT on its scanout and places it with the
+device-specific SET_OVERLAY_POS (0x0120). Overlays are created before
+output 0's primary, so a commit updates them first and the primary's
+flush presents the output with them; an overlay-only commit flushes the
+overlay. Only host-GL-texture resources are accepted (no dumb, blob or
+imported buffers), and only whole: the device draws the entire texture,
+so a plane whose source rectangle is not the full framebuffer at offset
+0 is refused as well. Anything rejected in atomic_check makes the
+composer fall back to GPU composition for that layer.
+
+This is the AAOS guest kernel's patch of the same name, rebased onto the
+DomU kernel (torvalds 6613476e, 6.8.0-rc1): drm_gem_is_imported() is not
+in this tree, so the imported-buffer test reads obj->import_attach, and
+the include hunk follows this tree's context. The note that patch keeps
+on what is left for later (a source rectangle on the overlays, seen on
+a Raspberry Pi 4 with Android) is not repeated here.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [uses device-specific virtio-gpu commands (SET_OVERLAY_POS) that are not in the virtio specification]
+---
+ drivers/gpu/drm/virtio/virtgpu_display.c |  12 +++
+ drivers/gpu/drm/virtio/virtgpu_drv.c     |   6 ++
+ drivers/gpu/drm/virtio/virtgpu_drv.h     |  20 ++++
+ drivers/gpu/drm/virtio/virtgpu_kms.c     |  14 +++
+ drivers/gpu/drm/virtio/virtgpu_plane.c   | 126 +++++++++++++++++++++++
+ drivers/gpu/drm/virtio/virtgpu_vq.c      |  17 +++
+ 6 files changed, 195 insertions(+)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index ad924a8..3fac928 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -259,6 +259,7 @@ static int vgdev_output_init(struct virtio_gpu_device *vgdev, int index)
+ 	struct drm_encoder *encoder = &output->enc;
+ 	struct drm_crtc *crtc = &output->crtc;
+ 	struct drm_plane *primary, *cursor;
++	int k;
+ 
+ 	output->index = index;
+ 	if (index == 0) {
+@@ -267,6 +268,17 @@ static int vgdev_output_init(struct virtio_gpu_device *vgdev, int index)
+ 		output->info.r.height = cpu_to_le32(YRES_DEF);
+ 	}
+ 
++	/*
++	 * Overlay planes first: planes are committed in creation order, and the
++	 * primary's flush has to present the output with the overlays already set.
++	 */
++	for (k = 0; index == 0 && k < vgdev->num_overlays; k++) {
++		struct drm_plane *overlay = virtio_gpu_overlay_plane_init(vgdev, k);
++
++		if (IS_ERR(overlay))
++			return PTR_ERR(overlay);
++	}
++
+ 	primary = virtio_gpu_plane_init(vgdev, DRM_PLANE_TYPE_PRIMARY, index);
+ 	if (IS_ERR(primary))
+ 		return PTR_ERR(primary);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index f8e9abe..2c4c0a6 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -47,6 +47,12 @@ static int virtio_gpu_modeset = -1;
+ MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
+ module_param_named(modeset, virtio_gpu_modeset, int, 0400);
+ 
++int virtio_gpu_overlay_planes;
++MODULE_PARM_DESC(overlay_planes,
++		 "Use the device's last N scanouts as overlay planes of output 0 "
++		 "(0..3, needs a device offering them, e.g. qemu overlay-planes=N)");
++module_param_named(overlay_planes, virtio_gpu_overlay_planes, int, 0400);
++
+ static int virtio_gpu_pci_quirk(struct drm_device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index bb7d86a..62c1b15 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -224,6 +224,8 @@ struct virtio_gpu_device {
+ 
+ 	struct virtio_gpu_output outputs[VIRTIO_GPU_MAX_SCANOUTS];
+ 	uint32_t num_scanouts;
++	/* extra device scanouts used as overlay planes of output 0 */
++	uint32_t num_overlays;
+ 
+ 	struct virtio_gpu_queue ctrlq;
+ 	struct virtio_gpu_queue cursorq;
+@@ -341,6 +343,24 @@ void virtio_gpu_cmd_resource_flush(struct virtio_gpu_device *vgdev,
+ 				   uint32_t width, uint32_t height,
+ 				   struct virtio_gpu_object_array *objs,
+ 				   struct virtio_gpu_fence *fence);
++/*
++ * Device-specific (qemu virtio-gpu-gl overlay-planes=N): place overlay plane
++ * scanout_id, one of the extra scanouts, at x, y on scanout 0.
++ */
++#define VIRTIO_GPU_CMD_SET_OVERLAY_POS 0x0120
++struct virtio_gpu_set_overlay_pos {
++	struct virtio_gpu_ctrl_hdr hdr;
++	__le32 scanout_id;
++	__le32 x;
++	__le32 y;
++	__le32 padding;
++};
++
++extern int virtio_gpu_overlay_planes;
++void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
++				    uint32_t scanout_id, int32_t x, int32_t y);
++struct drm_plane *virtio_gpu_overlay_plane_init(struct virtio_gpu_device *vgdev,
++						int overlay);
+ void virtio_gpu_cmd_set_scanout(struct virtio_gpu_device *vgdev,
+ 				uint32_t scanout_id, uint32_t resource_id,
+ 				uint32_t width, uint32_t height,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_kms.c b/drivers/gpu/drm/virtio/virtgpu_kms.c
+index 5a3b5aa..caed0b4 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c
+@@ -235,6 +235,20 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
+ 		DRM_INFO("number of scanouts: %d\n", num_scanouts);
+ 	}
+ 
++	if (vgdev->num_scanouts && virtio_gpu_overlay_planes > 0) {
++		uint32_t n = min_t(uint32_t, virtio_gpu_overlay_planes, 3);
++
++		if (vgdev->num_scanouts > n) {
++			vgdev->num_overlays = n;
++			vgdev->num_scanouts -= n;
++			DRM_INFO("scanouts %u..%u used as overlay planes of output 0\n",
++				 vgdev->num_scanouts, vgdev->num_scanouts + n - 1);
++		} else {
++			DRM_INFO("overlay_planes=%d ignored: the device has %u scanout(s)\n",
++				 virtio_gpu_overlay_planes, vgdev->num_scanouts);
++		}
++	}
++
+ 	virtio_cread_le(vgdev->vdev, struct virtio_gpu_config,
+ 			num_capsets, &num_capsets);
+ 	DRM_INFO("number of cap sets: %d\n", num_capsets);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index a72a2db..57b22c4 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_blend.h>
+ #include <drm/drm_damage_helper.h>
+ #include <drm/drm_fourcc.h>
+ 
+@@ -403,6 +404,131 @@ struct drm_plane *virtio_gpu_plane_init(struct virtio_gpu_device *vgdev,
+ 
+ 	if (type == DRM_PLANE_TYPE_PRIMARY)
+ 		drm_plane_enable_fb_damage_clips(plane);
++	/*
++	 * The overlay planes take zpos 1..N: the primary goes below them and
++	 * the cursor above. All planes need a zpos once one has it.
++	 */
++	if (type == DRM_PLANE_TYPE_PRIMARY && vgdev->num_overlays)
++		drm_plane_create_zpos_immutable_property(plane, 0);
++	if (type == DRM_PLANE_TYPE_CURSOR && vgdev->num_overlays)
++		drm_plane_create_zpos_immutable_property(plane,
++							 1 + vgdev->num_overlays);
+ 
+ 	return plane;
+ }
++
++/* ---- overlay planes of output 0 (virtio_gpu.overlay_planes) ---- */
++
++struct virtio_gpu_overlay {
++	struct drm_plane base;
++	uint32_t scanout_id;
++};
++
++static int virtio_gpu_overlay_atomic_check(struct drm_plane *plane,
++					   struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	struct virtio_gpu_object *bo;
++	struct drm_gem_object *obj;
++
++	if (!new_state->fb || WARN_ON(!new_state->crtc))
++		return 0;
++
++	/*
++	 * The device binds an overlay with SET_SCANOUT, i.e. as a host GL texture.
++	 * Anything else stays on the composer's GPU path.
++	 */
++	obj = new_state->fb->obj[0];
++	bo = gem_to_virtio_gpu_obj(obj);
++	if (bo->dumb || bo->host3d_blob || bo->guest_blob || obj->import_attach)
++		return -EINVAL;
++	/* The device shows the whole texture: no source crop, no source offset. */
++	if (new_state->src_x || new_state->src_y ||
++	    new_state->src_w != new_state->fb->width << 16 ||
++	    new_state->src_h != new_state->fb->height << 16)
++		return -EINVAL;
++
++	crtc_state = drm_atomic_get_crtc_state(state, new_state->crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++
++	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						   DRM_PLANE_NO_SCALING,
++						   DRM_PLANE_NO_SCALING,
++						   true, true);
++}
++
++static void virtio_gpu_overlay_plane_update(struct drm_plane *plane,
++					    struct drm_atomic_state *state)
++{
++	struct drm_plane_state *old_state =
++		drm_atomic_get_old_plane_state(state, plane);
++	struct drm_plane_state *new_state = plane->state;
++	struct virtio_gpu_device *vgdev = plane->dev->dev_private;
++	uint32_t id = container_of(plane, struct virtio_gpu_overlay, base)->scanout_id;
++	struct drm_crtc *crtc = new_state->crtc ? new_state->crtc : old_state->crtc;
++	struct virtio_gpu_object *bo;
++	bool primary_presents;
++
++	/* the primary plane is updated after the overlays and presents the output */
++	primary_presents = crtc && drm_atomic_get_new_plane_state(state, crtc->primary);
++
++	if (!new_state->fb || !new_state->crtc ||
++	    !new_state->crtc->state->active || !new_state->visible) {
++		if (old_state->fb && old_state->visible) {
++			virtio_gpu_cmd_set_scanout(vgdev, id, 0, 0, 0, 0, 0);
++			virtio_gpu_notify(vgdev);
++		}
++		return;
++	}
++
++	bo = gem_to_virtio_gpu_obj(new_state->fb->obj[0]);
++	if (new_state->fb != old_state->fb || !old_state->visible ||
++	    new_state->crtc_x != old_state->crtc_x ||
++	    new_state->crtc_y != old_state->crtc_y ||
++	    new_state->src_x != old_state->src_x ||
++	    new_state->src_y != old_state->src_y ||
++	    new_state->src_w != old_state->src_w ||
++	    new_state->src_h != old_state->src_h) {
++		virtio_gpu_cmd_set_overlay_pos(vgdev, id, new_state->crtc_x,
++					       new_state->crtc_y);
++		virtio_gpu_cmd_set_scanout(vgdev, id, bo->hw_res_handle,
++					   new_state->src_w >> 16,
++					   new_state->src_h >> 16,
++					   new_state->src_x >> 16,
++					   new_state->src_y >> 16);
++	}
++	if (!primary_presents)
++		virtio_gpu_cmd_resource_flush(vgdev, bo->hw_res_handle, 0, 0,
++					      new_state->fb->width,
++					      new_state->fb->height, NULL, NULL);
++	virtio_gpu_notify(vgdev);
++}
++
++static const struct drm_plane_helper_funcs virtio_gpu_overlay_helper_funcs = {
++	.prepare_fb		= virtio_gpu_plane_prepare_fb,
++	.cleanup_fb		= virtio_gpu_plane_cleanup_fb,
++	.atomic_check		= virtio_gpu_overlay_atomic_check,
++	.atomic_update		= virtio_gpu_overlay_plane_update,
++};
++
++struct drm_plane *virtio_gpu_overlay_plane_init(struct virtio_gpu_device *vgdev,
++						int overlay)
++{
++	struct virtio_gpu_overlay *ovl;
++
++	ovl = drmm_universal_plane_alloc(vgdev->ddev, struct virtio_gpu_overlay, base,
++					 1 << 0, &virtio_gpu_plane_funcs,
++					 virtio_gpu_formats,
++					 ARRAY_SIZE(virtio_gpu_formats), NULL,
++					 DRM_PLANE_TYPE_OVERLAY, NULL);
++	if (IS_ERR(ovl))
++		return ERR_CAST(ovl);
++
++	ovl->scanout_id = vgdev->num_scanouts + overlay;
++	drm_plane_helper_add(&ovl->base, &virtio_gpu_overlay_helper_funcs);
++	drm_plane_create_zpos_immutable_property(&ovl->base, 1 + overlay);
++	return &ovl->base;
++}
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+index b1a00c0..29b34c5 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -545,6 +545,23 @@ void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
+ 		virtio_gpu_cleanup_object(bo);
+ }
+ 
++void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
++				    uint32_t scanout_id, int32_t x, int32_t y)
++{
++	struct virtio_gpu_set_overlay_pos *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++
++	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
++	memset(cmd_p, 0, sizeof(*cmd_p));
++
++	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_SET_OVERLAY_POS);
++	cmd_p->scanout_id = cpu_to_le32(scanout_id);
++	cmd_p->x = cpu_to_le32(x);
++	cmd_p->y = cpu_to_le32(y);
++
++	virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
++}
++
+ void virtio_gpu_cmd_set_scanout(struct virtio_gpu_device *vgdev,
+ 				uint32_t scanout_id, uint32_t resource_id,
+ 				uint32_t width, uint32_t height,

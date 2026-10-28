@@ -537,3 +537,8 @@ SRC_URI:append:class-target = " file://0248-v10-virtio-gpu-coalesce-control-queu
 #   context ring); create a virgl context fence for it instead of a ctx0 EGL fence
 #   (RPi4 DomA: ~150/s, each an EGL sync on the main thread).
 SRC_URI:append:class-target = " file://0249-v10-virtio-gpu-virgl-honour-ring-idx-with-context-fences.patch"
+
+# 0250-v10: virtio-gpu overlay planes for the SDL GL display (overlay-planes=N, off by
+#   default). Pairs with the DomA kernel's virtio_gpu.overlay_planes=N; lets drm_hwcomposer
+#   put the system bars on overlays instead of SurfaceFlinger compositing on the GPU.
+SRC_URI:append:class-target = " file://0250-v10-virtio-gpu-gl-sdl2-overlay-planes.patch"
