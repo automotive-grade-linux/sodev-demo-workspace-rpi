@@ -99,6 +99,67 @@ XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@'' if d.getVar('RPI5_DOMA_HOST_SA
 RPI5_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI5_DOMA_GPU_RES').split('xres=')[1].split(',')[0]) if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else 0}"
 XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@'' if d.getVar('RPI5_DOMA_HWDEC_MAX_W') == '0' else ',host-max-width=' + d.getVar('RPI5_DOMA_HWDEC_MAX_W')}"
 
+# DomA's sound card writes its buffers out without the BQL (q11-092, the TX thread of
+# tx-poll-us): the main loop of DomA's device model holds the BQL for the video's GPU
+# work, and the thread then waited for it 15-66 ms while the ALSA output ran dry
+# (2026-10-23, H.264 1080p60 in a WebView). tx-no-bql needs the ALSA audiodev with the
+# mixing engine off, which also needs the fixed frequency, channels and format gone
+# (qemu refuses them without the mixing engine). Measured on the board (2026-10-24, 10
+# minutes a run, with the decoder mode's changes of that day, q11-086 and q11-087 among
+# them, and with DomD's and DomA's vcpus pinned one per pcpu and DomA's device model on
+# DomD's CPU 0, set at run time): the ALSA underruns qemu saw came to 0-3 a run, against
+# 138-454 restarts of the ALSA stream with the mixing engine on (2026-10-23). 0 leaves
+# both lines as they are; qemu 10.0.2 and 7.0.0 have no tx-no-bql, so the default is 0
+# there.
+#
+# With it the ALSA buffer grows from 60 to 100 ms and the PCM starts once 60 ms are in
+# it (threshold=60000, which needs q11-093: without it the threshold came to the whole
+# buffer), instead of on the guest's first 40 ms buffer. Starting on that one, the PCM
+# ran dry within 0.1 s of the start in three of four runs (the next buffer came 40.5 ms
+# later in one of them); and 60 ms left 20 ms beside a 40 ms guest buffer. Measured on
+# the board (2026-10-25, 10 minutes a run, a WebView's H.264 beside the HMI, then full
+# screen; start threshold 2880 of 4800 frames read back from ALSA): 1 and 1 underruns,
+# one at the first write of a playback whose PCM an earlier one had left in XRUN, the
+# other mid-playback with no BQL hold over 5 ms before it; starting on the full 100 ms
+# gave 0 and 1; 60 ms and no threshold 1-5 a run in four runs. doma.cfg records a 100 ms
+# buffer as running but silent with the mixing engine on; here the output ran at 48,140
+# frames a second with the buffer kept full. It was not listened to.
+RPI5_DOMA_SND_TX_NO_BQL ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+RPI5_DOMA_AUDIO_FIXED ?= "out.frequency=48000,out.channels=2,out.format=s16,"
+do_install[postfuncs] += "rpi5_doma_snd_tx_no_bql"
+do_install[vardeps] += "RPI5_DOMA_SND_TX_NO_BQL RPI5_DOMA_AUDIO_FIXED"
+
+rpi5_doma_snd_tx_no_bql:raspberrypi5() {
+    [ "${RPI5_DOMA_SND_TX_NO_BQL}" = 1 ] || return 0
+    case "${XT_DM_QEMU_VERSION}" in
+    11.*) ;;
+    *) bbfatal "RPI5_DOMA_SND_TX_NO_BQL=1 needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
+    esac
+    cfg="${D}${sysconfdir}/xen/doma.cfg"
+    [ -f "$cfg" ] || bbfatal "xt-xen-cfg-doma.bbappend (rpi5): $cfg not installed"
+    a=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "${RPI5_DOMA_AUDIO_FIXED}" || true)
+    v=$(grep "^[[:space:]]*'-device', 'virtio-sound-pci," "$cfg" | grep -cF -- "tx-poll-us=10000," || true)
+    if [ "$a" != "1" ] || [ "$v" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi5): expected one '-audiodev' line with '${RPI5_DOMA_AUDIO_FIXED}' ($a) and one virtio-sound-pci line with tx-poll-us=10000, ($v) in $cfg"
+    fi
+    b=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "out.buffer-length=60000,out.try-poll=off'" || true)
+    [ "$b" = "1" ] || bbfatal "xt-xen-cfg-doma.bbappend (rpi5): expected one '-audiodev' line ending in out.buffer-length=60000,out.try-poll=off ($b) in $cfg"
+    sed -i -e "/^[[:space:]]*'-audiodev',/s|${RPI5_DOMA_AUDIO_FIXED}|out.mixing-engine=off,|" \
+           -e "/^[[:space:]]*'-audiodev',/s|out.buffer-length=60000,out.try-poll=off'|out.buffer-length=100000,out.try-poll=off,threshold=60000'|" \
+           -e "/^[[:space:]]*'-device', 'virtio-sound-pci,/s|tx-poll-us=10000,|tx-poll-us=10000,tx-no-bql=on,|" "$cfg"
+    a=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -F -- "out.mixing-engine=off," | grep -cF -- "out.buffer-length=100000,out.try-poll=off,threshold=60000'" || true)
+    v=$(grep "^[[:space:]]*'-device', 'virtio-sound-pci," "$cfg" | grep -cF -- "tx-poll-us=10000,tx-no-bql=on," || true)
+    if [ "$a" != "1" ] || [ "$v" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi5): the tx-no-bql rewrite did not apply cleanly to $cfg"
+    fi
+    bbnote "xt-xen-cfg-doma.bbappend (rpi5): DomA's sound card writes without the BQL (tx-no-bql)"
+}
+
+# The default is a no-op, for the same reason as rpi5_doma_gpu_fhd's.
+rpi5_doma_snd_tx_no_bql() {
+    :
+}
+
 do_install[prefuncs] += "rpi5_doma_hwdec_check"
 
 rpi5_doma_hwdec_check:raspberrypi5() {
