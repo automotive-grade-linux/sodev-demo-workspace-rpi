@@ -1507,10 +1507,10 @@ mode); a prebuilt bundle carries whatever DomA it was built with.
 `meta-xt-doma/aosp-patches/external/minigbm/0003` adds the property. With it
 `true`, the virgl backend of DomA's minigbm asks the host for a linear resource
 (`VIRGL_BIND_LINEAR`) for every buffer allocated with `BO_USE_SCANOUT`
-(`GRALLOC_USAGE_HW_COMPOSER`: SurfaceFlinger's client target and the app layers
-the composer is handed) and not with `BO_USE_HW_VIDEO_DECODER`, so decoder output
-stays as the host allocates it. It is read once, when the gralloc library
-initialises, so it takes a restart of the graphics services to change. The
+(`GRALLOC_USAGE_HW_COMPOSER`: SurfaceFlinger's client target, the app layers the
+composer is handed, and a video decoder's output buffer it is handed). It is read
+once, when the gralloc library initialises, so it takes a restart of the graphics
+services to change. The
 Raspberry Pi 5 product sets it (`aosp_xenvm_trout_rpi5_arm64.mk`); the Raspberry
 Pi 4 product leaves it off. The bos are v3d's (system memory, which the Pi 5's HVS
 reaches through its IOMMU), so they take no CMA.
@@ -1529,12 +1529,16 @@ the buffer is UIF, the plane rejects it, and weston composites DomA with the GPU
 | HEVC 1080p60, SAND direct scanout | no: the decoder's SAND buffer goes to a plane from the device model directly | V3D 17.0 -> 16.6%, 61.07 -> 61.04 fps (2026-10-15) |
 | HEVC 4K scaled to 1080p, alone full screen | no, expected: with qemu `q11-082` the decoder's 4K SAND buffer goes to a plane and the HVS scales it (the property's effect not compared there) | display 60.2 on, 57.2-59.5 off (2026-10-17, before `q11-082`); with `q11-082` and the property, codec -T 59.6 fps at V3D 41% (2026-10-19). An earlier 59-60 -> 50.5 (2026-10-16) did not reproduce |
 | WebView HEVC 1080p60 with the HMI, qemu `q11-081` (`/run/qemu-plane-sand`) | yes: the app's and HMI's layers go on planes beside the decoder's SAND frame | V3D 58.5 -> 18.6%, weston 86% -> 0, 57.3 -> 58.0 shown per second, five planes (2026-10-19, CMA 384 MiB then) |
-| WebView H.264 1080p60 with the HMI | yes, together with qemu `q11-078` (opaque plane 0 and a backdrop) | weston mixed -> plane-only, DomA's steal 44/38 -> 27/23, 45.6/42.5 -> 51.2/46.5 shown per second (2026-10-17). The video layer itself stays UIF, as decoder output |
+| WebView H.264 1080p60 with the HMI | yes, together with qemu `q11-078` (opaque plane 0 and a backdrop) | weston mixed -> plane-only, DomA's steal 44/38 -> 27/23, 45.6/42.5 -> 51.2/46.5 shown per second (2026-10-17, decoder output not linear then) |
+| WebView H.264 1080p60 decoded in qemu, decoder output linear too (the property on in both runs compared; only the decoder's buffers differ) | yes: the decoder's RGBA output is the video layer | DomD's DRM state shows the frame's own buffer on the primary plane in place of weston's GPU composite; V3D render 80-84% -> about 50-57%; full screen 40.2/55.9 -> 58.7-59.1 shown per second in three runs of four (51.2 in the fourth), among the HMI 56.6 -> 59.2/59.3, ten minutes a run (2026-10-23) |
 | Vulkan composition with `/etc/qemu-gbm-layout` | redundant (gbm-layout makes DomA's resources linear already) | not measured |
 
 The cost is in decode speed when nothing is shown: `-S` of HEVC 1080p fell about
-5% (2026-10-15), and about 11% when decoder output was made linear too (a test
-build, not in this tree). Shown frame rates did not fall in this tree.
+5% (2026-10-15), and from 178-182 fps in four runs to 105-157 in six when decoder
+output was made linear too (2026-10-23; a test build on 2026-10-16, with an older
+device model, had measured about 11%). Shown frame rates did not fall: codec `-T`
+of HEVC 4K and 1080p 59.7-60.7 fps, within 0.3 fps of the runs without, and HEVC
+1080p60 in a WebView among the HMI 59.6 shown per second either way.
 
 Where qemu 10.0.2 and virglrenderer 1.2.0 are selected instead (no `0024`, no
 plane handoff) it changes nothing.
@@ -1545,11 +1549,11 @@ virglrenderer 1.3.0, where HEVC 1080p60 in a WebView among the HMI went from V3D
 `/run/qemu-plane-sand` and `/run/qemu-sand-scaled`, DomD's CMA 384 MiB then). The
 Raspberry Pi 4 has the same path (qemu 11.1.2, virglrenderer 1.3.0 and `0024`, the
 plane handoff) but is left off: its HVS has no IOMMU, so a linear v3d bo is not
-expected to go on a plane there and only the cost would remain (not measured). It
-is not needed with gbm-layout. Making decoder output linear as well
-is a separate choice (its video layer could then go to a plane, at the -S cost
-above). The allocator cannot tell at allocation time whether the composer will
-put a buffer on a plane, so the property stays a global switch.
+expected to go on a plane there and only the cost would remain (the property was not
+measured there; on 2026-09-23 weston composed such a buffer on the GPU after `gbm bo
+get handle failed`). It is not needed with gbm-layout. The allocator cannot tell at
+allocation time whether the composer will put a buffer on a plane, so the property
+stays a global switch.
 
 ## 7. Phase 4-B — DomU (AGL-IC)
 
