@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 19:10:00 +0900
+Subject: [PATCH] xen-mapcache: size the capped cache's hash for the guest,
+ cap the bytes mapped
+
+QEMU_XEN_MAPCACHE_MAX_MB (q11-053) sized the hash table of the foreign
+mapcache, so a 1024 MB cap over a 2 GB DomA gave every slot two guest
+buckets. Whenever one was locked by DMA the other got a chained entry
+that was munmapped again when its lock dropped: one
+XENMEM_remove_from_physmap per page, on the main loop under the BQL. On
+the Raspberry Pi 4 during a 720p60 video in a WebView that was about
+15000 chained entries in 760 s, and the 41-97 ms BQL holds that preceded
+the 720p ALSA under-runs.
+
+Size the table for the guest (QEMU_XEN_MAPCACHE_HASH_MB, default 8192
+MB, 128 Ki slots of 64 KiB) and keep the cap as a limit on the bytes
+mapped, held by unmapping unlocked bucket heads with a bounded
+second-chance sweep, so the scratch-space limit q11-053 exists for still
+holds. Count remaps, chained entries, evictions and munmap time in the
+device-model log.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's Xen device model; switched by an environment variable]
+---
+ hw/xen/xen-mapcache.c | 154 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 149 insertions(+), 5 deletions(-)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index c617c92ef..4c7cd1755 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -17,6 +17,7 @@
+ #include "hw/xen/xen-hvm-common.h"
+ #include "hw/xen/xen_native.h"
+ #include "qemu/bitmap.h"
++#include "qemu/timer.h"
+ 
+ #include "system/ramlist.h"
+ #include "system/runstate.h"
+@@ -47,6 +48,7 @@ typedef struct MapCacheEntry {
+ #define XEN_MAPCACHE_ENTRY_DUMMY (1 << 0)
+ #define XEN_MAPCACHE_ENTRY_GRANT (1 << 1)
+     uint8_t flags;
++    uint8_t ref;    /* q11-098: used since the eviction hand last passed */
+     hwaddr size;
+     struct MapCacheEntry *next;
+ } MapCacheEntry;
+@@ -78,6 +80,12 @@ typedef struct MapCache {
+     /* For most cases (>99.9%), the page address is the same. */
+     MapCacheEntry *last_entry;
+     unsigned long max_mcache_size;
++    /*
++     * q11-098: with QEMU_XEN_MAPCACHE_MAX_MB the cap limits the bytes mapped
++     * (mapped_cap), not the size of the hash table; 0 = no byte cap.
++     */
++    uint64_t mapped_bytes, mapped_cap;
++    unsigned long evict_hand;
+     unsigned int bucket_shift;
+     unsigned long bucket_size;
+ 
+@@ -91,6 +99,31 @@ static MapCache *mapcache_grants_ro;
+ static MapCache *mapcache_grants_rw;
+ static xengnttab_handle *xen_region_gnttabdev;
+ 
++/*
++ * q11-098 diagnostics (foreign cache only; the caches have their own locks,
++ * so these may race -- they are counters, nothing depends on them): remaps,
++ * how many replaced a live mapping, why a request needed a new chained entry
++ * (every chained entry is munmapped again when its lock drops), evictions
++ * under the byte cap, and the time spent in munmap.
++ */
++static unsigned long xen_mc_remaps, xen_mc_replaced, xen_mc_chain_idx,
++                     xen_mc_chain_size, xen_mc_evictions;
++static int64_t xen_mc_unmap_ns;
++
++static int xen_mc_munmap(MapCache *mc, MapCacheEntry *entry)
++{
++    int64_t t0 = get_clock();
++    int rc = munmap(entry->vaddr_base, entry->size);
++
++    if (mc == mapcache) {
++        xen_mc_unmap_ns += get_clock() - t0;
++    }
++    if (!rc && mc->mapped_bytes >= entry->size) {
++        mc->mapped_bytes -= entry->size;
++    }
++    return rc;
++}
++
+ bool xen_map_cache_enabled(void)
+ {
+     /* Map cache enabled implies xen_enabled().  */
+@@ -205,9 +238,32 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
+         unsigned long mb = cap ? strtoul(cap, NULL, 10) : 0;
+ 
+         if (mb >= 64 && (mb << 20) < max_mcache_size) {
+-            info_report("xen mapcache: foreign cache capped at %lu MB", mb);
++            /*
++             * q11-098: the cap used to size the hash table, so a 1024 MB cap
++             * over a 2 GB DomA gave every slot two guest buckets. Whenever one
++             * was locked by DMA the other got a chained entry that was
++             * munmapped again at unlock -- one XENMEM_remove_from_physmap per
++             * page, on the main loop under the BQL (RPi4, WebView 720p60:
++             * 15000 such entries in 760 s, and the 41-97 ms holds before the
++             * 720p ALSA under-runs). Size the table for the guest instead
++             * (QEMU_XEN_MAPCACHE_HASH_MB, default 8192, i.e. 128 Ki slots of
++             * 64 KiB, 6 MB of table) and make the cap a limit on the bytes
++             * mapped, kept by unmapping unlocked heads (xen_map_cache_evict).
++             */
++            const char *hs = getenv("QEMU_XEN_MAPCACHE_HASH_MB");
++            unsigned long hash_mb = hs ? strtoul(hs, NULL, 10) : 8192;
++
++            if (hash_mb < mb) {
++                hash_mb = mb;
++            }
++            if ((hash_mb << 20) > max_mcache_size) {
++                hash_mb = max_mcache_size >> 20;
++            }
++            info_report("xen mapcache: foreign cache capped at %lu MB mapped,"
++                        " hash for %lu MB of guest (q11-098)", mb, hash_mb);
+             mapcache = xen_map_cache_init_single(f, opaque, bucket_shift,
+-                                                 mb << 20);
++                                                 hash_mb << 20);
++            mapcache->mapped_cap = (uint64_t)mb << 20;
+         } else {
+             mapcache = xen_map_cache_init_single(f, opaque, bucket_shift,
+                                                  max_mcache_size);
+@@ -246,6 +302,22 @@ static void xen_remap_bucket(MapCache *mc,
+     hwaddr nb_pfn = size >> XC_PAGE_SHIFT;
+ 
+     trace_xen_remap_bucket(address_index);
++    if (mc == mapcache) {
++        xen_mc_remaps++;
++        if (entry->vaddr_base != NULL) {
++            xen_mc_replaced++;
++        }
++        if (xen_mc_remaps % 100 == 0) {
++            info_report("xen mapcache: %lu remaps (%lu replaced a live mapping),"
++                        " new chained entries: other index %lu, other size %lu;"
++                        " %lu evictions, %" PRIu64 " of %" PRIu64 " MB mapped,"
++                        " munmap total %" PRId64 " ms",
++                        xen_mc_remaps, xen_mc_replaced, xen_mc_chain_idx,
++                        xen_mc_chain_size, xen_mc_evictions,
++                        mc->mapped_bytes >> 20, mc->mapped_cap >> 20,
++                        xen_mc_unmap_ns / 1000000);
++        }
++    }
+ 
+     if (grant) {
+         refs = g_new0(uint32_t, nb_pfn);
+@@ -272,10 +344,13 @@ static void xen_remap_bucket(MapCache *mc,
+          */
+         assert(!vaddr || (entry->vaddr_base == vaddr && entry->size == size));
+ 
+-        if (!vaddr && munmap(entry->vaddr_base, entry->size) != 0) {
++        if (!vaddr && xen_mc_munmap(mc, entry) != 0) {
+             perror("unmap fails");
+             exit(-1);
+         }
++        if (vaddr && mc->mapped_bytes >= entry->size) {
++            mc->mapped_bytes -= entry->size;   /* replaced in place below */
++        }
+     }
+     g_free(entry->valid_mapping);
+     entry->valid_mapping = NULL;
+@@ -348,6 +423,7 @@ static void xen_remap_bucket(MapCache *mc,
+     entry->vaddr_base = vaddr_base;
+     entry->paddr_index = address_index;
+     entry->size = size;
++    mc->mapped_bytes += size;
+     entry->valid_mapping = g_new0(unsigned long,
+                                   BITS_TO_LONGS(size >> XC_PAGE_SHIFT));
+ 
+@@ -365,6 +441,58 @@ static void xen_remap_bucket(MapCache *mc,
+     }
+ }
+ 
++/*
++ * q11-098: keep the bytes mapped under mapped_cap by unmapping unlocked bucket
++ * heads, second chance: a head used since the hand last passed is spared once.
++ * Never the entry just mapped (keep), the last entry (its pointer may still be
++ * handed out), a locked or a grant entry. At most XEN_MC_EVICT_STEPS slots per
++ * call, so a cap held up by locked heads costs a bounded walk, not the whole
++ * table on every map; the hand persists, so the next call goes on from there.
++ * A cap overshoot by locked entries is left as it is, as before this change.
++ *
++ * Unlike a remap, which only ever replaces the slot being looked up, this
++ * unmaps other unlocked heads: a caller that kept an unlocked (lock == 0)
++ * pointer across a second lookup would see it go. Unlocked pointers are used
++ * at once under the BQL, and eviction only runs above the cap.
++ */
++#define XEN_MC_EVICT_STEPS 4096
++
++static void xen_map_cache_evict(MapCache *mc, MapCacheEntry *keep)
++{
++    unsigned long n;
++
++    for (n = 0; n < XEN_MC_EVICT_STEPS && n < mc->nr_buckets &&
++                mc->mapped_bytes > mc->mapped_cap; n++) {
++        MapCacheEntry *e = &mc->entry[mc->evict_hand];
++
++        mc->evict_hand = (mc->evict_hand + 1) % mc->nr_buckets;
++        if (!e->vaddr_base || e->lock || e == keep || e == mc->last_entry ||
++            (e->flags & XEN_MAPCACHE_ENTRY_GRANT)) {
++            continue;
++        }
++        if (e->ref) {
++            e->ref = 0;
++            continue;
++        }
++        if (!(e->flags & XEN_MAPCACHE_ENTRY_DUMMY)) {
++            ram_block_notify_remove(e->vaddr_base, e->size, e->size);
++        }
++        if (xen_mc_munmap(mc, e) != 0) {
++            perror("unmap fails");
++            exit(-1);
++        }
++        g_free(e->valid_mapping);
++        e->valid_mapping = NULL;
++        e->paddr_index = 0;
++        e->vaddr_base = NULL;
++        e->size = 0;
++        e->flags = 0;
++        if (mc == mapcache) {
++            xen_mc_evictions++;
++        }
++    }
++}
++
+ static uint8_t *xen_map_cache_unlocked(MapCache *mc,
+                                        hwaddr phys_addr, hwaddr size,
+                                        ram_addr_t ram_offset,
+@@ -438,10 +566,22 @@ tryagain:
+         pentry = free_pentry;
+     }
+     if (!entry) {
++        if (mc == mapcache) {
++            MapCacheEntry *h = &mc->entry[address_index % mc->nr_buckets];
++
++            if (h->paddr_index != address_index) {
++                xen_mc_chain_idx++;
++            } else {
++                xen_mc_chain_size++;
++            }
++        }
+         entry = g_new0(MapCacheEntry, 1);
+         pentry->next = entry;
+         xen_remap_bucket(mc, entry, NULL, cache_size, address_index, dummy,
+                          grant, is_write, ram_offset);
++        if (mc->mapped_cap) {
++            xen_map_cache_evict(mc, entry);
++        }
+     } else if (!entry->lock) {
+         if (!entry->vaddr_base || entry->paddr_index != address_index ||
+                 entry->size != cache_size ||
+@@ -450,6 +590,9 @@ tryagain:
+                     entry->valid_mapping)) {
+             xen_remap_bucket(mc, entry, NULL, cache_size, address_index, dummy,
+                              grant, is_write, ram_offset);
++            if (mc->mapped_cap) {
++                xen_map_cache_evict(mc, entry);
++            }
+         }
+     }
+ 
+@@ -473,6 +616,7 @@ tryagain:
+     }
+ 
+     mc->last_entry = entry;
++    entry->ref = 1;
+     if (lock) {
+         MapCacheRev *reventry = g_new0(MapCacheRev, 1);
+         entry->lock++;
+@@ -666,7 +810,7 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+         rc = xengnttab_unmap(xen_region_gnttabdev, entry->vaddr_base,
+                              entry->size >> mc->bucket_shift);
+     } else {
+-        rc = munmap(entry->vaddr_base, entry->size);
++        rc = xen_mc_munmap(mc, entry);
+     }
+ 
+     if (rc) {
+@@ -762,7 +906,7 @@ static void xen_invalidate_map_cache_single(MapCache *mc)
+             continue;
+         }
+ 
+-        if (munmap(entry->vaddr_base, entry->size) != 0) {
++        if (xen_mc_munmap(mc, entry) != 0) {
+             perror("unmap fails");
+             exit(-1);
+         }

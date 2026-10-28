@@ -303,3 +303,23 @@ SRC_URI:append:class-target = " file://q11-096-xen-QEMU_XEN_IOREQ_FIFO-runs-the-
 #   Raspberry Pi 5 runs (no host V4L2 decoder for the proxy), has its own publish in
 #   virtio-media-decoder.c and is unchanged.
 SRC_URI:append:class-target = " file://q11-097-virtio-media-proxy-say-what-area-of-the-texture-SAND-fills.patch"
+#
+# Shorter BQL holds in the device models.
+# q11-098: the capped foreign mapcache sizes its hash for the guest
+#   (QEMU_XEN_MAPCACHE_HASH_MB, default 8192) and caps the bytes mapped instead.
+# q11-099: released foreign mappings are unmapped on a worker thread, off the main loop.
+# q11-100: vhost leaves virtio-gpu blob memory out of its memory table.
+# q11-101: QEMU_GPU_CMDQ_BUDGET_US, a time budget for one bottom half of virtio-gpu's
+#   control queue; unset changes nothing.
+# q11-102: ui/sdl2-gl makes a surface's texture when it is drawn, not on SET_SCANOUT.
+# q11-103: QEMU_BLK_VQ_BUDGET_US, a time budget for virtio-blk's queues on the main loop;
+#   unset changes nothing.
+# q11-104: QEMU_MAIN_LOOP_ITER_BUDGET_US, one budget for a whole main-loop iteration that
+#   the two budgets above share; unset changes nothing.
+SRC_URI:append:class-target = " file://q11-098-xen-mapcache-size-the-capped-cache-s-hash-for-the-guest-cap-the-bytes-mapped.patch"
+SRC_URI:append:class-target = " file://q11-099-xen-mapcache-unmap-released-foreign-mappings-off-the-main-loop.patch"
+SRC_URI:append:class-target = " file://q11-100-vhost-leave-virtio-gpu-blob-memory-out-of-the-vhost-memory-table.patch"
+SRC_URI:append:class-target = " file://q11-101-virtio-gpu-give-the-main-loop-back-from-the-control-queue.patch"
+SRC_URI:append:class-target = " file://q11-102-ui-sdl2-gl-no-texture-upload-for-a-surface-not-on-screen.patch"
+SRC_URI:append:class-target = " file://q11-103-virtio-blk-give-the-main-loop-back-after-a-time-budget.patch"
+SRC_URI:append:class-target = " file://q11-104-main-loop-one-time-budget-for-a-whole-iteration.patch"

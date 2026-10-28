@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 26 Oct 2026 16:10:00 +0900
+Subject: [PATCH] virtio-blk: give the main loop back after a time budget
+
+Without ioeventfd, as under Xen, the guest's notify runs virtio-blk's
+queue handler from the ioreq handler with the BQL held, and it took
+every request queued: on the Raspberry Pi 4 during a 720p60 video in a
+WebView one notify held the BQL for 16-35 ms (130-226 small reads, or a
+few that mapped 8-14 MiB of guest memory into the mapcache).
+
+QEMU_BLK_VQ_BUDGET_US sets a time budget for the main loop's slice of
+the queues. Each call takes one request at least; the rest stays in the
+queue, in order, with the queue's notifications off, and a bottom half
+goes on with it, one slice each. The bottom half runs on the main loop
+only and is never nested in a blk_drain(); a reset leaves it nothing to
+go on with. Unset or 0 keeps the old behaviour.
+
+Measured on the Raspberry Pi 4 (2026-10-26, 6000 us, with q11-101 at
+8000 us, five 580 s runs): no ALSA under-run in any, and the main loop
+held the BQL for a vsync (16.7 ms) or more 0, 1, 1, 1 and 0 times, each
+time one GPU command. Both sets of runs had DomA's sound card writing
+without the BQL (tx-no-bql, the mixing engine off) and DomA's block
+read-ahead at 512 KiB, both set at run time; the Raspberry Pi 4 product
+now sets that read-ahead itself.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/block/virtio-blk.c          | 66 ++++++++++++++++++++++++++++++++++
+ include/hw/virtio/virtio-blk.h |  5 +++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index 6b92066af..e224bb7db 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -1019,6 +1019,19 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+     VirtIOBlockReq *req;
+     MultiReqBuffer mrb = {};
+     bool suppress_notifications = virtio_queue_get_notification(vq);
++    /*
++     * q11-103: give the main loop back after a time budget. Without ioeventfd
++     * (Xen) the guest's notify runs this from the ioreq handler with the BQL
++     * held, and it took every request queued: on the RPi4 during WebView 720p60
++     * one notify held the BQL for 16-35 ms (130-226 small reads, or a few that
++     * mapped 8-14 MiB of guest memory into the mapcache). Each call takes one
++     * request at least; the rest stays in the queue, in order, with the
++     * queue's notifications off, and a bottom half goes on with it.
++     */
++    unsigned q = virtio_get_queue_index(vq);
++    int64_t t_budget = (s->vq_budget_ns && !s->ioeventfd_started && q < 64) ?
++                       get_clock() : 0;
++    bool budget_hit = false;
+ 
+     defer_call_begin();
+ 
+@@ -1033,8 +1046,19 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+                 g_free(req);
+                 break;
+             }
++            if (t_budget && get_clock() - t_budget >= s->vq_budget_ns) {
++                budget_hit = true;
++                break;
++            }
+         }
+ 
++        if (budget_hit) {
++            /* notifications stay off; virtio_blk_vq_budget_bh turns them on again */
++            virtio_queue_set_notification(vq, 0);
++            s->vq_budget_pending |= 1ULL << q;
++            qemu_bh_schedule(s->vq_budget_bh);
++            break;
++        }
+         if (suppress_notifications) {
+             virtio_queue_set_notification(vq, 1);
+         }
+@@ -1047,6 +1071,25 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+     defer_call_end();
+ }
+ 
++/* q11-103: go on with the queues a budget stopped, one slice each */
++static void virtio_blk_vq_budget_bh(void *opaque)
++{
++    VirtIOBlock *s = opaque;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    uint64_t pending = s->vq_budget_pending;
++    unsigned q;
++
++    s->vq_budget_pending = 0;
++    for (q = 0; pending; q++, pending >>= 1) {
++        if (pending & 1) {
++            VirtQueue *vq = virtio_get_queue(vdev, q);
++
++            virtio_queue_set_notification(vq, 1);
++            virtio_blk_handle_vq(s, vq);
++        }
++    }
++}
++
+ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOBlock *s = (VirtIOBlock *)vdev;
+@@ -1150,6 +1193,12 @@ static void virtio_blk_reset(VirtIODevice *vdev)
+     /* Dataplane has stopped... */
+     assert(!s->ioeventfd_started);
+ 
++    /* q11-103: the queues are reset; nothing to go on with */
++    if (s->vq_budget_bh) {
++        qemu_bh_cancel(s->vq_budget_bh);
++    }
++    s->vq_budget_pending = 0;
++
+     /* ...but requests may still be in flight. */
+     blk_drain(s->blk);
+ 
+@@ -1846,6 +1895,19 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
+ 
+     blk_iostatus_enable(s->blk);
+ 
++    {
++        /* q11-103: QEMU_BLK_VQ_BUDGET_US, the main loop's slice for the queues */
++        const char *b = getenv("QEMU_BLK_VQ_BUDGET_US");
++
++        s->vq_budget_ns = b ? (int64_t)strtoul(b, NULL, 10) * 1000 : 0;
++        /* io variant: runs on the main loop only, never nested in a blk_drain() */
++        s->vq_budget_bh = virtio_bh_io_new_guarded(dev, virtio_blk_vq_budget_bh, s);
++        if (s->vq_budget_ns) {
++            info_report("virtio-blk: queue budget %" PRId64 " us (q11-103)",
++                        s->vq_budget_ns / 1000);
++        }
++    }
++
+     add_boot_device_lchs(dev, "/disk@0,0",
+                          conf->conf.lcyls,
+                          conf->conf.lheads,
+@@ -1859,6 +1921,10 @@ static void virtio_blk_device_unrealize(DeviceState *dev)
+     VirtIOBlkConf *conf = &s->conf;
+     unsigned i;
+ 
++    if (s->vq_budget_bh) {
++        qemu_bh_delete(s->vq_budget_bh);
++        s->vq_budget_bh = NULL;
++    }
+     blk_drain(s->blk);
+     del_boot_device_lchs(dev, "/disk@0,0");
+     virtio_blk_vq_aio_context_cleanup(s);
+diff --git a/include/hw/virtio/virtio-blk.h b/include/hw/virtio/virtio-blk.h
+index 3d8dee7ec..bd46d3527 100644
+--- a/include/hw/virtio/virtio-blk.h
++++ b/include/hw/virtio/virtio-blk.h
+@@ -74,6 +74,11 @@ struct VirtIOBlock {
+     uint64_t host_features;
+     size_t config_size;
+     BlockRAMRegistrar blk_ram_registrar;
++
++    /* q11-103: QEMU_BLK_VQ_BUDGET_US, the main loop's slice for the queues; 0 = none */
++    int64_t vq_budget_ns;
++    QEMUBH *vq_budget_bh;
++    uint64_t vq_budget_pending;     /* queues the bottom half goes on with */
+ };
+ 
+ typedef struct VirtIOBlockReq {

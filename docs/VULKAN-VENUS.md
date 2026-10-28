@@ -352,6 +352,23 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
   with either SKU (DomD's extended regions, the host RAM not given to DomD, are
   about 12 GB with `BOARD_RAM=16g` and 4.9 GB with `8g`; the recipe records the 8 GB
   memory map's measurement), 1024 otherwise. qemu 10.0.2 ignores the variable.
+  With `q11-098` the cap limits the bytes mapped, and the Raspberry Pi 4 sets 1536
+  instead of that default (with 2048 its device model died once 1925 MB were mapped
+  under load). `QEMU_XEN_MAPCACHE_HASH_MB` (`q11-098`, default 8192, not set by the
+  wrapper) sizes the hash table for the guest.
+- `QEMU_GPU_CMDQ_BUDGET_US`, `QEMU_BLK_VQ_BUDGET_US` and
+  `QEMU_MAIN_LOOP_ITER_BUDGET_US`, which the wrapper exports from
+  `XT_QEMU_GPU_CMDQ_BUDGET_US` (8000), `XT_QEMU_BLK_VQ_BUDGET_US` (6000) and
+  `XT_QEMU_MAIN_LOOP_ITER_BUDGET_US` (8000) of the DomD image recipe, on both boards:
+  the main loop's time budgets for virtio-gpu's control queue (`q11-101`), virtio-blk's
+  queues (`q11-103`) and a whole iteration (`q11-104`). An empty variable leaves its
+  budget off; qemu 10.0.2 ignores them. `QEMU_GPU_CMDQ_SUBMIT_US` (`q11-101`, not set
+  by the wrapper) is the part of the GPU budget after which a SUBMIT_3D waits for the
+  next slice, a quarter of it by default.
+- `RPI4_DOMA_SND_TX_NO_BQL` (`meta-xt-rpi4`'s `xt-xen-cfg-doma` append; `1` with qemu
+  11, `0` otherwise): DomA's sound card writes its buffers out without the BQL
+  (`tx-no-bql=on`, `q11-092`) with the ALSA audiodev's mixing engine off, as
+  `meta-xt-rpi5` does; the Raspberry Pi 4 keeps its 60 ms ALSA buffer.
 - Two files in DomD switch qemu 11 features, each off unless it exists:
   `/etc/qemu-ioreq-thread` (the wrapper exports `QEMU_XEN_IOREQ_THREAD=1`:
   virtio-pci notify writes are acknowledged, and ISR reads answered, on a dedicated

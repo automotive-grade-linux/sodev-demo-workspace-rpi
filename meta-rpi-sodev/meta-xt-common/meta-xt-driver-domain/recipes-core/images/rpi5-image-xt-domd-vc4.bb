@@ -316,6 +316,10 @@ install_qemu_xen_path_shim() {
 # minutes a run): DomA's device model called munmap 3320 times in 30 seconds with 1024
 # and 12 times with 4608, and with 4608 a 1.2 GB adb push into DomA, read back after
 # dropping its caches, ran through with matching data and no ENOMEM from the mapcache.
+# 1536 on the Raspberry Pi 4 (2026-10-24): with q11-098 the cap limits the bytes mapped,
+# and with 2048 DomA's device model died once 1925 MB were mapped under load ("Cannot
+# allocate new IOMEM resource"), while 1536 passed three re-reads of a 1.2 GB adb push.
+XT_QEMU_MAPCACHE_MAX_MB:raspberrypi4-64 = "1536"
 XT_QEMU_MAPCACHE_MAX_MB ?= "1024"
 XT_QEMU_MAPCACHE_MAX_MB:raspberrypi5 = "4608"
 # SCHED_FIFO priority of the device models' ioreq thread (qemu 11, q11-096); empty leaves
@@ -343,6 +347,19 @@ XT_QEMU_IOREQ_FIFO:raspberrypi4-64 = "49"
 # measured there).
 XT_QEMU_DM_PLACEMENT ?= "0"
 XT_QEMU_DM_PLACEMENT:raspberrypi5 = "1"
+# qemu 11's time budgets for the main loop, in microseconds, which the DomD qemu wrapper
+# exports to every device model: the control queue of virtio-gpu (q11-101), the queues
+# of virtio-blk (q11-103) and one budget for a whole main-loop iteration (q11-104).
+# Empty leaves a budget off. Measured on the Raspberry Pi 4 with all three (2026-10-26, a
+# WebView's 720p60 H.264, five 580 s runs): no ALSA under-run, and the BQL held for a
+# vsync or more only by single GPU commands (the patches' descriptions have the numbers),
+# with tx-no-bql and DomA's block read-ahead at 512 KiB set at run time; the Raspberry Pi
+# 4 product now sets that read-ahead itself (its device repository, xenvm-cf 0012). The
+# Raspberry Pi 5 takes the same budgets (decided 2026-10-28) and keeps the kernel's
+# read-ahead; not measured there.
+XT_QEMU_GPU_CMDQ_BUDGET_US ?= "8000"
+XT_QEMU_BLK_VQ_BUDGET_US ?= "6000"
+XT_QEMU_MAIN_LOOP_ITER_BUDGET_US ?= "8000"
 
 # Additional V4H DomD compatibility packages
 IMAGE_INSTALL:append = " kernel-module-tun xen-tools-devd xen-tools-xencommons xen-tools-xenstore xt-rpi5-domain cgshim"
@@ -414,6 +431,11 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 [ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
 # qemu 11 (q11-096): the ioreq thread at SCHED_FIFO; see XT_QEMU_IOREQ_FIFO in the recipe.
 [ -n "${XT_QEMU_IOREQ_FIFO}" ] && export QEMU_XEN_IOREQ_FIFO=${XT_QEMU_IOREQ_FIFO}
+# qemu 11 (q11-101, q11-103, q11-104): the main loop's time budgets; see
+# XT_QEMU_GPU_CMDQ_BUDGET_US in the recipe.
+[ -n "${XT_QEMU_GPU_CMDQ_BUDGET_US}" ] && export QEMU_GPU_CMDQ_BUDGET_US=${XT_QEMU_GPU_CMDQ_BUDGET_US}
+[ -n "${XT_QEMU_BLK_VQ_BUDGET_US}" ] && export QEMU_BLK_VQ_BUDGET_US=${XT_QEMU_BLK_VQ_BUDGET_US}
+[ -n "${XT_QEMU_MAIN_LOOP_ITER_BUDGET_US}" ] && export QEMU_MAIN_LOOP_ITER_BUDGET_US=${XT_QEMU_MAIN_LOOP_ITER_BUDGET_US}
 [ -f /etc/qemu-gbm-layout ] && [ "$wmclass" = DomA ] && export VIRGL_GBM_LAYOUT_ENABLE=1
 [ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
 # A device model's stdout and stderr go through a pipe to a cat of their own,

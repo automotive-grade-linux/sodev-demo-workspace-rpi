@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 25 Oct 2026 05:00:00 +0900
+Subject: [PATCH] ui/sdl2-gl: no texture upload for a surface that is not on
+ the screen
+
+In scanout mode the window shows the guest's texture and the console
+surface is not drawn, but every new surface was still uploaded with
+glTexImage2D. virgl_cmd_set_scanout makes a new surface whenever the
+guest changes its primary's rectangle. On the Raspberry Pi 4, a 720p60
+video in a WebView full screen does that about ten times in ten minutes,
+and each SET_SCANOUT then held the BQL for 15-31 ms of main-loop CPU
+(13.6 ms of a 14.5 ms resize was the upload). Make the texture when the
+surface is drawn instead: leaving scanout mode already does, and
+sdl2_gl_render_surface now does if it is missing.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ ui/sdl2-gl.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index cec7558eb..a70dd1c43 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -55,6 +55,8 @@ static void sdl2_gl_render_surface(struct sdl2_console *scon)
+     int ww, wh;
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    /* q11-102: sdl2_gl_switch leaves it to the first draw in scanout mode */
++    surface_gl_create_texture(scon->gls, scon->surface);
+ 
+     SDL_GetWindowSize(scon->real_window, &ww, &wh);
+     surface_gl_setup_viewport(scon->gls, scon->surface, ww, wh);
+@@ -108,7 +110,20 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
+         sdl2_window_resize(scon);
+     }
+ 
+-    surface_gl_create_texture(scon->gls, scon->surface);
++    /*
++     * q11-102: no upload for a surface that is not on the screen. In scanout
++     * mode the window shows the guest's texture (guest_fb), and the surface is
++     * drawn again only after sdl2_set_scanout_mode(false), which makes its
++     * texture, or by sdl2_gl_render_surface, which makes it if it is missing.
++     * virgl_cmd_set_scanout resizes the console (a new surface) whenever the
++     * guest changes its primary's rectangle. On the RPi4, WebView 720p60 full
++     * screen switches it between 1280x720 and 1280x599+0+60 about ten times in
++     * ten minutes, and each SET_SCANOUT then held the BQL for 15-31 ms of
++     * main-loop CPU; the texture upload was 13.6 ms of a 14.5 ms resize.
++     */
++    if (!scon->scanout_mode) {
++        surface_gl_create_texture(scon->gls, scon->surface);
++    }
+ }
+ 
+ void sdl2_gl_refresh(DisplayChangeListener *dcl)

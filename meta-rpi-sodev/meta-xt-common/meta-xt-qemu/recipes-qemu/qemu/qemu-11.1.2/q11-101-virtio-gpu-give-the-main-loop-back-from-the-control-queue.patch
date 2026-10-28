@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 25 Oct 2026 12:20:00 +0900
+Subject: [PATCH] virtio-gpu: give the main loop back from the control queue
+
+The GL control handler drained the queue for as long as the guest kept
+submitting, every command with the BQL held. On the Raspberry Pi 4
+during a 720p60 video in a WebView that bottom half held the BQL for a
+median of 27 ms and up to 145 ms, and the audio timer and the sound card
+waited behind it (ALSA under-runs).
+
+QEMU_GPU_CMDQ_BUDGET_US sets a time budget for one bottom half: once it
+is spent the rest stays queued, in order, and the bottom half runs again
+on the next main-loop iteration. A SUBMIT_3D can take 15 ms or more on
+its own, so it also waits once QEMU_GPU_CMDQ_SUBMIT_US (default a
+quarter of the budget) is spent. The fence poll at the end of the bottom
+half runs the queue too and shares the budget (given a fresh one, it ran
+7-15 ms more after the budget was spent). Every bottom half runs at
+least one command. Unset or 0 keeps the old behaviour.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-gl.c     | 14 ++++++++++
+ hw/display/virtio-gpu.c        | 50 ++++++++++++++++++++++++++++++++++
+ include/hw/virtio/virtio-gpu.h |  6 ++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index eb5e1252a..d2f562c06 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -89,6 +89,9 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+      * re-check below instead of costing a vCPU stall and a main-loop wakeup
+      * each.
+      */
++    /* q11-101: one time budget for this whole bottom half */
++    g->cmdq_budget_t0 = g->cmdq_budget_ns ? get_clock() : 0;
++    g->cmdq_bh_cmds = 0;
+     do {
+         virtio_queue_set_notification(vq, 0);
+ 
+@@ -106,9 +109,20 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+ 
+         virtio_gpu_process_cmdq(g);
+         virtio_queue_set_notification(vq, 1);
++        /* q11-101: budget spent, the scheduled bottom half goes on */
++        if (g->cmdq_budget_hit) {
++            break;
++        }
+     } while (!virtio_queue_empty(vq));
+ 
++    /*
++     * q11-101: the fence poll runs the queue as well (virtio_gpu_fence_poll
++     * calls virtio_gpu_process_cmdq), so it shares this budget. Ending the
++     * budget before it gave the poll a fresh one: 7-15 ms more in the same
++     * bottom half after the budget was spent, on the RPi4.
++     */
+     virtio_gpu_virgl_fence_poll(g);
++    g->cmdq_budget_t0 = 0;
+ }
+ 
+ static void virtio_gpu_gl_reset(VirtIODevice *vdev)
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 31a1b453a..354feab47 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1269,10 +1269,43 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+         t_run = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+     }
+     g->processing_cmdq = true;
++    g->cmdq_budget_hit = false;
+     virtio_gpu_notify_defer_begin(g);
++    {
++        int64_t t_budget = !g->cmdq_budget_ns ? 0 :
++                           g->cmdq_budget_t0 ? g->cmdq_budget_t0 : get_clock();
+     while (!QTAILQ_EMPTY(&g->cmdq)) {
+         cmd = QTAILQ_FIRST(&g->cmdq);
+ 
++        /*
++         * q11-101: give the main loop back once the budget is spent. Every
++         * command runs with the BQL held, and the GL control handler kept
++         * draining for as long as the guest kept submitting: on the RPi4
++         * during WebView 720p60 this bottom half held the BQL for a median
++         * of 27 ms and up to 145 ms, and the audio timer and the sound card
++         * waited behind it. The rest of the queue stays queued, in order,
++         * and the bottom half picks it up on the next main-loop iteration.
++         * The budget counts from the start of the bottom half (cmdq_budget_t0),
++         * which may call this more than once. A SUBMIT_3D alone can run for
++         * 15 ms or more, so once part of the budget is spent it waits for the
++         * next iteration too: then the hold is about one command at most.
++         * A bottom half always runs at least one command, so the queue moves.
++         */
++        if (t_budget && g->cmdq_bh_cmds) {
++            int64_t used = get_clock() - t_budget;
++            struct virtio_gpu_ctrl_hdr next;
++
++            if (used >= g->cmdq_budget_ns ||
++                (used >= g->cmdq_submit_ns &&
++                 iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0, &next,
++                            sizeof(next)) == sizeof(next) &&
++                 le32_to_cpu(next.type) == VIRTIO_GPU_CMD_SUBMIT_3D)) {
++                g->cmdq_budget_hit = true;
++                qemu_bh_schedule(g->ctrl_bh);
++                break;
++            }
++        }
++
+         if (g->parent_obj.renderer_blocked) {
+             break;
+         }
+@@ -1295,6 +1328,7 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+         }
+ 
+         QTAILQ_REMOVE(&g->cmdq, cmd, next);
++        g->cmdq_bh_cmds++;
+         if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+             g->stats.requests++;
+         }
+@@ -1312,6 +1346,7 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+             g_free(cmd);
+         }
+     }
++    }
+     g->processing_cmdq = false;
+     virtio_gpu_notify_defer_end(g);
+     if (t_run) {
+@@ -1815,6 +1850,21 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
+     g->ctrl_vq = virtio_get_queue(vdev, 0);
+     g->cursor_vq = virtio_get_queue(vdev, 1);
+     g->ctrl_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_ctrl_bh, g);
++    {
++        /* q11-101: QEMU_GPU_CMDQ_BUDGET_US, the control queue's time slice */
++        const char *b = getenv("QEMU_GPU_CMDQ_BUDGET_US");
++
++        const char *sb = getenv("QEMU_GPU_CMDQ_SUBMIT_US");
++
++        g->cmdq_budget_ns = b ? (int64_t)strtoul(b, NULL, 10) * 1000 : 0;
++        /* QEMU_GPU_CMDQ_SUBMIT_US: no SUBMIT_3D after this much of it, default 1/4 */
++        g->cmdq_submit_ns = sb ? (int64_t)strtoul(sb, NULL, 10) * 1000 : g->cmdq_budget_ns / 4;
++        if (g->cmdq_budget_ns) {
++            info_report("virtio-gpu: control queue budget %" PRId64 " us, SUBMIT_3D up to %"
++                        PRId64 " us into it (q11-101)",
++                        g->cmdq_budget_ns / 1000, g->cmdq_submit_ns / 1000);
++        }
++    }
+     g->cursor_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_cursor_bh, g);
+     g->reset_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_reset_bh, g);
+     qemu_cond_init(&g->reset_cond);
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 4cb84c9cd..0229a6275 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -250,6 +250,12 @@ struct VirtIOGPU {
+     VirtQueue *cursor_vq;
+ 
+     QEMUBH *ctrl_bh;
++    /* q11-101: stop draining the control queue after this long, 0 = never */
++    int64_t cmdq_budget_ns;
++    int64_t cmdq_submit_ns;
++    int64_t cmdq_budget_t0;
++    unsigned cmdq_bh_cmds;
++    bool cmdq_budget_hit;
+     QEMUBH *cursor_bh;
+     QEMUBH *reset_bh;
+     QemuCond reset_cond;

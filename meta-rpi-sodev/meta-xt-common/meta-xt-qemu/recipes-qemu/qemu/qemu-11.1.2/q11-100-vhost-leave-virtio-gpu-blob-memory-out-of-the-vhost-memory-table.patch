@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 23:45:00 +0900
+Subject: [PATCH] vhost: leave virtio-gpu blob memory out of the vhost
+ memory table
+
+A host-visible blob that virtio-gpu maps into the guest is a RAM region,
+so every blob that came or went changed the vhost memory table, and each
+vhost device then rebuilt it in the kernel from the main loop with the
+BQL held. On the Raspberry Pi 4 that was two holds of 345 and 282 ms
+when a Venus context was created during a 720p60 video in a WebView, and
+an ALSA under-run. No vhost device reads or writes GPU blob memory.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/vhost.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index 74e53a066..bad45efdf 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -664,6 +664,24 @@ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
+ {
+     MemoryRegion *mr = section->mr;
+ 
++    /*
++     * q11-100: leave virtio-gpu blob memory out of the vhost memory table.
++     *
++     * WHY. A host-visible blob that virtio-gpu maps into the guest is a RAM
++     * region, so every blob that comes or goes changed the table, and each
++     * vhost device (vhost-net, vhost-vsock) then rebuilt it in the kernel
++     * (VHOST_SET_MEM_TABLE) from the main loop with the BQL held. Measured on
++     * the Raspberry Pi 4 during WebView 720p60 in the HMI: when a Venus context
++     * was created, two holds of 345 and 282 ms, almost all kernel time, next to
++     * the "vhost_set_memory" lines, and an ALSA under-run. No vhost device
++     * reads or writes GPU blob memory: its buffers are in guest RAM.
++     */
++    if (mr->owner &&
++        object_dynamic_cast(mr->owner, "virtio-gpu-virgl-hostmem-region")) {
++        trace_vhost_reject_section(mr->name, 4);
++        return false;
++    }
++
+     if (memory_region_is_ram(mr) && !memory_region_is_rom(mr)) {
+         uint8_t dirty_mask = memory_region_get_dirty_log_mask(mr);
+         uint8_t handled_dirty;
