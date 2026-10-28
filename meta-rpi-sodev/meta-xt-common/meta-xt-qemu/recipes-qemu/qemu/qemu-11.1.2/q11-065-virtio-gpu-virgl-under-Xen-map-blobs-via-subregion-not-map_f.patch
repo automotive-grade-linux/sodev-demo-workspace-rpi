@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 13 Oct 2026 11:22:28 +0900
+Subject: [PATCH] virtio-gpu-virgl: under Xen, map blobs via subregion, not
+ map_fixed
+
+Built against virglrenderer >= 1.3.0, VIRGL_HAS_MAP_FIXED makes blob
+mapping use virgl_renderer_resource_map_fixed(). That only maps the blob
+into the device model's address space. Under Xen the region also has to
+reach the guest p2m, and only the subregion path does this: it hands the
+blob over as a dma-buf before the region is added. With map_fixed the
+guest cannot use host-visible blobs, and Venus in DomA fails
+vkCreateInstance with VK_ERROR_OUT_OF_HOST_MEMORY (seen on the RPi4 with
+virglrenderer 1.3.0, 2026-10-13).
+
+When xen_enabled(), skip the map_fixed branch and use the
+virgl_renderer_resource_map() subregion path. Without Xen nothing
+changes. There is no switch.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's Xen blob dma-buf hand-over patches]
+---
+ hw/display/virtio-gpu-virgl.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index db341dba6..e61035886 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -238,6 +238,17 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+     }
+ 
+ #if VIRGL_HAS_MAP_FIXED
++    /*
++     * q11-xen-no-map-fixed: under Xen the region has to reach the guest p2m, which
++     * only the subregion path below does (the dma-buf hand-over before the region
++     * is added). map_fixed only maps it into qemu, and the guest then cannot use
++     * the blob: Venus fails vkCreateInstance with VK_ERROR_OUT_OF_HOST_MEMORY
++     * (measured on the RPi4, virglrenderer 1.3.0, 2026-10-13).
++     */
++    if (xen_enabled()) {
++        goto map_subregion;
++    }
++
+     /*
+      * virgl_renderer_resource_map_fixed() allows to create multiple
+      * mappings of the same resource, while virgl_renderer_resource_map()
+@@ -272,6 +283,9 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+     }
+ #endif
+ 
++#if VIRGL_HAS_MAP_FIXED
++map_subregion:
++#endif
+     ret = virgl_renderer_resource_map(res->base.resource_id, &data, &size);
+     if (ret) {
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to map virgl resource: %s\n",

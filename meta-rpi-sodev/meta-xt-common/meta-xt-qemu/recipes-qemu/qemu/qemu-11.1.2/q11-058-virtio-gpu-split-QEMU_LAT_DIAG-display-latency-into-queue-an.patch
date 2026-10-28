@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 4 Oct 2026 16:32:36 +0900
+Subject: [PATCH] virtio-gpu: split QEMU_LAT_DIAG display latency into queue
+ and fence
+
+Debugging aid, extending the QEMU_LAT_DIAG=1 counters (off by default).
+
+The GL device takes commands off the ring in
+virtio_gpu_gl_handle_ctrl(), which the first version did not time-stamp,
+so stamp it there too. Split the display latency so that queueing can be
+told apart from fence waiting: the time from pop to the start of
+processing for RESOURCE_FLUSH and SUBMIT_3D, RESOURCE_FLUSH response
+latency separately for fenced and unfenced commands, and the duration of
+each virtio_gpu_process_cmdq() run. Each line also gains the number of
+samples over 8 ms.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [debugging aid]
+---
+ hw/display/virtio-gpu-gl.c     |  3 +++
+ hw/display/virtio-gpu.c        | 39 ++++++++++++++++++++++++++++------
+ include/hw/virtio/virtio-gpu.h |  6 +++++-
+ 3 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 9404f99..05edc1b 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -97,6 +97,9 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+             cmd->vq = vq;
+             cmd->error = 0;
+             cmd->finished = false;
++            /* QEMU_LAT_DIAG: this is the pop path the GL device uses */
++            cmd->t_pop_ns = qemu_lat_diag() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
++            cmd->t_proc_ns = 0;
+             QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+             cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+         }
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 8cd7e2a..ac3593b 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -167,7 +167,7 @@ virtio_gpu_find_check_resource(VirtIOGPU *g, uint32_t resource_id,
+ 
+ /* --- QEMU_LAT_DIAG ------------------------------------------------------------- */
+ static int lat_diag_on = -1;
+-static uint64_t lat_n[LAT_N], lat_over16[LAT_N];
++static uint64_t lat_n[LAT_N], lat_over8[LAT_N], lat_over16[LAT_N];
+ static int64_t lat_sum[LAT_N], lat_max[LAT_N], lat_last_ms;
+ 
+ bool qemu_lat_diag(void)
+@@ -181,7 +181,10 @@ bool qemu_lat_diag(void)
+ void qemu_lat_diag_add(int kind, int64_t ns)
+ {
+     static const char *const name[LAT_N] = {
+-        "gpu RESOURCE_FLUSH", "gpu SET_SCANOUT*", "gpu SUBMIT_3D", "media drain",
++        "gpu FLUSH queue (pop->start)", "gpu FLUSH unfenced (pop->resp)",
++        "gpu FLUSH fenced (pop->resp)", "gpu SET_SCANOUT* (pop->resp)",
++        "gpu SUBMIT_3D queue (pop->start)", "gpu SUBMIT_3D (pop->resp)",
++        "gpu process_cmdq run", "media drain",
+     };
+     int64_t now;
+     int k;
+@@ -191,6 +194,9 @@ void qemu_lat_diag_add(int kind, int64_t ns)
+     if (ns > lat_max[kind]) {
+         lat_max[kind] = ns;
+     }
++    if (ns > 8 * 1000 * 1000) {
++        lat_over8[kind]++;
++    }
+     if (ns > 16 * 1000 * 1000) {
+         lat_over16[kind]++;
+     }
+@@ -200,11 +206,12 @@ void qemu_lat_diag_add(int kind, int64_t ns)
+     }
+     for (k = 0; k < LAT_N; k++) {
+         if (lat_n[k]) {
+-            info_report("lat-diag: %s n=%" PRIu64 " mean %.2f ms max %.1f ms >16ms %"
+-                        PRIu64, name[k], lat_n[k], lat_sum[k] / 1e6 / lat_n[k],
+-                        lat_max[k] / 1e6, lat_over16[k]);
++            info_report("lat-diag: %s n=%" PRIu64 " mean %.2f ms max %.1f ms >8ms %"
++                        PRIu64 " >16ms %" PRIu64, name[k], lat_n[k],
++                        lat_sum[k] / 1e6 / lat_n[k], lat_max[k] / 1e6,
++                        lat_over8[k], lat_over16[k]);
+         }
+-        lat_n[k] = lat_over16[k] = 0;
++        lat_n[k] = lat_over8[k] = lat_over16[k] = 0;
+         lat_sum[k] = lat_max[k] = 0;
+     }
+     lat_last_ms = now;
+@@ -222,7 +229,8 @@ void virtio_gpu_ctrl_response(VirtIOGPU *g,
+ 
+         switch (cmd->cmd_hdr.type) {
+         case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+-            kind = LAT_GPU_FLUSH;
++            kind = (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE) ?
++                   LAT_GPU_FLUSH_FENCED : LAT_GPU_FLUSH;
+             break;
+         case VIRTIO_GPU_CMD_SET_SCANOUT:
+         case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+@@ -1250,9 +1258,14 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+     struct virtio_gpu_ctrl_command *cmd;
+     VirtIOGPUClass *vgc = VIRTIO_GPU_GET_CLASS(g);
+ 
++    int64_t t_run = 0;
++
+     if (g->processing_cmdq) {
+         return;
+     }
++    if (qemu_lat_diag()) {
++        t_run = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    }
+     g->processing_cmdq = true;
+     virtio_gpu_notify_defer_begin(g);
+     while (!QTAILQ_EMPTY(&g->cmdq)) {
+@@ -1263,6 +1276,14 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+         }
+ 
+         /* process command */
++        if (qemu_lat_diag() && cmd->t_pop_ns && !cmd->t_proc_ns) {
++            cmd->t_proc_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++            if (cmd->cmd_hdr.type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
++                qemu_lat_diag_add(LAT_GPU_FLUSH_Q, cmd->t_proc_ns - cmd->t_pop_ns);
++            } else if (cmd->cmd_hdr.type == VIRTIO_GPU_CMD_SUBMIT_3D) {
++                qemu_lat_diag_add(LAT_GPU_SUBMIT_Q, cmd->t_proc_ns - cmd->t_pop_ns);
++            }
++        }
+         vgc->process_cmd(g, cmd);
+ 
+         /* command suspended */
+@@ -1291,6 +1312,9 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+     }
+     g->processing_cmdq = false;
+     virtio_gpu_notify_defer_end(g);
++    if (t_run) {
++        qemu_lat_diag_add(LAT_GPU_CMDQ_RUN, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t_run);
++    }
+ }
+ 
+ static void virtio_gpu_process_fenceq(VirtIOGPU *g)
+@@ -1334,6 +1358,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->error = 0;
+         cmd->finished = false;
+         cmd->t_pop_ns = qemu_lat_diag() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
++        cmd->t_proc_ns = 0;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 7b66e91..6e44b9f 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -147,6 +147,7 @@ struct virtio_gpu_ctrl_command {
+     uint32_t error;
+     bool finished;
+     int64_t t_pop_ns;       /* QEMU_LAT_DIAG: when the device took it off the ring */
++    int64_t t_proc_ns;      /* QEMU_LAT_DIAG: when processing of it started */
+     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
+ };
+ 
+@@ -157,7 +158,10 @@ struct virtio_gpu_ctrl_command {
+  */
+ bool qemu_lat_diag(void);
+ void qemu_lat_diag_add(int kind, int64_t ns);
+-enum { LAT_GPU_FLUSH, LAT_GPU_SCANOUT, LAT_GPU_SUBMIT, LAT_MEDIA_DRAIN, LAT_N };
++enum {
++    LAT_GPU_FLUSH_Q, LAT_GPU_FLUSH, LAT_GPU_FLUSH_FENCED, LAT_GPU_SCANOUT,
++    LAT_GPU_SUBMIT_Q, LAT_GPU_SUBMIT, LAT_GPU_CMDQ_RUN, LAT_MEDIA_DRAIN, LAT_N
++};
+ 
+ struct VirtIOGPUBase {
+     VirtIODevice parent_obj;

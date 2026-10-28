@@ -301,6 +301,24 @@ install_qemu_xen_path_shim() {
     fi
 }
 
+# The foreign mapcache cap the qemu wrapper exports (QEMU_XEN_MAPCACHE_MAX_MB, q11-053;
+# 64 KiB buckets). Foreign mappings live in DomD's extended regions, which Xen makes from
+# the host RAM not given to DomD. 1024 by default: on the RPi4 (17 x 128 MB of extended
+# regions) an uncapped mapcache died with ENOMEM from privcmd (2026-10-03). With 1024,
+# DomA's RAM (2 GB at 1 GB and the rest at 8 GB) shares buckets: on a Raspberry Pi 5,
+# DomA's device model unmapped and remapped guest pages about 130 times a second each
+# during H.264 1080p60 in a WebView, about a tenth of its main thread. 4608 is the
+# smallest cap at which no two 64 KiB blocks of a 3072 or 4096 MB DomA share a bucket.
+# It is used only with BOARD_RAM=16g, whose DomD has about 12 GB of extended regions; on
+# an 8 GB board they are about 4.9 GB, which may be too few for both guests' RAM plus the
+# blobs mapped at once, and that has not been measured.
+XT_QEMU_MAPCACHE_MAX_MB ?= "1024"
+XT_QEMU_MAPCACHE_MAX_MB:raspberrypi5 = "${@'4608' if d.getVar('BOARD_RAM') == '16g' else '1024'}"
+# The wrapper that uses it is written by install_v4h_sodev_bits_ext4, which is listed in
+# ROOTFS_POSTPROCESS_COMMAND with its ";" and so does not bring its body into do_rootfs's
+# signature: name the variable, as DOM0_OS is named below.
+do_rootfs[vardeps] += "XT_QEMU_MAPCACHE_MAX_MB"
+
 # Additional V4H DomD compatibility packages
 IMAGE_INSTALL:append = " kernel-module-tun xen-tools-devd xen-tools-xencommons xen-tools-xenstore xt-rpi5-domain cgshim"
 
@@ -348,10 +366,19 @@ export SDL_VIDEO_WAYLAND_WMCLASS="$wmclass"
 # Force clock_gettime through the raw syscall (cgshim.so), bypassing the
 # aarch64 vDSO seqcount spin that hangs this device-model qemu in cpu_enable_ticks.
 export LD_PRELOAD=/usr/lib/cgshim.so
-# Opt-in switch, off unless the file exists:
+# qemu 11 only (q11-053; qemu 10 ignores it): cap the foreign mapcache. Uncapped, every
+# guest page ever DMAed through stays mapped; see XT_QEMU_MAPCACHE_MAX_MB in the recipe.
+export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
+# Opt-in switches, each off unless its file exists:
+#   /etc/qemu-ioreq-thread  qemu 11 (q11-052/054): acknowledge virtio-pci notify writes,
+#                           and answer ISR reads, on a dedicated ioreq thread instead of
+#                           waiting for the main loop.
 #   /etc/qemu-gbm-layout    virglrenderer 1.3.0: back guest resources with GBM dma-bufs, which
 #                           a Vulkan (Venus) DomA needs.
+#   /etc/qemu-lat-diag      qemu 11 (q11-057/058): log display-command latencies.
+[ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
 [ -f /etc/qemu-gbm-layout ] && export VIRGL_GBM_LAYOUT_ENABLE=1
+[ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
 exec "${REAL_QEMU}" "$@"
 EOF
         chmod 0755 ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64

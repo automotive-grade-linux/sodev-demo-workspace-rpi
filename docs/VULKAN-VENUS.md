@@ -288,7 +288,19 @@ weston 16.0.0 and virglrenderer 1.3.0. Each board yaml selects it by setting
 with `--dom0=linux`, `XT_DOM0_QEMU_VERSION` to the same value: that
 Dom0 writes the guest cfgs, in the syntax of the qemu it names. `doma.cfg`'s
 Bluetooth chardev then gets `reconnect-ms=1000` instead of `reconnect=1`, which
-qemu 11.1.2 no longer has.
+qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
+
+- `QEMU_XEN_MAPCACHE_MAX_MB`, which the DomD qemu wrapper exports for every
+  device model it starts: it caps the foreign mapcache (`q11-053`) at
+  `XT_QEMU_MAPCACHE_MAX_MB` from the DomD image recipe: 4608 on a Raspberry Pi 5
+  with `BOARD_RAM=16g` (DomD's extended regions, the host RAM not given to DomD,
+  are about 12 GB there), 1024 otherwise. qemu 10.0.2 ignores the variable.
+- Two files in DomD switch qemu 11 features, each off unless it exists:
+  `/etc/qemu-ioreq-thread` (the wrapper exports `QEMU_XEN_IOREQ_THREAD=1`:
+  virtio-pci notify writes are acknowledged, and ISR reads answered, on a dedicated
+  ioreq thread, `q11-052`/`q11-054`) and `/etc/qemu-lat-diag` (`QEMU_LAT_DIAG=1`:
+  display-command latencies are logged, `q11-057`/`q11-058`); nothing creates
+  either.
 
 This matters for scheduling: the fork *does* maintain post-9.2 branches, so the
 Xen ARM device-model work does not have to be abandoned to get Venus. It is a

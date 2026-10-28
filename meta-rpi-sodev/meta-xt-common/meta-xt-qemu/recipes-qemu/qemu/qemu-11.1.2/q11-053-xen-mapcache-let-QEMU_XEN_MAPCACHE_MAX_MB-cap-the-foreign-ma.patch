@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 16:49:05 +0900
+Subject: [PATCH] xen-mapcache: let QEMU_XEN_MAPCACHE_MAX_MB cap the foreign
+ mapcache
+
+On a 64-bit host the foreign mapcache is capped at 32 GB, i.e. one
+bucket per 64 KiB of any guest, so buckets never collide. Together with
+this layer's change that keeps unlocked foreign bucket heads mapped,
+every guest page that has ever been DMAed through stays mapped.
+
+On Arm each foreign mapping lives in the kernel's unpopulated "Xen
+scratch" space, which is sized from the hypervisor's extended regions:
+17 x 128 MB in the Raspberry Pi 4 DomD, for a 2 GB DomA plus blobs and
+grants. Once the mapcache covers most of DomA, the next privcmd mapping
+fails ("Cannot allocate new IOMEM resource", xenforeignmemory_map2:
+ENOMEM) and the device model dies. This was seen during a 226 MB read
+and a 286 MB adb install in DomA.
+
+QEMU_XEN_MAPCACHE_MAX_MB, read from the device model's environment, sets
+a smaller cap for the foreign (guest RAM) mapcache. With a cap, an
+unlocked bucket head that collides is remapped instead of a new mapping
+piling up. Values below 64 or not below the built-in cap are ignored;
+unset (the default) keeps the built-in cap. The grant mapcache is not
+affected: its entries are unmapped when their lock count drops to zero
+anyway.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's Xen device model; switched by an environment variable]
+---
+ hw/xen/xen-mapcache.c | 32 +++++++++++++++++++++++++++++---
+ 1 file changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index def688817..c617c92ef 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -184,9 +184,35 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
+         }
+     }
+ 
+-    mapcache = xen_map_cache_init_single(f, opaque,
+-                                         bucket_shift,
+-                                         max_mcache_size);
++    /*
++     * QEMU_XEN_MAPCACHE_MAX_MB caps the cache of FOREIGN mappings (guest RAM).
++     *
++     * WHY. A 64-bit host gets a 32 GB cap, i.e. one bucket per 64 KiB of any
++     * guest, so nothing ever collides, and with bucket heads kept mapped once
++     * unlocked (0224) every page the guest has ever DMAed through stays mapped.
++     * On Arm each foreign mapping lives in the kernel's unpopulated "Xen
++     * scratch" space, which is sized from the hypervisor's extended regions:
++     * 17 x 128 MB on RPi4 DomD, for a 2 GB DomA plus blobs and grants. Once the
++     * mapcache covers most of DomA, the next privcmd map fails ("Cannot allocate
++     * new IOMEM resource", xenforeignmemory_map2: ENOMEM) and the device model
++     * dies -- seen twice on 2026-10-03, during a 226 MB read and a 286 MB adb
++     * install. With a cap, an unlocked head that collides is remapped instead
++     * of a new one piling up. Grants are unaffected: their entries are unmapped
++     * at lock zero anyway.
++     */
++    {
++        const char *cap = getenv("QEMU_XEN_MAPCACHE_MAX_MB");
++        unsigned long mb = cap ? strtoul(cap, NULL, 10) : 0;
++
++        if (mb >= 64 && (mb << 20) < max_mcache_size) {
++            info_report("xen mapcache: foreign cache capped at %lu MB", mb);
++            mapcache = xen_map_cache_init_single(f, opaque, bucket_shift,
++                                                 mb << 20);
++        } else {
++            mapcache = xen_map_cache_init_single(f, opaque, bucket_shift,
++                                                 max_mcache_size);
++        }
++    }
+ 
+     /*
+      * Grant mappings must use XC_PAGE_SIZE granularity since we can't

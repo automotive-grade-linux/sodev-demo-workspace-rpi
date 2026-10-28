@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 4 Oct 2026 13:28:18 +0900
+Subject: [PATCH] virtio-gpu, virtio-media: log command latency when
+ QEMU_LAT_DIAG=1
+
+Debugging aid. To see where display and video time goes in the device
+model, add latency counters that are enabled only when QEMU_LAT_DIAG=1
+is in the device model's environment (read once). They are off by
+default; then the only cost is a cached flag test per command.
+
+When enabled, every 30 s the device model logs, for virtio-gpu
+RESOURCE_FLUSH, SET_SCANOUT/SET_SCANOUT_BLOB and SUBMIT_3D, how long a
+command waits between leaving the control ring and being answered
+(fenced commands are answered when their fence retires), and how long
+one virtio-media drain of the host decoder (DQBUF, GL conversion,
+events) holds the main loop. Each line gives the count, mean, maximum
+and the number of samples over 16 ms.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [debugging aid]
+---
+ hw/display/virtio-gpu.c        | 67 ++++++++++++++++++++++++++++++++++
+ hw/virtio/virtio-media.c       | 14 +++++++
+ include/hw/virtio/virtio-gpu.h | 10 +++++
+ 3 files changed, 91 insertions(+)
+
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index d6d6311..8cd7e2a 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -165,6 +165,51 @@ virtio_gpu_find_check_resource(VirtIOGPU *g, uint32_t resource_id,
+     return res;
+ }
+ 
++/* --- QEMU_LAT_DIAG ------------------------------------------------------------- */
++static int lat_diag_on = -1;
++static uint64_t lat_n[LAT_N], lat_over16[LAT_N];
++static int64_t lat_sum[LAT_N], lat_max[LAT_N], lat_last_ms;
++
++bool qemu_lat_diag(void)
++{
++    if (lat_diag_on < 0) {
++        lat_diag_on = g_strcmp0(getenv("QEMU_LAT_DIAG"), "1") == 0;
++    }
++    return lat_diag_on;
++}
++
++void qemu_lat_diag_add(int kind, int64_t ns)
++{
++    static const char *const name[LAT_N] = {
++        "gpu RESOURCE_FLUSH", "gpu SET_SCANOUT*", "gpu SUBMIT_3D", "media drain",
++    };
++    int64_t now;
++    int k;
++
++    lat_n[kind]++;
++    lat_sum[kind] += ns;
++    if (ns > lat_max[kind]) {
++        lat_max[kind] = ns;
++    }
++    if (ns > 16 * 1000 * 1000) {
++        lat_over16[kind]++;
++    }
++    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    if (now - lat_last_ms < 30000) {
++        return;
++    }
++    for (k = 0; k < LAT_N; k++) {
++        if (lat_n[k]) {
++            info_report("lat-diag: %s n=%" PRIu64 " mean %.2f ms max %.1f ms >16ms %"
++                        PRIu64, name[k], lat_n[k], lat_sum[k] / 1e6 / lat_n[k],
++                        lat_max[k] / 1e6, lat_over16[k]);
++        }
++        lat_n[k] = lat_over16[k] = 0;
++        lat_sum[k] = lat_max[k] = 0;
++    }
++    lat_last_ms = now;
++}
++
+ void virtio_gpu_ctrl_response(VirtIOGPU *g,
+                               struct virtio_gpu_ctrl_command *cmd,
+                               struct virtio_gpu_ctrl_hdr *resp,
+@@ -172,6 +217,27 @@ void virtio_gpu_ctrl_response(VirtIOGPU *g,
+ {
+     size_t s;
+ 
++    if (qemu_lat_diag() && cmd->t_pop_ns) {
++        int kind = -1;
++
++        switch (cmd->cmd_hdr.type) {
++        case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
++            kind = LAT_GPU_FLUSH;
++            break;
++        case VIRTIO_GPU_CMD_SET_SCANOUT:
++        case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
++            kind = LAT_GPU_SCANOUT;
++            break;
++        case VIRTIO_GPU_CMD_SUBMIT_3D:
++            kind = LAT_GPU_SUBMIT;
++            break;
++        }
++        if (kind >= 0) {
++            qemu_lat_diag_add(kind, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
++                                    cmd->t_pop_ns);
++        }
++    }
++
+     if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+         resp->flags |= VIRTIO_GPU_FLAG_FENCE;
+         resp->fence_id = cmd->cmd_hdr.fence_id;
+@@ -1267,6 +1333,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->vq = vq;
+         cmd->error = 0;
+         cmd->finished = false;
++        cmd->t_pop_ns = qemu_lat_diag() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index b6205a5..289ffb7 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -23,6 +23,7 @@
+ #include "system/address-spaces.h"
+ #include "hw/virtio/virtio.h"
+ #include "hw/virtio/virtio-media.h"
++#include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-media-virgl.h"
+ #include "standard-headers/linux/virtio_ids.h"
+ #include "system/dma.h"
+@@ -512,7 +513,20 @@ static void virtio_media_drain_events(VirtIOMediaSession *s)
+     }
+ }
+ 
++static void virtio_media_host_readable_body(void *opaque);
++
++/* QEMU_LAT_DIAG: how long one drain holds the main loop (DQBUF, GL conversion, events) */
+ static void virtio_media_host_readable(void *opaque)
++{
++    int64_t t0 = qemu_lat_diag() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
++
++    virtio_media_host_readable_body(opaque);
++    if (t0) {
++        qemu_lat_diag_add(LAT_MEDIA_DRAIN, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0);
++    }
++}
++
++static void virtio_media_host_readable_body(void *opaque)
+ {
+     VirtIOMediaSession *s = opaque;
+     VirtIOMedia *vm = s->vm;
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index d146aa7..7b66e91 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -146,9 +146,19 @@ struct virtio_gpu_ctrl_command {
+     struct virtio_gpu_ctrl_hdr cmd_hdr;
+     uint32_t error;
+     bool finished;
++    int64_t t_pop_ns;       /* QEMU_LAT_DIAG: when the device took it off the ring */
+     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
+ };
+ 
++/*
++ * QEMU_LAT_DIAG=1: log, every 30 s, how long display commands wait between leaving
++ * the ring and being answered (fenced ones are answered when the fence retires), and
++ * how long one virtio-media drain of the host decoder holds the main loop.
++ */
++bool qemu_lat_diag(void);
++void qemu_lat_diag_add(int kind, int64_t ns);
++enum { LAT_GPU_FLUSH, LAT_GPU_SCANOUT, LAT_GPU_SUBMIT, LAT_MEDIA_DRAIN, LAT_N };
++
+ struct VirtIOGPUBase {
+     VirtIODevice parent_obj;
+ 

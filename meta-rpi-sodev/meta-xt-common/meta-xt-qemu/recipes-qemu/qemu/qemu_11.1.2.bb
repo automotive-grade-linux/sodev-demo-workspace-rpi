@@ -14,7 +14,11 @@
 # (qemu 11.1.2 already takes SDL's EGLDisplay), whose place would have been q11-016 --
 # the number is left free so references to the others stay valid -- and 0249 (qemu 11
 # has its own ring_idx context fences), which came after 0248 = q11-050 and so leaves
-# no gap.
+# no gap. q11-055 and q11-056 are unused in the same way.
+#
+# Comments in the q11 patches mark the code of one feature with a tag of the form
+# q11-<feature> (often the name of its switch), so that its parts can be found across
+# files.
 
 require recipes-devtools/qemu/qemu_10.2.0.bb
 
@@ -149,3 +153,16 @@ SRC_URI:append:class-target = " file://q11-047-hw-arm-pass-the-virtio-pci-INTX-l
 SRC_URI:append:class-target = " file://q11-048-hw-virtio-media-let-host-nv12-scale-the-frame-down-to-the-di.patch"
 SRC_URI:append:class-target = " file://q11-049-hw-virtio-media-invalidate-the-RGBA-target-before-the-NV12-d.patch"
 SRC_URI:append:class-target = " file://q11-050-virtio-gpu-raise-the-control-queue-interrupt-once-per-batch.patch"
+# q11-052..058: an ioreq thread and ISR reads on it (opt-in, QEMU_XEN_IOREQ_THREAD=1), a
+#   cap on the foreign mapcache (QEMU_XEN_MAPCACHE_MAX_MB) and QEMU_LAT_DIAG=1 latency
+#   counters (x2).
+SRC_URI:append:class-target = " file://q11-052-xen-acknowledge-virtio-pci-notify-writes-on-an-ioreq-thread.patch"
+SRC_URI:append:class-target = " file://q11-053-xen-mapcache-let-QEMU_XEN_MAPCACHE_MAX_MB-cap-the-foreign-ma.patch"
+SRC_URI:append:class-target = " file://q11-054-xen-complete-virtio-pci-ISR-reads-on-the-ioreq-thread-under.patch"
+SRC_URI:append:class-target = " file://q11-057-virtio-gpu-virtio-media-log-command-latency-when-QEMU_LAT_DI.patch"
+SRC_URI:append:class-target = " file://q11-058-virtio-gpu-split-QEMU_LAT_DIAG-display-latency-into-queue-an.patch"
+# q11-065: under Xen, map blobs through the subregion path, not map_fixed (built against
+#   virglrenderer >= 1.3.0, map_fixed skips the guest p2m and Venus fails).
+# q11-068: retire a destroyed context's ring fences (an upstream 11.1.2 leak).
+SRC_URI:append:class-target = " file://q11-065-virtio-gpu-virgl-under-Xen-map-blobs-via-subregion-not-map_f.patch"
+SRC_URI:append:class-target = " file://q11-068-virtio-gpu-virgl-retire-a-destroyed-context-s-ring-fences.patch"
