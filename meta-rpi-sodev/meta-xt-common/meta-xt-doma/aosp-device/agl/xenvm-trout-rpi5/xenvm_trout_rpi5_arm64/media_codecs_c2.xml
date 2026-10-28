@@ -42,18 +42,24 @@
      No .secure variant: it needs Widevine and a secure allocator, neither of
      which exists on this product.
 
-     max size 1920x1088, as in the RPi4 file, although BCM2712's HEVC block is
-     rated for 4K. This path is not: decoder mode hands the guest RGBA, and a
-     4K RGBA frame (33,177,600 bytes) needs more scatter-gather entries than the
-     guest driver's 64 KiB shadow buffer holds (virtio-media patch 0009). On the
-     board (2026-09-24) a 4K stream made the decoder ask for 25 such buffers,
-     VIDIOC_QBUF failed, DomD ran out of CMA and DomA stopped. Claiming 4K would
-     let the framework hand the decoder a stream that ends that way.
+     HEVC up to 3840x2176: a stream wider than the display reaches DomA at
+     the display's width, scaled down by DomD's GPU conversion
+     (host-max-width, RPI5_DOMA_HWDEC_MAX_W in meta-xt-rpi5), and 4K60 plays
+     at 56 to 61 fps (board, 2026-10-16). The frame's MediaFormat
+     width and height stay the stream's; the crop is the scaled size, which
+     a Surface shows full size. One 4K stream at a time: a second one ran
+     DomD's CMA out (384 MiB then) and failed in its client (board,
+     2026-10-16), although concurrent-instances is 8; the 640 MiB CMA keeps
+     a 4K stream's frames referenced for the display, and two were not
+     tried. H.264 stays at 1920x1088, as in the RPi4 file: H.264 above
+     1080p reaches DomA scaled, but the software decoder plays 2560x1440
+     60p at 39.6 fps (board, 2026-10-16).
 
      HOW THE NUMBERS BELOW WERE DERIVED.
 
-     blocks-per-second is the ARITHMETIC MAXIMUM, exactly as in the RPi4 file:
-     1920x1088 in 16x16 blocks is 120 x 68 = 8160, times 60 = 489600.
+     blocks-per-second is the ARITHMETIC MAXIMUM, as in the RPi4 file:
+     1920x1088 in 16x16 blocks is 120 x 68 = 8160, times 60 = 489600 (avc);
+     3840x2176 is 240 x 136 = 32640, times 60 = 1958400 (hevc).
 
      performance-point-1920x1080 is 30. Measured on the board (2026-09-24)
      with AOSP's codec tool on a 1080p stream, the decode alone ran at 57 fps
@@ -87,10 +93,10 @@
 <MediaCodecs>
    <Decoders>
        <MediaCodec name="c2.v4l2.hevc.decoder" type="video/hevc" >
-           <Limit name="size" min="64x64" max="1920x1088" />
+           <Limit name="size" min="64x64" max="3840x2176" />
            <Limit name="alignment" value="2x2" />
            <Limit name="block-size" value="16x16" />
-           <Limit name="blocks-per-second" min="1" max="489600" />
+           <Limit name="blocks-per-second" min="1" max="1958400" />
            <Limit name="bitrate" range="1-120000000" />
            <Limit name="concurrent-instances" max="8" />
            <Limit name="performance-point-1920x1080" range="30-30" />

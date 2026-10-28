@@ -761,9 +761,13 @@ if fatload mmc 0 0xc000000 Image ; then
     # the 896 MiB bank at 0x68000000, which both SKUs have (DomD is direct-mapped, so
     # this is the physical address). Not above 4 GiB: at 0x100000000 the HDMI audio
     # DMA stopped (the PCM's hw_ptr stayed at 0 and the HDMI audio crackled; measured
-    # 2026-10-15). 640 MiB: a stream's decoder pool (up to 32 buffers, about 12.4 MB
-    # each at 4K) is in this CMA, and with its frames on a plane (qemu q11-081) some
-    # of them stay referenced for the display. The HVS is behind
+    # 2026-10-15). 640 MiB: a 4K stream's decoder pool (up to 32 buffers of about 12.4
+    # MB) is in this CMA, and with its frames on a plane (qemu q11-081/082/083) up to
+    # 26 of them stay referenced for the display. A 384 MiB CMA ran CmaFree down to 0
+    # during 4K60 in a WebView with 21 kept (a test build's 256 MiB bound). With 640
+    # its lowest was 23-111 MB in fourteen runs of q11-081..083 at 51-58 frames shown
+    # a second, and 0 kB and 40 kB in two runs of an earlier build, with no
+    # allocation failure (measured 2026-10-19). The HVS is behind
     # an IOMMU and vc4 allocates nothing from the CMA: the app's layers weston gives
     # it are v3d's (system memory), and the SAND frames it scans out are the
     # decoder's.

@@ -51,7 +51,10 @@ do_install[vardeps] += "RPI5_DOMA_GPU_RES_FROM RPI5_DOMA_GPU_RES"
 # any other, so the gl lane (qemu 7.0.0, which also gets no overlays) keeps it at 0. On
 # this board on their own (2026-10-15, no linear scanout buffers) SurfaceFlinger still
 # composed one CLIENT layer and a SW-decoded H.264 1080p60 shown by the codec test did
-# not get faster (-R 42.1-42.6 -> 38.2, -T 37.3-37.7 -> 38.1 fps).
+# not get faster (-R 42.1-42.6 -> 38.2, -T 37.3-37.7 -> 38.1 fps); with the display
+# switches and linear scanout buffers as well, every layer of a WebView's HEVC 1080p60
+# among the HMI went on a plane, five of them (2026-10-19, the product makefile's note
+# on vendor.minigbm.scanout_linear).
 # Defaults (?=), so a local.conf can override them. For an A/B without the overlays,
 # set both to 0: plane scaling 1 with no overlay planes stops the build.
 XT_DOMA_OVERLAY_PLANES ?= "3"

@@ -246,6 +246,6 @@ IMAGE_INSTALL:append = " ${DOMD_HEVC_PACKAGES}"
 
 # The DomA device model's display-path switches (/run/qemu-*), created at boot by tmpfiles.d:
 # the plane handoff (q11-066), media-sg-rw and fb-invalidate (q11-063) and the
-# direct-scanout switches (q11-063, q11-071), plane-sand (q11-081); only qemu 11 reads
-# them.
+# direct-scanout switches (q11-063, q11-071), plane-sand and sand-scaled (q11-081,
+# q11-082); only qemu 11 reads them.
 IMAGE_INSTALL:append:raspberrypi5 = " xt-qemu-display-toggles"

@@ -46,6 +46,8 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI:append:raspberrypi5 = " file://0001-v4l2request-hevc-take-the-one-buffer-SAND-for-8-bit-output.patch"
 
 # A bounded wait for a free destination buffer: qemu's decoder mode decodes on its
-# main loop and keeps frames for its display, and a frame the display holds is let go
-# only on that loop, so an unbounded wait there could not end. See the patch.
+# decode thread (q11-083), and a frame the display holds is let go only on qemu's
+# main loop, which may itself be waiting for that thread (a stop, a codec switch), so
+# an unbounded wait there could not end. See the patch, whose description is of the
+# decode on the main loop it was written for.
 SRC_URI:append:raspberrypi5 = " file://0002-v4l2request-bound-the-wait-for-a-free-destination-buffer.patch"

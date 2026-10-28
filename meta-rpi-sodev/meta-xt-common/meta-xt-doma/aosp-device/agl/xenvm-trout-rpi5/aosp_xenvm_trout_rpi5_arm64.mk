@@ -404,7 +404,8 @@ PRODUCT_PACKAGES += \
 # extended policy is never read and the V4L2 ioctls are killed by seccomp. No
 # SELinux denial is emitted, so the cause is invisible.
 # Codec2InfoBuilder reads media_codecs_c2.xml to describe vendor C2 components.
-# Decoders only, HEVC and H.264, up to 1920x1088: the file itself says why.
+# Decoders only, HEVC up to 3840x2176 and H.264 up to 1920x1088: the file itself
+# says why.
 PRODUCT_COPY_FILES += \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/codec2.vendor.ext.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/android.hardware.media.c2-extended-seccomp_policy
@@ -528,14 +529,18 @@ PRODUCT_VENDOR_PROPERTIES += \
 # Linear scanout buffers (aosp-patches/external/minigbm 0003, virglrenderer 0024 in
 # DomD): the client target and the app layers the composer is handed become linear GBM
 # bos on the host, which vc4's RGB planes take (LINEAR or T_TILED only, not UIF), so
-# weston puts DomA's layers on planes instead of composing them with the GPU. The
-# costs: HEVC -S fell about 5% (2026-10-15), and a layer that weston or SurfaceFlinger
-# does compose with the GPU after all is sampled through a tiled shadow copy on every
-# draw (V3D cannot sample linear). The bos are v3d's, in system memory mapped through
-# the HVS's IOMMU; they take no CMA. Decoder output is not made linear. gralloc reads
-# it once, when it initialises. The Raspberry Pi 4 product leaves it off: its HVS has
-# no IOMMU, so these bos are not expected to go on a plane there and only the shadow
-# copies would remain (not measured).
+# weston puts DomA's layers on planes instead of composing them with the GPU. Measured
+# on this board (2026-10-19, qemu's plane-sand and sand-scaled on, DomD's CMA 384 MiB
+# then): HEVC 1080p60 in a WebView among the HMI, V3D render 58.5% -> 18.6% at 57-58
+# frames shown a second, weston's GPU time 86% -> 0, five planes; a 4K60 stream full
+# screen goes on two (the decoder's SAND frame and the app's window). The costs: HEVC -S
+# fell about 5% (2026-10-15), and a layer that weston or SurfaceFlinger does compose
+# with the GPU after all is sampled through a tiled shadow copy on every draw (V3D
+# cannot sample linear). The bos are v3d's, in system memory mapped through the HVS's
+# IOMMU; they take no CMA. Decoder output is not made linear. gralloc reads it once,
+# when it initialises. The Raspberry Pi 4 product leaves it off: its HVS has no IOMMU,
+# so these bos are not expected to go on a plane there and only the shadow copies would
+# remain (not measured).
 PRODUCT_VENDOR_PROPERTIES += \
     vendor.minigbm.scanout_linear=true
 
