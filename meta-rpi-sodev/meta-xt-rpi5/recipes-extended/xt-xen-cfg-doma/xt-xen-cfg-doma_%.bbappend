@@ -38,3 +38,14 @@ rpi5_doma_gpu_fhd() {
 }
 
 do_install[vardeps] += "RPI5_DOMA_GPU_RES_FROM RPI5_DOMA_GPU_RES"
+
+# DomA's overlay planes, as on the Raspberry Pi 4 board the display path was measured
+# on (2026-10-02 .. 10-13): three overlay planes let drm_hwcomposer scan the app and the
+# system bars out as DEVICE layers instead of SurfaceFlinger compositing them on the GPU
+# (with two planes on qemu 10.0.2, before the kernel refused a plane not shown whole, a
+# 640x360 video in a WebView dropped 25% of its frames instead of 35% there). Both halves
+# come from the common recipe; the gl lane (qemu 7.0.0) gets no overlays whatever this
+# says. On this board (2026-10-15, with plane scaling as well and no linear scanout
+# buffers) SurfaceFlinger still composed one CLIENT layer, so the planes went unused.
+# A default (?=), so a local.conf can override it; 0 turns both halves off.
+XT_DOMA_OVERLAY_PLANES ?= "3"
