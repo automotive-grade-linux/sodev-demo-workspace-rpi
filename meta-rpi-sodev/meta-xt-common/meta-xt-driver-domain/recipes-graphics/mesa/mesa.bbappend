@@ -54,7 +54,7 @@ PACKAGECONFIG:append = " glvnd"
 # testing two of them for no benefit. Consequence to state plainly: `--gpu=gl`
 # is the pre-Venus device model and the pre-Venus memory map, but NOT the
 # pre-Venus mesa. The gl lane was build-verified in this configuration.
-# 26.2.4 (was 26.2.2); this layer's 4 patches below apply to it with patch -F 0.
+# 26.2.4 (was 26.2.2); this layer's 5 patches below apply to it with patch -F 0.
 PV = "26.2.4"
 SRC_URI[sha256sum] = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9"
 
@@ -114,3 +114,11 @@ SRC_URI += "file://0003-v3dv-build-the-signal-fence-once-per-submit.patch"
 # before it, the subtraction wrapped and vkCreateImage failed -- DomA's SurfaceFlinger
 # aborted on every such frame under Vulkan compositing (RPi5, 2026-10-14). See the patch.
 SRC_URI += "file://0004-v3dv-size-explicitly-laid-out-planes-from-their-own-offset.patch"
+
+# vulkan: sleep between the polls of spin_wait_for_sync_file() after the first 8 yields.
+# The yield-only loop keeps its CPU while the signal it waits for is held up. A Venus ring
+# thread of the cluster's context kept DomD's CPU 1 busy yielding for 20 minutes while
+# weston, holding the V3D mutex on that CPU, got none, and DomA's device model waited on
+# the mutex (RPi5, 2026-10-24); its stack was not sampled, and this loop is the one the
+# patch takes it to be. See the patch.
+SRC_URI += "file://0005-vulkan-sleep-between-the-polls-of-spin_wait_for_sync_file.patch"

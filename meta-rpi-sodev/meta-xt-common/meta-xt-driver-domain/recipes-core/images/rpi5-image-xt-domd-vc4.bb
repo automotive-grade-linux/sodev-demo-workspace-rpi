@@ -387,6 +387,15 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 [ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
 [ -f /etc/qemu-gbm-layout ] && [ "$wmclass" = DomA ] && export VIRGL_GBM_LAYOUT_ENABLE=1
 [ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
+# A device model's stdout and stderr go through a pipe to a cat of their own,
+# which writes the log that libxl opened for them (/var/log/xen/qdisk-N.log, on
+# the SD card's ext4). The main loop reports statistics there every few seconds,
+# and a write to that file waits whenever jbd2 is committing the block that holds
+# its inode: measured on a Raspberry Pi 4, one such write held the BQL for 112 ms.
+# The pipe takes the write instead and only cat waits. qemu ignores SIGPIPE, so a
+# cat that has gone makes its writes fail rather than kill it. Done before the
+# nice value and the wrapper's other settings below, so that cat keeps none of them.
+[ -n "$has_device" ] && exec > >(LD_PRELOAD= exec cat) 2>&1
 # Every DomA wait on the device model lands on one of qemu's threads: the main
 # loop answers each ioreq (virtio-media QBUF, virtio-gpu commands, virtqueue kicks)
 # while the guest vCPU waits, and the virgl render server it forks answers the

@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 25 Oct 2026 00:30:46 +0900
+Subject: [PATCH] xen: register only the MMIO spans the ioreq server does not
+ have yet
+
+IOREQ MMIO ranges are never unregistered (q11-035), so every
+region_del/region_add pair re-adds a span that Xen already has, in
+whole or in part, and Xen rejects the whole span on any overlap
+(-EEXIST). xen_map_memory_section() then registered the span again
+page by page, one hypercall per page. A Venus blob map or unmap in
+DomA re-adds the spans of the 256 MiB hostmem BAR, and on a Raspberry
+Pi 5 (2026-10-24) that held the BQL with the main loop busy for 90 to
+98 ms, 51,000 to 65,000 ioctls in 100 ms against about 200 otherwise,
+long enough for DomA's sound card to run dry.
+
+Keep a sorted list of the spans this device model has registered and
+register only the parts of a section the list does not cover, one call
+each; a span that is all registered costs no hypercall. qemu is the
+only one registering ranges for its ioreq server, so the list is
+exact. If Xen still answers -EEXIST for a gap, the gap is registered
+page by page as before, with a warning. The never-unregister policy is
+unchanged.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's q11-035 never-unregister policy]
+---
+ hw/xen/xen-hvm-common.c     | 147 +++++++++++++++++++++++++++++++++++-
+ include/hw/xen/xen_native.h |  68 ++---------------
+ 2 files changed, 151 insertions(+), 64 deletions(-)
+
+diff --git a/hw/xen/xen-hvm-common.c b/hw/xen/xen-hvm-common.c
+index 453754eab..872c1ce01 100644
+--- a/hw/xen/xen-hvm-common.c
++++ b/hw/xen/xen-hvm-common.c
+@@ -75,6 +75,150 @@ void xen_ram_alloc(ram_addr_t ram_addr, ram_addr_t size,
+     g_free(pfn_list);
+ }
+ 
++/*
++ * What this device model has registered as MMIO with its ioreq server:
++ * sorted, disjoint and merged [start, end] spans. Ranges are never
++ * unregistered (see xen_unmap_memory_section()), so a region_del/region_add
++ * pair, which every memory-topology change makes, re-adds a span that is
++ * already registered in whole or in part. Xen rejects the whole span on any
++ * overlap (common/ioreq.c: rangeset_overlaps_range -> -EEXIST) and has no
++ * call that reports what is registered, so only the parts this list does not
++ * cover are registered, one call each. qemu is the only one registering
++ * ranges for its ioreq server, so the list is exact. Touched from the memory
++ * listener only, under the BQL.
++ *
++ * Retrying the rejected span page by page instead, as before, costs one
++ * hypercall per page: a Venus blob map or unmap in DomA re-adds the spans of
++ * its 256 MiB hostmem BAR, and measured on a Raspberry Pi 5 (2026-10-24)
++ * that held the BQL for 90-98 ms of CPU, long enough for DomA's sound card to
++ * run dry.
++ */
++typedef struct XenMmioSpan {
++    hwaddr start, end;
++} XenMmioSpan;
++
++static GArray *xen_mmio_spans;
++
++static void xen_mmio_spans_add(hwaddr start, hwaddr end)
++{
++    XenMmioSpan n = { start, end };
++    guint i = 0, j;
++
++    while (i < xen_mmio_spans->len &&
++           g_array_index(xen_mmio_spans, XenMmioSpan, i).end < start &&
++           g_array_index(xen_mmio_spans, XenMmioSpan, i).end + 1 != start) {
++        i++;
++    }
++    for (j = i; j < xen_mmio_spans->len; j++) {
++        XenMmioSpan *r = &g_array_index(xen_mmio_spans, XenMmioSpan, j);
++
++        if (r->start > end && r->start != end + 1) {
++            break;
++        }
++        n.start = MIN(n.start, r->start);
++        n.end = MAX(n.end, r->end);
++    }
++    g_array_remove_range(xen_mmio_spans, i, j - i);
++    g_array_insert_val(xen_mmio_spans, i, n);
++}
++
++static void xen_map_mmio_gap(XenIOState *state, hwaddr start, hwaddr end)
++{
++    hwaddr a;
++
++    if (!xendevicemodel_map_io_range_to_ioreq_server(xen_dmod, xen_domid,
++                                                     state->ioservid, 1,
++                                                     start, end)) {
++        xen_mmio_spans_add(start, end);
++        return;
++    }
++    if (errno != EEXIST) {
++        /*
++         * Surface IOREQ MMIO-range registration failures that stock qemu
++         * silently drops. A guest read of an unregistered page is answered
++         * by Xen with an injected data abort (ISS=0) => vp_interrupt panic
++         * in the guest.
++         */
++        error_report("xen: map_io_range_to_ioreq_server FAILED errno=%d"
++                     " ioservid=%u start=0x%" HWADDR_PRIx " end=0x%" HWADDR_PRIx,
++                     errno, state->ioservid, start, end);
++        return;
++    }
++    /*
++     * Xen has part of a span the list says is free, which it should not:
++     * register it page by page, so that the part Xen lacks is not left out.
++     */
++    warn_report("xen: MMIO span 0x%" HWADDR_PRIx "-0x%" HWADDR_PRIx
++                " overlaps a range this device model did not register",
++                start, end);
++    for (a = start & XC_PAGE_MASK; a <= end; a += XC_PAGE_SIZE) {
++        hwaddr s = MAX(a, start), e = MIN(a + XC_PAGE_SIZE - 1, end);
++
++        if (!xendevicemodel_map_io_range_to_ioreq_server(xen_dmod, xen_domid,
++                                                         state->ioservid, 1,
++                                                         s, e) ||
++            errno == EEXIST) {
++            xen_mmio_spans_add(s, e);
++        } else {
++            error_report("xen: map_io_range_to_ioreq_server FAILED errno=%d"
++                         " ioservid=%u page=0x%" HWADDR_PRIx,
++                         errno, state->ioservid, a);
++        }
++    }
++}
++
++static void xen_map_mmio_section(XenIOState *state,
++                                 MemoryRegionSection *section)
++{
++    hwaddr start = section->offset_within_address_space;
++    hwaddr end = start + int128_get64(section->size) - 1;
++    g_autoptr(GArray) gaps = g_array_new(FALSE, FALSE, sizeof(XenMmioSpan));
++    bool covered = false;
++    hwaddr a = start;
++    guint i;
++
++    if (use_default_ioreq_server) {
++        return;
++    }
++    if (!xen_mmio_spans) {
++        xen_mmio_spans = g_array_new(FALSE, FALSE, sizeof(XenMmioSpan));
++    }
++
++    trace_xen_map_mmio_range(state->ioservid, start, end);
++    /* The parts of [start, end] the list does not cover, collected first:
++     * registering them changes the list. */
++    for (i = 0; i < xen_mmio_spans->len; i++) {
++        XenMmioSpan *r = &g_array_index(xen_mmio_spans, XenMmioSpan, i);
++
++        if (r->end < a) {
++            continue;
++        }
++        if (r->start > end) {
++            break;
++        }
++        if (r->start > a) {
++            XenMmioSpan g = { a, r->start - 1 };
++
++            g_array_append_val(gaps, g);
++        }
++        if (r->end >= end) {
++            covered = true;
++            break;
++        }
++        a = r->end + 1;
++    }
++    if (!covered) {
++        XenMmioSpan g = { a, end };
++
++        g_array_append_val(gaps, g);
++    }
++    for (i = 0; i < gaps->len; i++) {
++        XenMmioSpan *g = &g_array_index(gaps, XenMmioSpan, i);
++
++        xen_map_mmio_gap(state, g->start, g->end);
++    }
++}
++
+ static void xen_set_memory(struct MemoryListener *listener,
+                            MemoryRegionSection *section,
+                            bool add)
+@@ -85,8 +229,7 @@ static void xen_set_memory(struct MemoryListener *listener,
+         return;
+     } else {
+         if (add) {
+-            xen_map_memory_section(xen_domid, state->ioservid,
+-                                   section);
++            xen_map_mmio_section(state, section);
+         } else {
+             xen_unmap_memory_section(xen_domid, state->ioservid,
+                                      section);
+diff --git a/include/hw/xen/xen_native.h b/include/hw/xen/xen_native.h
+index 92f9240e4..dd3f0f915 100644
+--- a/include/hw/xen/xen_native.h
++++ b/include/hw/xen/xen_native.h
+@@ -366,66 +366,6 @@ static inline int xen_get_default_ioreq_server_info(domid_t dom,
+ 
+ static bool use_default_ioreq_server;
+ 
+-static inline void xen_map_memory_section(domid_t dom,
+-                                          ioservid_t ioservid,
+-                                          MemoryRegionSection *section)
+-{
+-    hwaddr start_addr = section->offset_within_address_space;
+-    ram_addr_t size = int128_get64(section->size);
+-    hwaddr end_addr = start_addr + size - 1;
+-    int rc;
+-
+-    if (use_default_ioreq_server) {
+-        return;
+-    }
+-
+-    trace_xen_map_mmio_range(ioservid, start_addr, end_addr);
+-    rc = xendevicemodel_map_io_range_to_ioreq_server(xen_dmod, dom, ioservid,
+-                                                     1, start_addr, end_addr);
+-    if (rc && errno == EEXIST) {
+-        /*
+-         * Ranges are never unregistered (see xen_unmap_memory_section
+-         * below), so a re-add of a span that overlaps what is already
+-         * registered is the normal outcome of region_del/region_add churn.
+-         * It must not be repaired by unmapping the span and adding it back
+-         * whole: that would open exactly the window the no-unmap policy
+-         * exists to close.
+-         *
+-         * But Xen rejects the WHOLE span on any overlap
+-         * (common/ioreq.c: rangeset_overlaps_range -> -EEXIST), so a span
+-         * that only partially overlaps would leave its new part
+-         * unregistered for good. Add it back page by page instead: each
+-         * page either succeeds or is a harmless EEXIST, and Xen merges
+-         * neighbours so the number of ranges does not grow.
+-         */
+-        hwaddr a;
+-
+-        for (a = start_addr & XC_PAGE_MASK; a <= end_addr;
+-             a += XC_PAGE_SIZE) {
+-            if (xendevicemodel_map_io_range_to_ioreq_server(
+-                    xen_dmod, dom, ioservid, 1, a, a + XC_PAGE_SIZE - 1) &&
+-                errno != EEXIST) {
+-                error_report("xen: map_io_range_to_ioreq_server FAILED"
+-                             " errno=%d ioservid=%u page=0x%" HWADDR_PRIx,
+-                             errno, ioservid, a);
+-            }
+-        }
+-        return;
+-    }
+-    if (rc) {
+-        /*
+-         * Surface IOREQ MMIO-range registration failures that stock qemu
+-         * silently drops.  A guest read of an unregistered page is
+-         * answered by Xen with an injected data abort (ISS=0) =>
+-         * vp_interrupt panic in the guest.  -EEXIST is handled above.
+-         */
+-        error_report("xen: map_io_range_to_ioreq_server FAILED rc=%d errno=%d"
+-                     " ioservid=%u start=0x%" HWADDR_PRIx
+-                     " end=0x%" HWADDR_PRIx,
+-                     rc, errno, ioservid, start_addr, end_addr);
+-    }
+-}
+-
+ static inline void xen_unmap_memory_section(domid_t dom,
+                                             ioservid_t ioservid,
+                                             MemoryRegionSection *section)
+@@ -451,7 +391,8 @@ static inline void xen_unmap_memory_section(domid_t dom,
+      * that hits no ioreq-server range is answered with an injected data
+      * abort (trap_unmapped_accesses, the libxl default) -- the guest sees a
+      * "ttbr address size fault" in vp_interrupt reading the virtio-pci ISR
+-     * page and panics. The -EEXIST handling above only repairs the
++     * page and panics. Registering the span again on region_add
++     * (xen_map_mmio_section() in xen-hvm-common.c) only repairs the
+      * aftermath of such a pair; it cannot close the window itself. Measured
+      * on RPi4 DomA 2026-09-05: two independent guest drivers that issue MMIO
+      * without waiting for the interrupt (async QBUF, polled completion) hit
+@@ -465,7 +406,10 @@ static inline void xen_unmap_memory_section(domid_t dom,
+      * and unmaps host-visible blobs inside the hostmem BAR while the guest
+      * runs, and every map is a region_add whose span stays registered too.
+      * How many disjoint ranges that leaves depends on where the guest puts
+-     * its blobs; it has not been measured against MAX_NR_IO_RANGES (256).
++     * its blobs. Counted by xen-hvm-common.c's list of the spans registered
++     * (merged as Xen merges them) on a Raspberry Pi 5 DomA (2026-10-25,
++     * about an hour from boot with two video playbacks in a WebView): 3, of
++     * MAX_NR_IO_RANGES (256).
+      */
+     (void)rc;
+ }
+-- 
+2.43.0
+

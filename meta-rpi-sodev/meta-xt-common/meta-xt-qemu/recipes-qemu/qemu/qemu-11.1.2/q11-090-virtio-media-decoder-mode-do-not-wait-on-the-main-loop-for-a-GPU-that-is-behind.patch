@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 27 Oct 2026 00:01:04 +0900
+Subject: [PATCH] virtio-media: decoder mode: do not wait on the main loop for
+ a GPU that is behind
+
+With a fence fd, a software codec's zero-copy path keeps up to
+DEC_GPU_HOLD_MAX frames whose GPU copies are not done
+(q11-dec-gpu-poll). One more makes dec_gpu_hold() wait for the oldest
+copy, with the BQL let go since q11-dec-gpu-unlocked, but on the main
+loop. On a Raspberry Pi 5 (2026-10-26, H.264 1080p60 in a WebView, 560 s
+runs with and without the HMI) that wait took up to 83-118 ms, 2 to 11
+times a run. Nothing else the main loop serves runs meanwhile, DomA's
+ioreqs included, and once DomD's ALSA under-ran right after a 118 ms
+one.
+
+The frame now waits where it is, as for a buffer weston holds
+(q11-dec-plane-held): dec_cap_for_frame() answers no buffer while the
+GPU is DEC_GPU_HOLD_MAX copies behind, and the same 2 ms timer looks
+again. After DEC_GPU_BEHIND_MAX_MS (200 ms) the frame goes on and
+dec_gpu_hold() waits as before; frames then do not wait again until the
+GPU is below DEC_GPU_HOLD_MAX, so a GPU that does not finish costs what
+it did before. The wait ends when a buffer is handed out, also when a
+frame waited for weston too. The zero-copy report counts the waits and
+the frames that went on after the limit.
+
+Hardware codecs and copies without a fence fd (GLsync) still wait at
+DEC_GPU_HOLD as before.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's q11 decoder mode]
+---
+ hw/virtio/virtio-media-decoder.c | 116 ++++++++++++++++++++++++++++---
+ 1 file changed, 107 insertions(+), 9 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 4dfb4054d..8204d1d3e 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -181,6 +181,13 @@ static const DecCodec dec_codecs[] = {
+  */
+ #define DEC_PLANE_HELD_MAX_MS 50
+ #define DEC_PLANE_HELD_POLL_MS 2
++/*
++ * q11-dec-gpu-behind: how long a frame waits, the main loop free, for the GPU
++ * to finish the oldest of DEC_GPU_HOLD_MAX copies before it goes on anyway
++ * (dec_gpu_hold then waits for that copy, with the BQL let go). It looks again
++ * every DEC_PLANE_HELD_POLL_MS.
++ */
++#define DEC_GPU_BEHIND_MAX_MS 200
+ /* -EAGAIN (no GL context) this many frames in a row is reported once. */
+ #define DEC_GPU_AGAIN_WARN 120
+ 
+@@ -558,6 +565,14 @@ struct VirtIOMediaDec {
+     bool plane_wait_counted;
+     QEMUTimer *plane_timer;
+     uint64_t plane_waits, plane_late;
++    /*
++     * q11-dec-gpu-behind (dec_gpu_behind): the same for a GPU DEC_GPU_HOLD_MAX
++     * copies behind; gpu_stuck: one went on late, and frames do not wait again
++     * until the GPU has caught up below DEC_GPU_HOLD_MAX
++     */
++    int64_t gpu_wait_ns;
++    bool gpu_wait_counted, gpu_late_counted, gpu_stuck;
++    uint64_t gpu_waits, gpu_late;
+     int thr_reorder;        /* avctx->has_b_frames after the last frame (thr_lock) */
+     unsigned thr_out_max;   /* decoded ahead at most (2 with the hwaccel's device) */
+ };
+@@ -794,6 +809,84 @@ static void dec_plane_wait_stop(VirtIOMediaDec *d)
+     }
+     d->plane_wait_ns = 0;
+     d->plane_wait_counted = false;
++    d->gpu_wait_ns = 0;
++    d->gpu_wait_counted = false;
++    d->gpu_late_counted = false;
++    d->gpu_stuck = false;
++}
++
++/* q11-dec-gpu-behind: the frame waiting for the GPU is written, or none waits any more */
++static void dec_gpu_wait_end(VirtIOMediaDec *d)
++{
++    if (d->gpu_late_counted) {
++        d->gpu_stuck = true;
++    }
++    d->gpu_wait_ns = 0;
++    d->gpu_wait_counted = false;
++    d->gpu_late_counted = false;
++}
++
++static void dec_plane_timer_arm(VirtIOMediaSession *s)
++{
++    VirtIOMediaDec *d = s->dec;
++
++    if (!d->plane_timer) {
++        d->plane_timer = timer_new_ms(QEMU_CLOCK_REALTIME, dec_plane_timer_cb, s);
++    }
++    timer_mod(d->plane_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + DEC_PLANE_HELD_POLL_MS);
++}
++
++static bool dec_gpu_reap(VirtIOMediaDec *d);
++
++/*
++ * q11-dec-gpu-behind: whether the next frame waits for the GPU. With a fence fd,
++ * a software codec's zero-copy write that would hold more than DEC_GPU_HOLD_MAX
++ * frames makes dec_gpu_hold() wait for the oldest copy, and that wait, even with
++ * the BQL let go, stops the main loop: on a Raspberry Pi 5 (2026-10-26, H.264
++ * 1080p60 in a WebView, 560 s runs) up to 118 ms, 2 to 11 times a run, and once
++ * DomD's ALSA under-ran after one (DomA's sound buffers were not served
++ * meanwhile). The frame stays where it is (in the decode thread's output, or
++ * d->held) and the timer looks again. After DEC_GPU_BEHIND_MAX_MS it goes on,
++ * dec_gpu_hold() waits as before, and frames do not wait again until the GPU is
++ * below DEC_GPU_HOLD_MAX (gpu_stuck), so a GPU that does not finish costs what
++ * it did before. take: as for dec_cap_for_frame; the wait ends when
++ * dec_cap_for_frame hands out a buffer (dec_gpu_wait_end).
++ */
++static bool dec_gpu_behind(VirtIOMediaSession *s, bool take)
++{
++    VirtIOMediaDec *d = s->dec;
++    int64_t now;
++
++    if (!d->codec || d->codec->hwaccel || d->gpu_held_n < DEC_GPU_HOLD_MAX ||
++        !dec_gpu_reap(d) || d->gpu_held_n < DEC_GPU_HOLD_MAX) {
++        d->gpu_stuck = false;
++        if (!d->gpu_late_counted) {
++            d->gpu_wait_ns = 0;
++            d->gpu_wait_counted = false;
++        }
++        return false;
++    }
++    if (d->gpu_stuck || d->gpu_late_counted) {
++        return false;
++    }
++    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    if (!d->gpu_wait_ns) {
++        d->gpu_wait_ns = now;
++    }
++    if (take && !d->gpu_wait_counted) {
++        d->gpu_wait_counted = true;
++        d->gpu_waits++;
++    }
++    if (now - d->gpu_wait_ns >= DEC_GPU_BEHIND_MAX_MS * SCALE_MS) {
++        if (take) {
++            d->gpu_late_counted = true;
++            d->gpu_late++;
++        }
++        return false;
++    }
++    dec_plane_timer_arm(s);
++    return true;
+ }
+ 
+ /*
+@@ -813,6 +906,9 @@ static int dec_cap_for_frame(VirtIOMediaSession *s, bool take)
+     int held = -1;
+     uint32_t i;
+ 
++    if (dec_next_cap_buffer(s) >= 0 && dec_gpu_behind(s, take)) {
++        return -1;
++    }
+     for (i = 0; i < q->num_bufs; i++) {
+         VirtIOMediaBuffer *gb = &q->guest[i];
+ 
+@@ -824,6 +920,7 @@ static int dec_cap_for_frame(VirtIOMediaSession *s, bool take)
+             if (take) {
+                 d->plane_wait_ns = 0;
+                 d->plane_wait_counted = false;
++                dec_gpu_wait_end(d);
+             }
+             return (int)i;
+         }
+@@ -834,6 +931,7 @@ static int dec_cap_for_frame(VirtIOMediaSession *s, bool take)
+     if (held < 0) {
+         d->plane_wait_ns = 0;   /* nothing queued (STREAMOFF, a drain): no wait stands */
+         d->plane_wait_counted = false;
++        dec_gpu_wait_end(d);
+         return -1;
+     }
+     now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+@@ -849,14 +947,11 @@ static int dec_cap_for_frame(VirtIOMediaSession *s, bool take)
+             d->plane_wait_ns = 0;
+             d->plane_wait_counted = false;
+             d->plane_late++;
++            dec_gpu_wait_end(d);
+         }
+         return held;
+     }
+-    if (!d->plane_timer) {
+-        d->plane_timer = timer_new_ms(QEMU_CLOCK_REALTIME, dec_plane_timer_cb, s);
+-    }
+-    timer_mod(d->plane_timer,
+-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + DEC_PLANE_HELD_POLL_MS);
++    dec_plane_timer_arm(s);
+     return -1;
+ }
+ 
+@@ -2292,9 +2387,11 @@ static void dec_zc_report(VirtIOMediaDec *d)
+                 "the pool, %" PRIu64 " layout or guest buffer, %" PRIu64
+                 " no GL, %" PRIu64 " off); pool %u buffers, %" PRIu64
+                 " decodes found none free; %" PRIu64 " waits for weston to release a "
+-                "buffer, %" PRIu64 " written still held", d->codec->desc, d->zc_n,
++                "buffer, %" PRIu64 " written still held; %" PRIu64 " waits for the "
++                "GPU, %" PRIu64 " written after %d ms", d->codec->desc, d->zc_n,
+                 d->zc_st_n, d->zc_st[0], d->zc_st[1], d->zc_st[2], d->zc_st[3],
+-                n, fb, d->plane_waits, d->plane_late);
++                n, fb, d->plane_waits, d->plane_late, d->gpu_waits, d->gpu_late,
++                DEC_GPU_BEHIND_MAX_MS);
+ }
+ 
+ /*
+@@ -3247,8 +3344,9 @@ static void dec_pump(VirtIOMediaSession *s)
+         if (!dec_deliver(s, d->frame)) {
+             /*
+              * No buffer after all: every queued one is still held by weston
+-             * (q11-dec-plane-held; the timer pumps again), or a race with
+-             * STREAMOFF. Keep the frame.
++             * (q11-dec-plane-held), the GPU is DEC_GPU_HOLD_MAX copies behind
++             * (q11-dec-gpu-behind; the timer pumps again for both), or a race
++             * with STREAMOFF. Keep the frame.
+              * av_frame_free first: d->held should be NULL by the reasoning at
+              * the top of this function, but an assignment over a non-NULL held
+              * frame is a silent leak and the guard costs nothing.
+-- 
+2.43.0
+

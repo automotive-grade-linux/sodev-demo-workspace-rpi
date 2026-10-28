@@ -255,3 +255,20 @@ SRC_URI:append:class-target = " file://q11-084-virtio-media-decoder-mode-retry-a
 #   later (with the next event or command, or from a timer) instead of dropping it; a
 #   dropped OUTPUT-done stopped playback in a test.
 SRC_URI:append:class-target = " file://q11-085-virtio-media-hold-an-event-when-the-guest-has-no-buffer-posted.patch"
+#
+# Shorter BQL holds in the main loop.
+# q11-086: decoder mode lets go of the frames whose GPU copies are done without waiting, and
+#   a software codec holds up to 8 frames instead of waiting for a fence with the BQL held.
+SRC_URI:append:class-target = " file://q11-086-virtio-media-decoder-mode-do-not-wait-for-the-GPU-with-the-BQL-held.patch"
+# q11-087: decoder mode waits for a software codec's GPU copies with the BQL let go when more
+#   than 8 are not done (the Xen ioreq thread then leaves ISR reads to the main loop).
+SRC_URI:append:class-target = " file://q11-087-virtio-media-decoder-mode-wait-for-the-GPU-with-the-BQL-let-go.patch"
+# q11-088: the Xen memory listener registers only the MMIO spans its ioreq server does not
+#   have yet, instead of the whole span again page by page.
+SRC_URI:append:class-target = " file://q11-088-xen-register-only-the-MMIO-spans-the-ioreq-server-does-not-have-yet.patch"
+# q11-089: decoder mode writes a frame into a CAPTURE buffer weston does not hold on a plane
+#   (an HVS direct scanout is not ordered with the write), waiting up to 50 ms.
+SRC_URI:append:class-target = " file://q11-089-virtio-media-decoder-mode-do-not-write-a-frame-into-a-buffer-weston-holds.patch"
+# q11-090: decoder mode does not wait on the main loop for a GPU DEC_GPU_HOLD_MAX copies
+#   behind; the frame waits on the q11-089 timer, up to 200 ms.
+SRC_URI:append:class-target = " file://q11-090-virtio-media-decoder-mode-do-not-wait-on-the-main-loop-for-a-GPU-that-is-behind.patch"
