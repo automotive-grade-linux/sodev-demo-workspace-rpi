@@ -10,5 +10,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/weston:"
 # appid_output_assigned stays true, and the next touch runs
 # kiosk_shell_surface_activate() -> kiosk_shell_output_raise_surface_subtree(NULL).
 # Three core dumps, the same backtrace each time; qemu then aborted and DomA's
-# panel stayed black. Upstream fixed exactly this after 15.0.0.
+# panel stayed black. Upstream fixed exactly this on main (daef679), which is in
+# neither 15.0.0 nor 16.0.0, so both versions carry it.
 SRC_URI += "file://0001-kiosk-shell-guard-against-NULL-output-during-hotplug.patch"
+
+# 16.0.0 only: a head whose EDID cannot be parsed (none read while HDMI hot-plug flaps)
+# supported no color format, and the next repaint aborted in kms-color.c on the
+# output's default AUTO color format (seen on the Raspberry Pi 4 board). 15.0.0 has no
+# color-format handling.
+SRC_URI += "${@'' if d.getVar('PV').startswith('15.') else 'file://0004-backend-drm-allow-the-AUTO-color-format-without-an-EDID-w16.patch'}"

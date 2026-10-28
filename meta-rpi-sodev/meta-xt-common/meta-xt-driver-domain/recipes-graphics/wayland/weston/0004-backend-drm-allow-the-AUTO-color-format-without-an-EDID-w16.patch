@@ -1,0 +1,42 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 18 Oct 2026 18:16:17 +0900
+Subject: [PATCH] backend-drm: allow the AUTO color format without an EDID
+
+A head starts with the AUTO color format (weston_head_init()). When a
+head that had an EDID loses it -- HDMI hot-plug flapping makes the
+kernel drop the EDID property -- drm_head_maybe_update_display_data()
+reports the change and drm_head_info_from_edid() is called with no
+data: it clears the display info and gives it the default EOTF and
+colorimetry masks, but leaves color_format_mask at 0. The head then
+supports no color format at all, while the output's color format stays
+WESTON_COLOR_FORMAT_AUTO, and the next repaint aborts in
+wdrm_color_format_from_output() (kms-color.c:205-206,
+weston_assert_true(supported & color_format)). A head that never had
+an EDID is not affected (nothing changes, and it keeps AUTO), and with
+an EDID get_color_format_mask() starts from AUTO.
+
+Give the no-EDID case the AUTO color format, as the EDID case and a
+new head have. weston 15.0.0 has no color-format handling and does not
+abort.
+
+Seen on the Raspberry Pi 4 board with weston 16.0.0 when HDMI hot-plug
+flapped. That board has run weston 16.0.0 with this change since
+2026-10-20 (a 2 h 45 min run that day kept the same weston process), but
+has not lost the EDID again with it; the Raspberry Pi 5 board's
+HDMI-A-1, which has never had an EDID, runs weston 16.0.0 without the
+abort, as the above predicts.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/libweston/backend-drm/modes.c
++++ b/libweston/backend-drm/modes.c
+@@ -371,6 +371,7 @@
+ 		memset(dhi, 0, sizeof(*dhi));
+ 		dhi->eotf_mask = WESTON_EOTF_MODE_SDR;
+ 		dhi->colorimetry_mask = WESTON_COLORIMETRY_MODE_DEFAULT;
++		dhi->color_format_mask = WESTON_COLOR_FORMAT_AUTO;
+ 		return NULL;
+ 	}
+ 

@@ -50,9 +50,9 @@ DOMU_GFX_PACKAGES = " \
 # (GPU=vulkan -> 'venus' in DISTRO_FEATURES). See docs/VULKAN-VENUS.md.
 # Measured against the `--gpu=gl` lane's built image first, which changed what this
 # list is for: two of the three packages are already in the shipping DomD rootfs
-# without any of this. weston 15 is built with -Drenderer-vulkan=true (its
-# PACKAGECONFIG filters 'vulkan' from DISTRO_FEATURES), so
-# /usr/lib/libweston-15/vulkan-renderer.so links libvulkan.so.1; weston therefore
+# without any of this. weston (16 on the vulkan lane, 15 on gl) is
+# built with -Drenderer-vulkan=true (its PACKAGECONFIG filters 'vulkan' from
+# DISTRO_FEATURES), so libweston-<N>/vulkan-renderer.so links libvulkan.so.1; weston therefore
 # RDEPENDS on vulkan-loader, whose RRECOMMENDS on virtual-vulkan-icd resolves to
 # mesa-vulkan-drivers. Confirmed in that lane's manifest: libvulkan1
 # 1.4.341.0 and mesa-vulkan-drivers are installed, and
