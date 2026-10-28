@@ -129,6 +129,13 @@ Before you build:
   alone peaks at 42.6 GiB, so this tree is built with **64 GiB** and `--memory=48g`;
   32 GiB is not enough for `-a` (it is killed during soong analysis).
 - Host is assumed Debian/Ubuntu (the Docker install links below are Ubuntu).
+- **Host architecture**: x86_64 or aarch64 (arm64), e.g. an arm64 server or an
+  Ubuntu VM on Apple Silicon. On aarch64, `build.sh` builds the builder image for
+  arm64. The default build and `-u` are tested there (`-z` is not yet), with two limits:
+  - `--aaos=source` (or `-a` resolving to it) is refused: AOSP builds only on x86_64.
+    `--aaos=prebuilt` needs no AOSP build, but is not yet tested on aarch64 hosts.
+  - `-u --gpu=gl` is refused: the arm64-host fixes for the AGL guest live in
+    `meta-agl-venus`, which the `gl` lane leaves out.
 
 ## Build configuration
 `build.sh` drives moulin + ninja inside Docker. It takes V4H `build.sh`-style
