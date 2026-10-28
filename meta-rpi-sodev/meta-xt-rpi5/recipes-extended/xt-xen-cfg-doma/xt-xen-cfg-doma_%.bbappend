@@ -160,6 +160,36 @@ rpi5_doma_snd_tx_no_bql() {
     :
 }
 
+# The H.264 software decoder's two frame threads (RPI5_DOMA_H264) run at the device
+# model's nice value, -19 (q11-094), by decision (2026-10-27): the threads DomA waits for
+# are kept ahead of them another way, the ioreq thread at SCHED_FIFO (XT_QEMU_IOREQ_FIFO),
+# and the nice value alone does not change how often the frame threads lose the CPU
+# (about 27-29 times a frame at -10, -15, -19 and -20; the others wake up far more often
+# than they run). With -19, weston at -19 on CPU 0 and the ioreq thread at FIFO 49,
+# a WebView's H.264 1080p60 beside the HMI played three runs with no ALSA XRUN and no PCM
+# restart in steady playback (DomA and DomD time-aligned, 2026-10-27). Empty leaves
+# them at the device model's nice value.
+RPI5_DOMA_H264_NICE ?= "${@'-19' if d.getVar('RPI5_DOMA_H264') == '1' else ''}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@',dec-sw-nice=' + d.getVar('RPI5_DOMA_H264_NICE') if d.getVar('RPI5_DOMA_H264_NICE') else ''}"
+
+# The same two frame threads run on both of DomD's CPUs (q11-095), out of the device
+# model's CPU 0 (the DomD qemu wrapper's taskset -c 0). Kept to CPU 1, they had CPU 1
+# to themselves only in name: DomU's device model, its ioreq thread and DomU's Venus
+# ring thread run there too, and Xen takes pcpu 1 to DomU's vcpu as well. On a
+# Raspberry Pi 5 (2026-10-27, H.264 1080p60 in a WebView with sound, 60 s a run) CPU 1
+# was idle 56 ms a second and stolen 88 ms, CPU 0 idle 710 ms, and each frame thread
+# waited 510 ms a second for CPU 1. The decoder then gave 51-52 frames a second
+# where the stream has 60, Chromium's video renderer ran out of frames
+# (DECODER_UNDERFLOW) and stopped the picture for 1-1.6 s, 15-16 times a minute.
+# With 0-1 it gave 54-59 frames a second and stopped 2-12 times. The reason they had
+# been kept off CPU 0 is gone: on 2026-10-24 0-1 made the main loop hold the BQL over
+# 50 ms 287 and 204 times in 10 minutes; with q11-088, q11-089, q11-090 and DomD
+# kernel 0017 it held it over 50 ms 0 times and over 20 ms 5 and 3 times (H.264
+# 1080p60 beside the HMI and full screen, 560 s each), with no ALSA under-run. Empty
+# leaves them at the device model's affinity.
+RPI5_DOMA_H264_CPUS ?= "${@'0-1' if d.getVar('RPI5_DOMA_H264') == '1' else ''}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@',dec-sw-cpus=' + d.getVar('RPI5_DOMA_H264_CPUS') if d.getVar('RPI5_DOMA_H264_CPUS') else ''}"
+
 do_install[prefuncs] += "rpi5_doma_hwdec_check"
 
 rpi5_doma_hwdec_check:raspberrypi5() {
@@ -192,6 +222,24 @@ rpi5_doma_hwdec_check:raspberrypi5() {
         11.*) ;;
         *) bbfatal "RPI5_DOMA_HWDEC_MAX_W=${RPI5_DOMA_HWDEC_MAX_W} needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
         esac
+        ;;
+    esac
+    case "${RPI5_DOMA_H264_NICE}" in
+    '') ;;
+    -[0-9]|-1[0-9]|-20|[0-9]|1[0-9])
+        [ "${RPI5_DOMA_H264}" = 1 ] || bbfatal "RPI5_DOMA_H264_NICE=${RPI5_DOMA_H264_NICE} needs RPI5_DOMA_H264=1 (it is '${RPI5_DOMA_H264}')"
+        ;;
+    *) bbfatal "RPI5_DOMA_H264_NICE must be empty or a nice value, -20 to 19 (got '${RPI5_DOMA_H264_NICE}')" ;;
+    esac
+    case "${RPI5_DOMA_H264_CPUS}" in
+    '') ;;
+    *[!0-9-]*|-*|*-|*-*-*) bbfatal "RPI5_DOMA_H264_CPUS must be empty, a CPU or a range of CPUs, N or N-M (got '${RPI5_DOMA_H264_CPUS}')" ;;
+    *)
+        [ "${RPI5_DOMA_H264}" = 1 ] || bbfatal "RPI5_DOMA_H264_CPUS=${RPI5_DOMA_H264_CPUS} needs RPI5_DOMA_H264=1 (it is '${RPI5_DOMA_H264}')"
+        # DomD has 2 vCPUs (its dom0less node's cpus): CPU 0 and CPU 1
+        c="${RPI5_DOMA_H264_CPUS}"
+        [ "${c%-*}" -le "${c#*-}" ] && [ "${c#*-}" -le 1 ] || \
+            bbfatal "RPI5_DOMA_H264_CPUS must be DomD's CPU 0 or 1, or the range 0-1 (got '${RPI5_DOMA_H264_CPUS}')"
         ;;
     esac
 }
