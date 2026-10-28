@@ -272,3 +272,14 @@ SRC_URI:append:class-target = " file://q11-089-virtio-media-decoder-mode-do-not-
 # q11-090: decoder mode does not wait on the main loop for a GPU DEC_GPU_HOLD_MAX copies
 #   behind; the frame waits on the q11-089 timer, up to 200 ms.
 SRC_URI:append:class-target = " file://q11-090-virtio-media-decoder-mode-do-not-wait-on-the-main-loop-for-a-GPU-that-is-behind.patch"
+#
+# DomA's sound.
+# q11-091: virtio-snd's reset drops the buffers of the rings it resets, and the TX thread
+#   (tx-poll-us) registers with RCU.
+SRC_URI:append:class-target = " file://q11-091-virtio-snd-drop-the-buffers-of-the-rings-a-reset-resets-register-the-TX-thread-with-RCU.patch"
+# q11-092: virtio-snd's tx-no-bql writes TX buffers out from the TX thread without the BQL
+#   (an ALSA audiodev with the mixing engine off); off by default.
+SRC_URI:append:class-target = " file://q11-092-virtio-snd-write-TX-buffers-out-without-the-BQL-tx-no-bql.patch"
+# q11-093: the ALSA audiodev's threshold counts from its own microseconds, not from the
+#   direction's buffer-length, and stays within the buffer the device granted.
+SRC_URI:append:class-target = " file://q11-093-audio-alsa-start-the-PCM-at-the-threshold-s-own-length-at-most-the-buffer.patch"
