@@ -526,23 +526,60 @@ PRODUCT_VENDOR_PROPERTIES += \
     debug.renderengine.backend=skiaglthreaded \
     debug.hwui.renderer=skiagl
 
+# No per-app frame rate overrides: SurfaceFlinger then keeps the display's 60 Hz for a
+# 30 fps video instead of dropping the app's render rate to 30 and back. Measured on the
+# Raspberry Pi 4 (xenvm-cf 0005): 1080p30 played at 27.1-28.8 frames a second where it
+# had swung between 14.7 and 28.4; on this board a runtime test (2026-09-24) took
+# 1080p30 in a VideoView from 15-16 to 19 frames a second.
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.surface_flinger.enable_frame_rate_override=false
+
+# SurfaceFlinger wakes 8 ms after the vsync instead of 1 ms (phase offsets, app 1 ms and
+# SF 1 ms by default; the early offsets follow the SF one when unset). A WebView hands
+# each video frame over in a transaction and, as its trace reads, sends the next one
+# once that is acknowledged; with SurfaceFlinger waking at the moment the WebView's
+# BeginFrame came, a frame a little late probably waited a whole vsync. Measured on this
+# board (2026-10-19, 4K60 HEVC in a WebView, two runs each, qemu q11-081..083, set by
+# hand): 55.2 and 51.4 -> 57.4 and 57.9 frames shown a second among the HMI; full screen
+# no change, 56.1 and 53.0 -> 56.6 and 52.7 (with q11-083 before its last changes,
+# 54.4-57.0 -> 57.1-58.3). SurfaceFlinger's composition took about 1 ms a frame there
+# (timestats' frameDuration), against 8.7 ms left before the vsync now. Not measured:
+# heavier GPU composition (screenshots, animations, a busy HMI), which past 8.7 ms would
+# now be a vsync late.
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.surface_flinger.vsync_sf_event_phase_offset_ns=8000000
+
 # Linear scanout buffers (aosp-patches/external/minigbm 0003, virglrenderer 0024 in
 # DomD): the client target and the app layers the composer is handed become linear GBM
 # bos on the host, which vc4's RGB planes take (LINEAR or T_TILED only, not UIF), so
-# weston puts DomA's layers on planes instead of composing them with the GPU. Measured
-# on this board (2026-10-19, qemu's plane-sand and sand-scaled on, DomD's CMA 384 MiB
-# then): HEVC 1080p60 in a WebView among the HMI, V3D render 58.5% -> 18.6% at 57-58
-# frames shown a second, weston's GPU time 86% -> 0, five planes; a 4K60 stream full
-# screen goes on two (the decoder's SAND frame and the app's window). The costs: HEVC -S
-# fell about 5% (2026-10-15), and a layer that weston or SurfaceFlinger does compose
-# with the GPU after all is sampled through a tiled shadow copy on every draw (V3D
-# cannot sample linear). The bos are v3d's, in system memory mapped through the HVS's
-# IOMMU; they take no CMA. Decoder output is not made linear. gralloc reads it once,
-# when it initialises. The Raspberry Pi 4 product leaves it off: its HVS has no IOMMU,
-# so these bos are not expected to go on a plane there and only the shadow copies would
-# remain (not measured).
+# weston puts DomA's layers on planes instead of composing them with the GPU. Measured on
+# this board (2026-10-19, qemu's plane-sand and sand-scaled on, DomD's CMA 384 MiB then):
+# HEVC 1080p60 in a WebView among the HMI, V3D render 58.5% -> 18.6% at 57-58 frames
+# shown a second, weston's GPU time 86% -> 0, five planes; a 4K60 stream full screen goes
+# on two (the decoder's SAND frame and the app's window). A decoder's output buffer the
+# composer is handed is linear too, so an H.264 frame decoded in qemu goes on the primary
+# plane itself (2026-10-23, 1080p60 in a WebView, ten minutes a run, against the
+# decoder's buffers left tiled): V3D render 80-84% -> about 50-57%, full screen 58.7-59.1
+# frames shown a second in three runs of four (51.2 in the fourth) against 40.2 and 55.9,
+# among the HMI 59.2 and 59.3 against 56.6; HEVC was shown at the same rates within 0.3
+# fps. The costs: decoding as fast as the GPU allows is slower (codec -S of HEVC 1080p
+# fell about 5% with the scanout buffers linear, 2026-10-15, and from 178-182 in four
+# runs to 105-157 in six with the decoder's too, 2026-10-23), and a layer that weston or
+# SurfaceFlinger does compose with the GPU after all is sampled through a tiled shadow
+# copy on every draw (V3D cannot sample linear). The bos are v3d's, in system memory
+# mapped through the HVS's IOMMU; they take no CMA. gralloc reads it once, when it
+# initialises. The Raspberry Pi 4 product leaves it off: its HVS has no IOMMU, so these
+# bos are not expected to go on a plane there and only the shadow copies would remain
+# (not measured).
 PRODUCT_VENDOR_PROPERTIES += \
     vendor.minigbm.scanout_linear=true
+
+# Full screen without CarSystemUI's per-display safe area, so a WebView's video can go on
+# its own plane (see DomaNoSafeAreaRRO/Android.bp), and the WebView switches that make
+# the video its own layer (init.xenvm-webview.rc).
+PRODUCT_PACKAGES += DomaNoSafeAreaRRO
+PRODUCT_COPY_FILES += \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/init.xenvm-webview.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-webview.rc
 
 # Install the ICD. BOARD_MESA3D_VULKAN_DRIVERS only DEFINES the module --
 # Mesa's android/Android.mk expands it to vulkan.virtio with an install path of

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Let the WebView hand decoded video to SurfaceFlinger as its own layer.
+#
+# With WebViewSurfaceControl the video of a <video> element becomes a child
+# SurfaceControl (webview_overlay_content) instead of being drawn into the app's
+# window every frame; drm_hwcomposer can then put the video and the app on
+# separate planes. Measured on the RPi4 (local 1080p30 H.264, full screen):
+# dropped frames 16% -> 1.7% over 5 minutes, app CPU 48 -> 38 (2026-10-03). On the
+# Raspberry Pi 5 both features were in use for every WebView video measurement
+# from 2026-10-16 on (set by hand on the board).
+#
+# WebView takes Chromium switches only from this file, and reads it only when
+# ro.debuggable=1 (userdebug, as this product is); it is read at app start, so a
+# WebView app started before the first boot completes runs without the switches (the
+# file then stays in /data). It applies to every WebView app.
+#
+# SELinux: works only while the product boots permissive. Creating a file in
+# /data/local/tmp (shell_data_file) is a neverallow for vendor_init and for init itself
+# (system/sepolicy/private/vendor_init.te:365, init.te:853), so no init script on any
+# partition can write it in enforcing; only adb's shell, adbd and dumpstate may. In
+# enforcing the write fails (init logs it) and WebView runs without the switches; put
+# the file there once with `adb shell` (it stays in /data). Not yet verified on the
+# board that init writes it (the board's file was put there by hand).
+on property:sys.boot_completed=1
+    write /data/local/tmp/webview-command-line "_ --enable-features=WebViewSurfaceControl,WebViewThreadSafeMedia"
+    chmod 0644 /data/local/tmp/webview-command-line

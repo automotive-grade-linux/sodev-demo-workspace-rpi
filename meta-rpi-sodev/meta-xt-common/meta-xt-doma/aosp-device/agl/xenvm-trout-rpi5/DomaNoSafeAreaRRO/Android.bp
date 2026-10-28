@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// DomaNoSafeAreaRRO -- no per-display safe area and toolbar in CarSystemUI.
+//
+// With config_enableSafeAreaAndToolbarPerDisplay=true (CarSystemUI's default,
+// packages/apps/Car/SystemUI/res/values/config.xml) a full-screen app is kept out
+// of a band by ShellLetterboxSurface, and SurfaceFlinger then composes every layer
+// on the GPU (CLIENT): a WebView's video can no longer go on its own plane.
+// Measured on the Raspberry Pi 5 (2026-10-16, an H.264 1080p60 video playing in a
+// WebView, with this value set by a runtime test overlay): all of SurfaceFlinger's
+// layers became DEVICE. weston on DomD composed plane-only in that test only together
+// with linear guest scanout buffers (vendor.minigbm.scanout_linear=true, minigbm 0003)
+// and decoder buffers linear too (then a test build, now 0003). The cost is visible: a
+// full-screen app covers the whole display, no band.
+//
+// A static product overlay, signed with the platform key like Car's own RROs. The
+// priority only orders it among static overlays of the same target in product. No
+// RRO this product installs sets this value (car_product's CarSystemUIDewdUIRRO does,
+// but it is installed only with HAS_SCALABLEUI=true, which this product does not set).
+runtime_resource_overlay {
+    name: "DomaNoSafeAreaRRO",
+    resource_dirs: ["res"],
+    certificate: "platform",
+    product_specific: true,
+}

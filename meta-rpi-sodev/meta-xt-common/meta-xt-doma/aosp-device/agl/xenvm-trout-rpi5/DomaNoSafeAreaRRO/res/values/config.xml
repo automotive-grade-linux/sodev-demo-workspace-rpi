@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <!-- See Android.bp: a full-screen app covers the display, so its video can be a plane. -->
+    <bool name="config_enableSafeAreaAndToolbarPerDisplay">false</bool>
+</resources>
