@@ -15,3 +15,9 @@ SRC_URI:append:raspberrypi4-64 = " file://00-genet-eth0.link"
 # 00-rp1-eth0.link in, and the naming rule is only wanted where the bridge is. Without
 # this the file would trip the installed-vs-shipped QA check.
 FILES:${PN}-flatbridge:append:raspberrypi4-64 = " ${sysconfdir}/systemd/network/00-genet-eth0.link"
+
+# -----------------------------------------------------------------------------
+# Keep DomA off QUIC (see the rule in domd-flatbridge-up). Measured on this board only:
+# with 2 vCPUs the WebView's QUIC fetches stall the video, over TCP they do not.
+# -----------------------------------------------------------------------------
+XT_DOMD_DROP_GUEST_QUIC:raspberrypi4-64 = "1"
