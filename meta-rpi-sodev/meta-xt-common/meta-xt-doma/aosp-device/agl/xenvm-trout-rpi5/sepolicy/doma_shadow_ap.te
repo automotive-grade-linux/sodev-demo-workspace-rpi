@@ -1,212 +1,84 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# /vendor/bin/doma-shadow-ap -- the shadow-AP bring-up script.
+# doma_shadow_ap: /vendor/bin/doma-shadow-ap (the shadow-AP bring-up oneshot) and
+# /vendor/bin/doma-wifi-relay (the long-lived relay), which share the domain (see
+# file_contexts). Both run from init.xenvm-hwsim.rc as uid wifi (the oneshot with
+# NET_ADMIN and NET_RAW, the relay with no capability), and use only /vendor's tools
+# (their PATH) and cuttlefish's Wi-Fi apex.
 #
-# WHY THIS EXISTS EVEN THOUGH THE BOARD IS PERMISSIVE.
-# This product boots permissive: device/epam/aosp-xenvm-trout/xenvm_trout_arm64/
-# BoardConfig.mk:31 adds androidboot.selinux=permissive and :56 sets
-# BOARD_KERNEL_CMDLINE = enforcing=0, and androidboot.selinux=permissive is present in
-# the built vendor-bootconfig.img (measured, so it is not clobbered by the := on :23).
-# The script therefore runs today without any policy. What it does NOT do today is
-# produce usable denials: with no exec type, /vendor/bin/doma-shadow-ap keeps the
-# generic vendor_file label and every avc line is attributed to init, which makes
-# audit2allow useless. Declaring the domain is what makes the remaining rules
-# measurable instead of guessed.
-#
-# Correspondingly, the rule set below is deliberately NOT complete. Every rule
-# here is justified by a specific step of doma-shadow-ap.sh; nothing is added
-# speculatively. Finish it from real denials:
+# The rules are the scripts' needs, each with the step that has it. Collect denials on
+# the board with
 #     adb shell dmesg | grep 'avc: .*doma_shadow_ap'
-#     ... | audit2allow
-# and add what comes out, with a comment saying which step provoked it.
+#     adb logcat -b events -d | grep 'avc: .*doma_shadow_ap'
+# (both, and early: the kernel rate-limits avc lines, and the logs then say audit_lost).
 
 type doma_shadow_ap, domain;
 type doma_shadow_ap_exec, exec_type, vendor_file_type, file_type;
 
 init_daemon_domain(doma_shadow_ap)
 
-# The script is #!/system/bin/sh (doma-shadow-ap.sh:1), so the domain runs the shell.
-allow doma_shadow_ap shell_exec:file rx_file_perms;
+# The scripts' interpreter (#!/vendor/bin/sh) and tools: toybox_vendor (ls, cp, mv,
+# chmod, grep, sed, cmp, date, brctl, ifconfig, log ...) and toolbox (getprop,
+# setprop), both vendor_toolbox_exec, and /vendor/bin's other programs, awk and iw
+# (iw_vendor), which take the vendor_file default label.
+allow doma_shadow_ap vendor_shell_exec:file rx_file_perms;
+allow doma_shadow_ap vendor_toolbox_exec:file rx_file_perms;
+allow doma_shadow_ap vendor_file:file rx_file_perms;
 
-# log, getprop and insmod (all called by doma-shadow-ap.sh) are toybox/toolbox
-# SYMLINKS, so the label that matters for execute is the target's: toolbox_exec.
-# MEASURED on the built image --
-#   /system/bin/getprop -> toolbox   (u:object_r:toolbox_exec:s0)
-#   /system/bin/insmod  -> toybox    (u:object_r:toolbox_exec:s0)
-#   /system/bin/log     -> toybox    (u:object_r:toolbox_exec:s0)
-# and toolbox_exec is one of the few types system/sepolicy/private/domain.te explicitly
-# excludes from the "vendor components must not execute files from system" neverallows
-# (:1246-1247 and :1334-1335, alongside shell_exec).
-allow doma_shadow_ap toolbox_exec:file rx_file_perms;
+# Step 2 of doma-shadow-ap.sh: mac80211_create_radios makes the hwsim radios over
+# generic netlink. It runs in this domain, as cuttlefish's init_wifi_sh runs it
+# (device/google/cuttlefish/shared/sepolicy/vendor/init_wifi_sh.te). The relay's iw
+# uses generic netlink (nl80211) too.
+allow doma_shadow_ap mac80211_create_radios_exec:file { getattr open read execute execute_no_trans map };
+allow doma_shadow_ap self:netlink_generic_socket create_socket_perms_no_ioctl;
 
-# NOT ALLOWED, AND CANNOT BE: /system/bin/ip (steps 1 and 4 of the script).
-# It is a REAL binary, not a toybox symlink (450512 bytes on the built image), and it has
-# no entry in plat_file_contexts, so it falls through to the default rule
-# `/system(/.*)?  u:object_r:system_file:s0` (plat_file_contexts:194) = system_file.
-#
-# `allow doma_shadow_ap system_file:file rx_file_perms;` BREAKS THE BUILD -- it
-# violates two neverallows in domain.te at once (:1228
-# entrypoint/execute/execute_no_trans, and :1302 which covers `:file *`), and a
-# neverallow violation is a hard secilc failure, not a warning:
-#
-#   neverallow check failed at ... from system/sepolicy/private/domain.te:1302
-#     allow at ... from device/agl/xenvm-trout-rpi5/sepolicy/doma_shadow_ap.te:33
-#     (allow doma_shadow_ap system_file_202704 (file (... execute ...)))
-#   Failed to build policydb
-#
-# The board is permissive, so the script's `ip` calls succeed today regardless. The
-# sanctioned Treble route when this board goes enforcing is
-# /system/bin/netutils-wrapper-1.0 (netutils_wrapper_exec, which IS excluded from both
-# neverallows and is present on the built image) -- i.e. change the SCRIPT to invoke
-# `netutils-wrapper-1.0 ip ...`, then add the allow for netutils_wrapper_exec here. That
-# allow is deliberately not added yet because nothing calls the wrapper.
+# Steps 1 and 4: renaming buried_eth1 back to eth1 is cuttlefish's rename_netiface,
+# in its own domain; the virt_wifi fallback execs cuttlefish's setup_wifi, in its own
+# domain.
+domain_auto_trans(doma_shadow_ap, rename_netiface_exec, rename_netiface)
+domain_auto_trans(doma_shadow_ap, setup_wifi_exec, setup_wifi)
 
-# CONF_DIR=/data/vendor/wifi/shadow: the mkdir -p, the chmods and the generated
-# hostapd.conf of step 3 of doma-shadow-ap.sh, and aps.conf, which
-# doma-wifi-relay writes.
+# Step 4: the uplink bridge. Socket ioctls: ifconfig's link flags and bionic's
+# if_nametoindex() on a UDP socket (toybox toys/net/ifconfig.c, bionic net_if.cpp),
+# brctl's addbr and addif on a TCP one (toybox toys/pending/brctl.c, xsocket(AF_INET,
+# SOCK_STREAM)). The radios, the bridge and the link state need NET_ADMIN (init grants
+# the capability, SELinux checks it as well).
+allow doma_shadow_ap self:capability { net_admin net_raw };
+allow doma_shadow_ap self:udp_socket { create ioctl };
+allowxperm doma_shadow_ap self:udp_socket ioctl { SIOCGIFFLAGS SIOCSIFFLAGS SIOCGIFINDEX };
+allow doma_shadow_ap self:tcp_socket { create ioctl };
+allowxperm doma_shadow_ap self:tcp_socket ioctl { SIOCBRADDBR SIOCBRADDIF };
+
+# The AP list, the generated hostapd.conf (hostapd's ctrl_interface directory is made
+# here; nothing here talks to its sockets) and the request drop-box:
+# /data/vendor/wifi/shadow (file_contexts).
 allow doma_shadow_ap hostapd_data_file:dir create_dir_perms;
 allow doma_shadow_ap hostapd_data_file:file create_file_perms;
+allow doma_shadow_ap doma_wifi_req_file:dir rw_dir_perms;
+allow doma_shadow_ap doma_wifi_req_file:file create_file_perms;
 
-# `ip link add name br-shadow type bridge`, `ip link set <p> master br-shadow`,
-# `ip link del wlan0` (steps 1 and 4 of doma-shadow-ap.sh).
-allow doma_shadow_ap self:capability { net_admin net_raw };
-allow doma_shadow_ap self:netlink_route_socket create_socket_perms_no_ioctl;
-
-# NOT WRITTEN HERE, ON PURPOSE: the transitions for the two apex binaries the script
-# execs, /apex/com.google.cf.wifi/bin/mac80211_create_radios
-# (mac80211_create_radios_exec, device/google/cuttlefish/shared/sepolicy/vendor/
-# mac80211_create_radios.te) and /apex/com.google.cf.wpa_supplicant/bin/hw/hostapd
-# (hal_wifi_hostapd_default_exec, system/sepolicy/vendor/hal_wifi_hostapd_default.te).
-# Both target domains exist in the built policy, so domain_auto_trans() into them is the
-# obvious rule -- but a transition from an arbitrary vendor domain into a hal_ domain is
-# exactly the shape system/sepolicy guards with neverallow rules, and a neverallow
-# violation is a hard build failure. It is not worth risking that without being able to
-# build. Permissive mode lets both execs succeed meanwhile; add the transitions once the
-# build loop is available and the denials confirm which form is needed.
-
-# The shipped AP-list seed, /vendor/etc/doma-shadow-aps.conf ($SEED in
-# doma-shadow-ap.sh, merged into $APS in step 3). PRODUCT_COPY_FILES puts it
-# under /vendor/etc with no file_contexts entry of its own, so it takes the
-# partition default
-# `/vendor/etc(/.*)?  u:object_r:vendor_configs_file:s0` (vendor_file_contexts). A vendor
-# domain reading a vendor config file is the sanctioned direction -- unlike the
-# system_file case above it trips no neverallow -- so this one is safe to write without a
-# build to check it against.
+# Step 3: the shipped AP-list seed, /vendor/etc/doma-shadow-aps.conf, takes the
+# partition default vendor_configs_file.
 allow doma_shadow_ap vendor_configs_file:file r_file_perms;
 
-# /sys/class/net/<if>/carrier, which stations_present() reads (THE PRIMARY way it
-# detects a station). The label comes from genfs:
-# system/sepolicy/private/genfs_contexts:138
-#   `genfscon sysfs /class/net   u:object_r:sysfs_net:s0`
-# A vendor domain reading sysfs_net is NOT COVERED BY ANY NEVERALLOW (the only
-# neverallows constraining sysfs_net are app_neverallows.te:118 /
-# gmscore_app.te:176 / priv_app_all.te:284 / netd.te:214, four rules, and each of
-# them targets an app or netd). Therefore, like vendor_configs_file above, this is
-# A DIRECTION THAT IS SAFE TO WRITE WITHOUT A BUILD TO CHECK IT.
-allow doma_shadow_ap sysfs_net:dir search;
+# The relay's stations_present() and both scripts' interface checks read
+# /sys/class/net/<if>/{carrier,flags,carrier_up_count,master} and list its entries
+# (genfs sysfs_net).
+allow doma_shadow_ap sysfs_net:dir r_dir_perms;
 allow doma_shadow_ap sysfs_net:file r_file_perms;
+allow doma_shadow_ap sysfs_net:lnk_file r_file_perms;
 
-# `setprop ctl.restart vendor.doma_shadow_hostapd` (the relay's only actuator) and
-# `setprop ctl.stop/start vendor.doma_shadow_hostapd` (this script).
-#
-# WRITE IT AGAINST ctl_default_prop. It must NOT be written against
-#   `ctl_restart_prop`: that allow is a hard secilc failure and breaks the build
-#   (the same shape as /system/bin/iw).
-#   THERE ARE TWO primary-source lines here, one prohibiting and one permitting;
-#   do not confuse them:
-#     private/property.te:190-193
-#       neverallow { domain -coredomain } { system_property_type
-#                                          -system_public_property_type }:property_service set;
-#       -> This is what blocks `set` (the property_service class).
-#         `ctl_default_prop` is a `system_public_prop()` at
-#         public/property.te:218, so IT IS SUBTRACTED OUT AND NEVER MATCHES,
-#         i.e. it is legal. `ctl_restart_prop` is a `system_internal_prop`, so it
-#         does match.
-#     public/te_macros:932-937 (the body of `system_internal_prop`)
-#       treble_sysprop_neverallow(`neverallow { domain -coredomain } $1:file no_rw_file_perms;')
-#       -> This one blocks READ (the file class). This is the line `get_prop`
-#         runs into.
-#   `ctl_restart_prop` IS DECLARED TWICE, at public/property.te:31 (internal) and
-#     :308 (public). The former sits inside the `compatible_property_only` at :15,
-#     the latter inside the `not_compatible_property` at :292, and
-#     `compatibleProperty()` in system/sepolicy/build/soong/policy.go:192-200 is
-#     HARDWIRED to "true" outside CTS and recovery, SO ONLY THE INTERNAL
-#     DECLARATION IS LIVE.
-#   The `dontaudit domain { ... ctl_default_prop ... }:property_service set;` at
-#     `private/property.te:253-262` IS NOT A PROHIBITION (it only silences auditing of
-#     the legacy `ctl.` property handling).
-#   Why ctl_default_prop is enough: when init receives `ctl.restart` it builds, at
-#   system/core/init/property_service.cpp:472-486, the legacy-check name
-#   `ctl.` + value = `ctl.vendor.doma_shadow_hostapd` and looks up permission on
-#   that. private/property_contexts has no individual line for
-#   `ctl.vendor.doma_shadow_hostapd`, so it falls to the `ctl.` prefix at :183 and
-#   becomes ctl_default_prop (a system_public_prop at public/property.te:218).
-#   Once that passes, property_service.cpp:484 returns true, so the newer
-#   `ctl.restart$...` check is never reached.
+# `setprop ctl.restart|stop|start vendor.doma_shadow_hostapd`: init checks the legacy
+# name ctl.vendor.doma_shadow_hostapd, which falls to the `ctl.` prefix,
+# ctl_default_prop, a system_public_prop a vendor domain may set
+# (system/core/init/property_service.cpp, private/property_contexts). Not
+# ctl_restart_prop, a system_internal_prop no vendor domain may be given.
 set_prop(doma_shadow_ap, ctl_default_prop)
 
-# The relay's entry point `exec 3<> /dev/hvc4` (the Wi-Fi channel).
-#
-# THE LABELS COME FROM cuttlefish, which assigns A DIFFERENT TYPE PER hvc NUMBER
-#   (device/google/cuttlefish/shared/sepolicy/vendor/file_contexts:21-24):
-#     /dev/hvc1 -> serial_device   /dev/hvc3 -> keymaster_device
-#     /dev/hvc4 -> gatekeeper_device   (OUR Wi-Fi channel)
-#   That directory is listed in BOARD_VENDOR_SEPOLICY_DIRS, so it is part of the
-#   policy. There is not a single neverallow on gatekeeper_device, SO THE ALLOW
-#   CAN BE WRITTEN (unlike iw_exec or init_service_status_private_prop, which
-#   cannot). The type name disagreeing with the use is just cuttlefish's
-#   assignment taken as is; overriding it from our own file_contexts risks a
-#   duplicate-specification failure in checkfc, so we leave the label alone and
-#   write the allow instead.
+# The relay's `exec 3<> /dev/hvc4`, its channel to DomD: cuttlefish labels /dev/hvc4
+# gatekeeper_device (device/google/cuttlefish/shared/sepolicy/vendor/file_contexts).
 allow doma_shadow_ap gatekeeper_device:chr_file rw_file_perms;
 
-# `getprop ro.boot.wifi_mac_prefix` (doma-shadow-ap.sh uses it as the hwsim MAC
-# prefix).
-#
-# THE LABEL IS OVERRIDDEN BY cuttlefish's vendor side WITH AN `exact` MATCH, so it
-#   is not the `ro.boot.` prefix in private/property_contexts (bootloader_prop,
-#   which private/domain.te:519 grants to all of domain) that wins, but
-#   device/google/cuttlefish/shared/sepolicy/vendor/property_contexts:3
-#     `ro.boot.wifi_mac_prefix  u:object_r:vendor_wifi_mac_prefix:s0 exact string`
-#   -- AN exact MATCH BEATS A prefix MATCH.
-#   That type is declared by `vendor_internal_prop(vendor_wifi_mac_prefix)` in the
-#   same vendor/init_wifi_sh.te:11, and it is granted to exactly two domains:
-#   init_wifi_sh (:12) and setup_wifi (setup_wifi.te:12).
-#   So IT HAS TO BE ADDED EXPLICITLY for our domain. Being a vendor type, it can
-#   be written (the vendor_internal_prop neverallow at te_macros:1008-1014 targets
-#   `{ coredomain -init -dumpstate }`, which does not cover a vendor domain).
-#   Corroboration: device/epam/aosp-xenvm-trout/sepolicy/dontaudit.te:129 carries a
-#   dontaudit of this type for flags_health_check, i.e. it is a type that really
-#   does show up as a denial.
+# `getprop ro.boot.wifi_mac_prefix`, the hwsim MAC prefix: cuttlefish labels it
+# vendor_wifi_mac_prefix with an exact match, granted per domain.
 get_prop(doma_shadow_ap, vendor_wifi_mac_prefix)
-
-# NOT ALLOWED, AND CANNOT BE: /system/bin/iw (the SECONDARY way stations_present()
-# detects a station).
-# The conclusion is the same as for /system/bin/ip above, but THE REASON DIFFERS;
-# do not confuse the two:
-#   - ip has no label and falls through to `system_file`.
-#   - iw HAS A LABEL OF ITS OWN (system/sepolicy/private/file_contexts:292
-#     `/system/bin/iw  u:object_r:iw_exec:s0`). But private/iw.te:2 declares
-#     `type iw_exec, system_file_type, exec_type, file_type;`, so it IS A MEMBER OF
-#     system_file_type, and iw_exec IS NOT IN the exclusion list of domain.te's
-#     "vendor must not access files on /system" neverallow (the `:file *` one) --
-#     that list is cgroup_desc_file / crash_dump_exec / file_contexts_file /
-#     netutils_wrapper_exec / property_contexts_file / system_event_log_tags_file /
-#     system_group_file / system_lib_file / system_bootstrap_lib_file /
-#     system_linker_exec / system_linker_config_file / system_passwd_file /
-#     system_seccomp_policy_file / system_security_cacerts_file / system_zoneinfo_file /
-#     task_profiles_file / shell_exec / toolbox_exec / virtualizationmanager_exec /
-#     early_virtmgr_exec.
-#     So `allow doma_shadow_ap iw_exec:file rx_file_perms;` WOULD BREAK THE BUILD
-#     (a hard secilc failure, exactly as measured for ip).
-#   - There is no netutils-wrapper escape either: the wrapped commands are only the
-#     five at system/netd/netutils_wrappers/NetUtilsWrapper-1.0.cpp:44-51 --
-#     ip6tables / iptables / ndc / tc / ip -- AND iw IS NOT AMONG THEM.
-# THE IMPLEMENTATION IS WRITTEN ON THE SAFE SIDE with this in mind:
-#   stations_present() consults carrier first. Even if iw cannot be exec'd (denied
-#   under enforcing), the decision is still reached from carrier, and when neither
-#   can be read it falls back to "a station is present", i.e. DO NOT RESTART
-#   hostapd. iw is therefore a bonus that only works while the board is
-#   permissive, and going enforcing regresses no functionality (all that is lost is
-#   the ability to find stations other than DomA on a secondary BSS, and in this
-#   configuration the only station that exists is DomA itself).

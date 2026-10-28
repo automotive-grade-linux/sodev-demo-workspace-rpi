@@ -191,8 +191,8 @@ PRODUCT_COPY_FILES += \
 #
 # THE SCAN RELAY. doma-shadow-ap only beacons what is in
 # /data/vendor/wifi/shadow/aps.conf, and with nothing keeping that file current it
-# stays at the seeded doma-shadow-aps.conf below, so the AAOS Wi-Fi screen lists a
-# fixed set of SSIDs regardless of what DomD can see. doma-wifi-relay consumes the
+# stays at the seeded doma-shadow-aps.conf below, which lists no AP, so the AAOS
+# Wi-Fi screen shows none, whatever DomD can see. doma-wifi-relay consumes the
 # DomD agent's scan feed on /dev/hvc4 and the companion app's PSK drop-box, and keeps
 # aps.conf in sync with the current scan. init.xenvm-hwsim.rc declares it `disabled`
 # and starts it at sys.boot_completed; it follows the Settings Wi-Fi toggle, and
@@ -212,24 +212,32 @@ PRODUCT_COPY_FILES += \
 # passphrase the user typed. NETWORK_SETTINGS is signature-level, but
 # READ_WIFI_CREDENTIAL is signature|privileged, so the module ships a privapp
 # allowlist entry (its Android.bp). It installs to /system_ext/priv-app, not
-# /vendor: soong rejects platform_apis on a vendor module. It reads the same
-# persist.vendor.doma.wifi_relay property and the same Settings Wi-Fi toggle as
-# the shell daemon: `false` stops both.
+# /vendor: soong rejects platform_apis on a vendor module. It follows the shell
+# daemon's init state (the property itself is a vendor one, which the app may not
+# read) and the same Settings Wi-Fi toggle: `false` stops both.
 PRODUCT_PACKAGES += \
     DomaWifiRelay
 
-# WHY doma-shadow-aps.conf IS SHIPPED AT ALL.
-# doma-shadow-ap dies with "$APS is empty" if /data/vendor/wifi/shadow/aps.conf
-# has no content, and /data is empty on a first boot, so on a freshly flashed
-# card the AAOS Wi-Fi screen would list nothing and there would be nothing to
-# select. The script merges this file into aps.conf on every boot, adding only
-# the SSIDs aps.conf lacks, so a row the relay or the user has written is never
-# overwritten.
-#
-# IT CARRIES ONE PLACEHOLDER ROW, EXAMPLE-SSID, AND NO REAL PASSPHRASE: this
-# file is in the source tree and in the vendor image. A real AP's passphrase is
-# typed on the Wi-Fi screen and reaches the shadow AP through DomaWifiRelay; the
-# file's own header says how, and why a shadow AP cannot learn it any other way.
+# The scripts run in a vendor domain, which may not execute /system's programs, so
+# they use /vendor/bin/iw (iw_vendor); the rest is toybox_vendor and cuttlefish's apexes.
+PRODUCT_PACKAGES += iw_vendor
+
+# A network AAOS found without internet -- DomA's station is on the shadow AP before
+# DomD has the real one -- is tried again after 10 minutes instead of never. Why the
+# value and the ordering are as they are is in its Android.bp
+# (device/agl/doma-common/DomaWifiOverlay).
+PRODUCT_PACKAGES += DomaWifiOverlay
+
+# doma-shadow-aps.conf: the seed. doma-shadow-ap merges it into
+# /data/vendor/wifi/shadow/aps.conf on every boot, adding only the SSIDs aps.conf
+# lacks, so a row the relay or the user has written is never overwritten. It ships
+# with NO data rows -- nothing would be listed that is not a real, reachable AP --
+# and an empty aps.conf is fine: hostapd then runs one hidden idle BSS until DomD's
+# first scan arrives. A build may add rows naming a real AP's SSID only (with the
+# relay's placeholder passphrase, or an empty one for an open AP); it must never
+# hold a real passphrase, since it is in the source tree and in the vendor image.
+# A real AP's passphrase is typed on the Wi-Fi screen and reaches the shadow AP
+# through DomaWifiRelay; the file's own header says how.
 
 # wificond. WifiNative talks to it over binder to do the nl80211 setup of wlan0, so
 # without it enabling Wi-Fi fails at exactly one line -- "Failed to setup iface in
@@ -580,6 +588,22 @@ PRODUCT_VENDOR_PROPERTIES += \
 PRODUCT_PACKAGES += DomaNoSafeAreaRRO
 PRODUCT_COPY_FILES += \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/init.xenvm-webview.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-webview.rc
+
+# The Wi-Fi relay restarts hostapd for a changed AP list only rate-limited (below), not
+# on every change (doma-wifi-relay.sh reads both on every notification; BOUNCE_ON_APS
+# and BOUNCE_MIN_S in its environment win). The restarts were background noise in every
+# measurement: on the Raspberry Pi 4 the restarts and the helpers around them took 17%
+# (of 200%) of DomA's CPU during playback, and DomA's idle went from 1.8% to 10% with
+# them off (2026-10-11).
+# bounce_min_s=300 lets it restart for a changed list at most once every 300 s, and only
+# while no station is associated, so a network that appears in DomD's scan reaches the
+# screen within 5 minutes of DomA not being connected, instead of at the next boot. A
+# network DomA's station is on that DomD loses, or cannot join for a reason other than
+# its key, is taken off the list whatever these say (the agent's LOST and FAILED
+# reports); one whose passphrase DomD rejects stays, with its key undone.
+PRODUCT_VENDOR_PROPERTIES += \
+    persist.vendor.doma.wifi_relay_bounce_on_aps=false \
+    persist.vendor.doma.wifi_relay_bounce_min_s=300
 
 # Install the ICD. BOARD_MESA3D_VULKAN_DRIVERS only DEFINES the module --
 # Mesa's android/Android.mk expands it to vulkan.virtio with an install path of

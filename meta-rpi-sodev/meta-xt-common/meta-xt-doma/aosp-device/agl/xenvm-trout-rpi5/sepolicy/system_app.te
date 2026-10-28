@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# DomaWifiRelay (/system_ext/priv-app, android.uid.system, so system_app) and the
+# relay's request drop-box, /data/vendor/wifi/shadow/req (file_contexts):
+#   - it writes relay.req (a typed passphrase for the relay) and removes wifi-cycle
+#     (doma-shadow-ap's request to cycle Wi-Fi);
+#   - it reads relay.state (DomD's last state for the network DomA's station is on).
+# DAC: req is 0770 wifi:system, its parents 0771 (init.xenvm-hwsim.rc).
+type doma_wifi_req_file, file_type, data_file_type;
+
+allow system_app vendor_data_file:dir search;
+allow system_app hostapd_data_file:dir search;
+allow system_app doma_wifi_req_file:dir rw_dir_perms;
+allow system_app doma_wifi_req_file:file create_file_perms;

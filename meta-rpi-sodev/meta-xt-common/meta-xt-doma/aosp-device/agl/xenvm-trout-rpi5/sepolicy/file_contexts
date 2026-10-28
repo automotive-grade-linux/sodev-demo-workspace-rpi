@@ -24,6 +24,10 @@
 # default already has the rules it needs for that type (22 references in the built
 # vendor_sepolicy.cil), so the apex hostapd works with no policy of its own.
 /data/vendor/wifi/shadow(/.*)?   u:object_r:hostapd_data_file:s0
+# The request drop-box DomaWifiRelay (system_app) writes into and the relay reads: a
+# type of its own, so the app is given this directory and not hostapd's files (the
+# passphrases in aps.conf and hostapd.conf). See system_app.te.
+/data/vendor/wifi/shadow/req(/.*)?   u:object_r:doma_wifi_req_file:s0
 
 # The v4l2 Codec2 HAL. Without this line the binary stays vendor_file and init
 # cannot exec it at all (neverallow init ...:file execute_no_trans), so the

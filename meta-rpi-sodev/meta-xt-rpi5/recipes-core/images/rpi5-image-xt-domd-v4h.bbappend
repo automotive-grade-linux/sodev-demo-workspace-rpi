@@ -119,6 +119,9 @@ DOMD_WIFI_FW = "${@'linux-firmware-rpidistro-bcm43455' \
 # wireless-regdb-static, not wireless-regdb, carries /lib/firmware/regulatory.db
 # and .p7s, which is where cfg80211 loads regulatory data from. Without it the
 # radio is clamped to the world-roaming channel set.
+#
+# xt_TCPMSS (the TCPMSS target) and xt_tcpudp (the tcp match its -p tcp needs) are for
+# the MSS cap DomD's NAT puts on forwarded TCP; neither is pulled in by anything else.
 DOMD_WIFI_PACKAGES = ""
 DOMD_WIFI_PACKAGES:raspberrypi5 = " \
     kernel-module-cfg80211 \
@@ -130,6 +133,8 @@ DOMD_WIFI_PACKAGES:raspberrypi5 = " \
     kernel-module-brcmfmac-wcc \
     kernel-module-xt-masquerade \
     kernel-module-xt-conntrack \
+    kernel-module-xt-tcpmss \
+    kernel-module-xt-tcpudp \
     ${DOMD_WIFI_FW} \
     wireless-regdb-static \
     wpa-supplicant \
