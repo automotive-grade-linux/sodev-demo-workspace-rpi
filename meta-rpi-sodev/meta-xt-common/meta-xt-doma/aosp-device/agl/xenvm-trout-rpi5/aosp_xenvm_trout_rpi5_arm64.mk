@@ -500,27 +500,27 @@ DEVICE_PACKAGE_OVERLAYS += device/agl/common/overlay
 # this one win is in its Android.bp (device/agl/doma-common/DomaSettingsProviderRRO).
 PRODUCT_PACKAGES += DomaSettingsProviderRRO
 
-# Render with Vulkan (Venus) by default: SurfaceFlinger's RenderEngine and HWUI in every
-# app. Both are debug.* properties, which is the only switch either has -- SurfaceFlinger
-# reads debug.renderengine.backend in chooseRenderEngineType() and has no ro.* variant;
-# HWUI reads debug.hwui.renderer (Properties::peekRenderPipelineType) ahead of
+# Render with GL by default: SurfaceFlinger's RenderEngine and HWUI in every app. Both
+# are debug.* properties, which is the only switch either has -- SurfaceFlinger reads
+# debug.renderengine.backend in chooseRenderEngineType() and has no ro.* variant; HWUI
+# reads debug.hwui.renderer (Properties::peekRenderPipelineType) ahead of
 # ro.hwui.use_vulkan. A vendor build.prop is allowed to carry debug.* (cuttlefish does the
-# same for debug.sf.vsync_reactor_ignore_present_fences), and the alternative -- a
-# hand-written /data/local.prop -- is lost by a factory reset or a fresh userdata.
+# same for debug.sf.vsync_reactor_ignore_present_fences).
 #
-# These two lines only make sense together with the DomD-side device model this series
-# adds (virglrenderer 0017/0018/0021 and VKR_DEVICE_HEAP_MIB); without it the Vulkan
-# path is not safe to switch on.
-#
-# The measurement behind choosing Vulkan over the GL default was taken on the RPi4 4 GiB
-# board (2026-09-13: Settings cold start 18.8-24.0 s on Vulkan against 34.5-44.2 s on GL,
-# and the GL runs fell into a VHAL/SystemUI crash cascade the Vulkan runs did not).
-# NOT re-measured on a Raspberry Pi 5: the guest is the same virtio VM on both boards and
-# the Venus path is board-independent, but this default is being set for rpi5 on the rpi4
-# result. docs/VULKAN-VENUS.md records what was and was not verified on which board.
+# WHY GL and not Vulkan (Venus) on this board. The Raspberry Pi 5 board has run GL since
+# 2026-10-14 for every video measurement (a hand-written /data/local.prop), and on the
+# Raspberry Pi 4 GL was the final choice for video too: switching from Vulkan to GL
+# alone took a 1080p H.264 playback from 7-10% dropped frames to 3.6% (2026-10-05).
+# Vulkan here also needs DomD's /etc/qemu-gbm-layout: without it
+# SurfaceFlinger fails in vkCreateInstance and no home screen comes up. The measurement
+# that once chose Vulkan was app start on the RPi4 4 GiB board (2026-09-13: Settings cold
+# start 18.8-24.0 s on Vulkan against 34.5-44.2 s on GL, and the GL runs fell into a
+# VHAL/SystemUI crash cascade the Vulkan runs did not). That measurement was taken
+# while DomA's watermark_scale_factor was miscomputed to 1777 and kswapd kept DomD busy;
+# it has not been repeated since, on either board.
 PRODUCT_VENDOR_PROPERTIES += \
-    debug.renderengine.backend=skiavkthreaded \
-    debug.hwui.renderer=skiavk
+    debug.renderengine.backend=skiaglthreaded \
+    debug.hwui.renderer=skiagl
 # Install the ICD. BOARD_MESA3D_VULKAN_DRIVERS only DEFINES the module --
 # Mesa's android/Android.mk expands it to vulkan.virtio with an install path of
 # /vendor/lib64/hw/vulkan.virtio.so -- and a module no product asks for is never
@@ -530,9 +530,10 @@ PRODUCT_VENDOR_PROPERTIES += \
 PRODUCT_PACKAGES += \
     vulkan.virtio
 
-# ro.hardware.vulkan is the other half of the pair above, and without it the two
-# properties above ask for a Vulkan backend the loader will never find one for:
-# empty means the loader looks for no driver at all. BOARD_MESA3D_VULKAN_DRIVERS
-# in this device's BoardConfig.mk builds the ICD this names.
+# ro.hardware.vulkan is the other half of the pair above: it names the ICD the loader
+# loads for every Vulkan user -- apps on Vulkan, and RenderEngine and HWUI if the
+# debug.* backends above are set back to skiavk; empty means the loader looks for no
+# driver at all. BOARD_MESA3D_VULKAN_DRIVERS in this device's BoardConfig.mk builds
+# the ICD this names.
 PRODUCT_VENDOR_PROPERTIES += \
     ro.hardware.vulkan=virtio

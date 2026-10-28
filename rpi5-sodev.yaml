@@ -903,8 +903,8 @@ parameters:
   #
   # NOTE for this board: the Vulkan lane's hardware verification was done on the RPi4
   # first (four domains, DomA full Vulkan). On this board DomA was verified compositing
-  # with Vulkan (SkiaVk) on 2026-09-24; docs/VULKAN-VENUS.md records what was measured
-  # where.
+  # with Vulkan (SkiaVk) on 2026-09-24; the product now composites with GL.
+  # docs/VULKAN-VENUS.md records what was measured where.
   #
   # "vulkan" is what the lines below describe; "gl" simply does not do them (and puts
   # PREFERRED_VERSION_qemu back to 7.0.0). Three things change, the second in the domu
