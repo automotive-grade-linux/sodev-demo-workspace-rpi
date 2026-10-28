@@ -56,8 +56,10 @@
 # /system/bin/extra_free_kbytes.sh pairs `grep "min" /proc/zoneinfo` lines with
 # zones -- the 6.x per-CPU `high_min:` lines match too -- and divides by
 # managed/10000, which is 2 for that small zone; it wrote watermark_scale_factor
-# 615 to 1777. kswapd then kept 734 MB free, re-read ~270 MB/s of evicted files
-# through the device model, and both DomD and DomA saturated (measured on the
+# 615 to 1777 (both defects are fixed since, in an AOSP source build, by
+# meta-xt-doma's aosp-patches/system/core 0001 and 0002). kswapd then kept 734 MB
+# free, re-read ~270 MB/s of evicted files through the device model, and both
+# DomD and DomA saturated (measured on the
 # board 2026-09-23: echo 10 into the sysctl took DomD from 200% to 32%). At 2048
 # the guest has DMA32 only and the script wrote 82. With 1080p30 playing, DomA
 # used 1420 MB and had ~570 MB available at 2048.

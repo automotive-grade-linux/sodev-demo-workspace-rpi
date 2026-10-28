@@ -56,7 +56,8 @@ overlay.
   2048 MiB**. DomA gives up 128 MiB more than DomD takes, so that its RAM stays in one
   memory zone -- at 2176 the 82 MB ZONE_NORMAL made AOSP's `extra_free_kbytes.sh` write a
   `watermark_scale_factor` of 615-1777 and kswapd saturated both domains (see
-  `xt-xen-cfg-doma_%.bbappend`).
+  `xt-xen-cfg-doma_%.bbappend`; the script's two defects are fixed since, in an
+  AOSP source build, by `meta-xt-doma`'s `aosp-patches/system/core` 0001 and 0002).
   The direction follows from the asymmetry -- if DomD runs out, weston loses DRM master and
   both guests' device models die with it, whereas AAOS at 2048 is the size upstream
   gives it. Sized at three times the 128 MiB `hostmem` of the time (the hard ceiling on
@@ -108,6 +109,11 @@ overlay.
 * **No SCMI, no MIP, no IOMMU.** Clocks and power come from the VideoCore firmware
   mailbox; PCIe MSI is inside the root complex. The SCMI overlays, the SCMI Kconfig
   fragment and the MIP MSI Xen patch are absent rather than remapped.
+* **Xen's console is the mini UART** (`/soc/serial@7e215040`), because the pl011 goes
+  to Bluetooth. `4.22-0014` (rpi4 only) makes Xen leave its divisor as the boot loader
+  programmed it: the automatic baud read returned 0 on some boots, the 16550 fallback
+  then wrote divisor 1 (~31 Mbaud on this UART) and the console was garbage from the
+  first line.
 * **`pixelvalve2` and `pixelvalve4` are the CRTCs** (HDMI0 and HDMI1), per
   `vc4_crtc.c`'s `bcm2711_pv2_data` / `bcm2711_pv4_data` — not pixelvalve0/1 as on
   BCM2712. `pixelvalve1` shares SPI 110 with pixelvalve4 and is deliberately left with
@@ -184,8 +190,9 @@ fetch; the Pi 5 checkout has no such project and skips it.
 board; `build.sh` still runs it between `ninja fetch-doma` and `ninja doma`, where it
 checks that the project, its board config, `init.xenvm-buried-eth0.rc`, the overlay's
 `defaults.xml` and the dialer's `config.xml` are present, that every XML under the
-overlay is well formed, and that `DomaWifiRelay` and `DomaSettingsProviderRRO` are each
-defined by exactly one `Android.bp` under `device/`. A forgotten group flag otherwise
+overlay and the device's `media_codecs_c2.xml` and audio policy XML are well formed,
+and that `DomaWifiRelay`, `DomaSettingsProviderRRO`, `DomaWifiOverlay` and
+`DomaNoSafeAreaRRO` are each defined by exactly one `Android.bp` under `device/`. A forgotten group flag otherwise
 surfaces as `lunch` reporting "Can't find a product spec", which points at neither the
 manifest nor the flag. Nothing under `device/epam/aosp-xenvm-trout` is modified either
 way, so `repo sync` has nothing to reset and the pinned manifest revision can move
