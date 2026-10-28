@@ -251,8 +251,14 @@ do_install() {
     if ! grep -q '^    XT_VENUS_QEMU_ENV_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "XT_VENUS_QEMU_ENV_PLACEHOLDER not found in doma.cfg"
     fi
+    # VKR_RING_IDLE_WAIT_MS=1000: an idle Venus ring thread wakes once a second
+    # instead of every 10 ms to look for a missed notification (virglrenderer 0022
+    # bounds the wait, 0023 makes the bound this variable). Measured on the RPi4:
+    # idle wake-ups 975 -> about 10 a second. VKR_RING_RELAX=0,100: between commands
+    # the ring thread sleeps from 100 us instead of yielding 15 times and sleeping from
+    # 10 us (virglrenderer 0025; measured on the Raspberry Pi 5 only).
     if [ -n "${XT_VENUS_GPU_OPTS}" ]; then
-        venus_env="    'VIRGL_EXTERNAL_GBM=1', 'V3DV_MAX_BO_CACHE_SIZE=${XT_VENUS_V3DV_BO_CACHE_MIB}', 'VKR_DEVICE_HEAP_MIB=${XT_VENUS_VKR_DEVICE_HEAP_MIB}',"
+        venus_env="    'VIRGL_EXTERNAL_GBM=1', 'V3DV_MAX_BO_CACHE_SIZE=${XT_VENUS_V3DV_BO_CACHE_MIB}', 'VKR_DEVICE_HEAP_MIB=${XT_VENUS_VKR_DEVICE_HEAP_MIB}', 'VKR_RING_IDLE_WAIT_MS=1000', 'VKR_RING_RELAX=0,100',"
     else
         venus_env=""
     fi

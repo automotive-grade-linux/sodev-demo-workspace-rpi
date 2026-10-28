@@ -29,9 +29,11 @@
 # APPLY ORDER. This layer and meta-xt-driver-domain have the same BBFILE_PRIORITY
 # (20), so which bbappend's SRC_URI lands first is decided by the bblayers order;
 # with the devel layer added last (how build.sh --devel adds it) these two are
-# applied AFTER the product series 0002/0009/0016/0017/0018/0021. Verified in that
-# order with `patch -p1 --fuzz=0` against a pristine 1.2.0 tree. The two files they
-# share with the product series are touched in different places: 0015 adds a
+# applied AFTER the product series (0002/0009/0016/0017/0018/0021/0022/0023/0025 on
+# 1.2.0). Verified in that order with `patch -p1 --fuzz=0` against a pristine 1.2.0
+# tree, and on 1.3.0 after its series. The three files they share with the product
+# series are touched in different places: 0015's vkr_ring.c hunk is inside
+# vkr_ring_submit_cmd(), which 0022/0023/0025 leave alone; 0015 adds a
 # function to vkr_cs.h near vkr_cs_decoder_set_buffer_stream() while 0016 edits
 # vkr_cs_decoder_lookup_object() further down, and 0019's hunk is in
 # vkr_dispatch_vkAllocateMemory() while 0017's is in

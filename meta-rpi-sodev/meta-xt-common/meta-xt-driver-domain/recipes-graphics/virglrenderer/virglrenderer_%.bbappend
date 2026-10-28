@@ -188,6 +188,30 @@ SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
     'file://0021-vkr-force-the-advertised-device-local-heap-size.patch', '', d)}"
 
+# 0022: the idle venus ring thread used to sleep in cnd_wait() with no bound, so one
+# lost guest wake-up left guest and renderer waiting on each other until the guest
+# aborted in vn_relax ~895 s later (RPi4 DomA WebView, four times on 2026-10-01).
+# Bounded at 10 ms on a CLOCK_MONOTONIC cond; a rescued wake-up is logged as
+# "no wake-up from the guest" so the loss rate stays measurable. See the patch.
+SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0022-vkr-bound-the-idle-ring-wait-so-a-lost-guest-wake-up.patch', '', d)}"
+
+# 0023: the guest rate-limits its notify to one per idle_timeout from when it sent it,
+# while the ring thread could go idle sooner than that after a notify arrived and
+# wiped it -- a submission in the gap sent nothing (a lost wake-up). Stay awake an
+# idle_timeout after each notify. Also VKR_RING_IDLE_WAIT_MS for the 0022 bound and
+# a late/never-sent count per rescue. See the patch.
+SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0023-vkr-keep-the-ring-awake-an-idle-timeout-after-each-notify.patch', '', d)}"
+
+# 0025: the ring thread's busy-wait between commands (15 yields, then sleeps from
+# 10 us) from VKR_RING_RELAX ("<order>,<first sleep us>"), unset = upstream's. The
+# guest configs set 0,100: on the Pi 5 the cluster's ring thread made ~24,000 yields a
+# second. The cost: a command in the ~1.3 ms before the ring goes idle waits up to
+# 0.4 ms instead of 40 us. See the patch.
+SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0025-vkr-make-the-ring-thread-s-busy-wait-tunable.patch', '', d)}"
+
 # virglrenderer 1.3.0 (the recipe from openembedded-core in this layer): 0009 is upstream there, and
 # 0017's diagnostic hunk is ported to 1.3.0's vrend_resource_gbm_init (which also gained a gbm_layout_feat
 # early-out: without VIRGL_GBM_LAYOUT_ENABLE / _FORCE_ENABLE a non-MINIGBM build gives no resource GBM backing).
