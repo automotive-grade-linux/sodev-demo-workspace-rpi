@@ -9,8 +9,8 @@ surface compositing onto HDMI. \
 This ext4 image is the SHIPPING DomD rootfs: it is written to SD p2 and mounted \
 directly by the dom0less DomD (root=/dev/mmcblk0p2 in the zephyr flavour, or \
 root=/dev/xvda over PV-block in the linux flavour, where Dom0 owns the SD). The \
-older RAM-initramfs boot path is available in the git history if a RAM-root \
-the tree for recovery but is no longer part of the boot flow."
+older RAM-initramfs boot path is no longer part of the boot flow; it is in the \
+git history if a RAM-root DomD is ever wanted for recovery."
 
 # Base: meta-xt-rpi5 minimal DomD image (= driver domain xen-tools subset)
 require recipes-core/images/rpi5-image-minimal-domd.bb
@@ -224,7 +224,7 @@ IMAGE_ROOTFS_SIZE = "6291456"
 # discard it, leaving no /var/log/xen in the shipped image at all.
 #
 # /var/volatile stays mounted for the other users that expect it.
-ROOTFS_POSTPROCESS_COMMAND =+ "install_persistent_var_log;"
+ROOTFS_POSTPROCESS_COMMAND =+ "install_persistent_var_log"
 install_persistent_var_log() {
     if [ -L ${IMAGE_ROOTFS}/var/log ]; then
         rm -f ${IMAGE_ROOTFS}/var/log
@@ -268,7 +268,7 @@ EOF
 # thermal-zone (kernel-managed FAN). CONFIG_SENSORS_PWM_FAN=m; force it via
 # systemd-modules-load (pwm-fan EPROBE_DEFERs until the RP1 PWM is up, then
 # binds). bcm2711_thermal / THERMAL_OF are =y (auto-bound).
-ROOTFS_POSTPROCESS_COMMAND += "install_pwm_fan_modload;"
+ROOTFS_POSTPROCESS_COMMAND += "install_pwm_fan_modload"
 install_pwm_fan_modload() {
     install -d ${IMAGE_ROOTFS}/etc/modules-load.d
     echo "pwm_fan" > ${IMAGE_ROOTFS}/etc/modules-load.d/pwm-fan.conf
@@ -288,7 +288,7 @@ install_pwm_fan_modload() {
 # device-model spawn failed; adding the symlink live on the board made the DomA
 # qemu spawn and AAOS boot. The shim is therefore required on ARM, despite the
 # i386 name.
-ROOTFS_POSTPROCESS_COMMAND += "install_qemu_xen_path_shim;"
+ROOTFS_POSTPROCESS_COMMAND += "install_qemu_xen_path_shim"
 install_qemu_xen_path_shim() {
     install -d ${IMAGE_ROOTFS}/usr/lib/xen/bin
     if [ ! -e ${IMAGE_ROOTFS}/usr/lib/xen/bin/qemu-system-i386 ]; then
@@ -308,16 +308,16 @@ install_qemu_xen_path_shim() {
 # DomA's RAM (2 GB at 1 GB and the rest at 8 GB) shares buckets: on a Raspberry Pi 5,
 # DomA's device model unmapped and remapped guest pages about 130 times a second each
 # during H.264 1080p60 in a WebView, about a tenth of its main thread. 4608 is the
-# smallest cap at which no two 64 KiB blocks of a 3072 or 4096 MB DomA share a bucket.
-# It is used only with BOARD_RAM=16g, whose DomD has about 12 GB of extended regions; on
-# an 8 GB board they are about 4.9 GB, which may be too few for both guests' RAM plus the
-# blobs mapped at once, and that has not been measured.
+# smallest cap at which no two 64 KiB blocks of a 3072 or 4096 MB DomA share a bucket,
+# and it is the Raspberry Pi 5's cap on both of its SKUs. With BOARD_RAM=16g DomD has
+# about 12 GB of extended regions; with 8g about 4.9 GB. Measured on a Raspberry Pi 5
+# with the 8 GB memory map (2026-10-24: a 16 GB board started with total_mem=8192, so
+# not a real 8 GB board; DomA 3072 MB, H.264 1080p60 in a WebView beside the HMI, 10
+# minutes a run): DomA's device model called munmap 3320 times in 30 seconds with 1024
+# and 12 times with 4608, and with 4608 a 1.2 GB adb push into DomA, read back after
+# dropping its caches, ran through with matching data and no ENOMEM from the mapcache.
 XT_QEMU_MAPCACHE_MAX_MB ?= "1024"
-XT_QEMU_MAPCACHE_MAX_MB:raspberrypi5 = "${@'4608' if d.getVar('BOARD_RAM') == '16g' else '1024'}"
-# The wrapper that uses it is written by install_v4h_sodev_bits_ext4, which is listed in
-# ROOTFS_POSTPROCESS_COMMAND with its ";" and so does not bring its body into do_rootfs's
-# signature: name the variable, as DOM0_OS is named below.
-do_rootfs[vardeps] += "XT_QEMU_MAPCACHE_MAX_MB"
+XT_QEMU_MAPCACHE_MAX_MB:raspberrypi5 = "4608"
 
 # Additional V4H DomD compatibility packages
 IMAGE_INSTALL:append = " kernel-module-tun xen-tools-devd xen-tools-xencommons xen-tools-xenstore xt-rpi5-domain cgshim"
@@ -326,7 +326,7 @@ IMAGE_INSTALL:append = " kernel-module-tun xen-tools-devd xen-tools-xencommons x
 # Driver-domain runtime postprocess. This is the single owner of the DomD
 # systemd fixups now that the initramfs image is out of the boot path.
 #
-ROOTFS_POSTPROCESS_COMMAND += "install_v4h_sodev_bits_ext4; "
+ROOTFS_POSTPROCESS_COMMAND += "install_v4h_sodev_bits_ext4"
 
 install_v4h_sodev_bits_ext4() {
     # 1. qemu wrapper.
@@ -348,8 +348,10 @@ install_v4h_sodev_bits_ext4() {
 REAL_QEMU="/usr/bin/qemu-system-aarch64.bin"
 name=""
 prev=""
+has_device=""
 for i in "$@"; do
     if [ "$prev" = "-name" ]; then name="$i"; fi
+    [ "$i" = "-device" ] && has_device=1
     prev="$i"
 done
 wmclass="$name"
@@ -385,6 +387,15 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 [ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
 [ -f /etc/qemu-gbm-layout ] && [ "$wmclass" = DomA ] && export VIRGL_GBM_LAYOUT_ENABLE=1
 [ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
+# Every DomA wait on the device model lands on one of qemu's threads: the main
+# loop answers each ioreq (virtio-media QBUF, virtio-gpu commands, virtqueue kicks)
+# while the guest vCPU waits, and the virgl render server it forks answers the
+# Venus rings. Run all of them at nice -19 (set here, before exec, so every thread
+# and the forked render server inherit it) so nothing else in DomD delays a guest
+# wait. Only a guest's device model (it has -device arguments): libxl starts the
+# qdisk PV-disk backend through this same wrapper, with no -device, and that one
+# keeps its nice. `renice PRIORITY` (no -n) is absolute in busybox and util-linux.
+[ -n "$has_device" ] && { renice -19 -p $$ >/dev/null 2>&1 || true; }
 exec "${REAL_QEMU}" "$@"
 EOF
         chmod 0755 ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64
@@ -408,9 +419,8 @@ ExecStart=
 ExecStart=/usr/sbin/xl devd -F
 EOF
 
-    # 3. /var/log/xen + /var/run/xen/device-model pre-create
+    # 3. /var/log/xen pre-create
     install -d ${IMAGE_ROOTFS}/var/log/xen
-    install -d ${IMAGE_ROOTFS}/var/run/xen/device-model
 
     # 4. Three notification services (block/bridge/weston-up status ready).
     # As on V4H DomD, they write drivers/<name>/status ready in xenstore; the
@@ -527,16 +537,24 @@ EOF
     # units and neither device can ever appear:
     #   - serial-getty@hvc0: /dev/hvc0 never appears. A dom0less DomD gets the
     #     vpl011, not the Xen PV console, so there is no hvc device to serve.
-    #   - serial-getty@ttyAMA10: enabled by poky from SERIAL_CONSOLES, which names
-    #     the RPi5 SoC's own debug UART. DomD does not own that UART -- it is Xen's,
-    #     and DomD sees only the emulated vpl011.
-    # Symptom in the journal: `Expecting device /dev/hvc0...` at t+2 s, then at
-    # t+92 s `Timed out waiting for device` and `Dependency failed for Serial Getty
-    # on hvc0` / `on ttyAMA10`, with multi-user.target held back until then.
-    # Drop both enablement symlinks (the units stay installed, just not wanted).
+    #   - the ones poky enables from SERIAL_CONSOLES, which names the SoC's own
+    #     console UART: ttyAMA10 on the Raspberry Pi 5, ttyS0 (the mini UART) on the
+    #     Raspberry Pi 4. DomD owns neither -- each is Xen's console, and DomD sees
+    #     only the emulated vpl011.
+    # Symptom in the journal (Raspberry Pi 5): `Expecting device /dev/hvc0...` at
+    # t+2 s, then at t+92 s `Timed out waiting for device` and `Dependency failed for
+    # Serial Getty on hvc0` / `on ttyAMA10`, with multi-user.target held back until
+    # then. Drop every serial getty's enablement symlink but ttyAMA0's (the units
+    # stay installed, just not wanted), whatever the board's names are.
     install -d ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants
-    rm -f ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty@hvc0.service
-    rm -f ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA10.service
+    # (serial-getty<baud>@<tty> is how poky names one at a non-default baud.)
+    for l in ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty*@*.service; do
+        [ -e "$l" ] || [ -L "$l" ] || continue
+        case "${l##*/}" in
+            serial-getty@ttyAMA0.service) ;;
+            *) rm -f "$l"; bbnote "not wanted: ${l##*/} (no such port in DomD)" ;;
+        esac
+    done
     ln -sf /lib/systemd/system/serial-getty@.service \
         ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service
 
@@ -575,7 +593,7 @@ EOF
 # in the flavour where it is supposed to. Same default as xt-rpi-u-boot-scr.bbappend.
 DOM0_OS ??= "zephyr"
 
-ROOTFS_POSTPROCESS_COMMAND += "mask_zephyr_toolstack_units; "
+ROOTFS_POSTPROCESS_COMMAND += "mask_zephyr_toolstack_units"
 mask_zephyr_toolstack_units() {
     if [ "${DOM0_OS}" = "zephyr" ]; then
         return
@@ -591,10 +609,6 @@ mask_zephyr_toolstack_units() {
         fi
     done
 }
-
-# The masks above are DOM0_OS-dependent, so a flavour switch must not reuse a rootfs
-# built for the other one. Same reason DOM0_OS is in domd-vc4's do_compile[vardeps].
-do_rootfs[vardeps] += "DOM0_OS"
 
 #
 # Note: the DomD is an xl-created guest, so boot files (start4.elf,

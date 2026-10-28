@@ -100,7 +100,8 @@ Before you build:
   bundle instead and skips the AOSP build (minutes). See *How the DomA artifacts are
   produced* (`docs/BUILD.md`).
 - **Behind an HTTP(S) proxy / restricted network?** Set `HTTPS_PROXY` (that is the
-  variable `build.sh` reads; `--proxy=<url>` does the same) and you will usually also
+  variable `build.sh` reads, and it fills the other proxy variables that are not set;
+  `--proxy=<url>` sets all four) and you will usually also
   need `CONNECTIVITY_CHECK_URIS=""` and `REPO_SKIP_SELF_UPDATE=1` (see *Docker
   usage*).
 - **Proxy on the host's loopback (`127.0.0.1:3128`, `localhost`)?** A bridged container
@@ -163,9 +164,10 @@ disables the heavy Android/Flatcar guests by default).
 | (`AAOS_GUEST_ANDROID`) / (`AAOS_GUEST_KERNEL`) | **17** / **6.18.32** | The DomA guest generation this tree builds and stages. A prebuilt bundle's `android=` / `guest_kernel=` are checked against them; the kernel version also names the staged kernel artifact (`aaos-android-kernel-xenbuilt-<ver>`, the recipe reads the same variable). Override only for a bundle whose p4 images were built against that other kernel |
 | (`AAOS_KERNEL_MD5`) / (`AAOS_RAMDISK_MD5`) | — (no check) | Expected md5 of the staged DomA guest kernel / vendor-boot ramdisk. **Opt-in and off by default**: set them only to pin one validated prebuilt bundle, and a mismatch then fails the `aaos-guest-binaries` recipe. `build.sh` says so when a bundle ships no `MANIFEST.md5` |
 | `--aaos-src=<dir>` (`AAOS_SRC_DIR`) | — | Reuse an existing AOSP checkout for `source` mode (skip the repo sync; still builds AOSP from it) |
-| `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from `rpi5-sodev.yaml`, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
+| `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from the board's yaml, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
 | (`XT_AAOS_SYNC_JOBS`) | 4 | Parallelism of the **reference-mirror pre-sync** (only with `--aaos-ref`/`--aaos-kernel-ref`); raise it on a fast link, lower it behind a rate-limited proxy. The plain `source`-mode sync is moulin's own `repo` fetch and is not affected |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
+| `--proxy=<url>` | — | HTTP(S) proxy for the docker builds and the fetches. `--proxy` sets all four proxy variables; without it `HTTPS_PROXY` (or `https_proxy`) fills the ones that are not set, and an HTTP proxy set apart is kept. A proxy change does not need `--rebuild-images` |
 | `--rebuild-images` | off | Force-rebuild the `XT_DOCKER` image (`sodev-builder-rpi`). It never touches the V4H workspace's `sodev-builder` -- the two workspaces use different Dockerfiles and, since this series, different tags. Not needed for the Zephyr SDK 1.0.1 / python3.12 move that this series makes: the new tag has no pre-existing image, so the first build creates it already up to date. You need it only when `XT_DOCKER` points at an older image (a pre-rename `sodev-builder`, say), which fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` (Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12`) |
 | `--west-cache=<dir>` (`XT_WEST_CACHE_DIR`) | — | Point the Zephyr west fetches at a pre-populated reference workspace, so `west update` runs offline (the AAOS analogue is `--aaos-ref`). Used for both west workspaces: Dom0's and DomZ's |
 | `--memory=<size>` (`XT_DOCKER_MEMORY`) | — (unlimited) | Cap each build container's RAM via docker `--memory` **and** `--memory-swap` (equal ⇒ no host-swap spill, so an unbounded moulin/AOSP/Yocto build cannot OOM the host), e.g. `24g` |
@@ -390,10 +392,14 @@ See also:
     │                            more than one layer, so they are NOT under
     │                            meta-rpi-sodev/scripts/ (which is layer-scoped). No
     │                            recipe references them; they are developer/CI tools.
+    ├── check-all.sh                # runs the checks below that need no build (and bash -n
+    │                               #   build.sh) in one command; exit status = failed checks
     ├── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
     ├── check-rpi4-memory-map.py    # the same for the RPi4, per --ram and --gpu lane: static-mem
     │                               #   banks, boot-script overrides and domain sizes against the
     │                               #   files that define them
+    ├── check-net-macs.py           # the guests' NIC MACs in doma.cfg / domu.cfg against the
+    │                               #   copies sodev-net.inc gives DomD's dnsmasq
     ├── check-yaml-drift.py         # the two product yamls share ~750 lines by copy; fails on
     │                                   unrecorded divergence (yaml-drift-baseline.txt records the
     │                                   differences that are there by design)
@@ -441,7 +447,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — what this port changed relative 
 | DomD | **SSH** (primary): `ssh root@192.168.10.10` — DomD runs the toolstack, so `xl list` / `xl console <domU/domA>` run from here. **UART**: DomD is a dom0less **vpl011** domain (console → hypervisor ring), so `xl console 1` / `xu console 1` cannot attach it (no PV console ring/evtchn is allocated for dom0less vpl011). On the debug UART press `Ctrl-A` three times to cycle input to `DOM1` (`raspberrypi5-domd login:`); or read its log with `xl dmesg \| grep DOM1`. |
 | DomU (AGL) | `ssh root@192.168.10.12`; or `xl console 3` from the toolstack domain (`domu login:`) |
 | DomZ (Zephyr) | **`xl console DomZ`** from the toolstack domain (DomD in the zephyr flavour, Dom0 in the linux one) — Zephyr's Xen **PV console**, which is why the `xenvm` board is used rather than a vpl011 dom0less domain. `xenconsole` needs a tty, so over ssh use `ssh -tt root@192.168.10.10 'xl console DomZ'`. No network, no display: this console is the only interface. Exit with `Ctrl-]` |
-| DomA (AAOS) | `adb connect 192.168.10.13:5555` (Android has no sshd); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The shell is not on the `virtconsole` sockets in `doma.cfg`: two of them carry DomA's Wi-Fi and Bluetooth links and the rest are inert — see the note below. |
+| DomA (AAOS) | `adb connect <DomA's wlan0 address>:5555` (Android has no sshd; the address of DomA's Wi-Fi station, 192.168.10.15 when the framework uses the MAC dnsmasq lists, otherwise from the range: see `sodev-net.inc`); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The shell is not on the `virtconsole` sockets in `doma.cfg`: two of them carry DomA's Wi-Fi and Bluetooth links and the rest are inert — see the note below. |
 
 
 See also:
@@ -486,7 +492,7 @@ RPi5 guest**, and touch input was not exercised. The per-item list:
 - Xen 4.21 boots (0 panics); all 4 domains auto-start; qemu device-models auto-spawn.
 - Dual display + native touch, no scanout artifacts.
 - SSH from the PC to DomD/DomU, adb to DomA; consoles for all domains.
-- DomA management IP (192.168.10.13) via dnsmasq static lease — no manual step.
+- DomA's Wi-Fi station takes its address from DomD's dnsmasq (a static lease where its MAC is listed) — no manual step.
 - Full 4-domain + hypervisor log audit performed; the actionable items are
   fixed in-tree (legacy Dom0 qdisk unit masked; prebuilt dumpstate backend not
   auto-enabled until rebuilt against wrynose libxml2).
@@ -578,7 +584,7 @@ not password-protected at all:
   remove the unused ones (re-verifying DomA, as `doma.cfg` explains), before any
   non-lab deployment. Note that DomA's actual shell — `xl console 2`,
   prompt `console:/ $` — is reachable by anything that can run the toolstack in DomD,
-  and `adb` is open on `192.168.10.13:5555` with no authentication.
+  and `adb` is open on port 5555 of DomA's wlan0 address with no authentication.
 
 `xen,static-mem`-related hypervisor hardening is also relaxed for the demo: the
 `4.22-0003` patch reverts an upstream restriction on buffered ioreq for Arm so the

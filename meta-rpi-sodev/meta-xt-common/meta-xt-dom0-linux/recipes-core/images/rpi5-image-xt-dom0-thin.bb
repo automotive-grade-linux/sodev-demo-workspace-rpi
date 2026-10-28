@@ -97,7 +97,7 @@ inherit core-image
 IMAGE_FEATURES:append = " empty-root-password allow-empty-password allow-root-login"
 
 
-ROOTFS_POSTPROCESS_COMMAND += "flatten_dom0_network; enable_hvc0_getty; mask_legacy_qdisk_backend; fix_dom0_hostname; linux_dom0_guest_disks; "
+ROOTFS_POSTPROCESS_COMMAND += "flatten_dom0_network enable_hvc0_getty mask_legacy_qdisk_backend fix_dom0_hostname linux_dom0_guest_disks"
 
 # [DOM0_OS=linux] The shared guest cfgs (domu.cfg/doma.cfg, from xt-xen-cfg-domu/
 # -doma) point qemu's -drive at /dev/mmcblk0p3 / p4 — correct for the zephyr

@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: MIT
 [Unit]
 Description=Bluetooth HCI bridge for DomA (btproxy: hci0 user channel <-> H4 on a Unix socket)
-# Without this, a start that fails before hci0 exists (early boot, or a board whose
-# BT UART was not passed through) latches the unit permanently failed and it never
-# comes back. Must live in [Unit], not [Service]. Same reasoning as
-# domd-wifi-agent.service, gnss_replay.service and cluster-service.service.
+# Started by hci0 itself: udev tags every bluetooth device for systemd
+# (99-systemd.rules), so hci0 is the device unit below once hci_uart has bound over
+# serdev to the brcm,bcm43438-bt child of the board's Bluetooth UART, and the
+# [Install] section hangs this unit off it. BindsTo stops it when hci0 goes (an
+# unbind, a module reload) and the device starts it again when hci0 comes back. Where
+# DomD has no Bluetooth UART (the Raspberry Pi 5 with DOM0_OS=linux) hci0 never
+# appears and this never starts.
+BindsTo=sys-subsystem-bluetooth-devices-hci0.device
+After=sys-subsystem-bluetooth-devices-hci0.device
+# A btproxy that fails right after hci0 appears is started again (Restart=always)
+# without ever latching the unit failed. Must live in [Unit], not [Service]. Same
+# reasoning as domd-wifi-agent.service, gnss_replay.service and
+# cluster-service.service.
 StartLimitIntervalSec=0
 
 [Service]
-# hci0 appears once hci_uart has bound over serdev to the brcm,bcm43438-bt child
-# of the board's Bluetooth UART, which needs the module loaded and the patchram
-# present. Wait in a loop rather than fail fast: with Restart=always a failing
-# check would restart every RestartSec and fill the journal. The wait still
-# counts against DefaultTimeoutStartSec (90 s), so where DomD has no Bluetooth
-# UART (the Raspberry Pi 5 with DOM0_OS=linux) the start times out and the unit
-# is started again, about every 92 s.
-ExecStartPre=/bin/sh -c 'while [ ! -d /sys/class/bluetooth/hci0 ]; do sleep 0.5; done'
 # --unix=<path> MUST use the `=` form. btproxy declares the option as
 # { "unix", optional_argument, NULL, 'u' } (tools/btproxy.c), and getopt does not
 # consume a space-separated value for an optional_argument -- `-u /run/bt-hci.sock`
@@ -27,4 +28,4 @@ Restart=always
 RestartSec=2
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sys-subsystem-bluetooth-devices-hci0.device

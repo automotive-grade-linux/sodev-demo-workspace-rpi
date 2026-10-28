@@ -66,7 +66,8 @@ do_install() {
 FILES:${PN} = "${systemd_system_unitdir}/domd-bt-proxy.service"
 
 # Both boards. Nothing in this recipe is board-specific: btproxy addresses hci0 by
-# index and the unit waits on /sys/class/bluetooth/hci0, so which UART produced the
+# index and the unit is started by hci0's device unit
+# (sys-subsystem-bluetooth-devices-hci0.device), so which UART produced the
 # controller never reaches here. The board-specific parts are the UART assignment
 # (config.txt + boot.cmd) and the partial-DT node, and those stay in the per-board
 # layers. Same shape as xt-doma-wifi-agent.

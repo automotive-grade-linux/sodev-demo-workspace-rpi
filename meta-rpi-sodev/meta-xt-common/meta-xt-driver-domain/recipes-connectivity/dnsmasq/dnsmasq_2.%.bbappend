@@ -21,6 +21,16 @@ do_install:append() {
     # for static configuration.
     echo "dhcp-range=${XT_DHCP_RANGE_START},${XT_DHCP_RANGE_END},12h" >> ${D}${sysconfdir}/dnsmasq.conf
     echo "dhcp-authoritative" >> ${D}${sysconfdir}/dnsmasq.conf
+    # Answer only the guests. eth0 is a port of xenbr0, so the wired network behind it
+    # reaches this server too, and an authoritative one hands its devices addresses and
+    # NAKs the leases they hold from that network's own server. The guests are the
+    # dhcp-host lines below (tag known) and DomA's Wi-Fi station, whose MAC is
+    # randomized but whose DHCP client sends the vendor class android-dhcp-<release>.
+    # An Android device on that wired network sends it too and is still answered:
+    # telling it apart needs the bridge port the request came in on, and DomD's
+    # kernel has no bridge netfilter (no br_netfilter, ebtables or nft bridge).
+    echo "dhcp-vendorclass=set:android,android-dhcp-" >> ${D}${sysconfdir}/dnsmasq.conf
+    echo "dhcp-ignore=tag:!android,tag:!known" >> ${D}${sysconfdir}/dnsmasq.conf
 
     # Static IPs for the demo guests (MACs are fixed in /etc/xen/domX.cfg,
     # shipped by xt-xen-cfg-*). Unconditional: the consolidated build dir
@@ -44,8 +54,8 @@ do_install:append() {
         wlan0_macs="${XT_DOMA_WLAN0_MAC},${XT_DOMA_WLAN0_PERM_MAC}"
     fi
     echo "dhcp-host=$wlan0_macs,doma-wlan0,${XT_DOMA_WLAN0_IP},infinite" >> ${D}${sysconfdir}/dnsmasq.conf
-    # domu keeps a static 192.168.10.12 in its rootfs; this mapping is a
-    # consistent fallback should it ever DHCP.
+    # domu: the AGL image takes its address over DHCP (connman) and gets .12 from
+    # this line; the devel images' domu-network sets the same .12 statically.
     echo "dhcp-host=${XT_DOMU_MAC},domu,${XT_DOMU_IP},infinite" >> ${D}${sysconfdir}/dnsmasq.conf
 
     # Use resolve.conf provided by systemd-resolved

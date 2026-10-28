@@ -35,8 +35,11 @@ xenstore-write "$XSKEY" "start uptime=$(cut -d. -f1 /proc/uptime)" 2>/dev/null |
 # rest of this script. Treat it as a conservative ceiling, not a requirement.
 if [ -f /etc/xen/doma.cfg ] || [ -f /etc/xen/domu.cfg ]; then
     i=0
+    # Any guest's tap: DomA's are vif-emu and vif-emu1, DomU's vif-emu2, so in a
+    # DomU-only build waiting for vif-emu alone ran the whole bound (181 s measured
+    # on an RPi4, 2026-08-04).
     while [ $i -lt 90 ]; do
-        [ -e /sys/class/net/vif-emu ] && break
+        for _t in /sys/class/net/vif-emu*; do [ -e "$_t" ] && break 2; done
         i=$((i+1)); sleep 2
     done
 fi
@@ -136,8 +139,8 @@ fi
 # interface names when a packet is matched, not when the rule is added, so they simply do
 # nothing until wpa_supplicant brings the interface up. That matters because this unit is
 # Type=oneshot and finishes long before Wi-Fi associates. -C before -A/-I keeps it
-# idempotent, which this script has to be -- xl-create-doma.service re-runs it on every
-# DomA (re)create.
+# idempotent, so a second run (a restart of domd-flatbridge.service by hand, say) adds
+# nothing twice.
 UPLINK_WIFI_IF=wlan0
 if command -v iptables >/dev/null 2>&1; then
     # 192.168.10.10/24 -> 192.168.10.0/24

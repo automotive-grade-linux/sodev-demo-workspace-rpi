@@ -72,15 +72,18 @@ mem="$(sed -n 's/^memory[[:space:]]*=[[:space:]]*\([0-9]\+\)[[:space:]]*$/\1/p' 
 XENVM_DTS="$WEST_WS/zephyr/$XENVM_DTS_REL"
 if [ -f "$XENVM_DTS" ]; then
   bank="$(sed -n '/memory@40000000/,/};/p' "$XENVM_DTS" | sed -n 's/.*DT_SIZE_M(\([0-9]\+\)).*/\1/p' | head -1)"
-  src="$XENVM_DTS_REL"
+  src="$XENVM_DTS_REL"; checked=1
 else
   bank="$XENVM_RAM_MIB_FALLBACK"
-  src="fallback literal; $WEST_WS is not populated, so this pair was NOT checked against the board dts"
+  src="fallback literal; $WEST_WS is not populated, so this pair was NOT checked against the board dts"; checked=0
 fi
 if [ -z "$bank" ]; then
   bad "could not read the xenvm RAM bank size from $XENVM_DTS"
-elif [ "$mem" = "$bank" ]; then
+elif [ "$mem" = "$bank" ] && [ "$checked" = 1 ]; then
   ok "domz.cfg memory = ${bank} MiB matches the xenvm RAM bank ($src)"
+elif [ "$mem" = "$bank" ]; then
+  # Equal to a literal in this script is not a check of the board: a SKIP, not a PASS.
+  skipit "domz.cfg memory = ${bank} MiB matches only this script's literal ($src)"
 else
   bad "domz.cfg memory = '${mem:-unreadable}' but the xenvm board links against ${bank} MiB at 0x40000000 ($src)"
 fi

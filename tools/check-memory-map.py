@@ -24,9 +24,13 @@ configurations from the real files and checks:
      for the dom0_mem this prediction assumes;
   7. the domain budget vs usable DRAM, reported per SKU. With dom0_mem=512M both SKUs
      fit; if a future change pushes a SKU over, it is reported as an explicit
-     OVER-COMMIT line rather than silently passing.
+     OVER-COMMIT line rather than silently passing. The same is reported with DomZ
+     added (build.sh -z).
+  8. a DomD `cma=SIZE@BASE` in a boot script's DomD bootargs lies inside one of that
+     SKU's static-mem banks (a CMA placed in a hole between banks, or across a bank's
+     end, is memory DomD does not own).
 
-Exit status is non-zero only for 1-6 (mechanical inconsistencies). 7 is informational
+Exit status is non-zero only for 1-6 and 8 (mechanical inconsistencies). 7 is informational
 by design, because the 8 GB usable figure is extrapolated rather than measured; use
 --strict-budget to make an over-commit fail too.
 
@@ -255,6 +259,52 @@ def parse_fatloads(path):
         for m in re.finditer(r"fatload\s+mmc\s+\S+\s+(0x[0-9a-fA-F]+)\s+(\S+)", line):
             out.append((int(m.group(1), 0), m.group(2)))
     return out
+
+
+# The suffixes the kernel's memparse() takes, in either case; none means bytes. The
+# number is read as simple_strtoull(.., 0) does: 0x for hex, a leading 0 for octal.
+_SIZE = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40, "P": 1 << 50,
+         "E": 1 << 60}
+_NUM = r"(?:0[xX][0-9a-fA-F]+|\d+)[KMGTPEkmgtpe]?"
+
+
+def memparse(text):
+    m = re.fullmatch(r"(0[xX][0-9a-fA-F]+|\d+)([KMGTPEkmgtpe]?)", text)
+    num = m.group(1)
+    base = 16 if num[:2].lower() == "0x" else 8 if len(num) > 1 and num[0] == "0" else 10
+    return int(num, base) * _SIZE[m.group(2).upper()]
+
+
+def parse_domd_cma(path):
+    """[(size, base or None), ...] from the `cma=` in the DomD bootargs lines."""
+    out = []
+    for line in open(path):
+        if "fdt set /chosen/domD/module@0 bootargs" not in line:
+            continue
+        for m in re.finditer(r"\bcma=(%s)(?:@(%s))?" % (_NUM, _NUM), line):
+            out.append((memparse(m.group(1)),
+                        memparse(m.group(2)) if m.group(2) else None))
+    return out
+
+
+def check_domd_cma(banks, label):
+    for flavour, path in sorted(BOOTCMDS.items()):
+        cmas = parse_domd_cma(path)
+        if not cmas:
+            ok("%s: %s: no cma= in DomD's bootargs" % (label, flavour))
+            continue
+        for size, base in cmas:
+            if base is None:
+                ok("%s: %s: cma=%d MiB without a base (the kernel places it)"
+                   % (label, flavour, size >> 20))
+                continue
+            inside = [b for b, sz in banks if b <= base and base + size <= b + sz]
+            if inside:
+                ok("%s: %s: cma=%d MiB@0x%x lies inside the bank at 0x%x"
+                   % (label, flavour, size >> 20, base, inside[0]))
+            else:
+                err("%s: %s: cma=%d MiB@0x%x is not inside any static-mem bank"
+                    % (label, flavour, size >> 20, base))
 
 
 def check_no_overlap(banks, label):
@@ -633,6 +683,30 @@ def report_budget(ram, strict):
     else:
         ok("%s: all four domains fit (%d MiB headroom; DomZ's 16 MiB heap allocation not counted)"
            % (ram, usable - total - XEN_OVERHEAD_MiB))
+    # build.sh -z adds DomZ to the same budget (its summary prints "+ DomZ N"); say what
+    # that leaves, so the two agree.
+    domz = domz_mib()
+    if domz is None:
+        warn("%s: could not read DomZ's memory from %s" % (ram, DOMZ_CFG))
+    elif total + domz + XEN_OVERHEAD_MiB > usable:
+        (err if strict else warn)("%s: with DomZ (-z, %d MiB) OVER-COMMIT by %d MiB"
+                                  % (ram, domz, total + domz + XEN_OVERHEAD_MiB - usable))
+    else:
+        ok("%s: with DomZ (-z, %d MiB) too: %d MiB headroom"
+           % (ram, domz, usable - total - domz - XEN_OVERHEAD_MiB))
+
+
+DOMZ_CFG = os.path.join(ROOT, "meta-rpi-sodev", "meta-xt-common", "meta-xt-domz",
+                        "recipes-guests", "domz", "files", "domz.cfg")
+
+
+def domz_mib():
+    """DomZ's `memory =` in MiB from domz.cfg, or None."""
+    try:
+        m = re.search(r"^memory\s*=\s*(\d+)\s*$", open(DOMZ_CFG).read(), re.M)
+    except OSError:
+        return None
+    return int(m.group(1)) if m else None
 
 
 def main():
@@ -693,6 +767,7 @@ def main():
         check_loads_clear(banks, ram)
         check_dom0_bank0(banks, ram, ram)
         check_domd_size(banks, ram)
+        check_domd_cma(banks, ram)
         report_budget(ram, args.strict_budget)
 
     if banks8 is not None and set(skus) == {"16g", "8g"}:

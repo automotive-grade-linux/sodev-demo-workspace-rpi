@@ -57,9 +57,9 @@ XT_AAOS_REF="${XT_AAOS_REF:-}"                      # --aaos-ref=<dir>        (r
 XT_AAOS_KERNEL_REF="${XT_AAOS_KERNEL_REF:-}"        # --aaos-kernel-ref=<dir> (repo object mirror for the AAOS guest-kernel tree)
 REBUILD_IMAGES="${REBUILD_IMAGES:-0}"              # --rebuild-images
 XT_DOCKER_NETWORK="${XT_DOCKER_NETWORK:-}"         # --network for the build containers, e.g. "host"
-XT_DOCKER_RUN_OPTS="${XT_DOCKER_RUN_OPTS:-}"       # extra `docker run` opts for the build containers, e.g. "--memory=48g --cpus=12" (recommended on shared hosts to bound the heavy AOSP/Yocto steps; empty = no limit)
+XT_DOCKER_RUN_OPTS="${XT_DOCKER_RUN_OPTS:-}"       # extra `docker run` opts for the build containers, e.g. "--cpus=12" (recommended on shared hosts to bound the heavy AOSP/Yocto steps; empty = no limit)
 XT_DOCKER_RUN_OPTS_AOSP="${XT_DOCKER_RUN_OPTS_AOSP:-}"  # extra `docker run` opts for the AOSP (DomA source) container ONLY, on top of XT_DOCKER_RUN_OPTS -- where the nsjail --security-opt relaxations go
-PROXY="${HTTPS_PROXY:-}"                            # --proxy=<url>
+PROXY=""                                            # --proxy=<url> (else the environment's, see below)
 # Set from BOARD once the flags are parsed (see "Board selection" below). Assigning it
 # here would freeze the rpi5 yaml before --board is read.
 MOULIN_YAML=""
@@ -185,7 +185,10 @@ Build environment:
       --dl=<dir>         Reuse an external Yocto downloads dir
       --west-cache=<dir> Reuse a west reference workspace (Zephyr Dom0 manifest+projects)
                          (the AAOS equivalents are --aaos-ref / --aaos-kernel-ref above)
-      --proxy=<url>      HTTP(S) proxy for docker builds + fetches
+      --proxy=<url>      HTTP(S) proxy for docker builds + fetches, set as all four
+                         proxy variables (default: the environment's; each variable
+                         fills its other-case twin, and an HTTP proxy not set at all
+                         takes the HTTPS one)
       --rebuild-images   Force-rebuild the docker/ build image (needed after a Dockerfile
                          change; a proxy change does NOT need it -- the proxy is passed
                          per run and is not stored in the image)
@@ -313,13 +316,18 @@ for _v in XT_SSTATE_DIR XT_DL_DIR XT_WEST_CACHE_DIR XT_AAOS_REF XT_AAOS_KERNEL_R
 done
 unset _v
 
-# Dom0 OS is a moulin parameter of rpi5-sodev.yaml: --DOM0_OS {zephyr,linux}
+# Dom0 OS is a moulin parameter of the board's yaml: --DOM0_OS {zephyr,linux}
 # selects the whole dom0 component (Zephyr west/zephyr build vs Linux yocto).
 case "$DOM0_OS" in zephyr|linux) ;; *) echo "ERROR: --dom0 must be 'zephyr' or 'linux' (got '$DOM0_OS')" >&2; exit 1 ;; esac
 # ENABLE_DOMU reaches moulin verbatim and the in-script gate matches "yes" exactly,
 # so a stray value would silently mean "no" yet still pass through — validate it.
-# (ENABLE_ANDROID is not validated here: it is derived from the resolved --aaos mode.)
 case "$ENABLE_DOMU" in no|yes) ;; *) echo "ERROR: ENABLE_DOMU must be 'no' or 'yes' (got '$ENABLE_DOMU'); use -u/--domu" >&2; exit 1 ;; esac
+# ENABLE_ANDROID from the environment is what the --aaos mode is derived from below
+# (yes => auto), so a stray value such as 1 would silently mean "no DomA".
+case "$ENABLE_ANDROID" in no|yes) ;; *) echo "ERROR: ENABLE_ANDROID must be 'no' or 'yes' (got '$ENABLE_ANDROID'); use -a/--android or --aaos" >&2; exit 1 ;; esac
+case "$REBUILD_IMAGES" in 0|1) ;; *) echo "ERROR: REBUILD_IMAGES must be 0 or 1 (got '$REBUILD_IMAGES'); use --rebuild-images" >&2; exit 1 ;; esac
+# NINJA_TARGET is passed to ninja as the goal: image-full, or empty (--domains-only).
+case "$NINJA_TARGET" in image-full|'') ;; *) echo "ERROR: NINJA_TARGET must be image-full or empty (got '$NINJA_TARGET'); use --domains-only" >&2; exit 1 ;; esac
 # Same reasoning for the DomZ pair: both reach moulin verbatim and the yaml
 # variants are exactly "yes"/"no", so a stray value would pass through and then
 # silently mean "no".
@@ -332,6 +340,18 @@ case "$GPU" in vulkan|gl) ;; *) echo "ERROR: --gpu must be 'vulkan' or 'gl' (got
 case "$ENABLE_DEVEL" in no|yes) ;; *) echo "ERROR: ENABLE_DEVEL must be 'no' or 'yes' (got '$ENABLE_DEVEL'); use --devel" >&2; exit 1 ;; esac
 # ACCEPT_SYNAPTICS_KILLSWITCH reaches moulin verbatim as well.
 case "$ACCEPT_SYNAPTICS_KILLSWITCH" in no|yes) ;; *) echo "ERROR: ACCEPT_SYNAPTICS_KILLSWITCH must be 'no' or 'yes' (got '$ACCEPT_SYNAPTICS_KILLSWITCH'); use --accept-synaptics-killswitch" >&2; exit 1 ;; esac
+# --memory reaches docker as both --memory and --memory-swap; docker would refuse a bad
+# size only at the first container. With a memory flag in XT_DOCKER_RUN_OPTS as well, the
+# later --memory wins and then disagrees with --memory-swap: docker refuses a larger one
+# only when the first container starts, and runs a smaller one with a limit nobody set.
+if [ -n "$XT_DOCKER_MEMORY" ]; then
+  [[ "$XT_DOCKER_MEMORY" =~ ^[0-9]+(\.[0-9]+)?([kKmMgGtTpP][iI]?)?[bB]?$ ]] || { echo "ERROR: --memory must be a docker size such as 24g (got '$XT_DOCKER_MEMORY')" >&2; exit 1; }
+  # XT_DOCKER_RUN_OPTS_AOSP goes on the same `docker run` as the rest, for the AOSP stage.
+  for _o in ${XT_DOCKER_RUN_OPTS:-} ${XT_DOCKER_RUN_OPTS_AOSP:-}; do
+    case "$_o" in -m|-m*|--memory|--memory=*|--memory-swap|--memory-swap=*) echo "ERROR: --memory and a memory option in XT_DOCKER_RUN_OPTS or XT_DOCKER_RUN_OPTS_AOSP ('$_o') both set the limit; use one" >&2; exit 1 ;; esac
+  done
+  unset _o
+fi
 
 # --- Board selection (which product yaml) --------------------------------------
 # One yaml per board, named <board>-sodev.yaml. They are siblings, not variants of one
@@ -354,6 +374,14 @@ fi
 # because the prebuilt staging path reads it long before the ninja command is assembled.
 AAOS_PRODUCT_DEVICE=$(sed -n 's/^[[:space:]]*ANDROID_DEVICE:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$MOULIN_YAML" | head -1)
 [ -n "$AAOS_PRODUCT_DEVICE" ] || { echo "ERROR: could not read ANDROID_DEVICE from $MOULIN_YAML" >&2; exit 1; }
+# It names the boot.img apply-aosp-patches.sh may remove and is interpolated into the
+# in-container command string (AOSP_CMD), so it must be a single path component.
+case "$AAOS_PRODUCT_DEVICE" in
+  *[!A-Za-z0-9._-]*|-*|.|..)
+    echo "ERROR: ANDROID_DEVICE in $MOULIN_YAML must be a single path component of" >&2
+    echo "       [A-Za-z0-9._-]; got '$AAOS_PRODUCT_DEVICE'." >&2
+    exit 1 ;;
+esac
 
 # The AOSP checkout and the AAOS guest-kernel checkout live under names the yaml owns,
 # and they are board-specific: rpi4 uses android-rpi4 / android_kernel-rpi4 where rpi5
@@ -497,13 +525,6 @@ if [ "$AAOS_MODE" = source ] && [ "$(uname -m)" = aarch64 ]; then
 fi
 echo ">> AAOS mode: $AAOS_MODE  (ENABLE_ANDROID=$ENABLE_ANDROID)"
 
-# --- 8 GB SKU: report the memory budget ---------------------------------------
-# Informational, not a warning: with dom0_mem=512M the four domains DO fit an 8 GB
-# board (7744 of ~8180 MiB) and the 3072/3072 split is verified to boot all four on
-# hardware. The margin is printed because the 8180 figure is EXTRAPOLATED from the
-# 16 GB board's total_memory=16372 -- no 8 GB Pi 5 has been measured here -- so if
-# `xl create doma.cfg` ever fails to allocate, this is the first line to come back
-# to. See the BOARD_RAM parameter in the yaml.
 # --- SD p3 when DomA is built without DomU -------------------------------------
 # The SD partition order is fixed by the yaml's definition order and the guest configs
 # address the SD by fixed device node: doma.cfg backs qemu's disk from /dev/mmcblk0p4,
@@ -595,6 +616,13 @@ if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] && [ "$GPU" = "gl" ] \
   echo ">>   or use an 8 GiB board." >&2
 fi
 
+# --- 8 GB SKU: report the memory budget ---------------------------------------
+# Informational, not a warning: with dom0_mem=512M the four domains DO fit an 8 GB
+# board (7744 of ~8180 MiB) and the 3072/3072 split is verified to boot all four on
+# hardware. The margin is printed because the 8180 figure is EXTRAPOLATED from the
+# 16 GB board's total_memory=16372 -- no 8 GB Pi 5 has been measured here -- so if
+# `xl create doma.cfg` ever fails to allocate, this is the first line to come back
+# to. See the BOARD_RAM parameter in the yaml.
 if [ "$BOARD" = "rpi5" ] && [ "$BOARD_RAM" = "8g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
   # Sum what this invocation actually asks for: DomU only with -u, DomZ only
   # with -z.
@@ -656,10 +684,26 @@ if [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" != "yes" ] \
   exit 1
 fi
 
-# Propagate --proxy to the docker build/run steps (build_img, in_docker) and their
-# containers via the standard proxy env vars. Unset => no proxy (any inherited env still wins).
+# Propagate the proxy to the docker build/run steps (build_img, in_docker) and their
+# containers via the standard proxy env vars. --proxy sets all four. Without it, each
+# scheme's variable fills its other-case twin when that is not set, and an HTTP proxy
+# that is not set at all takes the HTTPS one: a site whose HTTP proxy differs keeps
+# it in both cases. None set => no proxy.
 if [ -n "$PROXY" ]; then
   export HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" https_proxy="$PROXY" http_proxy="$PROXY"
+else
+  _ps="${HTTPS_PROXY:-${https_proxy:-}}"
+  _ph="${HTTP_PROXY:-${http_proxy:-}}"
+  [ -n "$_ph" ] || _ph="$_ps"
+  if [ -n "$_ps" ]; then
+    [ -n "${HTTPS_PROXY:-}" ] || export HTTPS_PROXY="$_ps"
+    [ -n "${https_proxy:-}" ] || export https_proxy="$_ps"
+  fi
+  if [ -n "$_ph" ]; then
+    [ -n "${HTTP_PROXY:-}" ] || export HTTP_PROXY="$_ph"
+    [ -n "${http_proxy:-}" ] || export http_proxy="$_ph"
+  fi
+  unset _ps _ph
 fi
 # "Empty" is not the same as "unset", and the AOSP `repo` launcher is the tool that
 # cares: it does `if "http_proxy" in os.environ:` and builds a ProxyHandler from the
@@ -1302,6 +1346,15 @@ if printf '%s\n' "$sub_status" | grep -q '^-'; then
   git submodule update --init --recursive
 else
   echo ">> submodules already initialized; skipping update"
+  # Not updated on purpose (a submodule may carry local work), but not silently either:
+  # '+' is a checkout that differs from the commit this tree records (after a pull that
+  # moved the gitlink, say), 'U' a merge conflict. (The update above, when it runs,
+  # moves the '+' ones as well.)
+  if printf '%s\n' "$sub_status" | grep -q '^[+U]'; then
+    echo "WARNING: these submodules are not at the commit this tree records; the build uses" >&2
+    echo "         them as they are ('git submodule update --recursive' would move them):" >&2
+    printf '%s\n' "$sub_status" | grep '^[+U]' | sed 's/^/         /' >&2
+  fi
 fi
 
 # 0-stage) AAOS artifacts. A DomA build needs the six AOSP output images
@@ -1450,7 +1503,7 @@ if [ "${ENABLE_ANDROID}" = "yes" ]; then
       [ -f "$src" ] || { echo "ERROR: --aaos=prebuilt needs image: $src" >&2; exit 1; }
       cp -f "$src" "$img_dst/$im.img"   # unconditional: never keep a stale/corrupt same-size image
     done
-    echo ">> AAOS prebuilt images staged into android/out (AOSP build will be skipped)."
+    echo ">> AAOS prebuilt images staged into $AAOS_DIR_NAME/out (AOSP build will be skipped)."
     # The DomA kernel/ramdisk are normally DERIVED from the AOSP outputs, but that needs
     # the AOSP checkout itself (system/tools/mkbootimg/unpack_bootimg.py) and the bazel
     # kernel Image -- neither of which exists in prebuilt mode, which is the whole point
@@ -1541,7 +1594,7 @@ fi
 #     not know), so seed the checkout HERE with the reference applied. moulin's later
 #     `repo init` preserves the recorded repo.reference, so every sync it runs stays
 #     local. Nothing is pinned twice: the manifest URL/rev/depth are read out of
-#     rpi5-sodev.yaml, which remains the single source of truth.
+#     the board's yaml (MOULIN_YAML), which remains the single source of truth.
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] &&
    { [ -n "$XT_AAOS_REF" ] || [ -n "$XT_AAOS_KERNEL_REF" ]; }; then
   # `repo --reference` wants a repo client: <ref>/.repo/project-objects/<name>.git.
@@ -1901,6 +1954,15 @@ else
         echo "       component of [A-Za-z0-9._-]; got '$AAOS_KERNEL_STAGE_DIR'." >&2
         exit 1 ;;
     esac
+    # The deploy directory names the file apply-aosp-patches.sh may remove (its Image)
+    # and is interpolated into the same string: a relative path inside the kernel
+    # checkout, without '..'.
+    case "$AAOS_KERNEL_DEPLOY_DIR" in
+      /*|*..*|*[!A-Za-z0-9._/-]*|-*)
+        echo "ERROR: ANDROID_KERNEL_DEPLOY_DIR in $MOULIN_YAML must be a relative path of" >&2
+        echo "       [A-Za-z0-9._/-] without '..'; got '$AAOS_KERNEL_DEPLOY_DIR'." >&2
+        exit 1 ;;
+    esac
     # moulin has no hook between `repo sync` and the AOSP build, so split it: the
     # fetch-only pass populates the checkout, stage-aosp-device.sh then puts this board's
     # AAOS product variant in place, THEN the AOSP build runs. The order is load-bearing
@@ -1941,7 +2003,14 @@ else
     # --aaos-src only redirects the AOSP tree: the kernel is always built at
     # $AAOS_KERNEL_DIR_NAME inside the workspace, so this call always targets
     # the workspace copy.
-    AOSP_CMD="ninja fetch-doma_kernel fetch-doma && '${APPLY_AOSP}' \"\$PWD/${AAOS_DIR_NAME}\" && '${APPLY_AOSP}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}\" aosp-kernel-patches && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma"
+    #
+    # Each call is also given its tree's ninja output: boot.img (the first of the AOSP
+    # build's six) and the kernel dist's Image. moulin's rules for them depend on the
+    # repo-sync stamp (and the AOSP one on the kernel), so in a workspace that has
+    # built once, a patch added to either set is applied and then not compiled. The
+    # script removes the output when a file its set touches is newer, and ninja builds
+    # again; Soong and bazel are incremental.
+    AOSP_CMD="ninja fetch-doma_kernel fetch-doma && '${APPLY_AOSP}' \"\$PWD/${AAOS_DIR_NAME}\" aosp-patches \"\$PWD/${AAOS_DIR_NAME}/out/target/product/${AAOS_PRODUCT_DEVICE}/boot.img\" && '${APPLY_AOSP}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}\" aosp-kernel-patches \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}/Image\" && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma"
   fi
   # NG-2 class hole, DomZ edition. --domains-only leaves NINJA_TARGET empty, so the
   # bare `ninja` builds moulin's DEFAULT target -- and the domz component is not in
@@ -2108,9 +2177,13 @@ in_docker "$XT_DOCKER" "
       echo \">> ninja failed inside nsjail. This is the Docker sandbox, not a transient\" >&2
       echo \">>   error: retrying cannot help. AOSP 17 runs one genrule under nsjail, which\" >&2
       echo \">>   needs to create namespaces, change mount propagation and pivot_root.\" >&2
+      # The apparmor value to name: unconfined, unless this host restricts unprivileged
+      # user namespaces, where the pre-flight check refuses it (see above).
+      aa=unconfined
+      [ \"\$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)\" = 1 ] && aa=docker-nsjail-build
       echo \">>   Grant all three and re-run; the build resumes incrementally:\" >&2
       echo \">>     XT_DOCKER_RUN_OPTS_AOSP=\\\"--security-opt seccomp=unconfined \\\\\" >&2
-      echo \">>       --security-opt apparmor=unconfined \\\\\" >&2
+      echo \">>       --security-opt apparmor=\$aa \\\\\" >&2
       echo \">>       --security-opt systempaths=unconfined\\\" ./build.sh ...\" >&2
       echo \">>   All three are needed: seccomp covers clone and pivot_root, and apparmor\" >&2
       echo \">>   and systempaths each block the mount on their own. No capability works\" >&2
@@ -2118,8 +2191,8 @@ in_docker "$XT_DOCKER" "
       echo \">>   variable, not XT_DOCKER_RUN_OPTS: an unconfined container breaks bitbake's\" >&2
       echo \">>   user-namespace check on hosts with apparmor_restrict_unprivileged_userns=1 --\" >&2
       echo \">>   and on such a host (Ubuntu 24.04) apparmor=unconfined does not help nsjail\" >&2
-      echo \">>   either: use apparmor=docker-nsjail-build (a confining profile, see the docs)\" >&2
-      echo \">>   or lower that sysctl for the build.\" >&2
+      echo \">>   either: the line above then names apparmor=docker-nsjail-build (a confining\" >&2
+      echo \">>   profile, see the docs); or lower that sysctl for the build.\" >&2
       echo \">>   See '### 0. Check the host' in docs/BUILD.md.\" >&2
       exit 1
     fi

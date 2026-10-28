@@ -67,6 +67,18 @@ ET.parse(sys.argv[1])
 EOF
 }
 
+# The device's codec and audio XML, for the same reason: a malformed media_codecs_c2.xml
+# builds and then registers no C2 component at all (its own header says how a stray
+# double hyphen does it), and the audio policy's XInclude failures are only logged.
+# Each must be there, too: the product copies them by name.
+check_device_xml() {
+	for x in "$1/$2/media_codecs_c2.xml" "$1/audio/audio_policy_configuration.xml" \
+		"$1/audio/bluetooth_audio_policy_configuration.xml"; do
+		[ -f "$x" ] || { echo "ERROR: $x is missing." >&2; exit 1; }
+		check_overlay_xml "$x"
+	done
+}
+
 case "$BOARD" in
 rpi4)
 	DEVICE="xenvm_trout_rpi4_arm64"
@@ -96,10 +108,12 @@ rpi4)
 	DIALER_XML="$DEV/overlay/frameworks/base/core/res/res/values/config.xml"
 	# Named explicitly for the same reason as on rpi5: a MISSING file is silent.
 	[ -f "$DIALER_XML" ] || { echo "ERROR: $DIALER_XML is missing." >&2; exit 1; }
-	# The device installs DomaWifiRelay and DomaSettingsProviderRRO from its own
-	# copies. A checkout that was staged for rpi5 still has device/agl/doma-common
-	# with the same module names, and soong rejects a duplicate module name.
-	for m in DomaWifiRelay DomaSettingsProviderRRO; do
+	check_device_xml "$DEV" "$DEVICE"
+	# The device installs DomaWifiRelay, DomaSettingsProviderRRO, DomaWifiOverlay
+	# and DomaNoSafeAreaRRO from its own copies. A checkout that was staged for
+	# rpi5 still has device/agl/doma-common and device/agl/xenvm-trout-rpi5 with
+	# the same module names, and soong rejects a duplicate module name.
+	for m in DomaWifiRelay DomaSettingsProviderRRO DomaWifiOverlay DomaNoSafeAreaRRO; do
 		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)
 		if [ "$n" != "1" ]; then
 			echo "ERROR: found $n Android.bp defining $m under $ROOT/device (expected 1)." >&2
@@ -121,6 +135,7 @@ rpi5)
 	SRC="$here/aosp-device/agl/xenvm-trout-rpi5"
 	DST="$ROOT/device/agl/xenvm-trout-rpi5"
 	[ -d "$SRC" ] || { echo "ERROR: missing device source $SRC" >&2; exit 1; }
+	check_device_xml "$SRC" "$DEVICE"
 
 	# device/agl/common holds what the product copies from; the product names that path,
 	# so a checkout that skipped it would fail the build outright.
@@ -156,10 +171,17 @@ rpi5)
 	# soong rejects a duplicate module name across the whole tree, so there
 	# must be exactly one Android.bp defining each. The rpi4 does not stage
 	# this directory: its device repository carries its own copies of the
-	# modules it installs, kept identical to these by hand.
+	# modules it installs, kept identical to these by hand. The product's own
+	# DomaNoSafeAreaRRO (device/agl/xenvm-trout-rpi5) has an rpi4 copy too.
 	rm -rf "$ROOT/device/agl/doma-common"
 	cp -a "$here/aosp-device/agl/doma-common" "$ROOT/device/agl/doma-common"
-	for m in DomaWifiRelay DomaSettingsProviderRRO DomaWifiOverlay; do
+	# Replace rather than merge, so a file deleted here does not linger in the checkout
+	# and keep taking part in the build. Idempotent: re-running restages the same content.
+	rm -rf "$DST"
+	cp -a "$SRC" "$DST"
+
+	# Counted after both are staged: DomaNoSafeAreaRRO is in $DST.
+	for m in DomaWifiRelay DomaSettingsProviderRRO DomaWifiOverlay DomaNoSafeAreaRRO; do
 		# --include=Android.bp: without it a comment in an .rc file that merely names
 		# the module would count as a second definition.
 		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)
@@ -169,11 +191,6 @@ rpi5)
 			exit 1
 		fi
 	done
-
-	# Replace rather than merge, so a file deleted here does not linger in the checkout
-	# and keep taking part in the build. Idempotent: re-running restages the same content.
-	rm -rf "$DST"
-	cp -a "$SRC" "$DST"
 
 	# The BoardConfig has to BE there: without it build/make/core/board_config.mk
 	# stops `lunch` with "No config file found for TARGET_DEVICE
