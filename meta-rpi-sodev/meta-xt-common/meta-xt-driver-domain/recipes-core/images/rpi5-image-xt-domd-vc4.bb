@@ -369,10 +369,11 @@ export LD_PRELOAD=/usr/lib/cgshim.so
 # qemu 11 only (q11-053; qemu 10 ignores it): cap the foreign mapcache. Uncapped, every
 # guest page ever DMAed through stays mapped; see XT_QEMU_MAPCACHE_MAX_MB in the recipe.
 export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
-# Opt-in switches, each off unless its file exists:
+# Switches, each off unless its file exists:
 #   /etc/qemu-ioreq-thread  qemu 11 (q11-052/054): acknowledge virtio-pci notify writes,
 #                           and answer ISR reads, on a dedicated ioreq thread instead of
-#                           waiting for the main loop.
+#                           waiting for the main loop. The image creates this file, so
+#                           it is on unless removed.
 #   /etc/qemu-gbm-layout    virglrenderer 1.3.0: back guest resources with GBM dma-bufs, which
 #                           a Vulkan (Venus) DomA needs. It costs the GL path (RPi4: a local
 #                           WebView 1080p fullscreen video stops, HMI 52-56 -> 35-41 fps).
@@ -388,6 +389,12 @@ exec "${REAL_QEMU}" "$@"
 EOF
         chmod 0755 ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64
     fi
+    # The ioreq thread on by default (see the wrapper's switches). A guest vCPU that kicks
+    # a virtqueue or reads the ISR otherwise waits for qemu's main loop: on the Raspberry Pi
+    # 4 with DomA decoding 1080p60 that was about 31% and 17% of a vCPU (q11-052/054).
+    # qemu 10.0.2 ignores the variable.
+    install -d ${IMAGE_ROOTFS}${sysconfdir}
+    touch ${IMAGE_ROOTFS}${sysconfdir}/qemu-ioreq-thread
 
     # 2. xendriverdomain.service drop-ins
     install -d ${IMAGE_ROOTFS}/etc/systemd/system/xendriverdomain.service.d

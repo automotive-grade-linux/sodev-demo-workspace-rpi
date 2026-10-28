@@ -336,9 +336,9 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
 - Two files in DomD switch qemu 11 features, each off unless it exists:
   `/etc/qemu-ioreq-thread` (the wrapper exports `QEMU_XEN_IOREQ_THREAD=1`:
   virtio-pci notify writes are acknowledged, and ISR reads answered, on a dedicated
-  ioreq thread, `q11-052`/`q11-054`) and `/etc/qemu-lat-diag` (`QEMU_LAT_DIAG=1`:
-  display-command latencies are logged, `q11-057`/`q11-058`); nothing creates
-  either.
+  ioreq thread, `q11-052`/`q11-054`), which the DomD image creates, so it is on
+  unless removed; and `/etc/qemu-lat-diag` (`QEMU_LAT_DIAG=1`: display-command
+  latencies are logged, `q11-057`/`q11-058`), which nothing creates.
 
 This matters for scheduling: the fork *does* maintain post-9.2 branches, so the
 Xen ARM device-model work does not have to be abandoned to get Venus. It is a

@@ -155,9 +155,9 @@ SRC_URI:append:class-target = " file://q11-047-hw-arm-pass-the-virtio-pci-INTX-l
 SRC_URI:append:class-target = " file://q11-048-hw-virtio-media-let-host-nv12-scale-the-frame-down-to-the-di.patch"
 SRC_URI:append:class-target = " file://q11-049-hw-virtio-media-invalidate-the-RGBA-target-before-the-NV12-d.patch"
 SRC_URI:append:class-target = " file://q11-050-virtio-gpu-raise-the-control-queue-interrupt-once-per-batch.patch"
-# q11-052..058: an ioreq thread and ISR reads on it (opt-in, QEMU_XEN_IOREQ_THREAD=1), a
-#   cap on the foreign mapcache (QEMU_XEN_MAPCACHE_MAX_MB) and QEMU_LAT_DIAG=1 latency
-#   counters (x2).
+# q11-052..058: an ioreq thread and ISR reads on it (QEMU_XEN_IOREQ_THREAD=1, which the
+#   DomD image's /etc/qemu-ioreq-thread turns on), a cap on the foreign mapcache
+#   (QEMU_XEN_MAPCACHE_MAX_MB) and QEMU_LAT_DIAG=1 latency counters (x2).
 SRC_URI:append:class-target = " file://q11-052-xen-acknowledge-virtio-pci-notify-writes-on-an-ioreq-thread.patch"
 SRC_URI:append:class-target = " file://q11-053-xen-mapcache-let-QEMU_XEN_MAPCACHE_MAX_MB-cap-the-foreign-ma.patch"
 SRC_URI:append:class-target = " file://q11-054-xen-complete-virtio-pci-ISR-reads-on-the-ioreq-thread-under.patch"
