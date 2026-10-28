@@ -348,6 +348,10 @@ export SDL_VIDEO_WAYLAND_WMCLASS="$wmclass"
 # Force clock_gettime through the raw syscall (cgshim.so), bypassing the
 # aarch64 vDSO seqcount spin that hangs this device-model qemu in cpu_enable_ticks.
 export LD_PRELOAD=/usr/lib/cgshim.so
+# Opt-in switch, off unless the file exists:
+#   /etc/qemu-gbm-layout    virglrenderer 1.3.0: back guest resources with GBM dma-bufs, which
+#                           a Vulkan (Venus) DomA needs.
+[ -f /etc/qemu-gbm-layout ] && export VIRGL_GBM_LAYOUT_ENABLE=1
 exec "${REAL_QEMU}" "$@"
 EOF
         chmod 0755 ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64

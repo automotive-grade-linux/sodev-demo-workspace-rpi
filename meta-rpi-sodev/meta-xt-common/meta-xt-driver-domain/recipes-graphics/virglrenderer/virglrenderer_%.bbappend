@@ -186,3 +186,9 @@ SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 # knob here and not two.
 SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
     'file://0021-vkr-force-the-advertised-device-local-heap-size.patch', '', d)}"
+
+# virglrenderer 1.3.0 (the recipe from openembedded-core in this layer): 0009 is upstream there, and
+# 0017's diagnostic hunk is ported to 1.3.0's vrend_resource_gbm_init (which also gained a gbm_layout_feat
+# early-out: without VIRGL_GBM_LAYOUT_ENABLE / _FORCE_ENABLE a non-MINIGBM build gives no resource GBM backing).
+SRC_URI:remove = "${@'file://0009-vrend-Correct-minigbm-definitions.patch file://0017-vkr-vrend-make-an-unexportable-guest-resource-survivab.patch' if d.getVar('PV').startswith('1.3') else ''}"
+SRC_URI += "${@(bb.utils.contains('DISTRO_FEATURES', 'venus', 'file://0017-vkr-vrend-make-an-unexportable-guest-resource-survivab-v130.patch', '', d) if d.getVar('PV').startswith('1.3') else '')}"

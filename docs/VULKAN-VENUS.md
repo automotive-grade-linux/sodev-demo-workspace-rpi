@@ -18,7 +18,7 @@ This is the authoritative list of what that means:
 |---|---|---|
 | DomD device model | qemu 10.0.2-xt (`meta-xt-qemu`) and its patch series, built with `gtk+` and `pixman` | qemu 7.0.0-xt, with its six 7.0.0-only device-model patches |
 | DomD rootfs | `mesa-vulkan-drivers`, `vulkan-loader` and `vulkan-tools` installed explicitly | no `vulkan-tools`; the V3DV ICD and the loader arrive only through weston's Vulkan renderer |
-| DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 6 product patches | oe-core's stock build, no venus, no patches |
+| DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 5 product patches on 1.3.0 on both boards (0009 is upstream there and 0017 is replaced by its 1.3.0 port); 6 on 1.2.0 when it is selected | oe-core's stock build, no venus, no patches |
 | guest cfg (`domu.cfg`/`doma.cfg`) | `hostmem=256M,blob=true,venus=true` on `virtio-gpu-gl-pci`; in `doma.cfg` the Venus `qemu_envs` (`VIRGL_EXTERNAL_GBM`, `V3DV_MAX_BO_CACHE_SIZE`, `VKR_DEVICE_HEAP_MIB`); the options and renames only qemu 10 takes | none of these |
 | Xen + libxl | `4.22-0007/0008/0009/0010` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices, one SPI per virtio-pci slot); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
 | rpi4 4 GiB SKU memory | DomD 1440 MiB / DomA 2048 MiB | DomD 1056 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
@@ -99,12 +99,20 @@ and one was a hard blocker; the table is written from that starting point, and t
 |---|---|---|---|
 | mesa | 26.0.5 in oe-core; **this series pins DomD's to 26.2.2** (ungated, so both lanes) -- section 7e | **V3DV already built AND already installed** | meta-raspberrypi `mesa.bbappend` appends `vulkan broadcom` for `rpi`, so `VULKAN_DRIVERS` gains `broadcom` → `libvulkan_broadcom.so` in `mesa-vulkan-drivers`. And it is already in the shipping rootfs: weston's `vulkan-renderer.so` links `libvulkan.so.1`, so weston RDEPENDS on vulkan-loader, whose `RRECOMMENDS virtual-vulkan-icd` resolves to `mesa-vulkan-drivers` |
 | weston | 15.0.0 (oe-core) | **Vulkan renderer already built** | `PACKAGECONFIG` filters `vulkan` from `DISTRO_FEATURES` → `-Drenderer-vulkan=true` |
-| virglrenderer | 1.2.0 (oe-core) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off |
+| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off |
 | qemu | **10.0.2** (xen-troops fork, `meta-xt-qemu`) by default; **7.0.0** with `--gpu=gl` | was the blocker | `virtio-gpu-gl` grew `venus=` in QEMU **9.2.0**, so the 7.0.0 the tree used to ship has no such property. Raising the device model is what this work turned into the default |
 
 So the host-side work was: raise QEMU, keep virglrenderer's venus backend, install
 the ICD into the DomD rootfs, and pass the device-model options. That is what the
 default `--GPU vulkan` does, and what `--gpu=gl` undoes.
+
+The virglrenderer pin (`PREFERRED_VERSION_virglrenderer = "1.2.%"`, in the DomD
+conf of both board yamls) is what keeps poky's version: `meta-xt-driver-domain` is
+the higher-priority layer, so without a pin its newer recipe would win, and
+`DEFAULT_PREFERENCE` cannot hand the choice back to poky. A board that wants the
+newer one sets the variable again, as both boards' `vulkan` lanes do (virglrenderer
+1.3.0, with qemu 10.0.2 built against it; a qemu built against 1.3.0 does not start
+with the 1.2 library).
 
 `CONFIG_UDMABUF` needs nothing: the Raspberry Pi kernel's own
 `arch/arm64/configs/bcm2712_defconfig` already sets `CONFIG_UDMABUF=y` (line 1489
@@ -333,7 +341,7 @@ configuration now, and the six 7.0.0-only patches are why it was not:
 
 That gates on `venus` in `DISTRO_FEATURES` and turns on:
 
-- qemu 10.0.2-xt instead of 7.0.0-xt;
+- qemu 10.0.2-xt (with virglrenderer 1.3.0) instead of 7.0.0-xt;
 - virglrenderer's venus backend, by making the domd conf's
   `PACKAGECONFIG:remove:pn-virglrenderer` empty (`XT_VIRGL_VENUS_REMOVE`);
 - virglrenderer's **render server** (`PACKAGECONFIG:append:pn-virglrenderer =

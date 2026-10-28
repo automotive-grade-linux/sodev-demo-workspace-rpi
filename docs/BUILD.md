@@ -611,8 +611,8 @@ options:
                         (default: no)
   --GPU {gl,vulkan}     Which graphics stack the guests get. vulkan (default):
                         Venus (guest Vulkan over virtio-gpu) for DomA and DomU
-                        -- qemu 10.0.2-xt, virglrenderer's venus backend, the
-                        DomD/DomU Vulkan runtime and venus=true device-model
+                        -- qemu 10.0.2-xt, virglrenderer 1.3.0's venus backend,
+                        the DomD/DomU Vulkan runtime and venus=true device-model
                         options. gl: the pre-Venus OpenGL stack on qemu
                         7.0.0-xt. See docs/VULKAN-VENUS.md. (default: vulkan)
   --ENABLE_DEVEL {no,yes}
