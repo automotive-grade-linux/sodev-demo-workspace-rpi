@@ -49,7 +49,8 @@ What it checks, and why each one can actually go wrong:
      watermark_scale_factor (see the bbappend);
  12. in both board yamls XT_DOMA_HWDEC is false on the gl lane, and true on
      the vulkan lane with the zephyr Dom0 -- the guest's decoder needs the
-     qemu 10.0.2 device model and, on 4 GiB, the venus lane's 1440 MiB DomD.
+     qemu 10.0.2 or 11.1.2 device model and, on 4 GiB, the venus lane's 1440 MiB
+     DomD.
 
 Usage: tools/check-rpi4-memory-map.py [--strict-budget]
 Exit status is non-zero if any check fails. --strict-budget additionally fails the
@@ -363,7 +364,7 @@ def parse_hwdec_gate(path):
     The value reaches the AOSP build through the doma builder's env, and the guest's
     hardware-decode additions are inside `ifeq ($(XT_DOMA_HWDEC),true)`. It must
     never be true off the venus lane: the decoder the guest talks to is a
-    virtio-media device, which only the qemu 10.0.2 device model has.
+    virtio-media device, which only the qemu 10.0.2 and 11.1.2 device models have.
 
     The vulkan branch names %{XT_DOMA_HWDEC_VULKAN}, which the top-level
     variables set and a Dom0 flavour can override, so the result is per
@@ -653,7 +654,8 @@ def main():
         else:
             bad("%s: XT_DOMA_HWDEC is %r -- it must be false on gl and true "
                 "on vulkan with the zephyr Dom0, because the decoder is a "
-                "virtio-media device and only qemu 10.0.2 provides one"
+                "virtio-media device and only qemu 10.0.2 and 11.1.2 provide "
+                "one"
                 % (board, gate))
 
     print("\n%d ok, %d failure(s)" % (PASS, FAIL))

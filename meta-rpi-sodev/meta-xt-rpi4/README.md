@@ -73,13 +73,14 @@ overlay.
   numbers cannot drift apart (it fails if DomA gives up less than DomD gains or if the
   condition is ever inverted).
 
-  `--gpu=vulkan` selects qemu 10.0.2-xt, which version-gates off the six 7.0.0-only
+  `--gpu=vulkan` selects qemu 11.1.2, which version-gates off the six 7.0.0-only
   device-model patches. `0111` (virtio-tablet `BTN_TOUCH`) is among them, and Android
   classifies an ABS_X/ABS_Y device as a touchscreen only when it also reports `BTN_TOUCH`;
-  that fix is rebased for 10.0.2 as `meta-xt-qemu`'s `0118`, so the Vulkan lane keeps the touch
-  this SKU's hardware run verified. `0110` is rebased too (as `0120`), `0112` and `0113`
-  do not apply to 10.0.2 at all, and `0101`/`0103` guard a failure that does not
-  reproduce on it -- the per-patch evidence is in `meta-xt-driver-domain`'s
+  that fix is carried for 11.1.2 as `meta-xt-qemu`'s `q11-017` (for the selectable
+  10.0.2-xt as `0118`), so the Vulkan lane keeps the touch this SKU's hardware run
+  verified. `0110` is carried too (`q11-019`; `0120` for 10.0.2), `0101`/`0103` are
+  forward-ported as `q11-021` (`0201` for 10.0.2), and `0112` and `0113` do not apply
+  -- the per-patch evidence against 10.0.2 is in `meta-xt-driver-domain`'s
   `qemu_%.bbappend`. `--gpu=gl` rebuilds the 7.0.0-xt device model with all six.
   See `docs/VULKAN-VENUS.md`.
 
