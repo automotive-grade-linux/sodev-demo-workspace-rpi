@@ -54,7 +54,7 @@ PACKAGECONFIG:append = " glvnd"
 # testing two of them for no benefit. Consequence to state plainly: `--gpu=gl`
 # is the pre-Venus device model and the pre-Venus memory map, but NOT the
 # pre-Venus mesa. The gl lane was build-verified in this configuration.
-# 26.2.4 (was 26.2.2); this layer's 3 patches below apply to it with patch -F 0.
+# 26.2.4 (was 26.2.2); this layer's 4 patches below apply to it with patch -F 0.
 PV = "26.2.4"
 SRC_URI[sha256sum] = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9"
 
@@ -106,3 +106,11 @@ SRC_URI += "file://0002-v3d-fill-the-tiled-blit-temporary-with-the-TFU.patch"
 # in spin_wait_for_sync_file() meanwhile (RPi4, 2026-10-01: merges 4563 -> 26 per 10 s,
 # spin iterations 1883 -> 474). See the patch.
 SRC_URI += "file://0003-v3dv-build-the-signal-fence-once-per-submit.patch"
+
+# v3dv: size explicitly laid out planes from their own offset.
+# An AHardwareBuffer's YV12 planes are in memory as Y, Cr, Cb; Vulkan orders them Y, Cb,
+# Cr, so the explicit layout Venus passes for a software-decoded video frame has Cr's
+# offset below Cb's. v3dv counted each plane's size from the running sum of the planes
+# before it, the subtraction wrapped and vkCreateImage failed -- DomA's SurfaceFlinger
+# aborted on every such frame under Vulkan compositing (RPi5, 2026-10-14). See the patch.
+SRC_URI += "file://0004-v3dv-size-explicitly-laid-out-planes-from-their-own-offset.patch"

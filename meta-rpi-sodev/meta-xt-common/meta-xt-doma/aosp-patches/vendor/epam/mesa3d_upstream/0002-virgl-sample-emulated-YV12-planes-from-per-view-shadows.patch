@@ -1,0 +1,349 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 14 Oct 2026 21:30:58 +0900
+Subject: [PATCH] virgl: sample emulated YV12 planes from per-view shadows
+
+A host whose gbm cannot handle YV12 -- virglrenderer allocates through
+gbm when it finds one, and asks gbm_device_is_format_supported whether a
+format can be sampled; Mesa's gbm has no YUV formats -- does not report
+YV12 as sampleable. The guest allocator then emulates the buffer
+(minigbm's virgl backend; YV12 is what the Android software video
+decoders produce) as one R8 host resource: the Y-plane, then the two
+chroma planes at half its stride. The gallium frontend lowers the EGL
+image to one R8 resource per plane, all sharing that hw_res, and the
+plane index travels in the sampler view's first-layer field. The host
+takes the index for a texture-view layer of a single-layer texture,
+computes no layers (plane 1) or -1 (plane 2), rejects the view and puts
+the whole context in error ("vrend_create_sampler_view: Invalid number
+of layers (-1)"). For SurfaceFlinger that means a black screen for every
+software-decoded video frame. Sampling the whole R8 resource would not
+be right either, and a chroma plane is not even a rectangle of it.
+
+Detect such a plane when it is imported: non-blob, lowered to R8 from a
+three-plane YUV format, on a host that cannot sample YV12 (the sampler
+test minigbm makes, among others, before it emulates). Give each sampler
+view of it a shadow of the plane's own size and sample that instead.
+Before a draw or a dispatch reads the view, upload the plane from guest
+memory into the shadow (texture_subdata, at the offset and stride of the
+import), once per submitted command buffer; the upload is ordered before
+the draw in the consumer's own command stream. The CPU reads the guest
+memory when the draw is issued: right for the Android software video
+decoders, which finish writing with the CPU and queue the buffer without
+a fence, not for a producer whose fence the consumer waits for on the
+GPU, nor for one that writes on the host. A shadow per view keeps the
+state per context: views belong to one context. A plane that cannot be
+mapped is logged once, since its view then samples a shadow that was
+never written, and the winsys keeps the first mapping when several
+threads map an imported resource at once (its hw_res is shared by the
+screen's contexts).
+
+NV12-like formats are left as they were: their chroma plane is lowered
+to RG88. And the encoder no longer sends the plane index of an emulated
+plane, so that one without a shadow (allocation failed) cannot fail the
+context.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -36,6 +36,7 @@
+ #include "nir/nir_to_tgsi.h"
+ #include "util/format/u_format.h"
+ #include "indices/u_primconvert.h"
++#include "util/log.h"
+ #include "util/u_draw.h"
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+@@ -202,7 +203,76 @@ static void virgl_attach_res_sampler_views(struct virgl_context *vctx,
+    for (int i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; ++i) {
+       if (binding->views[i] && binding->views[i]->texture) {
+          struct virgl_resource *res = virgl_resource(binding->views[i]->texture);
++         struct pipe_resource *shadow =
++            virgl_sampler_view(binding->views[i])->emu_shadow;
++
+          vws->emit_res(vws, vctx->cbuf, res->hw_res, false);
++         if (shadow)
++            vws->emit_res(vws, vctx->cbuf, virgl_resource(shadow)->hw_res, false);
++      }
++   }
++}
++
++/* A shadow of an emulated YUV plane's own size, for a view to sample. */
++static struct pipe_resource *
++virgl_emu_plane_shadow_create(struct virgl_context *vctx, struct virgl_resource *res)
++{
++   struct pipe_screen *screen = vctx->base.screen;
++   struct pipe_resource templ = {0};
++
++   templ.target = PIPE_TEXTURE_2D;
++   templ.format = res->b.format;
++   templ.width0 = res->b.width0;
++   templ.height0 = res->b.height0;
++   templ.depth0 = 1;
++   templ.array_size = 1;
++   templ.bind = PIPE_BIND_SAMPLER_VIEW;
++   return screen->resource_create(screen, &templ);
++}
++
++/* Upload the emulated YUV planes the views bound to the stages [first, last]
++ * sample from guest memory into their shadows, once per command buffer; the
++ * upload is ordered before the draw in this context's command stream. The
++ * CPU reads the guest memory when the draw is issued, which is right for a
++ * producer that finishes writing with the CPU before it queues the buffer
++ * without a fence (the Android software video decoders), not for one whose
++ * acquire fence the consumer waits for on the GPU, nor for one that writes
++ * on the host. It must run before the caller emits anything for the draw:
++ * it may flush. */
++static void virgl_upload_emu_planes(struct virgl_context *vctx,
++                                    mesa_shader_stage first, mesa_shader_stage last)
++{
++   struct virgl_winsys *vws = virgl_screen(vctx->base.screen)->vws;
++
++   for (mesa_shader_stage stage = first; stage <= last; stage++) {
++      struct virgl_shader_binding_state *binding = &vctx->shader_bindings[stage];
++
++      if (!binding->emu_planes)
++         continue;
++      for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++) {
++         struct virgl_sampler_view *view = virgl_sampler_view(binding->views[i]);
++         struct virgl_resource *res;
++         struct pipe_box box;
++         const uint8_t *src;
++
++         if (!view || !view->emu_shadow || view->emu_serial == vctx->emu_serial)
++            continue;
++         res = virgl_resource(view->base.texture);
++         src = vws->resource_map(vws, res->hw_res);
++         if (!src) {
++            static bool warned;
++            /* the view then samples a shadow that was never written */
++            if (!warned)
++               mesa_logw("virgl: cannot map an emulated YUV plane for upload");
++            warned = true;
++            continue;
++         }
++         u_box_2d(0, 0, res->b.width0, res->b.height0, &box);
++         vctx->base.texture_subdata(&vctx->base, view->emu_shadow, 0,
++                                    PIPE_MAP_DISCARD_WHOLE_RESOURCE, &box,
++                                    src + res->emu_offset, res->emu_stride, 0);
++         /* after the upload: it may have flushed and bumped the serial */
++         view->emu_serial = vctx->emu_serial;
+       }
+    }
+ }
+@@ -1036,6 +1106,9 @@ static void virgl_draw_vbo(struct pipe_context *ctx,
+       util_primconvert_draw_vbo(vctx->primconvert, dinfo, drawid_offset, indirect, draws, num_draws);
+       return;
+    }
++
++   virgl_upload_emu_planes(vctx, MESA_SHADER_VERTEX, MESA_SHADER_COMPUTE - 1);
++
+    if (info.index_size) {
+            pipe_resource_reference(&ib.buffer, info.has_user_indices ? NULL : info.index.resource);
+            ib.user_buffer = info.has_user_indices ? info.index.user : NULL;
+@@ -1097,6 +1170,7 @@ void virgl_flush_eq(struct virgl_context *ctx, void *closure,
+ 
+    /* send the buffer to the remote side for decoding */
+    ctx->num_draws = ctx->num_compute = 0;
++   ctx->emu_serial++;
+ 
+    virgl_transfer_queue_clear(&ctx->queue, ctx->cbuf);
+ 
+@@ -1143,7 +1217,15 @@ static struct pipe_sampler_view *virgl_create_sampler_view(struct pipe_context *
+ 
+    res = virgl_resource(texture);
+    handle = virgl_object_assign_handle();
+-   virgl_encode_sampler_view(vctx, handle, res, state);
++   if (res->emu_plane) {
++      /* sample the plane from a shadow; without one, the encoder at least
++       * keeps the host context alive (see virgl_encode_sampler_view) */
++      grview->emu_shadow = virgl_emu_plane_shadow_create(vctx, res);
++      grview->emu_serial = vctx->emu_serial - 1;
++   }
++   virgl_encode_sampler_view(vctx, handle,
++                             grview->emu_shadow ? virgl_resource(grview->emu_shadow) : res,
++                             state);
+ 
+    grview->base = *state;
+    grview->base.reference.count = 1;
+@@ -1178,6 +1260,14 @@ static void virgl_set_sampler_views(struct pipe_context *ctx,
+       }
+    }
+ 
++   binding->emu_planes = false;
++   for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++) {
++      if (binding->views[i] && virgl_sampler_view(binding->views[i])->emu_shadow) {
++         binding->emu_planes = true;
++         break;
++      }
++   }
++
+    virgl_encode_set_sampler_views(vctx, shader_type,
+          start_slot, num_views, (struct virgl_sampler_view **)binding->views);
+    virgl_attach_res_sampler_views(vctx, shader_type);
+@@ -1207,6 +1297,7 @@ static void virgl_destroy_sampler_view(struct pipe_context *ctx,
+    struct virgl_sampler_view *grview = virgl_sampler_view(view);
+ 
+    virgl_encode_delete_object(vctx, grview->handle, VIRGL_OBJECT_SAMPLER_VIEW);
++   pipe_resource_reference(&grview->emu_shadow, NULL);
+    pipe_resource_reference(&view->texture, NULL);
+    FREE(view);
+ }
+@@ -1548,6 +1639,8 @@ static void virgl_launch_grid(struct pipe_context *ctx,
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+ 
++   virgl_upload_emu_planes(vctx, MESA_SHADER_COMPUTE, MESA_SHADER_COMPUTE);
++
+    if (!vctx->num_compute)
+       virgl_reemit_compute_resources(vctx);
+    vctx->num_compute++;
+--- a/src/gallium/drivers/virgl/virgl_context.h
++++ b/src/gallium/drivers/virgl/virgl_context.h
+@@ -41,6 +41,12 @@ struct virgl_vertex_elements_state;
+ struct virgl_sampler_view {
+    struct pipe_sampler_view base;
+    uint32_t handle;
++
++   /* For a view of an emulated YUV plane (virgl_resource::emu_plane): the
++    * resource sampled instead, and the context's emu_serial at its last
++    * upload (virgl_upload_emu_planes). */
++   struct pipe_resource *emu_shadow;
++   uint32_t emu_serial;
+ };
+ 
+ struct virgl_so_target {
+@@ -64,6 +70,9 @@ struct virgl_shader_binding_state {
+ 
+    struct pipe_image_view images[PIPE_MAX_SHADER_IMAGES];
+    uint32_t image_enabled_mask;
++
++   /* a bound view samples the shadow of an emulated YUV plane */
++   bool emu_planes;
+ };
+ 
+ /*
+@@ -86,6 +95,10 @@ struct virgl_context {
+    struct pipe_shader_buffer atomic_buffers[PIPE_MAX_HW_ATOMIC_BUFFERS];
+    uint32_t atomic_buffer_enabled_mask;
+ 
++   /* bumped at every submitted command buffer; emulated YUV planes are
++    * uploaded into their shadows once per value (virgl_upload_emu_planes) */
++   uint32_t emu_serial;
++
+    struct virgl_vertex_elements_state *vertex_elements;
+ 
+    struct virgl_framebuffer_state framebuffer;
+--- a/src/gallium/drivers/virgl/virgl_encode.c
++++ b/src/gallium/drivers/virgl/virgl_encode.c
+@@ -1175,7 +1175,10 @@ int virgl_encode_sampler_view(struct virgl_context *ctx,
+       virgl_encoder_write_dword(ctx->cbuf, state->u.buf.offset / elem_size);
+       virgl_encoder_write_dword(ctx->cbuf, (state->u.buf.offset + state->u.buf.size) / elem_size - 1);
+    } else {
+-      if (res->metadata.plane) {
++      /* An emulated YUV plane has no plane of its own on the host (see
++       * virgl_resource::emu_plane): the host would read the index as a
++       * texture-view layer, reject the view and fail the whole context. */
++      if (res->metadata.plane && !res->emu_plane) {
+          assert(state->u.tex.first_layer == 0 && state->u.tex.last_layer == 0);
+          virgl_encoder_write_dword(ctx->cbuf, res->metadata.plane);
+       } else {
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -740,6 +740,20 @@ static struct pipe_resource *virgl_resource_from_handle(struct pipe_screen *scre
+       return NULL;
+    }
+ 
++   /* An emulated YUV plane: see emu_plane in virgl_resource.h. NV12-like
++    * formats are left alone: their chroma plane is lowered to RG88, which
++    * a copy of R8 rows cannot fill.
++    */
++   if (!res->blob_mem && templ && templ->target == PIPE_TEXTURE_2D &&
++       templ->format == PIPE_FORMAT_R8_UNORM &&
++       util_format_is_yuv(whandle->format) &&
++       util_format_get_num_planes(whandle->format) == 3 &&
++       whandle->stride >= res->b.width0 && !vs->host_samples_yv12) {
++      res->emu_plane = true;
++      res->emu_offset = whandle->offset;
++      res->emu_stride = whandle->stride;
++   }
++
+    /* do not use winsys returns for guest storage info of classic resource */
+    if (!res->blob_mem) {
+       winsys_stride = 0;
+@@ -760,6 +774,12 @@ static struct pipe_resource *virgl_resource_from_handle(struct pipe_screen *scre
+    */
+   storage_size = vs->vws->resource_get_storage_size(vs->vws, res->hw_res);
+ 
++   /* the upload reads the plane from guest memory: it must lie inside */
++   if (res->emu_plane && (!res->b.height0 ||
++       (uint64_t)res->emu_offset + (uint64_t)res->emu_stride * (res->b.height0 - 1) +
++       res->b.width0 > storage_size))
++      res->emu_plane = false;
++
+    if (res->metadata.total_size > storage_size)
+       res->use_staging = 1;
+ 
+--- a/src/gallium/drivers/virgl/virgl_resource.h
++++ b/src/gallium/drivers/virgl/virgl_resource.h
+@@ -68,6 +68,20 @@ struct virgl_resource {
+    unsigned bind_history;
+    uint32_t blob_mem;
+ 
++   /* One plane of a three-plane YUV image (YV12) that the guest allocator
++    * had to emulate in a single R8 host resource, because the host cannot
++    * sample YV12. The frontend lowers the image to one R8 resource per plane,
++    * all sharing that hw_res; the host cannot sample a plane of it on its own
++    * (it would take the plane index for a texture-view layer and reject the
++    * view), and the chroma planes are not rectangles of the host resource
++    * (they are at half its stride). So a view samples a shadow of the plane's
++    * own size, uploaded from the plane in guest memory, at emu_offset and
++    * emu_stride (bytes), before a draw reads it (virgl_upload_emu_planes).
++    */
++   bool emu_plane;
++   uint32_t emu_offset;
++   uint32_t emu_stride;
++
+    uint16_t clean_mask;
+    uint16_t use_staging : 1;
+    uint16_t reserved : 15;
+--- a/src/gallium/drivers/virgl/virgl_screen.c
++++ b/src/gallium/drivers/virgl/virgl_screen.c
+@@ -1050,6 +1050,8 @@ virgl_create_screen(struct virgl_winsys *vws, const struct pipe_screen_config *c
+ 
+    union virgl_caps *caps = &screen->caps.caps;
+    screen->tweak_gles_emulate_bgra &= !virgl_format_check_bitmask(PIPE_FORMAT_B8G8R8A8_SRGB, caps->v1.render.bitmask, false);
++   /* the sampler test minigbm makes, among others, before emulating YV12 */
++   screen->host_samples_yv12 = virgl_format_check_bitmask(PIPE_FORMAT_YV12, caps->v1.sampler.bitmask, false);
+    screen->refcnt = 1;
+ 
+    virgl_init_shader_caps(screen);
+--- a/src/gallium/drivers/virgl/virgl_screen.h
++++ b/src/gallium/drivers/virgl/virgl_screen.h
+@@ -62,6 +62,8 @@ struct virgl_screen {
+ 
+    uint32_t sub_ctx_id;
+    bool tweak_gles_emulate_bgra;
++   /* the host samples YV12, i.e. guest YV12 images need no emulation */
++   bool host_samples_yv12;
+    bool tweak_gles_apply_bgra_dest_swizzle;
+    bool tweak_l8_srgb_readback;
+    bool no_coherent;
+--- a/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
++++ b/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
+@@ -710,7 +710,12 @@ static void *virgl_drm_resource_map(struct virgl_winsys *qws,
+    if (ptr == MAP_FAILED)
+       return NULL;
+ 
+-   res->ptr = ptr;
++   /* an imported hw_res is shared by the contexts of the screen, which may
++    * map it from several threads: keep the first mapping */
++   if (p_atomic_cmpxchg(&res->ptr, NULL, ptr) != NULL) {
++      os_munmap(ptr, res->size);
++      return res->ptr;
++   }
+    return ptr;
+ 
+ }

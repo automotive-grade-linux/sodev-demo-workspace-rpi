@@ -1,0 +1,84 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 07:29:06 +0900
+Subject: [PATCH] v3dv: size explicitly laid out planes from their own offset
+
+v3d_setup_plane_slices() takes a plane's start from the explicit plane
+layout when one is given, but computes the plane's size as its end minus
+plane_offset, the running sum of the sizes of the planes before it. That
+is only right when the layout puts the planes one after the other in
+plane order. A layout whose planes are in another order makes the uint32
+subtraction wrap, the image's size goes past 4 GiB and vkCreateImage
+fails with VK_ERROR_OUT_OF_DEVICE_MEMORY.
+
+Android hits it with every software-decoded video frame under Venus: a
+YV12 buffer has its planes in memory as Y, Cr, Cb, Vulkan's
+G8_B8_R8_3PLANE_420 orders them Y, Cb, Cr, and the guest driver passes
+the Android buffer's offsets in Vulkan's plane order, so Cr's offset is
+below Cb's. The AHardwareBuffer import fails and SurfaceFlinger aborts
+("Failed to create a valid texture ... format:842094169"), measured on a
+Raspberry Pi 5 host on 2026-10-14.
+
+Count each plane's size from where the plane starts, and make the image
+end where its last-ending plane does. Without an explicit layout the
+planes follow each other, and both are what they were. A disjoint plane
+has memory of its own, which has to hold the layout's offset as well, so
+its size still counts from 0, as before.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/broadcom/vulkan/v3dv_image.c
++++ b/src/broadcom/vulkan/v3dv_image.c
+@@ -101,7 +101,7 @@ v3d_get_dimension_mpad(uint32_t dimension, uint32_t level, uint32_t block_dimens
+ 
+ static bool
+ v3d_setup_plane_slices(struct v3dv_device *device, struct v3dv_image *image,
+-                       uint8_t plane, uint32_t plane_offset,
++                       uint8_t plane, uint32_t plane_offset, bool disjoint,
+                        const VkSubresourceLayout *plane_layouts)
+ {
+    assert(image->planes[plane].cpp > 0);
+@@ -156,6 +156,12 @@ v3d_setup_plane_slices(struct v3dv_device *device, struct v3dv_image *image,
+       offset = plane_offset;
+    }
+    assert(plane_offset % 64 == 0);
++   /* where this plane starts: with an explicit layout its offset need not
++    * follow the planes before it (Android's YV12 puts Cr before Cb, which
++    * Vulkan's plane order reverses), so the plane's size is counted from
++    * here, not from plane_offset. A disjoint plane has its own memory, which
++    * must hold the layout's offset too, so its size still counts from 0. */
++   const uint32_t plane_start = plane_layouts && !disjoint ? offset : plane_offset;
+ 
+    for (int32_t i = image->vk.mip_levels - 1; i >= 0; i--) {
+       struct v3d_resource_slice *slice = &image->planes[plane].slices[i];
+@@ -277,7 +283,7 @@ v3d_setup_plane_slices(struct v3dv_device *device, struct v3dv_image *image,
+       offset += slice_total_size;
+    }
+ 
+-   image->planes[plane].size = offset - plane_offset;
++   image->planes[plane].size = offset - plane_start;
+ 
+    /* UIF/UBLINEAR levels need to be aligned to UIF-blocks, and LT only
+     * needs to be aligned to utile boundaries.  Since tiles are laid out
+@@ -354,11 +360,18 @@ v3d_setup_slices(struct v3dv_device *device, struct v3dv_image *image,
+    uint64_t offset = 0;
+    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+       offset = disjoint ? 0 : offset;
+-      if (!v3d_setup_plane_slices(device, image, plane, offset, plane_layouts)) {
++      if (!v3d_setup_plane_slices(device, image, plane, offset, disjoint,
++                                  plane_layouts)) {
+          assert(plane_layouts);
+          return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+       }
+-      offset += align64(image->planes[plane].size, 64);
++      /* the image ends where its last-ending plane does; without an explicit
++       * layout the planes follow each other and that is the running sum (a
++       * disjoint plane's size already counts from 0) */
++      const uint64_t plane_end =
++         (plane_layouts && !disjoint ? plane_layouts[plane].offset : offset) +
++         align64(image->planes[plane].size, 64);
++      offset = MAX2(offset, plane_end);
+    }
+ 
+    /* From the Vulkan spec:
