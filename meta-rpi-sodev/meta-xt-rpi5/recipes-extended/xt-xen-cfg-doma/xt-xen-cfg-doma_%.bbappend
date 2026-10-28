@@ -56,3 +56,39 @@ do_install[vardeps] += "RPI5_DOMA_GPU_RES_FROM RPI5_DOMA_GPU_RES"
 # set both to 0: plane scaling 1 with no overlay planes stops the build.
 XT_DOMA_OVERLAY_PLANES ?= "3"
 XT_DOMA_PLANE_SCALING ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+
+# DomA's hardware-decoded HEVC reaches its RGBA buffer on the GPU, not the CPU: qemu's
+# decoder mode imports each SAND frame into GL (q11-069; ffmpeg's 0001 makes the frame one
+# dmabuf) and waits for the GPU through a fence fd. 1 imports it through EGL with the SAND
+# modifier, 2 detiles it in a shader (texture height limits it to frames below 4K), 0 keeps
+# the CPU conversion. qemu 10.0.2 has neither the path nor the host-sand property (it
+# would refuse the device), so the default is 0 there, and rpi5_doma_hwdec_check
+# stops the build for any other combination.
+#
+# 1 is the default because it measured fastest (RPi5, 2026-10-15, codec CLI, HEVC 1080p60,
+# GL SurfaceFlinger, the AGL cluster running in DomU): decode only / decode and display
+# 60.5-61.3 / 54.2-54.7 fps with 0, 74.2-75.4 / 53.1-55.0 with 2 and 133.8-136.9 /
+# 66.3-66.5 with 1, the device model's main thread at about 17% of a core. (2 was
+# measured before q11-069 deferred its GPU wait; 1 gave 91.9-95.3 / 58.3-59.1 then.)
+RPI5_DOMA_HOST_SAND ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@'' if d.getVar('RPI5_DOMA_HOST_SAND') == '0' else ',gpu-fence-fd=on,host-sand=' + d.getVar('RPI5_DOMA_HOST_SAND')}"
+
+do_install[prefuncs] += "rpi5_doma_hwdec_check"
+
+rpi5_doma_hwdec_check:raspberrypi5() {
+    case "${RPI5_DOMA_HOST_SAND}" in
+    0) ;;
+    1|2)
+        case "${XT_DM_QEMU_VERSION}" in
+        11.*) ;;
+        *) bbfatal "RPI5_DOMA_HOST_SAND=${RPI5_DOMA_HOST_SAND} needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
+        esac
+        ;;
+    *) bbfatal "RPI5_DOMA_HOST_SAND must be 0, 1 or 2 (got '${RPI5_DOMA_HOST_SAND}')" ;;
+    esac
+}
+
+# The default is a no-op, for the same reason as rpi5_doma_gpu_fhd's.
+rpi5_doma_hwdec_check() {
+    :
+}

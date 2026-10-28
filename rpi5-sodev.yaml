@@ -572,11 +572,11 @@ parameters:
   #        size the overlay records as having OOM-killed `xl devd` with both guests'
   #        qemu device-models + weston + the VHAL backend running, which is why 16g
   #        uses 4096. 3072/3072 keeps DomD clear of that figure and still fits.
-  #        (static-mem: bank4 at 0x180000000 dropped, bank3 at 0x100000000 2G -> 1G,
-  #         and the boot script sets /chosen/domD memory = <0x0 0x300000> = 3072 MiB;
-  #         the three low banks are kept because bank[0]=0x50000000 is where
-  #         place_modules() puts the DomD kernel/DTB and 0x20000000/0x80000000 are
-  #         inside the VPU 32-bit DMA window that carries vc4's CMA.
+  #        (static-mem: bank4 at 0x180000000 dropped, the rest kept, and the boot
+  #         script sets /chosen/domD memory = <0x0 0x300000> = 3072 MiB; the low
+  #         banks are kept because bank[0]=0x50000000 is where place_modules() puts
+  #         the DomD kernel/DTB and 0x68000000 holds DomD's CMA (cma=640M@0x68000000
+  #         with the Zephyr Dom0).
   #         DomA's 3072 comes from doma.cfg, which xt-xen-cfg-doma substitutes per
   #         BOARD_RAM: 16g -> 4096, 8g -> 3072.)
   #

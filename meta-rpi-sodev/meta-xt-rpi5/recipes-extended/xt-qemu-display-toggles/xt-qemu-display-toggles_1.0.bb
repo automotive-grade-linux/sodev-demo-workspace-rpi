@@ -1,7 +1,8 @@
 SUMMARY = "DomD boot-time switches for the DomA device model's display path (RPi5)"
 DESCRIPTION = "A tmpfiles.d entry that creates the /run/qemu-* files the q11 qemu series reads \
-(the plane handoff and two of its helpers), so the display path measured on the Raspberry Pi 4 \
-is active from boot with the qemu 11 device model. See qemu-domd-display.conf."
+(the plane handoff and its helpers, the SAND direct scanout of the decoder's buffers, and \
+the decoder's buffers on the handoff's planes), so that display path is active from boot with the qemu 11 device model. \
+See qemu-domd-display.conf."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 

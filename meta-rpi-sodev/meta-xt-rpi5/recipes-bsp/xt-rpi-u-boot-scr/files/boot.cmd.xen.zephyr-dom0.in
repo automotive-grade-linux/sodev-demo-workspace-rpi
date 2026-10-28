@@ -125,29 +125,29 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 8 GiB SKU: shrink DomD from 4096 to 2048 MiB.
+# 8 GiB SKU: shrink DomD from 4096 to 3072 MiB.
 # -----------------------------------------------------------------------------
 # Must come AFTER `fdt apply`: /chosen/domD is created by the overlay, so a
 # `fdt set` before this point would fail with FDT_ERR_NOTFOUND.
 #
-# Only the two HIGH banks change; the three low banks are untouched, which
-# matters for two reasons:
+# Only the high bank4 is dropped; the low banks are those of the 16 GiB map
+# (bcm2712-raspberrypi5-xen.dtso), which matters for two reasons:
 #   * bank[0] = 0x50000000 is where Xen's place_modules() puts the DomD kernel and
 #     DTB. Keeping it preserves the sizing that was verified on the 16 GiB board.
-#   * 0x20000000 and 0x80000000 are inside the VPU's 32-bit DMA window and carry
-#     vc4's CMA. Moving them would take CMA out of that window.
+#   * 0x68000000 holds DomD's CMA (cma=640M@0x68000000 in the bootargs below).
+#     The bank there is the RAM between bank[0]'s end and Dom0's 0xa0000000.
 # No U-Boot module load lives in the freed range either -- every fatload in this
 # script targets below 4 GiB (xen@0x2000000, zephyr.bin@0x4000000,
-# domd.dtb@0xa000000, DomD Image@0xc000000), so dropping bank4 and halving bank3
-# cannot collide with a load address. The highest static-mem address drops from
-# 0x1c0000000 (7 GiB) to 0x140000000 (5 GiB).
+# domd.dtb@0xa000000, DomD Image@0xc000000), so dropping bank4 cannot collide
+# with a load address. The highest static-mem address drops from 0x1c0000000
+# (7 GiB) to 0x168000000 (5.6 GiB).
 #
 #   0x50000000  +0x18000000  ( 384 MiB)  kept
 #   0x20000000  +0x08000000  ( 128 MiB)  kept
-#   0x80000000  +0x20000000  ( 512 MiB)  kept
-#   0x100000000 +0x40000000  (1024 MiB)  bank3: 2 GiB -> 1 GiB
+#   0x68000000  +0x38000000  ( 896 MiB)  kept (the CMA's)
+#   0x100000000 +0x68000000  (1664 MiB)  bank3: kept
 #   0x180000000 +0x40000000  (1024 MiB)  bank4: dropped
-#                             = 2048 MiB  -> memory = <0x0 0x200000> (KiB)
+#                             = 3072 MiB  -> memory = <0x0 0x300000> (KiB)
 #
 # `test` is always available: cmd/Makefile has `obj-$(CONFIG_HUSH_PARSER) += test.o`,
 # and the u-boot this build produces really does set it -- verified in the built
@@ -160,7 +160,7 @@ fi
 if test "${board_ram}" = "8g" ; then
     echo "board_ram=8g: DomD 3072 MiB (bank4 dropped)"
     fdt set /chosen/domD memory <0x0 0x300000>
-    fdt set /chosen/domD xen,static-mem <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x80000000 0x0 0x20000000 0x1 0x0 0x0 0x80000000>
+    fdt set /chosen/domD xen,static-mem <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x68000000 0x0 0x38000000 0x1 0x0 0x0 0x68000000>
 fi
 echo "board_ram=${board_ram} dom0_mem=512M (placement-driven, board-independent)"
 
@@ -555,7 +555,6 @@ fdt rm /framebuffer@3f800000
 #     MEMF_bits ceiling one bit at a time and takes the first ceiling that fits:
 #         dom0_mem=1024M -> bank[0] = 0xc0000000   (measured)
 #         dom0_mem= 512M -> bank[0] = 0xa0000000   (MEASURED - what this script asks for)
-#         dom0_mem= 256M -> bank[0] = 0x70000000   (bits=31 fits 0x68000000-0x80000000)
 #         dom0_mem= 128M -> bank[0] = 0x10000000   (Zephyr's pre-relink address)
 #     Zephyr's sram0 is relinked to 0xa0000000 in
 #     meta-xt-dom0-zephyr/0008-rpi5-board-domd-owns-sd.patch.
@@ -581,17 +580,6 @@ fdt rm /framebuffer@3f800000
 # 0x2000000+0x80000 and extended region 0 = 0x2200000-0x8000000, both low holes.
 # Shrinking Dom0 only grows the region that ends at bank[0] (measured at 1024M:
 # "d0: extended region 5: 0xa0000000->0xc0000000"), and that region is not declared.
-#
-# For reference, if a high-memory reservation is combined with this, Xen's
-# allocate_memory_11() splits the allocation into 3 low banks + 1 high bank:
-#  - BANK[0] 0x10000000-0x18000000 (128 MiB, ex-Zephyr-Dom0 slot)
-#  - BANK[1] 0x20000000-0x28000000 (128 MiB)
-#  - BANK[2] 0x30000000-0x38000000 (128 MiB)
-#  - BANK[3] 0x1e8000000-0x1f0000000 (128 MiB at 8 GiB area)
-#
-# The 3 low-memory banks are within the VPU 32-bit DMA window, so the mailbox keeps
-# working. The 4th bank is VPU-accessible only via the IOMMU (high address).
-# All weston / vc4 buffers are allocated from low memory.
 # ------------------------------------------------------------------
 # Individual arguments:
 #
@@ -765,10 +753,20 @@ if fatload mmc 0 0xc000000 Image ; then
     # KERN_INFO flood from hash tables etc. overflowed the ring). -> `quiet`
     # (console_loglevel=4, KERN_WARNING+ only) suppresses the early flood so the ring
     # does not overflow. Avoids the backpressure spin on both pl011/PV console.
-    # cma=128M: originally 256M, halved to leave headroom for the RAM initramfs to
-    # unpack. That reason is gone now that the root is the p2 ext4, but the value is
-    # kept because 128M is ample for the 1080p weston desktop and raising it back
-    # would be an unmeasured change to the GPU allocator.
+    # cma=640M@0x68000000: DomA's HEVC hardware decode takes its buffers from DomD's
+    # CMA (rpi-hevc-dec has no IOMMU here; the decoder's own buffers plus ffmpeg's
+    # output pool, /dev/dma_heap/reserved), and 4K ran a 128 MiB CMA dry. A plain
+    # cma=SIZE cannot exceed 128 MiB: the mailbox bus's dma-ranges end ZONE_DMA at
+    # 0x28000000, and DomD's RAM below that is the 128 MiB bank. @BASE places it in
+    # the 896 MiB bank at 0x68000000, which both SKUs have (DomD is direct-mapped, so
+    # this is the physical address). Not above 4 GiB: at 0x100000000 the HDMI audio
+    # DMA stopped (the PCM's hw_ptr stayed at 0 and the HDMI audio crackled; measured
+    # 2026-10-15). 640 MiB: a stream's decoder pool (up to 32 buffers, about 12.4 MB
+    # each at 4K) is in this CMA, and with its frames on a plane (qemu q11-081) some
+    # of them stay referenced for the display. The HVS is behind
+    # an IOMMU and vc4 allocates nothing from the CMA: the app's layers weston gives
+    # it are v3d's (system memory), and the SAND frames it scans out are the
+    # decoder's.
     # xen_privcmd.unrestricted=1: Linux 6.18's drivers/xen/privcmd.c restricts
     # hypercalls by default (auto-runs restrict_driver() when !xen_initial_domain()).
     # A dom0less DomD has no xenstore target node and is treated as DOMID_IDLE -> the
@@ -780,7 +778,7 @@ if fatload mmc 0 0xc000000 Image ; then
     # p2 ext4 directly. rw is required (systemd and sshd write to the root); rootwait
     # covers the mmc probe taking longer than the rootfs lookup. There is no ramdisk
     # module any more.
-    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 8250.nr_uarts=1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=128M net.ifnames=0 quiet loglevel=3"
+    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 8250.nr_uarts=1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=640M@0x68000000 net.ifnames=0 quiet loglevel=3"
     fdt mknode /chosen/domD module@1
     fdt set /chosen/domD/module@1 compatible "multiboot,device-tree" "multiboot,module"
     fdt set /chosen/domD/module@1 reg <0x0 0xa000000 0x0 0x${domd_dtb_size}>
@@ -812,9 +810,9 @@ fi
 # and the board hangs silently with no message.
 #
 # 0xa0000000 is used instead: it starts immediately after DomD's last static-mem
-# bank (0x80000000-0xa0000000), ends at 0xb468b008 which is below the 4 GB boundary
-# U-Boot can address, and overlaps none of DomD's banks (0x50000000-0x68000000,
-# 0x20000000-0x28000000, 0x80000000-0xa0000000).
+# bank below 4 GiB (0x68000000-0xa0000000), ends at 0xb468b008 which is below the
+# 4 GB boundary U-Boot can address, and overlaps none of DomD's banks
+# (0x50000000-0x68000000, 0x20000000-0x28000000, 0x68000000-0xa0000000).
 #
 # DomU and DomA are created by the toolstack (`xl create`) rather than as dom0less
 # domains: the dom0less path cannot be completed here because the qemu xenpvh

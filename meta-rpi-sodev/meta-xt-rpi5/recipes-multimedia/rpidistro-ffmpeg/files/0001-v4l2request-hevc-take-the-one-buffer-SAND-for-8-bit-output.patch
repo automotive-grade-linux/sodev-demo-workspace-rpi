@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 00:59:55 +0900
+Subject: [PATCH] v4l2request: hevc: take the one-buffer SAND for 8-bit
+ output
+
+rpi-hevc-dec lists NV12MT_COL128 (luma and chroma in two buffers) before
+NV12_COL128 (one buffer, the chroma of each 128-byte column after its
+luma), and the destination format callback takes the first SAND format
+it is offered, so 8-bit frames come out in two dmabufs.
+
+A consumer that imports the frame into GL as one dmabuf cannot use that.
+qemu's virtio-media decoder does exactly that to hand hardware frames to
+a guest without a pass over the pixels on the CPU, and its import takes
+one buffer with the chroma at an offset, the layout bcm2835-codec
+produces.
+
+Refuse the two-buffer form for 8 bit, so NV12_COL128 is chosen. The
+frame descriptor then has one object and two planes. 10 bit is
+unchanged.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/libavcodec/v4l2_request_hevc.c
++++ b/libavcodec/v4l2_request_hevc.c
+@@ -151,10 +151,15 @@ static int dst_fmt_accept_cb(void * v, const struct v4l2_fmtdesc *fmtdesc)
+ 
+     // SAND is currently confised as to whether it is s/w or hardware
+     // *** Current usage is probably wrong - it shouldn't be a h/w fmt
+-    if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_COL128 ||
+-        fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_COL128M) {
++    // 8 bit: the one-buffer form only. A consumer that imports the frame
++    // as one dmabuf (qemu's virtio-media decoder, into GL) cannot take the
++    // two-buffer NV12MT_COL128, which rpi-hevc-dec lists first.
++    if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_COL128) {
+         return bit_depth == 8;
+     }
++    if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_COL128M) {
++        return 0;
++    }
+     if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_10_COL128 ||
+         fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_10_COL128M) {
+         return bit_depth == 10;

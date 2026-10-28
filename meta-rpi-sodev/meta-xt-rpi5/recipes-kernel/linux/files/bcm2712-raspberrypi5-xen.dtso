@@ -33,8 +33,8 @@
 		 * (Dom0 was 1024 until dom0_mem was cut to 512M: this Dom0
 		 * is either Zephyr, which addresses only 128 MB of SRAM, or
 		 * a thin Linux with no compositor).
-		 * The extra memory is supplied by extending static bank3 to
-		 * 2 GB at HPA 0x100000000 and adding a 1 GB bank4 at HPA
+		 * The extra memory is supplied by static bank3, 1664 MiB at HPA
+		 * 0x100000000, and a 1 GB bank4 at HPA
 		 * 0x180000000, both kept within firmware DRAM bank boundaries
 		 * (2 GB granularity). static-mem is reserved before Dom0
 		 * allocation (init_staticmem_pages), so there is no overlap
@@ -56,10 +56,12 @@
 		 * set sys.boot_completed, while DomD itself still had 1.3 GiB
 		 * free and was never OOM-killed. The remaining banks stay
 		 * place_modules() puts the DomD kernel/DTB, and
-		 * 0x20000000/0x80000000 sit inside the VPU 32-bit DMA window
-		 * that carries vc4's CMA. Keeping the 16 GB values here means
-		 * a hand-built DTB (no boot script) still gets the verified
-		 * default. Do NOT edit these to the 8 GB values -- the SKU is
+		 * 0x68000000 holds DomD's CMA (cma=640M@0x68000000 with the
+		 * Zephyr Dom0). Keeping the 16 GB values here means
+		 * a hand-built DTB (no boot script) still gets the 16 GB map;
+		 * the map with the 0x68000000 bank (2026-10-19) was booted
+		 * only as the 8 GB override, not as a 16 GB image. Do NOT
+		 * edit these to the 8 GB values -- the SKU is
 		 * a build option, not a source edit. */
 		memory = <0x0 0x400000>;
 		vpl011 = <0x1>;
@@ -75,13 +77,11 @@
 		 * booted and measured.
 		 *
 		 * static-mem banks (HPA / size in bytes):
-		 *   0x50000000 (384M) + 0x20000000 (128M) + 0x80000000 (512M)
-		 *   + 0x100000000 (2 GB) + 0x180000000 (1 GB) = 4 GB total.
-		 * The 0x80000000-0xa0000000 bank overlaps extended region 6
-		 * (0x68000000-0x1ffe00000), but that region only reserves guest
-		 * IPA while the static-mem HPA allocation takes precedence.
+		 *   0x50000000 (384M) + 0x20000000 (128M) + 0x68000000 (896M)
+		 *   + 0x100000000 (1664M) + 0x180000000 (1 GB) = 4 GB total.
+		 * The 0x68000000 bank runs up to the Zephyr Dom0's 0xa0000000.
 		 */
-		xen,static-mem = <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x80000000 0x0 0x20000000 0x1 0x0 0x0 0x80000000 0x1 0x80000000 0x0 0x40000000>;
+		xen,static-mem = <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x68000000 0x0 0x38000000 0x1 0x0 0x0 0x68000000 0x1 0x80000000 0x0 0x40000000>;
 		xen,enhanced = "enabled";
 		xen,tee = "optee";
 	};
