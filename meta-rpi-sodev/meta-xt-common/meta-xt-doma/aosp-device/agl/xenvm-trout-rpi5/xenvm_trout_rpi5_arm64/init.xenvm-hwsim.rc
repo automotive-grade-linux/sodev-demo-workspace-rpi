@@ -225,6 +225,21 @@ on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=
 on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=true
     start doma_wifi_relay
 
+# Threaded NAPI on the uplink vif (virtio_net): its receive work runs in a kernel thread
+# (napi/eth1-*, nice 0) instead of softirq, which preempts every thread whatever its nice
+# value. MEASURED ON THE RPi4, 2026-10-27: a WebView video fetched over TCP arrives in
+# bursts of 4.6-6.5 MB/s, the softirq took 35-57% of cpu0 at the XRUNs, both vCPUs busy,
+# and DomA's audio HAL (out_write, CFS nice -19) fell behind: "Not supplying enough data
+# to HAL" and ALSA XRUNs in DomD (6 and 2 in two 580 s runs). With threaded=1 cpu0's
+# softirq during the bursts went 30 -> 15% on average (57 -> 39% at most), 0 XRUNs in
+# a 580 s run. On the RPi5 (2026-10-27, a WebView's H.264 1080p60 beside the HMI, 60 s
+# runs): cpu0's softirq went 2.8 -> 1.4%, displayed frames 45 -> 49-54/s, no XRUN either
+# way. setup_wifi may have renamed the vif buried_eth1 (see doma-shadow-ap.sh step 1),
+# and the attribute follows it: both names are tried, the absent one failing harmlessly.
+on property:sys.boot_completed=1
+    write /sys/class/net/eth1/threaded 1
+    write /sys/class/net/buried_eth1/threaded 1
+
 on post-fs-data
     # hostapd's ctrl_interface and the AP list live here. Same owner/mode as the
     # hostapd directories cuttlefish's init.vendor.rc creates for its own hwsim path.
