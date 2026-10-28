@@ -41,11 +41,12 @@ BOARD_RAM ??= "16g"
 # and the BOARD_RAM map in do_install is not consulted. Empty means "use the map".
 DOMA_MEM_MiB ??= ""
 
-# DomA's vCPU count and its physical-core mask: 2 vCPUs on pcpu 2-3 on every board,
-# off the pcpus DomD and its device model run on. The measurements behind it are in
-# doma.cfg next to the two tokens. Board layers can still override either.
+# DomA's vCPU count and the pcpu of each vCPU, in order (space separated; one entry
+# per vCPU, each a pcpu or a range): 2 vCPUs on pcpu 2 and 3 on every board, off the
+# pcpus DomD and its device model run on. The measurements behind it are in doma.cfg
+# next to the two tokens. Board layers can still override either.
 DOMA_VCPUS ?= "2"
-DOMA_CPUS ?= "2-3"
+DOMA_CPUS ?= "2 3"
 
 # [Venus] virtio-gpu-gl device-model options, from the moulin GPU parameter (see
 # do_install). Defaulted for the same reason BOARD_RAM is defaulted a few lines above:
@@ -245,11 +246,28 @@ do_install() {
     if ! grep -q '^vcpus = DOMA_VCPUS_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "DOMA_VCPUS_PLACEHOLDER not found in doma.cfg"
     fi
-    if ! grep -q '^cpus = "DOMA_CPUS_PLACEHOLDER"$' ${D}${sysconfdir}/xen/doma.cfg; then
+    if ! grep -q '^cpus = DOMA_CPUS_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "DOMA_CPUS_PLACEHOLDER not found in doma.cfg"
     fi
+    # xl's list form, one pcpu (or range) per vCPU: cpus = ["2", "3"]
+    doma_cpus=""
+    doma_sep=""
+    for c in ${DOMA_CPUS}; do
+        case "$c" in
+        *[!0-9-]*|-*|*-|*-*-*) bbfatal "DOMA_CPUS: '$c' is not a pcpu or a range of pcpus" ;;
+        *-*) [ "${c%-*}" -le "${c#*-}" ] || bbfatal "DOMA_CPUS: '$c' is a range from high to low" ;;
+        esac
+        doma_cpus="$doma_cpus$doma_sep\"$c\""
+        doma_sep=", "
+    done
+    # Counted with wc rather than $((...)): bitbake's shell parser cannot take
+    # arithmetic expansion and fails the whole recipe at parse time.
+    doma_ncpus=$(echo ${DOMA_CPUS} | wc -w)
+    if [ "$doma_ncpus" != "${DOMA_VCPUS}" ]; then
+        bbfatal "DOMA_CPUS has $doma_ncpus entries for DOMA_VCPUS=${DOMA_VCPUS}: one per vCPU"
+    fi
     sed -i -e "s/^vcpus = DOMA_VCPUS_PLACEHOLDER\$/vcpus = ${DOMA_VCPUS}/" \
-           -e "s/^cpus = \"DOMA_CPUS_PLACEHOLDER\"\$/cpus = \"${DOMA_CPUS}\"/" \
+           -e "s/^cpus = DOMA_CPUS_PLACEHOLDER\$/cpus = [$doma_cpus]/" \
         ${D}${sysconfdir}/xen/doma.cfg
 
     # [Venus] Substitute the virtio-gpu-gl device-model options. XT_VENUS_GPU_OPTS

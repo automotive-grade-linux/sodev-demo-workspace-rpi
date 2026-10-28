@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 27 Oct 2026 22:43:45 +0900
+Subject: [PATCH] xen: QEMU_XEN_IOREQ_FIFO runs the ioreq thread at SCHED_FIFO
+
+The ioreq thread (q11-052/054) answers a guest vCPU's virtio-pci notify
+writes and ISR reads, and queues the rest for the main loop. A vCPU
+waits on it, but it ran at the device model's SCHED_OTHER nice value
+beside the H.264 decoder's frame threads and the main loop, and waited
+for a CPU behind them. QEMU_XEN_IOREQ_FIFO=N (1-99) has the thread set
+itself to SCHED_FIFO priority N when it starts; unset or empty changes
+nothing, and a value outside 1-99 is reported and ignored.
+
+It cannot hold a CPU for long: it only polls the event channel and
+answers or queues. On a Raspberry Pi 5 (2026-10-27, H.264 1080p60
+played in a WebView) DomA's ioreq thread woke 398-422 times a second
+and ran 27 ms a second.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's q11 ioreq thread]
+---
+ hw/xen/xen-hvm-common.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/hw/xen/xen-hvm-common.c b/hw/xen/xen-hvm-common.c
+index 872c1ce01..9c7f65b7b 100644
+--- a/hw/xen/xen-hvm-common.c
++++ b/hw/xen/xen-hvm-common.c
+@@ -23,6 +23,8 @@
+ #include "qemu/event_notifier.h"
+ #include "qemu/rcu.h"
+ #include <poll.h>
++#include <sched.h>          /* SCHED_FIFO, for QEMU_XEN_IOREQ_FIFO */
++#include "qemu/cutils.h"   /* qemu_strtoul */
+ 
+ MemoryRegion xen_memory, xen_grants;
+ 
+@@ -974,6 +976,37 @@ static void xen_ioreq_notified(void *opaque)
+     g_free(it);
+ }
+ 
++/*
++ * q11-xen-ioreq-fifo: QEMU_XEN_IOREQ_FIFO=N (1-99) runs the ioreq thread at SCHED_FIFO
++ * priority N, so that a guest vCPU waiting on an ioreq does not wait for a CPU behind
++ * the device model's other threads. The thread only polls the event channel and either
++ * answers or queues, a few hundred times a second for DomA (2026-10-27, Raspberry Pi 5,
++ * WebView 1080p60: 398-422 wakeups/s, 27 ms/s of CPU), so it cannot hold a CPU for long.
++ * Unset or empty leaves it at the device model's policy.
++ */
++static void xen_ioreq_thread_set_fifo(void)
++{
++    const char *e = getenv("QEMU_XEN_IOREQ_FIFO");
++    struct sched_param sp = { 0 };
++    unsigned long n;
++    int r;
++
++    if (!e || !*e) {
++        return;
++    }
++    if (qemu_strtoul(e, NULL, 10, &n) < 0 || n < 1 || n > 99) {
++        warn_report("xen: QEMU_XEN_IOREQ_FIFO=%s is not 1-99; ignored", e);
++        return;
++    }
++    sp.sched_priority = (int)n;
++    r = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
++    if (r) {
++        warn_report("xen: ioreq thread: SCHED_FIFO %lu: %s", n, strerror(r));
++        return;
++    }
++    info_report("xen: ioreq thread at SCHED_FIFO %lu", n);
++}
++
+ static void *xen_ioreq_thread(void *opaque)
+ {
+     XenIOState *state = opaque;
+@@ -983,6 +1016,7 @@ static void *xen_ioreq_thread(void *opaque)
+     int64_t last = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+ 
+     rcu_register_thread();
++    xen_ioreq_thread_set_fifo();
+     for (;;) {
+         struct pollfd pfd = { .fd = fd, .events = POLLIN };
+         evtchn_port_t port;
+-- 
+2.43.0
+

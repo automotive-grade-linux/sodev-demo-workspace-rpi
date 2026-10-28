@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 16:03:09 +0900
+Subject: [PATCH] virtio-media: decoder mode: set the CPUs of the software
+ frame threads
+
+A device model kept on one CPU so that its main loop is not held off it
+(the DomD qemu wrapper keeps DomA's on CPU 0 on the Raspberry Pi 5, the
+vcpu Xen pins to pcpu 0, shared only with Dom0 and DomZ) would decode
+H.264 there too: libavcodec's two frame threads inherit the affinity of
+the thread that creates them, and take about 60% of a CPU each at
+1080p60.
+
+The new property dec-sw-cpus ("N" or "N-M") sets their CPU affinity the
+way dec-sw-nice sets their nice value: avcodec_open2() runs on its
+short-lived thread with that affinity, and the frame threads it creates
+keep it. Unset, the default, leaves them at the device model's affinity,
+as before; realize refuses anything that is not a CPU or a range of
+CPUs, and warns when the device is no decoder. A hardware-accelerated
+codec (HEVC) is not affected.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
+---
+ hw/virtio/virtio-media-decoder.c | 30 +++++++++++++++++++++++++++---
+ hw/virtio/virtio-media.c         | 28 ++++++++++++++++++++++++++++
+ include/hw/virtio/virtio-media.h |  8 ++++++++
+ 3 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index a129190ca..b3d3cbd3b 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -79,6 +79,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <sys/resource.h>
++#include <sched.h>   /* sched_setaffinity, for dec-sw-cpus */
+ #include <linux/dma-buf.h>
+ #include <linux/dma-heap.h>
+ 
+@@ -3491,11 +3492,17 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+  * CPU with them evenly. The main loop's own nice value is never changed, so
+  * nothing has to be raised back (which would need CAP_SYS_NICE). A device
+  * model under a real-time policy is unaffected: nice does not apply to it.
++ *
++ * q11-dec-sw-cpus: dec-sw-cpus moves the frame threads to other CPUs the same
++ * way, so that a device model kept on one CPU for its main loop (the DomD
++ * qemu wrapper keeps DomA's on CPU 0) does not decode there too.
+  */
+ typedef struct DecOpen {
+     AVCodecContext *avctx;
+     const AVCodec *codec;
+     int nice;
++    int cpu_first;   /* -1: inherited */
++    int cpu_last;
+     int ret;
+ } DecOpen;
+ 
+@@ -3504,10 +3511,25 @@ static void *dec_open_run(void *opaque)
+     DecOpen *o = opaque;
+ 
+     /* Linux: PRIO_PROCESS 0 is the calling thread */
+-    if (setpriority(PRIO_PROCESS, 0, o->nice) < 0) {
++    if (o->nice != VIRTIO_MEDIA_DEC_SW_NICE_INHERIT &&
++        setpriority(PRIO_PROCESS, 0, o->nice) < 0) {
+         warn_report_once("virtio-media/dec: dec-sw-nice %d: %s", o->nice,
+                          strerror(errno));
+     }
++    /* q11-dec-sw-cpus: the same way, for the CPU affinity (0: this thread) */
++    if (o->cpu_first >= 0) {
++        cpu_set_t set;
++        int c;
++
++        CPU_ZERO(&set);
++        for (c = o->cpu_first; c <= o->cpu_last; c++) {
++            CPU_SET(c, &set);
++        }
++        if (sched_setaffinity(0, sizeof(set), &set) < 0) {
++            warn_report_once("virtio-media/dec: dec-sw-cpus %d-%d: %s",
++                             o->cpu_first, o->cpu_last, strerror(errno));
++        }
++    }
+     o->ret = avcodec_open2(o->avctx, o->codec, NULL);
+     return NULL;
+ }
+@@ -3515,10 +3537,12 @@ static void *dec_open_run(void *opaque)
+ static int dec_avcodec_open(VirtIOMediaSession *s, const AVCodec *codec)
+ {
+     VirtIOMediaDec *d = s->dec;
+-    DecOpen o = { d->avctx, codec, s->vm->dec_sw_nice, 0 };
++    DecOpen o = { d->avctx, codec, s->vm->dec_sw_nice,
++                  s->vm->dec_sw_cpu_first, s->vm->dec_sw_cpu_last, 0 };
+     QemuThread t;
+ 
+-    if (d->codec->hwaccel || o.nice == VIRTIO_MEDIA_DEC_SW_NICE_INHERIT) {
++    if (d->codec->hwaccel || (o.nice == VIRTIO_MEDIA_DEC_SW_NICE_INHERIT &&
++                              o.cpu_first < 0)) {
+         return avcodec_open2(d->avctx, codec, NULL);
+     }
+     qemu_thread_create(&t, "vmedia-open", dec_open_run, &o,
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 460b0a3a8..4cc5b4128 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -12,9 +12,12 @@
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <poll.h>
++#include <sched.h>   /* CPU_SETSIZE, for dec-sw-cpus */
+ 
+ #include "qapi/error.h"
+ #include "qemu/error-report.h"
++#include "qemu/cutils.h"   /* qemu_strtoui, for dec-sw-cpus */
++#include "qemu/ctype.h"
+ #include "qemu/iov.h"
+ #include "qemu/log.h"
+ #include "qemu/main-loop.h"
+@@ -3378,6 +3381,30 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+                    "-20 to 19 (or 20, the default: inherited)");
+         return;
+     }
++    vm->dec_sw_cpu_first = vm->dec_sw_cpu_last = -1;
++    if (vm->dec_sw_cpus) {
++        const char *s = vm->dec_sw_cpus, *end = s;
++        unsigned first = 0, last;
++        bool ok = qemu_isdigit(*s) &&
++                  qemu_strtoui(s, &end, 10, &first) == 0;
++
++        last = first;
++        if (ok && *end == '-') {
++            s = end + 1;
++            ok = qemu_isdigit(*s) && qemu_strtoui(s, &end, 10, &last) == 0;
++        }
++        if (!ok || *end || first > last || last >= CPU_SETSIZE) {
++            error_setg(errp, "virtio-media: dec-sw-cpus must be a CPU or a "
++                       "range of CPUs, N or N-M (got '%s')", vm->dec_sw_cpus);
++            return;
++        }
++        if (!vm->decoder) {
++            warn_report("virtio-media: dec-sw-cpus has no effect without "
++                        "the decoder property");
++        }
++        vm->dec_sw_cpu_first = first;
++        vm->dec_sw_cpu_last = last;
++    }
+     if (vm->host_sand && (!vm->host_nv12 || !vm->gpu_xfer)) {
+         warn_report("virtio-media: host-sand has no effect without "
+                     "host-nv12=on and gpu-xfer=on");
+@@ -3539,6 +3566,7 @@ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
+     DEFINE_PROP_INT32("dec-sw-nice", VirtIOMedia, dec_sw_nice,
+                       VIRTIO_MEDIA_DEC_SW_NICE_INHERIT),
++    DEFINE_PROP_STRING("dec-sw-cpus", VirtIOMedia, dec_sw_cpus),
+ };
+ 
+ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index f06aa146e..9f2faf557 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -442,6 +442,14 @@ struct VirtIOMedia {
+      * realize refuses anything else outside -20 to 19.
+      */
+     int32_t dec_sw_nice;
++    /*
++     * dec-sw-cpus: the CPUs ("N" or "N-M") libavcodec's frame threads for a
++     * software codec run on, which otherwise inherit the device model's
++     * affinity. Unset leaves them at it. Parsed at realize into the range.
++     */
++    char *dec_sw_cpus;
++    int dec_sw_cpu_first;   /* -1: unset */
++    int dec_sw_cpu_last;
+ 
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;
+-- 
+2.43.0
+

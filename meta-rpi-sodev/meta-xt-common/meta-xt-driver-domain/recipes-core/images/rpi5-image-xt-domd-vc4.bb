@@ -318,9 +318,36 @@ install_qemu_xen_path_shim() {
 # dropping its caches, ran through with matching data and no ENOMEM from the mapcache.
 XT_QEMU_MAPCACHE_MAX_MB ?= "1024"
 XT_QEMU_MAPCACHE_MAX_MB:raspberrypi5 = "4608"
+# SCHED_FIFO priority of the device models' ioreq thread (qemu 11, q11-096); empty leaves
+# it at the device model's nice value. 49 on the Raspberry Pi 5: one below the kernel's
+# own FIFO threads in DomD (the threaded IRQs, the DRM commit workers card0-crtcN and
+# watchdogd are at 50, sched_set_fifo()'s default; migration at 99), so that it runs
+# before every SCHED_OTHER thread but never delays an interrupt or a page flip. Nothing
+# else in DomD's user space runs at SCHED_FIFO. Decided 2026-10-27, with qemu, the H.264
+# frame threads and weston at nice -19; a WebView's H.264 1080p60 beside the HMI, 3 runs:
+# no ALSA XRUN and no PCM restart in steady playback. The Raspberry Pi 4 takes the same
+# 49, with weston at nice -19 on CPU 0 and without the device-model placement below
+# (2026-10-28, a WebView's 720p60 H.264, full screen and beside the HMI, four 300 s runs
+# each with and without the two, set at run time): no ALSA XRUN, PCM restart or HAL
+# shortfall in any run, one BQL hold of 16.8 ms in eight, frames dropped 5.3 -> 5.5% full
+# screen and 13.9 -> 17.6% beside the HMI, a 3.7-point difference, less than the one
+# between the two runs without them (10.2 and 17.5%). Nothing got better; it is taken
+# because nothing got worse.
+XT_QEMU_IOREQ_FIFO ?= ""
+XT_QEMU_IOREQ_FIFO:raspberrypi5 = "49"
+XT_QEMU_IOREQ_FIFO:raspberrypi4-64 = "49"
+# Whether the DomD qemu wrapper places the device models on DomD's CPUs (DomA's on CPU 0,
+# DomU's on CPU 1; the wrapper's comment has the reasons and the measurements). On the
+# Raspberry Pi 5 only: the Raspberry Pi 4 leaves its device models on both CPUs (decided
+# 2026-10-28, where the placement is expected to cost DomA's device model CPU time; not
+# measured there).
+XT_QEMU_DM_PLACEMENT ?= "0"
+XT_QEMU_DM_PLACEMENT:raspberrypi5 = "1"
 
 # Additional V4H DomD compatibility packages
 IMAGE_INSTALL:append = " kernel-module-tun xen-tools-devd xen-tools-xencommons xen-tools-xenstore xt-rpi5-domain cgshim"
+# taskset for the qemu wrapper's CPU placement (busybox here has no taskset applet).
+IMAGE_INSTALL:append = "${@' util-linux-taskset' if d.getVar('XT_QEMU_DM_PLACEMENT') == '1' else ''}"
 
 #
 # Driver-domain runtime postprocess. This is the single owner of the DomD
@@ -385,6 +412,8 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 #                           on a linear gbm bo.
 #   /etc/qemu-lat-diag      qemu 11 (q11-057/058): log display-command latencies.
 [ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
+# qemu 11 (q11-096): the ioreq thread at SCHED_FIFO; see XT_QEMU_IOREQ_FIFO in the recipe.
+[ -n "${XT_QEMU_IOREQ_FIFO}" ] && export QEMU_XEN_IOREQ_FIFO=${XT_QEMU_IOREQ_FIFO}
 [ -f /etc/qemu-gbm-layout ] && [ "$wmclass" = DomA ] && export VIRGL_GBM_LAYOUT_ENABLE=1
 [ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
 # A device model's stdout and stderr go through a pipe to a cat of their own,
@@ -405,6 +434,39 @@ export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
 # qdisk PV-disk backend through this same wrapper, with no -device, and that one
 # keeps its nice. `renice PRIORITY` (no -n) is absolute in busybox and util-linux.
 [ -n "$has_device" ] && { renice -19 -p $$ >/dev/null 2>&1 || true; }
+# CPU placement, with XT_QEMU_DM_PLACEMENT=1 (the Raspberry Pi 5). domain-cpu-pin pins
+# DomD's vcpu 0 to pcpu 0, which it shares with Dom0 and DomZ, and vcpu 1 to pcpu 1,
+# which it shares with DomU on the Raspberry Pi 5. DomA's whole device model runs on CPU
+# 0 (= vcpu 0): its main loop holds the BQL while it answers DomA's ioreqs, and the
+# sound card's TX thread gives DomA's buffers back under it, so a main loop whose vcpu
+# Xen takes away keeps DomA's audio waiting. Its other threads and the virgl render
+# server it forks inherit CPU 0 too; only the H.264 decoder's frame threads are let out
+# of it, by virtio-media's dec-sw-cpus (RPI5_DOMA_H264_CPUS). DomU's device model runs
+# on CPU 1. weston is not placed here; its unit starts it on CPU 0 (the board layers'
+# weston-init drop-ins). It holds V3D's kernel locks while it submits, and DomA's device
+# model waits for them: kept to CPU 1 beside DomU's device model at nice -19, it got no
+# CPU for 20 minutes while DomU's Venus ring thread kept CPU 1 busy, and DomA's main
+# loop waited on V3D all that time (Raspberry Pi 5, 2026-10-24). Measured on a Raspberry
+# Pi 5 (2026-10-24, H.264 1080p60 in a WebView beside the HMI, 10 minutes a run, with
+# virtio-snd's tx-no-bql on and weston kept on CPU 1): with DomD's vcpus on pcpu 0-1 and
+# no placement the main loop held the BQL over 50 ms 194 times, using 3-5 ms of CPU in
+# each; with this placement 52 and 37 times in two runs. Letting the frame threads onto
+# CPU 0 as well (dec-sw-cpus=0-1) made it 287 and 204 then; they have been on 0-1 since
+# the main loop's long holds were fixed (2026-10-27, see RPI5_DOMA_H264_CPUS).
+# Interrupts are not placed: DomD's device interrupts (the SDIO Wi-Fi's mmc1 about 330 a
+# second, V3D's about 370) were on CPU 0 and the device models' event channels on CPU 1;
+# swapping the two at run time gave 41 and 15 in two runs, too few to settle it, so it
+# is left out. Set before exec, like the nice value, so that every thread inherits it.
+cpu=""
+if [ -n "$has_device" ] && [ "${XT_QEMU_DM_PLACEMENT}" = 1 ]; then
+    case "$wmclass" in
+        DomA) cpu=0 ;;
+        DomU) cpu=1 ;;
+    esac
+fi
+if [ -n "$cpu" ] && ! taskset -p -c $cpu $$ >/dev/null 2>&1; then
+    logger -t qemu-wrapper "taskset -c $cpu failed for $wmclass's device model" 2>/dev/null || true
+fi
 exec "${REAL_QEMU}" "$@"
 EOF
         chmod 0755 ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64

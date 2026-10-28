@@ -33,9 +33,9 @@ was kept identical.
   |         SDHCI, Mesa 26.2.4 + weston 16.0.0 + qemu 11.1.2 device-models
   |         (weston 15.0.0 + qemu 7.0.0-xt with --gpu=gl),
   |         AND the xl toolstack that creates
-  |         DomU/DomA/DomZ                                               [2 vCPUs @ pCPU 0-1]
-  |- DomU : AGL instrument cluster (Flutter cluster demo) -> HDMI-A-1    [1 vCPU  @ pCPU 1]
-  |- DomA : Android Automotive OS (trout/xenvm)           -> HDMI-A-2    [2 vCPUs @ pCPU 2-3]
+  |         DomU/DomA/DomZ                                         [2 vCPUs @ pCPU 0, 1 (one each)]
+  |- DomU : AGL instrument cluster (Flutter cluster demo) -> HDMI-A-1    [1 vCPU  @ pCPU 1; RPi4: 2-3]
+  |- DomA : Android Automotive OS (trout/xenvm)           -> HDMI-A-2    [2 vCPUs @ pCPU 2, 3 (one each)]
   |- DomZ : Zephyr RTOS domain (xenvm board)                             [1 vCPU  @ pCPU 0]
 
   DOM0_OS=linux (alternative — classic control plane)

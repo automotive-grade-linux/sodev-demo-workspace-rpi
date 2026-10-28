@@ -283,3 +283,14 @@ SRC_URI:append:class-target = " file://q11-092-virtio-snd-write-TX-buffers-out-w
 # q11-093: the ALSA audiodev's threshold counts from its own microseconds, not from the
 #   direction's buffer-length, and stays within the buffer the device granted.
 SRC_URI:append:class-target = " file://q11-093-audio-alsa-start-the-PCM-at-the-threshold-s-own-length-at-most-the-buffer.patch"
+#
+# Priority.
+# q11-094: decoder mode's dec-sw-nice sets the nice value of a software codec's (H.264)
+#   frame threads, which otherwise inherit the device model's.
+SRC_URI:append:class-target = " file://q11-094-virtio-media-decoder-mode-set-the-nice-value-of-the-software-frame-threads.patch"
+# q11-095: decoder mode's dec-sw-cpus sets the CPUs of a software codec's frame threads,
+#   which otherwise inherit the device model's affinity.
+SRC_URI:append:class-target = " file://q11-095-virtio-media-decoder-mode-set-the-CPUs-of-the-software-frame-threads.patch"
+# q11-096: QEMU_XEN_IOREQ_FIFO=N runs the ioreq thread at SCHED_FIFO priority N (the DomD
+#   qemu wrapper exports it from XT_QEMU_IOREQ_FIFO); unset changes nothing.
+SRC_URI:append:class-target = " file://q11-096-xen-QEMU_XEN_IOREQ_FIFO-runs-the-ioreq-thread-at-SCHED_FIFO.patch"

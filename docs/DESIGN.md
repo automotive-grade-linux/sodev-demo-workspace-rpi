@@ -22,10 +22,32 @@ from the R-Car V4H AGL SoDeV reference it came from.
 | Domain | vCPUs | pCPU pin | Role |
 |---|---|---|---|
 | Dom0 | 1 | 0 | zephyr: xenstore server only / linux: xl toolstack + SD block backend |
-| DomD | 2 | 0–1 | dom0less, direct-mapped; GPU + RP1 (+ SDHCI with zephyr Dom0); qemu virtio backends; toolstack (zephyr flavour) |
-| DomU | 1 | 1 | AGL cluster guest (virtio-pci, grant DMA) |
-| DomA | 2 | 2–3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
+| DomD | 2 | vCPU 0 → 0, vCPU 1 → 1 | dom0less, direct-mapped; GPU + RP1 (+ SDHCI with zephyr Dom0); qemu virtio backends; toolstack (zephyr flavour). credit2 weight 512 (the others 256) |
+| DomU | 1 | 1 (Raspberry Pi 4: 2–3) | AGL cluster guest (virtio-pci, grant DMA) |
+| DomA | 2 | vCPU 0 → 2, vCPU 1 → 3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
 | DomZ | 1 | 0 | Zephyr RTOS guest (`xenvm` board); no virtio at all — PV console only |
+
+`domain-cpu-pin.service` in DomD pins DomD and sets its weight; the guests pin
+themselves through `cpus` in their xl cfgs. Inside DomD on the Raspberry Pi 5, the
+qemu wrapper keeps DomA's device model on CPU 0 -- the vCPU that shares pCPU 0 only
+with Dom0 and DomZ -- and DomU's on CPU 1 (`XT_QEMU_DM_PLACEMENT`; the Raspberry Pi
+4 leaves its device models on both CPUs); the H.264 decoder's frame threads run on
+both. weston starts at nice -19 on CPU 0 on both boards (the board layers'
+weston-init drop-ins): DomA's device model waits for the V3D locks weston holds, and
+on the Raspberry Pi 5, kept to CPU 1, it went
+without CPU for 20 minutes behind DomU's busy Venus ring thread. DomA's
+device-model main loop holds the BQL while it answers DomA's ioreqs and gives its
+sound buffers back, and it was measured (2026-10-24, Raspberry Pi 5, Zephyr Dom0,
+virtio-snd's tx-no-bql on) to be held off its vCPU by Xen, the BQL held, while
+DomD's vCPUs shared pCPU 1 with DomU: the BQL held over 50 ms 194 times in 10
+minutes of H.264 1080p60 in a WebView beside the HMI, 52 and 37 times with this
+map and weston then kept on CPU 1 too. Interrupts are not placed: DomD's device
+interrupts land on CPU 0 and the device models' event channels on CPU 1, and
+swapping them at run time (41 and 15) was too few runs to settle it.
+
+The Raspberry Pi 4 runs DomA and DomU one at a time on the 4 GiB board, so its DomU
+takes DomA's pCPUs; an 8 GiB board running both shares them. The Raspberry Pi 4 map
+has not been measured.
 
 BCM2712 has **no IOMMU**, so DomD is direct-mapped (`xen,static-mem` + libxl
 direct-map). DomU virtio uses grant-based DMA; DomA virtio uses foreign mapping

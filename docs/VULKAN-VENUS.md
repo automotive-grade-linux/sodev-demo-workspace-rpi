@@ -328,6 +328,23 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
   stream wider than the display, such as 4K HEVC, reaches DomA scaled down to it by
   the decoder mode's GPU conversion (`q11-076`); the append refuses a non-zero value
   with any other qemu.
+- `RPI5_DOMA_H264_NICE` (the same append; `-19` with `RPI5_DOMA_H264=1`, empty
+  otherwise): `dec-sw-nice=N`, the nice value of the H.264 decoder's two frame threads
+  (`q11-094`), the device model's own -19 by decision; the threads DomA waits for are kept
+  ahead by `XT_QEMU_IOREQ_FIFO` instead. The append refuses a value outside -20 to 19, or
+  a value without `RPI5_DOMA_H264=1`.
+- `XT_QEMU_IOREQ_FIFO` (DomD image recipe; `49` on the Raspberry Pi 5 and 4, empty
+  otherwise): `QEMU_XEN_IOREQ_FIFO`, the SCHED_FIFO priority of the device models' ioreq
+  thread (`q11-096`), one below DomD's kernel FIFO threads (50).
+- `XT_QEMU_DM_PLACEMENT` (DomD image recipe; `1` on the Raspberry Pi 5, `0` otherwise):
+  the DomD qemu wrapper puts DomA's device model on DomD's CPU 0 and DomU's on CPU 1
+  (`taskset`, from util-linux, which the image then installs).
+- `RPI5_DOMA_H264_CPUS` (the same append; `0-1` with `RPI5_DOMA_H264=1`, empty
+  otherwise): `dec-sw-cpus=N` or `N-M`, the CPUs of the same two frame threads
+  (`q11-095`), out of DomD's CPU 0 alone, where the DomD qemu wrapper keeps DomA's
+  device model (`XT_QEMU_DM_PLACEMENT`, the DomD image recipe; on CPU 1 alone they
+  decoded 1080p60 at 51-52 frames a second); the append refuses anything but a CPU or a
+  range, or a value without `RPI5_DOMA_H264=1`.
 - `QEMU_XEN_MAPCACHE_MAX_MB`, which the DomD qemu wrapper exports for every
   device model it starts: it caps the foreign mapcache (`q11-053`) at
   `XT_QEMU_MAPCACHE_MAX_MB` from the DomD image recipe: 4608 on a Raspberry Pi 5,
