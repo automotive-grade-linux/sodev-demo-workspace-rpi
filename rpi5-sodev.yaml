@@ -463,7 +463,7 @@ parameters:
                 # there, and README.md), and as there not keyed on the lane. This
                 # Dom0's image does not install qemu, but xen-tools RRECOMMENDS it, so
                 # this build makes the qemu named above, and on the vulkan lane that
-                # is 10.0.2, which DEPENDS on rpidistro-ffmpeg on raspberrypi5.
+                # is 11.1.2, which DEPENDS on rpidistro-ffmpeg on raspberrypi5.
                 # Without these three lines the build stops at "Nothing PROVIDES
                 # 'rpidistro-ffmpeg'".
                 - [LICENSE_FLAGS_ACCEPTED:append:raspberrypi5, " commercial_rpidistro-ffmpeg"]
@@ -480,7 +480,7 @@ parameters:
                 # is: in the linux flavour it is DOM0's copy of doma.cfg that
                 # `xl create` reads. Same GPU parameter that sets it on the AOSP side,
                 # because the decoder IS a virtio-media device and only the qemu
-                # 10.0.2 device model has one.
+                # 10.0.2 and 11.1.2 device models have one.
                 - [XT_DOMA_HWDEC, "%{XT_DOMA_HWDEC}"]
                 # [V4H-style DomA gate] meta-xt-doma is always in `layers` (like the
                 # V4H prod-devel-rcar4 yaml); ENABLE_ANDROID=no masks ALL its recipes
@@ -888,20 +888,18 @@ parameters:
   # Which graphics stack the guests get. vulkan (Venus: guest Vulkan over virtio-gpu)
   # is the DEFAULT; gl rebuilds the pre-Venus OpenGL stack.
   #
-  # WHAT THE SWITCH COSTS. Venus needs qemu >= 9.2 for the virtio-gpu-gl
-  # `venus=` property, so the vulkan lane selects the fork's 10.0.2-xt build
-  # instead of 7.0.0, and the six 7.0.0-only device-model patches are
-  # version-gated off in it. All six are accounted for: 0111 (DomA touch) is
-  # rebased as meta-xt-qemu's 0118 and 0110
-  # (virtio-pci ISR IOREQ range) as 0120; 0112 (vTPM GUEST_TPM_BASE guard) is moot
-  # because 10.0.2 has no hw/arm/xen_arm.c and no reference to that define at all, and
-  # 0113 (sched_attr redefinition) is fixed upstream in 10.0.2's own
-  # linux-user/syscall.c; 0101 (RESUME with no QMP monitor) and 0103 (deferred autostart
-  # vm_start) guard a pre-main-loop death whose code sites were reshaped in qemu 9/10
-  # (softmmu/vl.c -> system/vl.c) and which has not reproduced on 10.0.2 -- both guests'
-  # device models came up on every boot
-  # of the RPi4 board verification. See meta-xt-driver-domain's qemu_%.bbappend for the
-  # per-patch statement and docs/VULKAN-VENUS.md for the whole procedure.
+  # WHAT THE SWITCH COSTS. Venus needs qemu >= 9.2 for the virtio-gpu-gl `venus=`
+  # property, so the vulkan lane selects a newer device model instead of 7.0.0 -- on
+  # this board qemu 11.1.2 (qemu_11.1.2.bb, the fork's 10.0.2-xt series ported onto
+  # the upstream release; it was the fork's 10.0.2-xt build until both boards took
+  # qemu 11.1.2) -- and the six 7.0.0-only device-model patches are version-gated off
+  # in it. All six are accounted for: 0111 (DomA touch) is carried as meta-xt-qemu's
+  # q11-017 (0118 for 10.0.2) and 0110 (virtio-pci ISR IOREQ range) as q11-019 (0120);
+  # 0101 (RESUME with no QMP monitor) and 0103 (deferred autostart vm_start) are
+  # forward-ported as q11-021 (0201 for 10.0.2); 0112 (vTPM GUEST_TPM_BASE guard) and
+  # 0113 (sched_attr redefinition) do not apply. See meta-xt-driver-domain's
+  # qemu_%.bbappend for the per-patch statement and docs/VULKAN-VENUS.md for the whole
+  # procedure.
   #
   # NOTE for this board: the Vulkan lane's hardware verification was done on the RPi4
   # first (four domains, DomA full Vulkan). On this board DomA was verified compositing
@@ -911,10 +909,10 @@ parameters:
   # "vulkan" is what the lines below describe; "gl" simply does not do them (and puts
   # PREFERRED_VERSION_qemu back to 7.0.0). Three things change, the second in the domu
   # build as well as the domd one, so the guest-side ICD gate matches the host-side one:
-  #   - PREFERRED_VERSION_qemu 7.0.0 -> 10.0.2 (meta-xt-qemu/qemu_10.0.2.bb, the
-  #     same fork on its v10.0.2-xt branch), with weston 16.% and virglrenderer 1.3.%
-  #     over the base conf's poky pins. moulin appends the override conf lines after
-  #     the base ones and bitbake takes the last assignment, so these win.
+  #   - PREFERRED_VERSION_qemu 7.0.0 -> 11.1.2 (meta-xt-qemu/qemu_11.1.2.bb), with
+  #     weston 16.% and virglrenderer 1.3.% over the base conf's poky pins. moulin
+  #     appends the override conf lines after the base ones and bitbake takes the
+  #     last assignment, so these win.
   #   - DISTRO_FEATURES += venus. This is the tree's OWN feature name (no upstream
   #     recipe keys off it): it gates the Vulkan runtime installs in the image
   #     recipes, the virglrenderer patches and PACKAGECONFIG this tree adds, and
@@ -932,7 +930,7 @@ parameters:
   # wrynose's DISTRO_FEATURES_DEFAULTS and is not removed here (the mesa version
   # pin in meta-xt-driver-domain applies to both lanes as well).
   GPU:
-    desc: "Which graphics stack the guests get. vulkan (default): Venus (guest Vulkan over virtio-gpu) for DomA and DomU -- qemu 10.0.2-xt, weston 16.0.0, virglrenderer 1.3.0's venus backend, the DomD/DomU Vulkan runtime and venus=true device-model options. gl: the pre-Venus OpenGL stack on qemu 7.0.0-xt. See docs/VULKAN-VENUS.md."
+    desc: "Which graphics stack the guests get. vulkan (default): Venus (guest Vulkan over virtio-gpu) for DomA and DomU -- qemu 11.1.2, weston 16.0.0, virglrenderer 1.3.0's venus backend, the DomD/DomU Vulkan runtime and venus=true device-model options. gl: the pre-Venus OpenGL stack on qemu 7.0.0-xt. See docs/VULKAN-VENUS.md."
     "gl":
       overrides:
         variables:
@@ -942,10 +940,10 @@ parameters:
           XT_VIRGL_VENUS_REMOVE: "venus"
           # The guest's hardware-decode path is not built on this lane, and that is a
           # hard dependency rather than a policy: the decoder the guest talks to is a
-          # virtio-media device, which only the qemu 10.0.2 device model has, and this
-          # lane builds qemu 7.0.0-xt. With XT_DOMA_HWDEC=true here, AOSP would install
-          # the c2 HAL and its seccomp policy for a device that is not on the
-          # bus, and the failure would appear as a codec bug in the guest.
+          # virtio-media device, which only the qemu 10.0.2 and 11.1.2 device models
+          # have, and this lane builds qemu 7.0.0-xt. With XT_DOMA_HWDEC=true here, AOSP
+          # would install the c2 HAL and its seccomp policy for a device that is not on
+          # the bus, and the failure would appear as a codec bug in the guest.
           XT_DOMA_HWDEC: "false"
     "vulkan":
       default: true
@@ -1007,7 +1005,7 @@ parameters:
           XT_VENUS_GPU_OPTS: ",hostmem=256M,blob=true,venus=true"
           # The same lane for the linux flavour's Dom0 build (see its conf).
           XT_DOM0_VENUS_FEATURE: " venus"
-          XT_DOM0_QEMU_VERSION: "10.0.2"
+          XT_DOM0_QEMU_VERSION: "11.1.2"
           # Keep virglrenderer's venus backend. Without it the device model has
           # no Venus renderer at all, whatever qemu supports; the gl lane sets
           # this to "venus" (see PACKAGECONFIG:remove:pn-virglrenderer in the
@@ -1023,7 +1021,7 @@ parameters:
           # nothing, and the hal_codec2_default sepolicy, which only matters
           # for a binary the gl lane does not install.
           # It is tied to this lane because the decoder is a virtio-media
-          # device and only the qemu 10.0.2 device model provides one.
+          # device and only the qemu 10.0.2 and 11.1.2 device models provide one.
           # XT_DOMA_HWDEC_VULKAN is where a Dom0 flavour turns it off.
           XT_DOMA_HWDEC: "%{XT_DOMA_HWDEC_VULKAN}"
         components:
@@ -1031,11 +1029,13 @@ parameters:
             builder:
               conf:
                 - [DISTRO_FEATURES:append, " venus"]
-                # weston 16.0.0 and virglrenderer 1.3.0, the same on both boards. The
-                # base conf pins weston and virglrenderer to poky's 15 and 1.2; this
-                # lane sets them again. The gl lane keeps qemu 7.0.0 and poky's weston
-                # and virglrenderer.
-                - [PREFERRED_VERSION_qemu, "10.0.2"]
+                # The Raspberry Pi 5 runs the DomD graphics stack it was measured
+                # with (the Raspberry Pi 4's lane takes the same):
+                # the qemu 11.1.2 device model (qemu_11.1.2.bb's series), weston
+                # 16.0.0 and virglrenderer 1.3.0. The base conf pins weston and
+                # virglrenderer to poky's 15 and 1.2; this lane sets them again. The
+                # gl lane keeps qemu 7.0.0 and poky's weston and virglrenderer.
+                - [PREFERRED_VERSION_qemu, "11.1.2"]
                 - [PREFERRED_VERSION_weston, "16.%"]
                 - [PREFERRED_VERSION_virglrenderer, "1.3.%"]
                 # virglrenderer's RENDER SERVER, and it is not optional: qemu >= 9.2

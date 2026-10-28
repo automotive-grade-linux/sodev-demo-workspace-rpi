@@ -10,8 +10,8 @@
 # local hardware. Only the far side of the device model differs:
 #
 #     RPi4   virtio-media -> DomD /dev/video10 -> bcm2835-codec (H.264, stateful)
-#     RPi5   virtio-media -> qemu's own stateful HEVC shim (patch 0217), which
-#            drives rpi-hevc-dec (stateless) with libavcodec inside DomD
+#     RPi5   virtio-media -> qemu's own stateful HEVC shim (q11-041; 0217 on 10.0.2),
+#            which drives rpi-hevc-dec (stateless) with libavcodec inside DomD
 #
 # From SELinux's point of view those are the same object with the same label.
 #
