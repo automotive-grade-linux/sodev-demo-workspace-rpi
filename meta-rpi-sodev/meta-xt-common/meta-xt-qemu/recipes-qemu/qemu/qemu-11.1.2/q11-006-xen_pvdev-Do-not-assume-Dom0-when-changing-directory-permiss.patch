@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrii <andrii_chepurnyi@epam.com>
+Date: Thu, 21 Aug 2025 12:12:09 +0000
+Subject: [PATCH] xen_pvdev: Do not assume Dom0 when changing directory
+ permissions
+
+Instead of forcing the owner to domid 0, read the directory permissions
+and add xen_domid with the given permission to it.
+
+Note that for other than Dom0 domain (non toolstack domain) the
+"driver_domain" property should be set in domain config file for the
+toolstack to create required directories in advance.
+
+(cherry picked from commit 92cbabbbefb34f34f5abd8486dd2de8f3ebe9a4e)
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Andrii <andrii_chepurnyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 92cbabbbefb34f34f5abd8486dd2de8f3ebe9a4e
+---
+ hw/xen/xen-operations.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/hw/xen/xen-operations.c b/hw/xen/xen-operations.c
+index e00983ec4..ce2d13e4d 100644
+--- a/hw/xen/xen-operations.c
++++ b/hw/xen/xen-operations.c
+@@ -15,6 +15,7 @@
+ 
+ #include "hw/xen/xen_native.h"
+ #include "hw/xen/xen_backend_ops.h"
++#include "hw/xen/xen_pvdev.h"
+ 
+ /*
+  * If we have new enough libxenctrl then we do not want/need these compat
+@@ -285,7 +286,8 @@ static bool libxenstore_create(struct qemu_xs_handle *h, xs_transaction_t t,
+                                unsigned int owner, unsigned int domid,
+                                unsigned int perms, const char *path)
+ {
+-    struct xs_permissions perms_list[] = {
++    unsigned int num;
++    struct xs_permissions *tmp, perms_list[] = {
+         {
+             .id    = owner,
+             .perms = XS_PERM_NONE,
+@@ -300,6 +302,14 @@ static bool libxenstore_create(struct qemu_xs_handle *h, xs_transaction_t t,
+         return false;
+     }
+ 
++    tmp = xs_get_permissions(h->xsh, 0, path, &num);
++    if (tmp == NULL) {
++        xen_pv_printf(NULL, 0, "xs_get_permissions %s: failed\n", path);
++        return false;
++    }
++    perms_list[0].id = tmp[0].id; /* retain the owner */
++    free(tmp);
++
+     return xs_set_permissions(h->xsh, t, path, perms_list,
+                               ARRAY_SIZE(perms_list));
+ }

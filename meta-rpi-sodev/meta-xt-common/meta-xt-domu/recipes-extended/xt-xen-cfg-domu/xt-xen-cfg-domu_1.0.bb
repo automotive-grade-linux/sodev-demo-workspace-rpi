@@ -29,8 +29,9 @@ S = "${UNPACKDIR}"
 # xt-xen-cfg-doma defaults BOARD_RAM.
 XT_VENUS_GPU_OPTS ??= ""
 # [qemu 10] The qemu version the guests' device model is built from. It comes from
-# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: 10.0.2 in the
-# default GPU=vulkan lane (meta-xt-qemu/qemu_10.0.2.bb, docs/VULKAN-VENUS.md),
+# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: in the default
+# GPU=vulkan lane 11.1.2 on both boards (qemu_11.1.2.bb; docs/VULKAN-VENUS.md), or
+# 10.0.2 where a board selects meta-xt-qemu/qemu_10.0.2.bb instead,
 # 7.0.0 for --gpu=gl -- which is the yaml's base value, left standing.
 #
 # The '7.0.0' fallback below is deliberately the OLDER of the two, because the

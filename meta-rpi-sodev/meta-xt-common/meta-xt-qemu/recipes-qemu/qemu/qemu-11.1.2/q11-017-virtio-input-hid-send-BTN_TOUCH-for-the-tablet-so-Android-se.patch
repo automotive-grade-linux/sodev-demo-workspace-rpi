@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-input-hid: send BTN_TOUCH for the tablet, so Android
+ sees a touchscreen
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0118-virtio-input-hid-send-BTN_TOUCH-for-the-tablet-so-An.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same BTN_LEFT->BTN_TOUCH remap for the tablet; qemu 11's handler
+takes the button from evt->btn and has no vhid local, so the port
+declares vhid = VIRTIO_INPUT_HID(dev); the comment was shortened.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [same downstream policy as the 7.0.0 original; upstream's answer is for the front end to emit INPUT_BUTTON_TOUCH, which SDL's mouse path does not]
+---
+ hw/input/virtio-input-hid.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/hw/input/virtio-input-hid.c b/hw/input/virtio-input-hid.c
+index 1019d6b2e..db10c7423 100644
+--- a/hw/input/virtio-input-hid.c
++++ b/hw/input/virtio-input-hid.c
+@@ -85,6 +85,18 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+ {
+     VirtIOInput *vinput = VIRTIO_INPUT(dev);
+     virtio_input_event event;
++    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
++    /*
++     * Android classifies an ABS_X/ABS_Y device as a touchscreen only when it
++     * also reports BTN_TOUCH; with BTN_LEFT it is an absolute pointer and the
++     * guest's input stack routes nothing to the UI (source.android.com, "Touch
++     * device classification"). The tablet already advertises BTN_TOUCH
++     * (keymap_button carries [INPUT_BUTTON_TOUCH]); this remaps what it sends.
++     * Not behind a property: it is what the tablet is for on this platform,
++     * and the AGL DomU compositor keeps working with it.
++     */
++    bool is_tablet = vhid->handler && vhid->handler->name &&
++                     !strcmp(vhid->handler->name, VIRTIO_ID_NAME_TABLET);
+ 
+     switch (evt->type) {
+     case INPUT_EVENT_KIND_KEY:
+@@ -104,7 +116,11 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+             virtio_input_send(vinput, &event);
+         } else if (keymap_button[evt->btn.button]) {
+             event.type  = cpu_to_le16(EV_KEY);
+-            event.code  = cpu_to_le16(keymap_button[evt->btn.button]);
++            if (evt->btn.button == INPUT_BUTTON_LEFT && is_tablet) {
++                event.code = cpu_to_le16(BTN_TOUCH);
++            } else {
++                event.code = cpu_to_le16(keymap_button[evt->btn.button]);
++            }
+             event.value = cpu_to_le32(evt->btn.down ? 1 : 0);
+             virtio_input_send(vinput, &event);
+         } else {

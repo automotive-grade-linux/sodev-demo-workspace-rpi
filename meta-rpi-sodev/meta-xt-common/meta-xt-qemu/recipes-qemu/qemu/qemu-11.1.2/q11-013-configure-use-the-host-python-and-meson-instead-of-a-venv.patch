@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:30 +0900
+Subject: [PATCH] configure: use the host python and meson instead of a venv
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0114-configure-use-the-host-python-and-meson-not-a-venv.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same host python/mkvenv replacement; qemu 11.1.2's configure
+computes the venv meson in a new block (get_pwd, EXESUF, Haiku), so
+instead of replacing that line the port overrides meson with the host
+one right after it.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [oe specific; see the oe-core originals]
+---
+ configure | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/configure b/configure
+index 6ddfe4b53..5cbdccb03 100755
+--- a/configure
++++ b/configure
+@@ -937,14 +937,14 @@ python="$(command -v "$python")"
+ echo "python determined to be '$python'"
+ echo "python version: $($python --version)"
+ 
+-python="$($python -B "${source_path}/python/scripts/mkvenv.py" create pyvenv)"
++python=python3
+ if test "$?" -ne 0 ; then
+     error_exit "python venv creation failed"
+ fi
+ 
+ # Suppress writing compiled files
+ python="$python -B"
+-mkvenv="$python ${source_path}/python/scripts/mkvenv.py"
++mkvenv=true
+ 
+ # Finish preparing the virtual environment using vendored .whl files.
+ # Even if PyPI is allowed, we disallow it here to force installation
+@@ -978,6 +978,9 @@ if test "$host_os" = "haiku" && test ! -e "$meson" ; then
+     meson="$(cd pyvenv/non-packaged/bin; get_pwd)/meson"
+ fi
+ 
++# Yocto (0114): use the host meson from PATH, not the venv one; mkvenv is disabled above.
++meson=$(command -v meson)
++
+ mkvenv_online_flag=""
+ if test "$download" = "enabled" ; then
+     mkvenv_online_flag=" --online"

@@ -77,16 +77,17 @@ XT_VENUS_GPU_OPTS ??= ""
 XT_VENUS_V3DV_BO_CACHE_MIB ??= "8"
 XT_VENUS_VKR_DEVICE_HEAP_MIB ??= "1088"
 # [qemu 10] The qemu version the guests' device model is built from. It comes from
-# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: 10.0.2 in the
-# default GPU=vulkan lane (meta-xt-qemu/qemu_10.0.2.bb, docs/VULKAN-VENUS.md),
+# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: in the default
+# GPU=vulkan lane 11.1.2 on both boards (qemu_11.1.2.bb; docs/VULKAN-VENUS.md), or
+# 10.0.2 where a board selects meta-xt-qemu/qemu_10.0.2.bb instead,
 # 7.0.0 for --gpu=gl -- which is the yaml's base value, left standing.
 #
 # The '7.0.0' fallback below is deliberately the OLDER of the two, because the
 # 7.0.0-only syntax is the conservative choice: every qemu in this tree parses
 # the config it produces, whereas the 10.x form makes a 7.0.0 device model exit
 # on an unknown property. It is not a safe default in general, though: a build
-# that leaves PREFERRED_VERSION_qemu unset gets oe-core's qemu
-# (10.2.0 at the time of writing) while this fallback still emits the 7.0.0-only
+# that leaves PREFERRED_VERSION_qemu unset gets meta-xt-qemu's newest default qemu
+# (10.0.2 at the time of writing) while this fallback still emits the 7.0.0-only
 # syntax, and that device model exits on it. Such a build must set
 # XT_DM_QEMU_VERSION itself. Inside moulin the variable is always set, so the
 # fallback only ever applies to a bare `bitbake` in this tree's own conf.
@@ -361,6 +362,26 @@ do_install() {
     elif grep -q 'tx-poll-us' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "doma.cfg: tx-poll-us left in for qemu ${XT_DM_QEMU_VERSION}, whose device model has no such property"
     fi
+
+    # [bluetooth] The HCI chardev's retry option, keyed on the device model's version
+    # like tx-poll-us above. doma.cfg spells it reconnect=1, which 7.0.0 and 10.0.2
+    # take; qemu removed `reconnect` in 10.2, so 11.1.2 only has reconnect-ms
+    # (chardev/char.c) and its device model refuses the option and exits, taking
+    # DomA's disk with it (one device model serves every DomA virtio device).
+    bt_from="socket,path=/run/bt-hci.sock,server=off,reconnect=1,"
+    grep -q "$bt_from" ${D}${sysconfdir}/xen/doma.cfg || \
+        bbfatal "doma.cfg: the Bluetooth chardev '$bt_from' not found"
+    case "${XT_DM_QEMU_VERSION}" in
+    11.*)
+        sed -i "s|$bt_from|socket,path=/run/bt-hci.sock,server=off,reconnect-ms=1000,|" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "socket,path=/run/bt-hci.sock,server=off,reconnect-ms=1000," ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: reconnect-ms=1000 did not reach the Bluetooth chardev"
+        if grep -v '^[[:space:]]*#' ${D}${sysconfdir}/xen/doma.cfg | grep -q 'reconnect='; then
+            bbfatal "doma.cfg: a chardev reconnect= left in for qemu ${XT_DM_QEMU_VERSION}, which has no such option"
+        fi
+        ;;
+    esac
 
     # [display] Substitute the board's extra virtio-gpu-gl-pci properties on the
     # qemu 10 device model, and empty the token on 7.0.0. Keyed on the device

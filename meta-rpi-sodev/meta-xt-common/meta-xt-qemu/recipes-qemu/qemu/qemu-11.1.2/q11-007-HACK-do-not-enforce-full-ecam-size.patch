@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrii <andrii_chepurnyi@epam.com>
+Date: Tue, 26 Aug 2025 17:19:04 +0000
+Subject: [PATCH] HACK: do not enforce full ecam size
+
+Since we are using only 16MB for the virt PCI ECAM region and do not
+need the full size, as described in the specification for the real PCI
+host device, the restriction on the 256MB size of ECAM can be removed.
+Additionally, increasing it to 256MB will require modifying Android
+u-boot to avoid overlapping of memory regions.
+
+(cherry picked from commit 44874fd63ba407719ac9e2f93873ed9a5f685732)
+
+Signed-off-by: Andrii <andrii_chepurnyi@epam.com>
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 44874fd63ba407719ac9e2f93873ed9a5f685732
+---
+ hw/xen/xen-pvh-common.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/hw/xen/xen-pvh-common.c b/hw/xen/xen-pvh-common.c
+index 51ff1fe8e..458bd9239 100644
+--- a/hw/xen/xen-pvh-common.c
++++ b/hw/xen/xen-pvh-common.c
+@@ -317,10 +317,6 @@ static void xen_pvh_init(MachineState *ms)
+ 
+     /* Non-zero pci-ecam-size enables PCI.  */
+     if (s->cfg.pci_ecam.size) {
+-        if (s->cfg.pci_ecam.size != 256 * MiB) {
+-            error_report("pci-ecam-size only supports values 0 or 0x10000000");
+-            exit(EXIT_FAILURE);
+-        }
+         if (!s->cfg.pci_intx_irq_base) {
+             error_report("PCI enabled but pci-intx-irq-base not set");
+             exit(EXIT_FAILURE);

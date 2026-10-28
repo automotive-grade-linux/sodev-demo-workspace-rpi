@@ -32,8 +32,9 @@ ENABLE_DOMU="${ENABLE_DOMU:-no}"                   # -u/--domu    : add DomU (AG
 ENABLE_ANDROID="${ENABLE_ANDROID:-no}"             # -a/--android : add DomA (AAOS p4 nested GPT; heavy)
 ENABLE_DOMZ="${ENABLE_DOMZ:-no}"                   # -z/--domz    : add DomZ (Zephyr guest / RTOS domain: p1 zephyr-domz.bin)
 GPU="${GPU:-vulkan}"                               # --gpu=vulkan|gl : guest graphics stack. vulkan (default) = Venus (guest
-                                                   #   Vulkan over virtio-gpu) for DomA and DomU on qemu 10.0.2-xt; gl = the
-                                                   #   pre-Venus OpenGL stack on qemu 7.0.0-xt
+                                                   #   Vulkan over virtio-gpu) for DomA and DomU on qemu 11.1.2 (both
+                                                   #   boards); gl = the pre-Venus OpenGL stack on
+                                                   #   qemu 7.0.0-xt
 ENABLE_DEVEL="${ENABLE_DEVEL:-no}"                 # --devel      : add meta-rpi-sodev-devel to the DomD build (diagnostics; never ships)
 ACCEPT_SYNAPTICS_KILLSWITCH="${ACCEPT_SYNAPTICS_KILLSWITCH:-no}"  # --accept-synaptics-killswitch : accept linux-firmware-rpidistro's licence flag (DomD's Wi-Fi firmware; see README)
 NINJA_TARGET="${NINJA_TARGET-image-full}"          # --domains-only => "" (build domains, skip SD assembly)
@@ -122,8 +123,9 @@ Domain options:
                          assembles only during SD-image assembly)
       --gpu=<stack>      vulkan (DEFAULT) | gl -- which graphics stack the guests get.
                            vulkan: DomA and DomU render with Vulkan through Venus. The
-                             device model is qemu 10.0.2-xt (the venus= property needs
-                             >= 9.2), virglrenderer keeps its venus backend and gains
+                             device model is qemu 11.1.2 on both boards (the venus=
+                             property needs >= 9.2),
+                             virglrenderer keeps its venus backend and gains
                              render-server + minigbm_allocation, hostmem/blob/venus go on
                              the guests' virtio-gpu-gl, the DomD/DomU Vulkan runtime is
                              installed, DomA composites with SkiaVk and DomU's cluster
@@ -1975,7 +1977,7 @@ if [ "$NINJA_TARGET" = "image-full" ]; then
   IMG_NAME="${BOARD}-${BOARD_RAM%g}GB-${img_dom0}"
   [ "$ENABLE_DOMU" = yes ]    && IMG_NAME="${IMG_NAME}-DomU"
   # The graphics stack belongs in the name for exactly the reason this block exists:
-  # it swaps the device model (qemu 10.0.2 <-> 7.0.0) and the guests' whole render
+  # it swaps the device model (qemu 10.0.2 or 11.1.2 <-> 7.0.0) and the guests' whole render
   # path, which is a larger difference than any other flag here, and two images that
   # differ only by --gpu would otherwise be told apart only by timestamp. The default
   # (vulkan) is named too, so an image's name always says which stack is in it.

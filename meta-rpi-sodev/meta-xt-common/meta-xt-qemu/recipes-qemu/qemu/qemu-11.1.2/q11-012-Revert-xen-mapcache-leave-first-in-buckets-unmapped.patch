@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Date: Wed, 6 May 2026 10:14:31 +0300
+Subject: [PATCH] Revert "xen: mapcache: leave first in buckets unmapped"
+
+This reverts commit 8e6a6725d07530cbe5051255c25433d7b6841a81.
+
+After adjusting bucket sizes for mapcache, this W/A is not needed.
+Moreover, it leads to long time reboot of the domain, due to needings of
+unmaping a lot of memory while domain destroy operation.
+
+(cherry picked from commit f460a03528d82c819ac449b56783c086d619d604)
+
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Reviewed-by: Dmytro Firsov <dmytro_firsov@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit f460a03528d82c819ac449b56783c086d619d604
+---
+ hw/xen/xen-mapcache.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index 51334a27e..7dfe8dc95 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -593,11 +593,10 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+         return;
+     }
+     entry->lock--;
+-    if (entry->lock > 0 || pentry == NULL) {
++    if (entry->lock > 0) {
+         return;
+     }
+ 
+-    pentry->next = entry->next;
+     ram_block_notify_remove(entry->vaddr_base, entry->size, entry->size);
+     if (entry->flags & XEN_MAPCACHE_ENTRY_GRANT) {
+         rc = xengnttab_unmap(xen_region_gnttabdev, entry->vaddr_base,
+@@ -612,7 +611,22 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+     }
+ 
+     g_free(entry->valid_mapping);
+-    g_free(entry);
++    if (pentry) {
++        pentry->next = entry->next;
++        g_free(entry);
++    } else {
++        /*
++         * Invalidate mapping but keep entry->next pointing to the rest
++         * of the list.
++         *
++         * Note that lock is already zero here, otherwise we don't unmap.
++         */
++        entry->paddr_index = 0;
++        entry->vaddr_base = NULL;
++        entry->valid_mapping = NULL;
++        entry->flags = 0;
++        entry->size = 0;
++    }
+ }
+ 
+ typedef struct XenMapCacheData {

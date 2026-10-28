@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Date: Thu, 14 May 2026 11:43:22 +0300
+Subject: [PATCH] xen-mapcache: adjust bucket size
+
+Due to the nature of the xen-mapcache algorithms and virtio protocols,
+using large bucket sizes leads to insufficient performance, especially
+for virtio-blk. Each I/O operation using virtio requires several to tens
+of map/unmap operations. Synthetic tests show that the average map/unmap
+speed for foreign memory is approximately 300-350 MB/s. This means that
+with a bucket size of 1 MB (the default shift of 20 bits), each map and
+unmap operation takes about 3 to 10 ms. Considering this is pure delay -
+and that, in addition, QEMU must process other operations and
+synchronize them - the total I/O throughput may decrease to as low as
+3-4 MB/s.
+
+Therefore, reducing the bucket size decreases the overhead for map/unmap
+operations on small buffers that were not previously mapped by mapcache,
+resulting in increased total I/O bandwidth. Setting the bucket size to
+16 bits (64 KB) is optimal, as making it smaller would increase overhead
+from ioctl calls.
+
+(cherry picked from commit 0bafd78991825f7d5f167d0591684fc5835ca593)
+
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Reviewed-by: Dmytro Firsov <dmytro_firsov@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 0bafd78991825f7d5f167d0591684fc5835ca593
+---
+ hw/xen/xen-mapcache.c | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index 6cd5b16c5..51334a27e 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -139,11 +139,13 @@ static MapCache *xen_map_cache_init_single(phys_offset_to_gaddr_t f,
+     return mc;
+ }
+ 
++#define DEFAULT_BUCKET_SHIFT 16U
++
+ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
+ {
+     struct rlimit rlimit_as;
+     unsigned long max_mcache_size;
+-    unsigned int bucket_shift;
++    unsigned int bucket_shift = DEFAULT_BUCKET_SHIFT;
+ 
+     xen_region_gnttabdev = xengnttab_open(NULL, 0);
+     if (xen_region_gnttabdev == NULL) {
+@@ -151,12 +153,6 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
+         exit(EXIT_FAILURE);
+     }
+ 
+-    if (HOST_LONG_BITS == 32) {
+-        bucket_shift = 16;
+-    } else {
+-        bucket_shift = 20;
+-    }
+-
+     if (geteuid() == 0) {
+         rlimit_as.rlim_cur = RLIM_INFINITY;
+         rlimit_as.rlim_max = RLIM_INFINITY;

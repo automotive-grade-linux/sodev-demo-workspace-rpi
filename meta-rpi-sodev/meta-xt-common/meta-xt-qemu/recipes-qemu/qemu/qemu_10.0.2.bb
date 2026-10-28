@@ -1,6 +1,7 @@
-# The Venus-capable qemu for this board, and the device model a plain build gets:
-# GPU=vulkan is the default lane and appends PREFERRED_VERSION_qemu = "10.0.2" to
-# the domd conf. The yaml's base value for that variable is still 7.0.0, which is
+# The xen-troops fork's Venus-capable qemu, selectable for either board: GPU=vulkan
+# is the default lane and appends PREFERRED_VERSION_qemu = "11.1.2" to the domd conf
+# on both boards; setting it to "10.0.2" there selects this one.
+# The yaml's base value for that variable is still 7.0.0, which is
 # what `--gpu=gl` leaves standing. virtio-gpu-gl grew the `venus=` property in
 # QEMU 9.2.0, so the vendored 7.0.0 fork cannot carry Venus at all -- see
 # docs/VULKAN-VENUS.md.

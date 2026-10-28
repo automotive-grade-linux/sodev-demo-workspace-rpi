@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Fri, 15 Jul 2022 11:20:53 +0300
+Subject: [PATCH] xen-bus: Set offline if backend's state is XenbusStateClosed
+
+Both state (XenbusStateClosed) and online (0) are expected by
+toolstack/xl devd to completely destroy the device. But "offline" is
+never being set by the backend resulting in timeout during domain
+destruction, garbage in Xestore and still running Qemu instance.
+
+(cherry picked from commit 20b5702efd9ca805e1c28dd5a861639518b8b696)
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 20b5702efd9ca805e1c28dd5a861639518b8b696
+---
+ hw/xen/xen-bus.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/hw/xen/xen-bus.c b/hw/xen/xen-bus.c
+index 181c9b093..ff19fff71 100644
+--- a/hw/xen/xen-bus.c
++++ b/hw/xen/xen-bus.c
+@@ -525,6 +525,9 @@ static void xen_device_backend_changed(void *opaque, const char *path)
+         xen_device_backend_set_state(xendev, XenbusStateClosed);
+     }
+ 
++    if (xen_device_backend_get_state(xendev) == XenbusStateClosed)
++        xen_device_backend_set_online(xendev, false);
++
+     /*
+      * If a backend is still 'online' then we should leave it alone but,
+      * if a backend is not 'online', then the device is a candidate

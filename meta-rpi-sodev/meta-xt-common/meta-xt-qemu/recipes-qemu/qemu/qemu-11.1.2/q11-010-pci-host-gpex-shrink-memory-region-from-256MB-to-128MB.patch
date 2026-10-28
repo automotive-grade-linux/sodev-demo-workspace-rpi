@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Date: Thu, 26 Feb 2026 15:07:13 +0200
+Subject: [PATCH] pci-host: gpex: shrink memory region from 256MB to 128MB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since we are not using the standard full ECAM size of 256MB, and the
+base address for virtio PCI on R-Car setups starts from 0x33000000, the
+memory region overlaps with GUEST_RAM0_BASE (0x40000000). This overlap
+causes issues when trying to utilize the memory region
+[0x40000000–0x43000000], for example, when loading Android images from
+U-Boot. As we are using the PCI range [0x33000000–0x3a800000], which
+fits within a 128MB length, the memory region can be reduced from 256MB
+to 128MB.
+
+(cherry picked from commit 90cc72e21366022be94ce68ccd52548ba0012afa)
+
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 90cc72e21366022be94ce68ccd52548ba0012afa
+---
+ hw/pci-host/gpex.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/pci-host/gpex.c b/hw/pci-host/gpex.c
+index e66784ce5..fc509d778 100644
+--- a/hw/pci-host/gpex.c
++++ b/hw/pci-host/gpex.c
+@@ -97,7 +97,7 @@ static void gpex_host_realize(DeviceState *dev, Error **errp)
+ 
+     s->irq = g_malloc0_n(s->num_irqs, sizeof(*s->irq));
+ 
+-    pcie_host_mmcfg_init(pex, PCIE_MMCFG_SIZE_MAX);
++    pcie_host_mmcfg_init(pex, PCIE_MMCFG_SIZE_MAX/2);
+     sysbus_init_mmio(sbd, &pex->mmio);
+ 
+     /*

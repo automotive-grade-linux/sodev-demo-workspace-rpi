@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Date: Wed, 25 Feb 2026 14:20:15 +0200
+Subject: [PATCH] xen: mapcache: leave first in buckets unmapped
+
+In general, this commit reverts changes introduced by the following
+commits: 872cb9cced796e75d4f719c31d70ed5fd629efca xen: mapcache: Fix
+unmapping of first entries in buckets
+
+123acd816dccbd358570ec7ab79c5cb2c863780b xen: mapcache: Unmap first
+entries in buckets
+
+With such fixes, observed a lot of map/unmap operations during
+virtio-blk IO operations. E.g. on Gen5 setup, every unmap takes about
+2-3ms, and according to virtio-blk logic every 1MB read/write may
+require 80-256 map and unmap operations, which in total takes avarage
+150-200ms and as a result drops IO performance to 3-4MB/s. On the other
+hand, leaving the first entries in every bucket always unmapped allows
+us to reuse the memory and avoid numerious of map/unmaps.
+
+This is a workaround solution, as a proper fix requires debugging the
+root cause, why every unmap operation takes a few ms. Note: this is how
+it works now in QEMU 7 without any observed issues.
+
+(cherry picked from commit 8e6a6725d07530cbe5051255c25433d7b6841a81)
+
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 8e6a6725d07530cbe5051255c25433d7b6841a81
+---
+ hw/xen/xen-mapcache.c | 20 +++-----------------
+ 1 file changed, 3 insertions(+), 17 deletions(-)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index 85cf0cf35..6cd5b16c5 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -597,10 +597,11 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+         return;
+     }
+     entry->lock--;
+-    if (entry->lock > 0) {
++    if (entry->lock > 0 || pentry == NULL) {
+         return;
+     }
+ 
++    pentry->next = entry->next;
+     ram_block_notify_remove(entry->vaddr_base, entry->size, entry->size);
+     if (entry->flags & XEN_MAPCACHE_ENTRY_GRANT) {
+         rc = xengnttab_unmap(xen_region_gnttabdev, entry->vaddr_base,
+@@ -615,22 +616,7 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+     }
+ 
+     g_free(entry->valid_mapping);
+-    if (pentry) {
+-        pentry->next = entry->next;
+-        g_free(entry);
+-    } else {
+-        /*
+-         * Invalidate mapping but keep entry->next pointing to the rest
+-         * of the list.
+-         *
+-         * Note that lock is already zero here, otherwise we don't unmap.
+-         */
+-        entry->paddr_index = 0;
+-        entry->vaddr_base = NULL;
+-        entry->valid_mapping = NULL;
+-        entry->flags = 0;
+-        entry->size = 0;
+-    }
++    g_free(entry);
+ }
+ 
+ typedef struct XenMapCacheData {

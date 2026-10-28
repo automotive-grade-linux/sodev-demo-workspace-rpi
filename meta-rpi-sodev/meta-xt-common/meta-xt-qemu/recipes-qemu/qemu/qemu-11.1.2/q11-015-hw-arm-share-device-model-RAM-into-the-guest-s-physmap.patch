@@ -1,0 +1,778 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] hw/arm: share device-model RAM into the guest's physmap
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0116-hw-arm-share-device-model-RAM-into-the-guest-s-physma.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same share logic; qemu 11 turned the hostmem region into a QOM
+object, so the refusal path frees it by clearing vmr->g and setting
+free=g_free instead of a custom free hook (and no longer disables the
+region first), the !CONFIG_XEN_IS_POSSIBLE inline stubs are dropped
+because qemu 11's xen.h declares Xen functions unconditionally, and the
+new qemu 11 256 MiB hostmem background region is not created under Xen
+so blobs stay one region each as in 10.0.2. Several explanatory comments
+were shortened.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [upstream wants the XSM question settled first, and probably a machine property to gate it. The pagemap route here has no real pin; 0121 gives the shmem-backed blobs one through udmabuf, and a dma-buf is pinned by the gntdev import, so what is left unpinned upstream would object to is the anonymous-memory case]
+---
+ hw/arm/xen-stubs.c            | 512 ++++++++++++++++++++++++++++++++++
+ hw/display/virtio-gpu-gl.c    |  10 +-
+ hw/display/virtio-gpu-virgl.c |  80 ++++++
+ hw/i386/xen/xen-hvm.c         |  26 ++
+ include/system/xen.h          |  30 ++
+ 5 files changed, 657 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/xen-stubs.c b/hw/arm/xen-stubs.c
+index 00bc31025..e526a6f97 100644
+--- a/hw/arm/xen-stubs.c
++++ b/hw/arm/xen-stubs.c
+@@ -6,19 +6,531 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qapi/qapi-commands-migration.h"
++#include "qemu/error-report.h"
+ #include "system/xen.h"
+ #include "hw/core/hw-error.h"
+ #include "hw/xen/xen-hvm-common.h"
++#include "hw/xen/xen_native.h"
+ #include "hw/xen/arch_hvm.h"
+ 
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <xen/gntdev.h>
++
++/*
++ * The kernel side of this (0014 in the DomD kernel) imports a dma-buf and
++ * returns the frame numbers of its pages, which userspace cannot work out for
++ * itself. Declared here because the build sysroot's uapi headers predate it.
++ */
++#ifndef IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS
++struct ioctl_gntdev_dmabuf_imp_to_gfns {
++    uint32_t fd;
++    uint32_t count;
++    uint32_t reserved[2];
++    uint64_t gfns[1];
++};
++#define IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS \
++    _IOC(_IOC_NONE, 'G', 13, sizeof(struct ioctl_gntdev_dmabuf_imp_to_gfns))
++#endif
++
++/*
++ * The ioctl NUMBER encodes sizeof(the struct), so this file and the kernel must
++ * agree on the layout or the request silently becomes a different one and the
++ * kernel answers ENOTTY -- which the error path below would misattribute to a
++ * kernel that lacks the ioctl. The kernel side (0014) declares __u32 fd,
++ * __u32 count, __u32 reserved[2], __u64 gfns[1]: 16 bytes of header then the
++ * array, which is what the two asserts below pin down. Assert it
++ * here so a sysroot whose uapi headers grow a different version of this struct
++ * (in which case the #ifndef above skips ours) fails to build instead.
++ */
++QEMU_BUILD_BUG_ON(offsetof(struct ioctl_gntdev_dmabuf_imp_to_gfns, gfns) != 16);
++QEMU_BUILD_BUG_ON(sizeof(struct ioctl_gntdev_dmabuf_imp_to_gfns) != 24);
++
+ void arch_handle_ioreq(XenIOState *state, ioreq_t *req)
+ {
+     hw_error("Invalid ioreq type 0x%x\n", req->type);
+ }
+ 
++/*
++ * Device-model RAM in a guest's address space -- a virtio-gpu host-visible blob
++ * window is the case that matters -- is only registered with the IOREQ server
++ * by xen_set_memory(), so every guest access to it traps out to this process
++ * for emulation. On arm64 that is not merely slow, it is fatal: a data abort
++ * from a SIMD/FP access carries no valid syndrome, Xen falls back to decoding
++ * the instruction itself, and its decoder covers only the general-purpose
++ * load/store forms (xen/arch/arm/decode.c). Mesa's venus writes its command
++ * ring with memcpy(), which is SIMD on aarch64, so Xen logs "unhandled Arm
++ * instruction" and injects the abort -- killing the guest's Vulkan client at
++ * its first ring write. Measured on a Raspberry Pi 5.
++ *
++ * So insert those pages into the guest's p2m instead, and let the guest access
++ * them directly with no trap at all. The pages belong to this domain (the
++ * driver domain running the device model), which shares them with the guest it
++ * serves, via XENMAPSPACE_gmfn_foreign with DOMID_SELF as the owner.
++ *
++ * Caveats, all PoC-level and deliberately visible in the log:
++ *  - the guest frame numbers of our own pages come from /proc/self/pagemap, so
++ *    this needs the pages to be present (they are faulted in first) and the
++ *    process to be privileged enough to read the PFNs -- true for a device
++ *    model;
++ *  - mlock() keeps them resident but does not stop the kernel from migrating
++ *    them (compaction, ballooning). A production version needs a real pin,
++ *    which means kernel help;
++ *  - the hypervisor has to permit the direction at all. Without the matching
++ *    change (4.22-0007) the batch below fails -- with -ESRCH on Xen 4.22, whose
++ *    rcu_lock_remote_domain_by_id() cannot resolve DOMID_SELF, and with -EPERM
++ *    on 4.21, whose xsm_map_gmfn_foreign() check is written for the opposite
++ *    direction (a control domain mapping a guest's page into itself). Either
++ *    way the caller withdraws the window rather than leaving it trapping, so
++ *    the guest gets VK_ERROR_MEMORY_MAP_FAILED instead of an undecodable abort.
++ */
++typedef struct XenArmRamMapping {
++    hwaddr start_gfn;
++    unsigned long nr_pages;
++    void *hva;
++    uint64_t size;
++    /*
++     * Set when the frame numbers came from a gntdev dma-buf import, which
++     * has to be released -- and until it is, keeps the buffer's pages in
++     * place.
++     */
++    int dmabuf_fd;
++    int gntdev_fd;
++    QLIST_ENTRY(XenArmRamMapping) next;
++} XenArmRamMapping;
++
++static QLIST_HEAD(, XenArmRamMapping) xen_arm_ram_mappings =
++    QLIST_HEAD_INITIALIZER(xen_arm_ram_mappings);
++
++/* Outcome of the last xen_arm_map_ram_section(), for the accessor below. */
++static bool xen_arm_share_failed;
++
++/* dma-buf handed over for the region being added, and whether we kept it. */
++static int xen_arm_blob_dmabuf_fd = -1;
++static bool xen_arm_blob_dmabuf_taken;
++
++/*
++ * Set by a caller that could not pin the pages of the region it is about to
++ * add. The pagemap route below is only safe for memory nothing migrates, so a
++ * caller that knows better must be able to veto it.
++ */
++static bool xen_arm_blob_refuse;
++
++void xen_dm_refuse_blob_share(void)
++{
++    xen_arm_blob_refuse = true;
++}
++
++void xen_dm_set_blob_dmabuf(int fd)
++{
++    xen_dm_clear_blob_dmabuf();
++    xen_arm_blob_dmabuf_fd = fd;
++    xen_arm_blob_dmabuf_taken = false;
++}
++
++void xen_dm_clear_blob_dmabuf(void)
++{
++    if (xen_arm_blob_dmabuf_fd >= 0 && !xen_arm_blob_dmabuf_taken) {
++        close(xen_arm_blob_dmabuf_fd);
++    }
++    xen_arm_blob_dmabuf_fd = -1;
++    xen_arm_blob_dmabuf_taken = false;
++    xen_arm_blob_refuse = false;
++}
++
++/*
++ * Ask the kernel for the frame numbers of a dma-buf's pages. gntdev already
++ * computes exactly this on its import path; 0014 adds the ioctl that returns
++ * it. The import also keeps the buffer attached, so its pages stay put until
++ * released -- a stronger guarantee than the mlock() the pagemap path settles
++ * for.
++ */
++static int xen_arm_gfns_from_dmabuf(int dmabuf_fd, unsigned long nr_pages,
++                                    xen_ulong_t *idxs, int *gntdev_fd)
++{
++    struct ioctl_gntdev_dmabuf_imp_to_gfns *op;
++    size_t len = sizeof(*op) + (nr_pages - 1) * sizeof(op->gfns[0]);
++    unsigned long i;
++    int fd, ret = -1;
++
++    fd = open("/dev/xen/gntdev", O_RDWR | O_CLOEXEC);
++    if (fd < 0) {
++        error_report("xen-arm: cannot open /dev/xen/gntdev: %s",
++                     strerror(errno));
++        return -1;
++    }
++
++    op = g_malloc0(len);
++    op->fd = dmabuf_fd;
++    op->count = nr_pages;
++
++    if (ioctl(fd, IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS, op)) {
++        error_report("xen-arm: gntdev dma-buf import of %lu pages failed: %s%s",
++                     nr_pages, strerror(errno),
++                     (errno == EINVAL || errno == ENOTTY) ?
++                     " -- a kernel without the IMP_TO_GFNS ioctl answers like this"
++                     : "");
++        close(fd);
++        goto out;
++    }
++
++    for (i = 0; i < nr_pages; i++) {
++        idxs[i] = op->gfns[i];
++    }
++    *gntdev_fd = fd;
++    ret = 0;
++
++out:
++    g_free(op);
++    return ret;
++}
++
++static void xen_arm_release_dmabuf(int gntdev_fd, int dmabuf_fd)
++{
++    struct ioctl_gntdev_dmabuf_imp_release rel = { .fd = dmabuf_fd };
++
++    if (ioctl(gntdev_fd, IOCTL_GNTDEV_DMABUF_IMP_RELEASE, &rel)) {
++        warn_report("xen-arm: releasing the gntdev dma-buf import failed: %s",
++                    strerror(errno));
++    }
++    close(gntdev_fd);
++    close(dmabuf_fd);
++}
++
++bool xen_dm_ram_share_failed(void)
++{
++    return xen_arm_share_failed;
++}
++
++static int xen_arm_hva_to_gfns(void *hva, unsigned long nr_pages,
++                               xen_ulong_t *gfns)
++{
++    int fd, ret = -1;
++    unsigned long i;
++
++    /*
++     * pagemap reports a zero entry for a page that is not present, so populate
++     * the mapping first -- and populate it for WRITE, not READ. A read fault on
++     * a MAP_PRIVATE|MAP_ANONYMOUS page maps the shared zero page, whose pagemap
++     * entry is present with a valid PFN, so MADV_POPULATE_READ would hand us
++     * the SAME frame number for every page and we would insert one physical
++     * page into the guest's p2m nr_pages times, silently. MADV_POPULATE_WRITE
++     * faults in real pages, is a no-op for pages already present, and refuses
++     * the same VMAs.
++     *
++     * EINVAL is the answer for a VMA whose pages cannot be populated this way
++     * (VM_PFNMAP/VM_IO -- a dma-buf mapping), which is exactly the case this
++     * function cannot handle, so act on it rather than warning and carrying on
++     * into a pagemap loop that can only fail more obscurely.
++     */
++    if (madvise(hva, nr_pages << XC_PAGE_SHIFT, MADV_POPULATE_WRITE)) {
++        if (errno == EINVAL) {
++            error_report("xen-arm: %p is a VM_PFNMAP/VM_IO mapping"
++                         " (madvise: %s)"
++                         " -- its frames are not in pagemap; this is dma-buf"
++                         " memory and needs the gntdev path",
++                         hva, strerror(errno));
++            return -1;
++        }
++        warn_report("xen-arm: MADV_POPULATE_WRITE on %p failed: %s",
++                    hva, strerror(errno));
++    }
++
++    fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        error_report("xen-arm: cannot open /proc/self/pagemap: %s",
++                     strerror(errno));
++        return -1;
++    }
++
++    for (i = 0; i < nr_pages; i++) {
++        uint64_t entry;
++        off_t off = (((uintptr_t)hva >> XC_PAGE_SHIFT) + i) * sizeof(entry);
++
++        if (pread(fd, &entry, sizeof(entry), off) != sizeof(entry)) {
++            error_report("xen-arm: pagemap read failed at page %lu: %s",
++                         i, strerror(errno));
++            goto out;
++        }
++        if (!(entry & (1ULL << 63))) {
++            error_report("xen-arm: page %lu of %lu at hva %p is not present "
++                         "(pagemap entry 0x%" PRIx64 "%s)", i, nr_pages,
++                         (char *)hva + (i << XC_PAGE_SHIFT), entry,
++                         (entry & (1ULL << 61)) ? ", file/shared-anon" : "");
++            goto out;
++        }
++        gfns[i] = entry & ((1ULL << 55) - 1);
++        if (!gfns[i]) {
++            error_report("xen-arm: pagemap gave no frame number "
++                         "(needs privilege to read PFNs)");
++            goto out;
++        }
++    }
++    /*
++     * Belt and braces for the failure the MADV_POPULATE_WRITE above exists to
++     * avoid: if every page reports the same frame, the mapping was populated
++     * with one shared page (the zero page) rather than nr_pages distinct ones,
++     * and inserting that into a guest's p2m repeatedly would alias the whole
++     * window onto one host page. Cheap to check and impossible to notice
++     * afterwards.
++     */
++    if (nr_pages > 1) {
++        for (i = 1; i < nr_pages; i++) {
++            if (gfns[i] != gfns[0]) {
++                break;
++            }
++        }
++        if (i == nr_pages) {
++            error_report("xen-arm: all %lu pages at %p report frame 0x%lx -- a "
++                         "shared zero page, or a mapping this path cannot handle",
++                         nr_pages, hva, (unsigned long)gfns[0]);
++            goto out;
++        }
++    }
++    ret = 0;
++
++out:
++    close(fd);
++    return ret;
++}
++
++static void xen_arm_map_ram_section(MemoryRegionSection *section)
++{
++    hwaddr start_addr = section->offset_within_address_space;
++    uint64_t size = int128_get64(section->size);
++    XenArmRamMapping *m;
++    unsigned long nr_pages, i, n, failed = 0;
++    xen_ulong_t *idxs;
++    xen_pfn_t *gpfns;
++    int *errs, rc, first_err = 0;
++    int dmabuf_fd = -1, gntdev_fd = -1;
++    bool locked = false;
++    void *hva;
++
++    if (!memory_region_is_ram(section->mr) ||
++        memory_region_is_rom(section->mr) ||
++        memory_region_is_romd(section->mr)) {
++        return;
++    }
++
++    /*
++     * Assume failure until the batch comes back clean, so a caller that checks
++     * xen_dm_ram_share_failed() right after adding its region sees the truth
++     * for every path out of this function.
++     */
++    xen_arm_share_failed = true;
++
++    hva = memory_region_get_ram_ptr(section->mr) +
++          section->offset_within_region;
++
++    if ((start_addr & ~XC_PAGE_MASK) || (size & ~XC_PAGE_MASK) ||
++        ((uintptr_t)hva & ~XC_PAGE_MASK) || !size) {
++        warn_report("xen-arm: not mapping unaligned device RAM at 0x%"
++                    HWADDR_PRIx" (size 0x%" PRIx64 ", hva %p)",
++                    start_addr, size, hva);
++        return;
++    }
++
++    nr_pages = size >> XC_PAGE_SHIFT;
++
++    info_report("xen-arm: device RAM '%s' at gpa 0x%" HWADDR_PRIx
++                ", %lu pages, hva %p%s", memory_region_name(section->mr),
++                start_addr, nr_pages, hva,
++                xen_arm_blob_dmabuf_fd >= 0 ? " (dma-buf)" : "");
++
++    idxs = g_new0(xen_ulong_t, nr_pages);
++    gpfns = g_new0(xen_pfn_t, nr_pages);
++    errs = g_new0(int, nr_pages);
++
++    if (xen_arm_blob_dmabuf_fd >= 0) {
++        /*
++         * GPU memory: the kernel has to tell us its frames, and the import
++         * keeps the pages in place for as long as we hold it -- no mlock()
++         * needed.
++         */
++        if (xen_arm_gfns_from_dmabuf(xen_arm_blob_dmabuf_fd, nr_pages, idxs,
++                                     &gntdev_fd)) {
++            goto out;
++        }
++        dmabuf_fd = xen_arm_blob_dmabuf_fd;
++    } else {
++        /*
++         * Refuse, not warn. Without the pin the kernel may migrate these frames
++         * (compaction, ballooning) after they are in the guest's p2m, and the
++         * guest would then be reading whatever landed there instead -- a
++         * cross-domain memory disclosure, not a rough edge. The header's caveat
++         * is that a production version needs a real pin; until then, no pin
++         * means no share.
++         */
++        if (xen_arm_blob_refuse) {
++            error_report("xen-arm: the caller could not pin the pages of the"
++                         " region at 0x%" HWADDR_PRIx " -- refusing to share"
++                         " unpinned frames", start_addr);
++            goto out;
++        }
++        if (mlock(hva, size)) {
++            error_report("xen-arm: mlock of %p (%" PRIu64 " bytes) failed: %s"
++                         " -- refusing to share unpinned frames",
++                         hva, size, strerror(errno));
++            goto out;
++        }
++        locked = true;
++        if (xen_arm_hva_to_gfns(hva, nr_pages, idxs)) {
++            goto out;
++        }
++    }
++    for (i = 0; i < nr_pages; i++) {
++        gpfns[i] = (start_addr >> XC_PAGE_SHIFT) + i;
++    }
++
++    /*
++     * One hypercall carries at most UINT16_MAX pages: its page count
++     * (xen_add_to_physmap_batch.size) is a uint16_t, and libxc copies ours into
++     * it unchecked. A blob that fills a 256 MiB window is 65536 pages, which
++     * would wrap to 0 -- Xen would map nothing, report success, and leave the
++     * guest the trapping mapping this function exists to replace. So issue the
++     * batch in chunks. A chunk the hypercall rejects outright is recorded as
++     * failed page by page, and so is everything after it, so the partial-batch
++     * path below also takes out the chunks that did go in.
++     */
++    for (i = 0; i < nr_pages; i += n) {
++        n = MIN(nr_pages - i, (unsigned long)UINT16_MAX);
++        rc = xc_domain_add_to_physmap_batch(xen_xc, xen_domid, DOMID_SELF,
++                                           XENMAPSPACE_gmfn_foreign,
++                                           n, idxs + i, gpfns + i, errs + i);
++        if (rc) {
++            int e = errno;
++
++            error_report("xen-arm: sharing pages %lu-%lu of %lu of device RAM"
++                         " into dom%u at 0x%" HWADDR_PRIx " failed: %s", i,
++                         i + n - 1, nr_pages, xen_domid, start_addr,
++                         strerror(e));
++            for (; i < nr_pages; i++) {
++                errs[i] = -e;
++            }
++            break;
++        }
++    }
++    for (i = 0; i < nr_pages; i++) {
++        if (errs[i]) {
++            if (!failed) {
++                first_err = errs[i];
++            }
++            failed++;
++        }
++    }
++    if (failed) {
++        error_report("xen-arm: %lu of %lu pages of device RAM at 0x%"
++                     HWADDR_PRIx " were not shared into dom%u (first error %d)",
++                     failed, nr_pages, start_addr, xen_domid, first_err);
++        /*
++         * A partial batch leaves the pages that DID go in visible to the
++         * guest, and nothing will ever take them out: no mapping is recorded
++         * below, so the region_del path returns at its !m check without doing
++         * anything. Undo them here. The region is withdrawn by the caller
++         * either way, so device-model memory left behind in a guest's p2m is
++         * a cross-domain disclosure, not a leak.
++         */
++        for (i = 0; i < nr_pages; i++) {
++            if (!errs[i] &&
++                xc_domain_remove_from_physmap(xen_xc, xen_domid, gpfns[i])) {
++                warn_report("xen-arm: rolling gfn 0x%lx back out of dom%u"
++                            " failed: %s", (unsigned long)gpfns[i],
++                            xen_domid, strerror(errno));
++            }
++        }
++        goto out;
++    }
++
++    m = g_new0(XenArmRamMapping, 1);
++    m->start_gfn = start_addr >> XC_PAGE_SHIFT;
++    m->nr_pages = nr_pages;
++    m->hva = hva;
++    m->size = size;
++    m->dmabuf_fd = dmabuf_fd;
++    m->gntdev_fd = gntdev_fd;
++    if (gntdev_fd >= 0) {
++        xen_arm_blob_dmabuf_taken = true;
++    }
++    QLIST_INSERT_HEAD(&xen_arm_ram_mappings, m, next);
++
++    xen_arm_share_failed = false;
++    info_report("xen-arm: shared %lu pages of device RAM into dom%u at 0x%"
++                HWADDR_PRIx " (%s, no IOREQ emulation for this range)",
++                nr_pages, xen_domid, start_addr,
++                gntdev_fd >= 0 ? "dma-buf" : "pagemap");
++
++    goto free_arrays;
++
++out:
++    if (gntdev_fd >= 0) {
++        /* The mapping did not happen, so do not keep the buffer pinned. */
++        xen_arm_release_dmabuf(gntdev_fd, dmabuf_fd);
++        xen_arm_blob_dmabuf_taken = true;   /* the fd is closed now */
++    }
++    if (locked) {
++        /*
++         * Nothing reached the guest's p2m, so nothing needs these pages
++         * resident. Without this every refused map charges RLIMIT_MEMLOCK
++         * permanently -- and refusal repeats, once per vkMapMemory retry.
++         */
++        munlock(hva, size);
++    }
++
++    /*
++     * Reached on success as well: the three arrays are scratch for the batch
++     * hypercall and nothing in the mapping refers to them. They are freed under
++     * their own label rather than by falling through `out:`, because falling
++     * through would release the dma-buf import the successful path has just
++     * handed to the mapping. One array is nr_pages entries wide -- 2025 for a
++     * 1920x1080 swapchain image -- so leaking them per map is not academic.
++     */
++free_arrays:
++    g_free(errs);
++    g_free(gpfns);
++    g_free(idxs);
++}
++
++static void xen_arm_unmap_ram_section(MemoryRegionSection *section)
++{
++    hwaddr start_gfn = section->offset_within_address_space >> XC_PAGE_SHIFT;
++    XenArmRamMapping *m;
++    unsigned long i;
++
++    QLIST_FOREACH(m, &xen_arm_ram_mappings, next) {
++        if (m->start_gfn == start_gfn) {
++            break;
++        }
++    }
++    if (!m) {
++        return;
++    }
++
++    for (i = 0; i < m->nr_pages; i++) {
++        if (xc_domain_remove_from_physmap(xen_xc, xen_domid,
++                                          m->start_gfn + i)) {
++            warn_report("xen-arm: removing gfn 0x%" HWADDR_PRIx
++                        " from dom%u failed: %s",
++                        m->start_gfn + i, xen_domid, strerror(errno));
++        }
++    }
++    if (m->gntdev_fd >= 0) {
++        xen_arm_release_dmabuf(m->gntdev_fd, m->dmabuf_fd);
++    } else {
++        munlock(m->hva, m->size);
++    }
++    QLIST_REMOVE(m, next);
++    g_free(m);
++}
++
+ void arch_xen_set_memory(XenIOState *state, MemoryRegionSection *section,
+                          bool add)
+ {
++    if (add) {
++        xen_arm_map_ram_section(section);
++    } else {
++        xen_arm_unmap_ram_section(section);
++    }
+ }
+ 
+ void xen_hvm_modified_memory(ram_addr_t start, ram_addr_t length)
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 2b7a41c46..8d6369c81 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -20,6 +20,7 @@
+ #include "system/system.h"
+ #include "hw/virtio/virtio.h"
+ #include "hw/virtio/virtio-gpu.h"
++#include "system/xen.h"
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
+ #include "hw/core/qdev-properties.h"
+@@ -143,7 +144,14 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+ #endif
+ 
+ #if !defined(CONFIG_WIN32)
+-    if (virtio_gpu_hostmem_enabled(b->conf)) {
++    /*
++     * Not under Xen (0116): the device model shares each blob's own frames
++     * into the guest's p2m as the blob is mapped, and a 256 MiB anonymous
++     * background region under the whole window would be shared too, then
++     * shadowed by every blob subregion. Blobs are mapped one region each,
++     * as before qemu 11.
++     */
++    if (virtio_gpu_hostmem_enabled(b->conf) && !xen_enabled()) {
+         map = qemu_ram_mmap(-1, b->conf.hostmem, qemu_real_host_page_size(),
+                             0, 0);
+         if (map == MAP_FAILED) {
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 9bda57242..614f2a8f0 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -17,6 +17,7 @@
+ #include "trace.h"
+ #include "hw/virtio/virtio.h"
+ #include "hw/virtio/virtio-gpu.h"
++#include "system/xen.h"
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
+ 
+@@ -223,8 +224,73 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+ 
+     mr = &vmr->mr;
+     memory_region_init_ram_ptr(mr, OBJECT(vmr), "mr", size, data);
++
++    /*
++     * Under Xen the region has to be put into the guest's p2m, and for GPU
++     * memory that means asking the kernel for the buffer's frame numbers --
++     * userspace cannot read them out of a dma-buf mapping. Hand the fd over
++     * before the region is added, because that is when the Xen memory listener
++     * runs.
++     */
++    if (xen_enabled()) {
++        /*
++         * XT_XEN_NO_BLOB_EXPORT is a diagnostic: set it to a non-empty value
++         * other than "0" to skip the gntdev dma-buf path, so a failure can be
++         * attributed to the export or to the p2m insert. Documented in
++         * docs/VULKAN-VENUS.md.
++         */
++        const char *no_export = getenv("XT_XEN_NO_BLOB_EXPORT");
++        bool skip_export = no_export && no_export[0] && strcmp(no_export, "0");
++
++        if (!skip_export) {
++            uint32_t fd_type = 0;
++            int blob_fd = -1;
++            int rc;
++
++            rc = virgl_renderer_resource_export_blob(res->base.resource_id,
++                                                     &fd_type, &blob_fd);
++            if (rc || blob_fd < 0) {
++                warn_report("%s: blob export failed (rc=%d, fd=%d);"
++                            " falling back to pagemap",
++                            __func__, rc, blob_fd);
++            } else if (fd_type == VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF) {
++                xen_dm_set_blob_dmabuf(blob_fd);
++            } else {
++                close(blob_fd);
++            }
++        }
++    }
++
+     memory_region_add_subregion_overlap(&b->hostmem, offset, mr, 1);
+ 
++    if (xen_enabled()) {
++        xen_dm_clear_blob_dmabuf();
++    }
++
++    /*
++     * Under Xen the region may not have made it into the guest's p2m, in which
++     * case the guest would reach it through IOREQ emulation. Withdraw it
++     * instead of handing the guest a window it cannot safely touch: on arm64 an
++     * emulated access from a SIMD instruction is undecodable and Xen kills the
++     * task that made it.
++     */
++    if (xen_enabled() && xen_dm_ram_share_failed()) {
++        error_report("%s: cannot share the blob window with the guest; "
++                     "refusing the map", __func__);
++        /*
++         * res->mr is never set on this path, so the unmap path (which frees vmr
++         * and pairs the finalize's renderer_blocked--) never runs for it.
++         * Clearing vmr->g makes the finalize a no-op, and obj->free = g_free
++         * lets QOM free the g_new0() storage once the last reference is gone.
++         */
++        vmr->g = NULL;
++        OBJECT(vmr)->free = g_free;
++        memory_region_del_subregion(&b->hostmem, mr);
++        object_unparent(OBJECT(vmr));
++        virgl_renderer_resource_unmap(res->base.resource_id);
++        return -EOPNOTSUPP;
++    }
++
+     res->mr = mr;
+ 
+     trace_virtio_gpu_cmd_res_map_blob(res->base.resource_id, vmr, mr);
+@@ -942,6 +1008,20 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
+     memset(&resp, 0, sizeof(resp));
+     resp.hdr.type = VIRTIO_GPU_RESP_OK_MAP_INFO;
+     virgl_renderer_resource_get_map_info(mblob.resource_id, &resp.map_info);
++    /*
++     * The guest picks its page attributes from this: 1=CACHED, 2=UNCACHED,
++     * 3=WC. Under Xen the region is now real memory in the guest's p2m, mapped
++     * cacheable stage-2, while the renderer accesses it cached on the host --
++     * so a guest that maps it non-cacheable sees stale data both ways. It has
++     * not misbehaved in practice -- the guest honours the blob's WC attribute
++     * and V3D maps its BOs WC on the host, so the two agree -- but the value is
++     * logged because nothing else reports it.
++     */
++    if (xen_enabled()) {
++        info_report("xen-arm: blob res %u map_info 0x%x "
++                    "(cache 1=cached 2=uncached 3=wc)",
++                    mblob.resource_id, resp.map_info);
++    }
+     virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
+ }
+ 
+diff --git a/hw/i386/xen/xen-hvm.c b/hw/i386/xen/xen-hvm.c
+index d3ce082e0..2e8664e49 100644
+--- a/hw/i386/xen/xen-hvm.c
++++ b/hw/i386/xen/xen-hvm.c
+@@ -705,6 +705,32 @@ void qmp_xen_set_global_dirty_log(bool enable, Error **errp)
+     }
+ }
+ 
++/*
++ * x86 does not share device-model RAM into the guest's p2m at all -- its
++ * arch_xen_set_memory() relocates guest RAM for the VGA framebuffer -- so there
++ * is nothing for a caller to withdraw.
++ */
++bool xen_dm_ram_share_failed(void)
++{
++    return false;
++}
++
++/* x86 never shares device-model RAM, so it has no use for the buffer either. */
++void xen_dm_set_blob_dmabuf(int fd)
++{
++    if (fd >= 0) {
++        close(fd);
++    }
++}
++
++void xen_dm_clear_blob_dmabuf(void)
++{
++}
++
++void xen_dm_refuse_blob_share(void)
++{
++}
++
+ void arch_xen_set_memory(XenIOState *state, MemoryRegionSection *section,
+                                 bool add)
+ {
+diff --git a/include/system/xen.h b/include/system/xen.h
+index 43b857e4d..d54315ff3 100644
+--- a/include/system/xen.h
++++ b/include/system/xen.h
+@@ -29,6 +29,36 @@ extern bool xen_allowed;
+ #endif /* CONFIG_XEN_IS_POSSIBLE */
+ 
+ void xen_hvm_modified_memory(ram_addr_t start, ram_addr_t length);
++/*
++ * NOTE: only the Arm implementation of the four functions below is compiled in
++ * this product's configuration (--target-list=aarch64-softmmu builds
++ * hw/arm/xen-stubs.c; hw/i386/xen/xen-hvm.c is not built here and has never
++ * been compiled).
++ *
++ * True when the device model could not share the RAM region it last put in
++ * the guest's address space into the guest's p2m, so the guest would reach it
++ * through IOREQ emulation instead. A caller that has a choice should withdraw
++ * the region: on arm64 an emulated access from a SIMD instruction cannot be
++ * decoded by Xen and kills the guest task that made it.
++ */
++bool xen_dm_ram_share_failed(void);
++/*
++ * Hand the device model the dma-buf backing the RAM region it is about to put
++ * in the guest's address space, so the Xen code can ask the kernel for that
++ * buffer's frame numbers (userspace cannot work them out: a dma-buf mapping is
++ * VM_PFNMAP, which /proc/self/pagemap reports as a hole). Ownership of @fd
++ * passes to the callee; xen_dm_clear_blob_dmabuf() closes it if it went unused.
++ */
++void xen_dm_set_blob_dmabuf(int fd);
++void xen_dm_clear_blob_dmabuf(void);
++/*
++ * Say that the pages of the region about to be added could NOT be pinned, so
++ * the device model must not share them. Sharing unpinned frames is not a slow
++ * path but a correctness bug: the kernel may migrate them afterwards and the
++ * guest then reads a frame nobody writes any more. Cleared, like the dma-buf
++ * above, by xen_dm_clear_blob_dmabuf().
++ */
++void xen_dm_refuse_blob_share(void);
+ void xen_ram_alloc(ram_addr_t ram_addr, ram_addr_t size,
+                    const MemoryRegion *mr, Error **errp);
+ bool xen_mr_is_memory(const MemoryRegion *mr);
