@@ -1031,10 +1031,13 @@ parameters:
                 - [DISTRO_FEATURES:append, " venus"]
                 # The Raspberry Pi 5 runs the DomD graphics stack it was measured
                 # with (the Raspberry Pi 4's lane takes the same):
-                # the qemu 11.1.2 device model (qemu_11.1.2.bb's series), weston
-                # 16.0.0 and virglrenderer 1.3.0. The base conf pins weston and
-                # virglrenderer to poky's 15 and 1.2; this lane sets them again. The
-                # gl lane keeps qemu 7.0.0 and poky's weston and virglrenderer.
+                # the qemu 11.1.2 device model (qemu_11.1.2.bb's series, needed
+                # for the overlay planes' primary-rect
+                # scaling and the plane handoff this board's xt-xen-cfg-doma
+                # bbappend and xt-qemu-display-toggles turn on), weston 16.0.0 and
+                # virglrenderer 1.3.0. The base conf pins weston and virglrenderer
+                # to poky's 15 and 1.2; this lane sets them again. The gl lane keeps
+                # qemu 7.0.0 and poky's weston and virglrenderer.
                 - [PREFERRED_VERSION_qemu, "11.1.2"]
                 - [PREFERRED_VERSION_weston, "16.%"]
                 - [PREFERRED_VERSION_virglrenderer, "1.3.%"]

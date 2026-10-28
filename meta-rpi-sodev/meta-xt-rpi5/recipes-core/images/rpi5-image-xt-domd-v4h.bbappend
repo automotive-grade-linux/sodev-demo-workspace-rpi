@@ -243,3 +243,8 @@ DOMD_HEVC_PACKAGES:raspberrypi5 = " \
     ffmpeg \
     "
 IMAGE_INSTALL:append = " ${DOMD_HEVC_PACKAGES}"
+
+# The DomA device model's display-path switches (/run/qemu-*), created at boot by tmpfiles.d:
+# the plane handoff (q11-066), media-sg-rw and fb-invalidate (q11-063); only qemu 11
+# reads them.
+IMAGE_INSTALL:append:raspberrypi5 = " xt-qemu-display-toggles"
