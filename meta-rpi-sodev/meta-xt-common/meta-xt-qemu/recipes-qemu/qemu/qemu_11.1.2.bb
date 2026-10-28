@@ -294,3 +294,12 @@ SRC_URI:append:class-target = " file://q11-095-virtio-media-decoder-mode-set-the
 # q11-096: QEMU_XEN_IOREQ_FIFO=N runs the ioreq thread at SCHED_FIFO priority N (the DomD
 #   qemu wrapper exports it from XT_QEMU_IOREQ_FIFO); unset changes nothing.
 SRC_URI:append:class-target = " file://q11-096-xen-QEMU_XEN_IOREQ_FIFO-runs-the-ioreq-thread-at-SCHED_FIFO.patch"
+#
+# plane-sand for the proxy.
+# q11-097: the proxy (the Raspberry Pi 4's ISP path) says what area of the texture its
+#   SAND buffer fills (DirectScanout.src_w/src_h, the guest's visible rectangle), so
+#   q11-081's plane-sand takes it when host-max-width scales the texture (1280x726 for a
+#   1920x1080 stream) or the codec pads it (1920x1088). Decoder mode, the only mode the
+#   Raspberry Pi 5 runs (no host V4L2 decoder for the proxy), has its own publish in
+#   virtio-media-decoder.c and is unchanged.
+SRC_URI:append:class-target = " file://q11-097-virtio-media-proxy-say-what-area-of-the-texture-SAND-fills.patch"

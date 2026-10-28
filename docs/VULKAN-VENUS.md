@@ -306,7 +306,8 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
   qemu 11.
 - The `/run/qemu-*` display-path switches `q11-063`, `q11-066`, `q11-071`, `q11-081`
   and `q11-082` read, created at boot by each board layer's `xt-qemu-display-toggles`:
-  nine on the Raspberry Pi 4 (its ISP and SAND direct scanout among them), ten on the
+  ten on the Raspberry Pi 4 (its ISP and SAND direct scanout among them, and
+  `plane-sand` with `q11-097` for the proxy's buffers), ten on the
   Raspberry Pi 5 (the plane handoff, `media-sg-rw`, `fb-invalidate`, the SAND direct
   scanout of the decoder mode's buffers, `q11-071`, and `plane-sand` and `sand-scaled`,
   `q11-081`/`q11-082`, which give a plane the decoder's buffer and offer a frame scaled

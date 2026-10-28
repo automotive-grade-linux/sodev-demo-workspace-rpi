@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 23 Oct 2026 10:45:17 +0900
+Subject: [PATCH] virtio-media: proxy says what area of the texture its SAND
+ buffer fills
+
+plane-sand (q11-081) takes a producer buffer of another size than the
+plane's texture only when the producer says what area of the texture the
+picture fills (DirectScanout.src_w/src_h). The Raspberry Pi 4 proxy
+published its SAND buffer at the visible size without it, so a texture
+scaled by host-max-width (1280x726 for a 1920x1080 stream) or padded by
+the codec (1920x1088) never matched: 1080p in a WebView went through the
+ISP and the TFU on every frame. Give the visible rectangle in the
+guest's pixels (guest_vis_w/h, from G_SELECTION); 0 x 0 before the guest
+asked keeps 1:1.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
+---
+ hw/virtio/virtio-media.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 4cc5b4128..fccdf8e19 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -983,6 +983,16 @@ static bool virtio_media_sand_publish_idx(VirtIOMediaQueue *q, uint32_t tex, uin
+             .stride = q->width,
+             .fourcc = 0x3231564e /* NV12 */, .modifier = VM_SAND128_COL_HEIGHT(q->sand_col_height),
+             .offset1 = luma_rows * 128, .pitch1 = q->width,
++            /*
++             * q11-097: the guest texture's area this picture fills -- the visible
++             * rectangle in the guest's (scaled) pixels. The texture is larger than
++             * that area when host-max-width scales it (1280x726 for a 1920x1080
++             * picture) or when the codec pads it (1920x1088), and plane-sand takes a
++             * buffer of another size only when it says what area it fills. 0 x 0
++             * (no G_SELECTION yet): 1:1, as before.
++             */
++            .src_w = q->guest_vis_w && q->guest_vis_h ? q->guest_vis_w : 0,
++            .src_h = q->guest_vis_w && q->guest_vis_h ? q->guest_vis_h : 0,
+             .slot = idx, .seq = q->sand_seq[idx],
+             .current = virtio_media_sand_scan_current, .hold = virtio_media_sand_scan_hold,
+         };
