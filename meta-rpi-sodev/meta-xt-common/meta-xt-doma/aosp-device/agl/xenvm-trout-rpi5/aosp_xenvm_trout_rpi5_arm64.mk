@@ -379,7 +379,10 @@ PRODUCT_SOONG_NAMESPACES += external/v4l2_codec2
 #         (0217-v10) therefore presents a STATEFUL HEVC decoder to the guest and
 #         drives the stateless side with libavcodec in DomD, so the codec2 entry is
 #         c2.v4l2.hevc.decoder and nothing in v4l2_codec2 is HEVC- or
-#         stateless-specific.
+#         stateless-specific. With qemu 11.1.2 and RPI5_DOMA_H264=1 (meta-xt-rpi5)
+#         decoder mode also offers H.264 (q11-072), decoded by libavcodec in
+#         SOFTWARE in DomD, as c2.v4l2.avc.decoder: not hardware, but faster
+#         than DomA's own software decoder.
 #
 # Everything here is gated on XT_DOMA_HWDEC=true, which rpi5-sodev.yaml sets on
 # the vulkan lane with the zephyr Dom0 only, for the same reason as on the RPi4:
@@ -401,7 +404,7 @@ PRODUCT_PACKAGES += \
 # extended policy is never read and the V4L2 ioctls are killed by seccomp. No
 # SELinux denial is emitted, so the cause is invisible.
 # Codec2InfoBuilder reads media_codecs_c2.xml to describe vendor C2 components.
-# Decoders only, HEVC only, up to 1920x1088: the file itself says why.
+# Decoders only, HEVC and H.264, up to 1920x1088: the file itself says why.
 PRODUCT_COPY_FILES += \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/codec2.vendor.ext.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/android.hardware.media.c2-extended-seccomp_policy

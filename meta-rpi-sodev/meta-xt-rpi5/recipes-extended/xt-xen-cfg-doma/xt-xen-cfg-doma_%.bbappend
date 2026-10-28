@@ -71,7 +71,30 @@ XT_DOMA_PLANE_SCALING ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('1
 # 66.3-66.5 with 1, the device model's main thread at about 17% of a core. (2 was
 # measured before q11-069 deferred its GPU wait; 1 gave 91.9-95.3 / 58.3-59.1 then.)
 RPI5_DOMA_HOST_SAND ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+
+# DomA's H.264 is decoded in DomD too: 1 makes the device decoder=hevc+h264, and qemu
+# 11.1.2's decoder mode decodes H.264 with libavcodec in software on a thread of its own,
+# the frames reaching the guest on the GPU (q11-072..074). The Pi 5 has no H.264 block,
+# so without it DomA's own software decoder, c2.android.avc, does the work on DomA's two
+# vCPUs. Measured on the board (codec CLI, -T): H.264 1080p60 35.4 fps with c2.android.avc
+# (2026-10-15), 60.6-60.8 with this (2026-10-16); HEVC unchanged. 0 leaves the device HEVC only.
+# qemu 10.0.2's decoder mode takes "hevc" alone (it would refuse the device), so the
+# default is 0 there and rpi5_doma_hwdec_check stops the build for 1.
+# This append comes before the host-sand one: "+h264" belongs right after "decoder=hevc".
+RPI5_DOMA_H264 ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@'+h264' if d.getVar('RPI5_DOMA_H264') == '1' else ''}"
 XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@'' if d.getVar('RPI5_DOMA_HOST_SAND') == '0' else ',gpu-fence-fd=on,host-sand=' + d.getVar('RPI5_DOMA_HOST_SAND')}"
+
+# A stream wider than DomA's display reaches DomA at the display's width: q11-076 lets
+# qemu 11.1.2's decoder mode take host-max-width (q11-048), and the GPU conversion into
+# DomA's RGBA buffer scales the frame down, so a 4K frame is a 1920x1080 buffer instead
+# of a 3840x2160 one that DomA then composes down. Measured on the board (2026-10-16,
+# codec CLI, HEVC 3840x2160 60p, -T): 47.3-48.1 fps with V3D 99% -> 56.4-60.5 fps; HEVC
+# and H.264 1080p60 unchanged. The width comes from RPI5_DOMA_GPU_RES, as on the RPi4;
+# 0 turns it off. qemu 10.0.2's decoder mode ignores the property, so the default is 0
+# there and rpi5_doma_hwdec_check stops the build for another value.
+RPI5_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI5_DOMA_GPU_RES').split('xres=')[1].split(',')[0]) if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else 0}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi5 = "${@'' if d.getVar('RPI5_DOMA_HWDEC_MAX_W') == '0' else ',host-max-width=' + d.getVar('RPI5_DOMA_HWDEC_MAX_W')}"
 
 do_install[prefuncs] += "rpi5_doma_hwdec_check"
 
@@ -85,6 +108,27 @@ rpi5_doma_hwdec_check:raspberrypi5() {
         esac
         ;;
     *) bbfatal "RPI5_DOMA_HOST_SAND must be 0, 1 or 2 (got '${RPI5_DOMA_HOST_SAND}')" ;;
+    esac
+    case "${RPI5_DOMA_H264}" in
+    0) ;;
+    1)
+        case "${XT_DM_QEMU_VERSION}" in
+        11.*) ;;
+        *) bbfatal "RPI5_DOMA_H264=1 needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
+        esac
+        ;;
+    *) bbfatal "RPI5_DOMA_H264 must be 0 or 1 (got '${RPI5_DOMA_H264}')" ;;
+    esac
+    case "${RPI5_DOMA_HWDEC_MAX_W}" in
+    0) ;;
+    *[!0-9]*|'') bbfatal "RPI5_DOMA_HWDEC_MAX_W must be 0 or a width (got '${RPI5_DOMA_HWDEC_MAX_W}')" ;;
+    *)
+        [ "${RPI5_DOMA_HWDEC_MAX_W}" -ge 128 ] || bbfatal "RPI5_DOMA_HWDEC_MAX_W must be 0 or at least 128 (got '${RPI5_DOMA_HWDEC_MAX_W}')"
+        case "${XT_DM_QEMU_VERSION}" in
+        11.*) ;;
+        *) bbfatal "RPI5_DOMA_HWDEC_MAX_W=${RPI5_DOMA_HWDEC_MAX_W} needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
+        esac
+        ;;
     esac
 }
 

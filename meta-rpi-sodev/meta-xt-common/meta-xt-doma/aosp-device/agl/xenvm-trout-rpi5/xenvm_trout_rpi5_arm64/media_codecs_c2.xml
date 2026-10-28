@@ -3,8 +3,9 @@
 <!-- Codec2 components provided by external/v4l2_codec2, for the DomA
      hardware-decode path on this board.
 
-     DECODERS ONLY, AND HEVC ONLY. The RPi4 file has one H.264 entry because
-     VideoCore decodes H.264 there; this SoC has no H.264 hardware.
+     DECODERS ONLY: HEVC in hardware, and H.264 in software in DomD. The
+     RPi4 file has one H.264 entry because VideoCore decodes H.264 there;
+     this SoC has no H.264 hardware.
 
      BCM2712 has no VCHIQ node at all. Measured by decompiling the shipped DTBs:
      zero occurrences in bcm2712-rpi-5-b.dtb against two in
@@ -14,8 +15,16 @@
      bind to: H.264 hardware decode is not unported here, it is absent.
 
      What this SoC does have is codec@800000, brcm,bcm2712-hevc-dec, driven by
-     rpi-hevc-dec. So the RPi4 file's single avc entry becomes a single hevc
-     entry.
+     rpi-hevc-dec: the hevc entry.
+
+     THE avc ENTRY IS NOT HARDWARE. It is the device model's libavcodec
+     software decoder in DomD (qemu q11-072 to q11-074), there because DomD
+     plays H.264 1080p60 at 60 fps where DomA's own software decoder,
+     c2.android.avc on two vCPUs, reached 35.4 (board, 2026-10-15). v4l2_codec2
+     lists c2.v4l2.avc.decoder only when the device offers H.264
+     (decoder=hevc+h264, RPI5_DOMA_H264 in meta-xt-rpi5) and then picks it
+     before c2.android.avc; without that, Codec2InfoBuilder lists only the
+     components the store has, and this entry is not used.
 
      WHY THERE IS AN ENTRY AT ALL, GIVEN THE DRIVER IS STATELESS. rpi-hevc-dec
      wants a media device and a request fd per frame, which virtio-media cannot
@@ -28,8 +37,7 @@
      No VP8/VP9/AV1: the template in external/v4l2_codec2/README.md lists them
      and none has hardware here.
 
-     No encoders: this block decodes only, and the device model proxies one
-     decode path.
+     No encoders: the device model's decoder mode decodes only.
 
      No .secure variant: it needs Widevine and a secure allocator, neither of
      which exists on this product.
@@ -64,6 +72,11 @@
      getSupportedPerformancePoints() is a getter, a JNI read-out or the
      interface declaration, never codec selection.
 
+     The avc entry has no performance point and the bitrate of H.264 level
+     4.2 High (62.5 Mbit/s). concurrent-instances is 2, the most that was
+     measured, and two already fall short: 720p60 and 1080p60 together
+     played at 58.0 and 50.4 fps (2026-10-16), DomD's CPU being the limit.
+
      NOTE for whoever edits this file: an XML comment may not contain two
      consecutive hyphens. It is worse than a build break: MediaCodecsXmlParser
      reports BAD_VALUE,
@@ -81,6 +94,15 @@
            <Limit name="bitrate" range="1-120000000" />
            <Limit name="concurrent-instances" max="8" />
            <Limit name="performance-point-1920x1080" range="30-30" />
+           <Feature name="adaptive-playback" />
+       </MediaCodec>
+       <MediaCodec name="c2.v4l2.avc.decoder" type="video/avc" >
+           <Limit name="size" min="64x64" max="1920x1088" />
+           <Limit name="alignment" value="2x2" />
+           <Limit name="block-size" value="16x16" />
+           <Limit name="blocks-per-second" min="1" max="489600" />
+           <Limit name="bitrate" range="1-62500000" />
+           <Limit name="concurrent-instances" max="2" />
            <Feature name="adaptive-playback" />
        </MediaCodec>
    </Decoders>
