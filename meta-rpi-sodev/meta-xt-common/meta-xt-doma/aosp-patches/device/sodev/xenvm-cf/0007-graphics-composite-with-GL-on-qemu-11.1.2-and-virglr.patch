@@ -1,0 +1,128 @@
+From 31f7c811b6e3f403ef19659a8981c37dd3ba82b7 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 19 Oct 2026 01:20:38 +0900
+Subject: [PATCH] graphics: composite with GL on qemu 11.1.2 and virglrenderer
+ 1.3.0
+
+The AGL layer's Raspberry Pi 4 vulkan lane now takes the DomD graphics
+stack this board was measured with: qemu 11.1.2, weston 16.0.0 and
+virglrenderer 1.3.0. On virglrenderer 1.3.0, the SkiaVk compositing
+this product asked for needs DomD's /etc/qemu-gbm-layout, without which
+SurfaceFlinger fails in vkCreateInstance and no home screen comes up
+(measured on this board); with it, GL compositing in DomD slows down
+(the HMI 52-56 -> 35-41 fps).
+
+Composite with GL (skiaglthreaded, skiagl), as the board has run since
+2026-10-05 from a hand-written /data/local.prop, and as the Raspberry
+Pi 5 product does: GL was the final choice for video (a 1080p H.264
+playback from 7-10% dropped frames to 3.6%). The measurement that once
+chose Vulkan was taken while DomA's watermark_scale_factor was
+miscomputed to 1777 and has not been repeated. README.md describes the
+GL default.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ README.md                      | 15 ++++++++-------
+ aosp_xenvm_trout_rpi4_arm64.mk | 34 ++++++++++++++++++++++++----------
+ 2 files changed, 32 insertions(+), 17 deletions(-)
+
+diff --git a/README.md b/README.md
+index 61c8a54..9aa104b 100644
+--- a/README.md
++++ b/README.md
+@@ -55,17 +55,18 @@ Raspberry Pi workspace that builds this product
+ patches against other AOSP projects and the guest kernel, and applies them to
+ the checkout.
+ 
+-* **Vulkan compositing.** `BOARD_MESA3D_VULKAN_DRIVERS := virtio` builds the Venus ICD
++* **Vulkan (Venus) for apps; GL compositing.** `BOARD_MESA3D_VULKAN_DRIVERS := virtio` builds the Venus ICD
+   and `PRODUCT_PACKAGES += vulkan.virtio` installs it (the board config only defines the
+   module; an unasked-for module is never installed),
+   `ro.hardware.vulkan=virtio` makes the loader look for it, and
+   `TARGET_VULKAN_SUPPORT := false` drops `com.google.cf.vulkan` -- whose `.rc` sets
+   `ro.vulkan.apex`, which confines the loader's search to that APEX's linker namespace
+-  and would hide an ICD in `/vendor`. `debug.renderengine.backend=skiavkthreaded` and
+-  `debug.hwui.renderer=skiavk` then move SurfaceFlinger and HWUI onto it. Without all
+-  six the guest runs on the Venus device line and still composites with GL, and the
+-  difference is only run-to-run noise -- which is what made the missing switch look like
+-  Venus doing nothing.
++  and would hide an ICD in `/vendor`. SurfaceFlinger and HWUI composite with GL
++  (`debug.renderengine.backend=skiaglthreaded`, `debug.hwui.renderer=skiagl`): on the
++  DomD stack this board runs (qemu 11.1.2, virglrenderer 1.3.0), Vulkan compositing
++  needs DomD's `/etc/qemu-gbm-layout`, without which no home screen comes up, and with
++  which GL compositing in DomD slows down. `skiavkthreaded` and `skiavk` would move
++  them onto the Venus ICD; the product makefile says why it does not.
+ * **Wi-Fi, shadow AP.** The guest gets simulated radios that beacon the SSIDs
+   the host really sees, so the AAOS Wi-Fi screen lists real access points
+   instead of virt_wifi's single synthetic entry; `DomaWifiRelay` is what makes
+@@ -168,7 +169,7 @@ Not run, and therefore not claimed: booting that image on a Raspberry Pi 4. The
+ 2026-08-18 hardware run predates the move; what the move changes is where the
+ files come from, and that is what the build above checks.
+ 
+-The DomA feature files -- Vulkan compositing, the Wi-Fi shadow AP, Bluetooth
++The DomA feature files -- Vulkan (Venus), the Wi-Fi shadow AP, Bluetooth
+ A2DP and HFP, and hardware decode -- came after the move, and they change the
+ product makefile, the board config and the overlay as well. They were measured
+ on hardware from the workspace layer they came from, and not every item was
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 981aaf7..6232f0c 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -121,7 +121,7 @@ LOCAL_AUDIO_PRODUCT_COPY_FILES := \
+ # levels describe gfxstream, not Venus over V3D, and re-declaring them would be
+ # asserting a capability nobody measured on this board. SurfaceFlinger's
+ # RenderEngine and HWUI do not consult them -- they go through the loader -- so
+-# Vulkan compositing does not wait on this. Declare them from a vulkaninfo run
++# Vulkan compositing would not wait on this. Declare them from a vulkaninfo run
+ # on the board, one level at a time.
+ TARGET_VULKAN_SUPPORT := false
+ 
+@@ -157,13 +157,27 @@ PRODUCT_PACKAGES += \
+ PRODUCT_VENDOR_PROPERTIES += \
+     ro.hardware.vulkan=virtio
+ 
+-# What actually turns Vulkan compositing on. Without these two the guest runs
+-# on the Venus device line and still composites with GL, which is measurable
+-# only as run-to-run noise -- so their absence looks like "Venus does nothing"
+-# rather than like a missing switch.
++# Render with GL: SurfaceFlinger's RenderEngine and HWUI in every app. Both are
++# debug.* properties, which is the only switch either has -- SurfaceFlinger reads
++# debug.renderengine.backend in chooseRenderEngineType() and has no ro.* variant;
++# HWUI reads debug.hwui.renderer (Properties::peekRenderPipelineType) ahead of
++# ro.hwui.use_vulkan. A vendor build.prop is allowed to carry debug.*.
++#
++# WHY GL and not Vulkan (Venus). The DomD stack is qemu 11.1.2 with virglrenderer
++# 1.3.0, on which Vulkan compositing also needs DomD's /etc/qemu-gbm-layout: without
++# it SurfaceFlinger fails in vkCreateInstance and no home screen comes up (measured on
++# this board), and with it GL compositing in DomD gets slower (the HMI 52-56 -> 35-41 fps).
++# GL was this board's final choice for video: switching from Vulkan to GL alone took a
++# 1080p H.264 playback from 7-10% dropped frames to 3.6% (2026-10-05), and the board
++# has run GL since (a hand-written /data/local.prop). The measurement that once chose
++# Vulkan was app start on the 4 GiB board (2026-09-13: Settings cold start 18.8-24.0 s
++# on Vulkan against 34.5-44.2 s on GL, with a VHAL/SystemUI crash cascade on GL),
++# taken while DomA's watermark_scale_factor was miscomputed to 1777 and kswapd kept
++# DomD busy; it has not been repeated since. The Raspberry Pi 5 product composites
++# with GL too.
+ PRODUCT_VENDOR_PROPERTIES += \
+-    debug.renderengine.backend=skiavkthreaded \
+-    debug.hwui.renderer=skiavk
++    debug.renderengine.backend=skiaglthreaded \
++    debug.hwui.renderer=skiagl
+ 
+ # Keep SurfaceFlinger rendering at the panel's 60 Hz. With frame rate override
+ # on (the default, SurfaceFlinger.cpp:4256), a lone 30 fps video makes
+@@ -406,9 +420,9 @@ PRODUCT_PACKAGES += \
+ # workspace's rpi4-sodev.yaml sets on its vulkan lane. The C2 service ships a
+ # VINTF fragment declaring android.hardware.media.c2@1.2, and declaring a HAL
+ # that cannot start (there is no /dev/videoN in DomA without the virtio-media
+-# device, which only the qemu 10.0.2 device model has) would leave init
+-# crash-looping a service and the VINTF manifest advertising a HAL the device
+-# does not have.
++# device, which the vulkan lane's device models have and qemu 7.0.0 does not)
++# would leave init crash-looping a service and the VINTF manifest advertising a
++# HAL the device does not have.
+ ifeq ($(XT_DOMA_HWDEC),true)
+ 
+ # The V4L2 codec2 service and the plugin store it loads.

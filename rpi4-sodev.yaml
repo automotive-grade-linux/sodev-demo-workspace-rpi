@@ -1211,7 +1211,8 @@ parameters:
   #
   # And it runs: the Pi 4 board verification of 2026-09-12 brought up DomU
   # Vulkan and a full-Vulkan AAOS DomA on this configuration, and on the Pi 5
-  # DomA was verified compositing with Vulkan (SkiaVk) on 2026-09-24.
+  # DomA was verified compositing with Vulkan (SkiaVk) on 2026-09-24 (the Pi 5
+  # product now composites with GL).
 components:
   # =========================================================================
   # Dom0 / DomD — RPi5 base, copied verbatim from external/meta-xt-prod-devel-rpi5/rpi5.yaml.
