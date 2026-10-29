@@ -477,6 +477,13 @@ if [ "$GPU" = gl ]; then
   echo ">>       needs those settings reverted."
   echo ">>       See docs/VULKAN-VENUS.md."
 fi
+# The arm64-host fixes for the AGL guest are in meta-agl-venus, which --gpu=gl
+# leaves out, so flutter-engine:do_fetch would fail after a multi-GB sync.
+if [ "$GPU" = gl ] && [ "$ENABLE_DOMU" = yes ] && [ "$(uname -m)" = aarch64 ]; then
+  echo "ERROR: -u with --gpu=gl is not supported on an aarch64 build host;" >&2
+  echo "       use --gpu=vulkan (the default) or an x86_64 host." >&2
+  exit 1
+fi
 echo ">> AAOS mode: $AAOS_MODE  (ENABLE_ANDROID=$ENABLE_ANDROID)"
 
 # --- 8 GB SKU: report the memory budget ---------------------------------------

@@ -65,3 +65,58 @@ SRC_URI += "file://0001-impeller-trim-thread-local-pool-caches-in-RenderToTarget
 # follow one MSAA policy; --gpu=gl, which leaves this layer out, keeps
 # meta-flutter's 4x.
 SRC_URI += "file://0002-impeller-do-not-request-4x-MSAA-for-the-onscreen-swapchain.patch"
+
+# aarch64 build host. The engine's DEPS always fetches the CIPD package
+# flutter/java/openjdk/${platform}, which has no linux-arm64 build, and
+# gclient does not apply custom_deps to CIPD packages. The prefunc writes
+# DEPS with GN_DEPS_SED_PATCHES applied (the value from meta-flutter#747)
+# to GN_DEPS_FILE, which gclient reads instead. The file is outside the
+# checkout because gclient sync --force -D deletes untracked files there.
+# The Fuchsia SDK has no linux-arm64 build either.
+#
+# Drop this block once AGL pins a meta-flutter with #747.
+#
+# :aarch64 is the target arch, so arm64-host comes from BUILD_ARCH.
+OVERRIDES:append = "${@':arm64-host' if d.getVar('BUILD_ARCH') == 'aarch64' else ''}"
+
+GN_DEPS_FILE:arm64-host = "../DEPS.arm64-host"
+GN_DEPS_SED_PATCHES:arm64-host = "# Always download the JDK since java is required for running the formatter.|'condition': 'download_android_deps',"
+GN_CUSTOM_VARS:arm64-host = '\
+{\
+    "download_android_deps": False, \
+    "download_windows_deps": False, \
+    "download_linux_deps": False,   \
+    "download_fuchsia_deps": False, \
+}'
+
+do_fetch[prefuncs] += "${@'flutter_engine_arm64_host_deps' if d.getVar('BUILD_ARCH') == 'aarch64' else ''}"
+
+python flutter_engine_arm64_host_deps() {
+    import os
+    from bb.fetch2 import runfetchcmd
+
+    url = next(u for u in d.getVar("SRC_URI").split() if u.startswith("gn://"))
+    if os.path.exists(bb.fetch2.Fetch([url], d).localpath(url)):
+        return  # already fetched, gclient will not run
+
+    # Only DEPS is needed: one commit, blobs on demand.
+    srcrev = d.getVar("SRCREV")
+    uri = url.split(";")[0].replace("gn://", "https://")
+    gitdir = os.path.join(d.getVar("WORKDIR"), "arm64-host-deps")
+    fetch = f"git init -q . && git fetch -q --depth=1 --filter=blob:none --no-tags {uri} {srcrev}"
+    bb.utils.remove(gitdir, recurse=True)
+    bb.utils.mkdirhier(gitdir)
+    bb.fetch2.check_network_access(d, fetch, uri)
+    runfetchcmd(fetch, d, workdir=gitdir)
+    deps = runfetchcmd(f"git show {srcrev}:DEPS", d, workdir=gitdir)
+    bb.utils.remove(gitdir, recurse=True)
+
+    for line in filter(None, (l.strip() for l in d.getVar("GN_DEPS_SED_PATCHES").splitlines())):
+        old, sep, new = line.partition("|")
+        if not sep or deps.count(old) != 1:
+            bb.fatal(f"GN_DEPS_SED_PATCHES entry '{line}' must be 'old|new' with 'old' once in DEPS "
+                     f"at {srcrev}; it occurs {deps.count(old)} times")
+        deps = deps.replace(old, new)
+    with open(os.path.normpath(os.path.join(d.getVar("S"), d.getVar("GN_DEPS_FILE"))), "w") as f:
+        f.write(deps)
+}

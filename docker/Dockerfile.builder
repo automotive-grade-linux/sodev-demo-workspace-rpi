@@ -60,8 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         android-sdk-libsparse-utils \
         # AOSP / AAOS host requirements (source.android.com/setup/build/initializing)
         openjdk-17-jdk-headless ccache pkg-config \
-        g++-multilib gcc-multilib libc6-dev-i386 \
-        lib32ncurses-dev libncurses5-dev lib32z1-dev zlib1g-dev \
+        libncurses5-dev zlib1g-dev \
         libxml2-utils libxml-simple-perl libgl1-mesa-dev \
         gperf imagemagick libjpeg-dev libpng-dev libsdl1.2-dev \
         libwxgtk3.0-gtk3-dev squashfs-tools xsltproc fontconfig \
@@ -69,6 +68,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake device-tree-compiler \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
+
+# 32-bit x86 libraries for the AOSP build; they only exist on amd64
+RUN if [ "$(dpkg --print-architecture)" = amd64 ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            g++-multilib gcc-multilib libc6-dev-i386 lib32ncurses-dev lib32z1-dev \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Downgrade tar version to workaround fakeroot issue. Kept from upstream: a newer
 # tar makes fakeroot fail during Yocto's do_package. Placed before the Zephyr
@@ -109,7 +115,7 @@ RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
         -o /usr/local/bin/repo \
     && chmod 0755 /usr/local/bin/repo \
     && curl -fsSL -o /usr/local/bin/bazel \
-        https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-amd64 \
+        https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-$(dpkg --print-architecture) \
     && chmod 0755 /usr/local/bin/bazel
 
 # Python 3.12 for the Zephyr build only.
@@ -180,15 +186,15 @@ ENV PIP_REQUIRE_VIRTUALENV=1
 ARG ZSDK=1.0.1
 RUN cd /opt \
     && curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
-        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/zephyr-sdk-${ZSDK}_linux-x86_64_minimal.tar.xz \
-    && tar xf zephyr-sdk-${ZSDK}_linux-x86_64_minimal.tar.xz \
-    && rm zephyr-sdk-${ZSDK}_linux-x86_64_minimal.tar.xz \
+        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/zephyr-sdk-${ZSDK}_linux-$(uname -m)_minimal.tar.xz \
+    && tar xf zephyr-sdk-${ZSDK}_linux-$(uname -m)_minimal.tar.xz \
+    && rm zephyr-sdk-${ZSDK}_linux-$(uname -m)_minimal.tar.xz \
     && cd zephyr-sdk-${ZSDK} \
     && curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
-        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/toolchain_gnu_linux-x86_64_aarch64-zephyr-elf.tar.xz \
+        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/toolchain_gnu_linux-$(uname -m)_aarch64-zephyr-elf.tar.xz \
     && mkdir -p gnu \
-    && tar xf toolchain_gnu_linux-x86_64_aarch64-zephyr-elf.tar.xz -C gnu \
-    && rm toolchain_gnu_linux-x86_64_aarch64-zephyr-elf.tar.xz \
+    && tar xf toolchain_gnu_linux-$(uname -m)_aarch64-zephyr-elf.tar.xz -C gnu \
+    && rm toolchain_gnu_linux-$(uname -m)_aarch64-zephyr-elf.tar.xz \
     && test -d gnu/aarch64-zephyr-elf
 # setup.sh -c writes the CMake package registry into $HOME/.cmake/packages, and $HOME
 # is /root at this point while the build runs as `builder` - so it would not be read.
