@@ -151,7 +151,8 @@ DomA (AAOS) options:
       --aaos=<mode>      off | auto | source | prebuilt   (default: off; -a => auto)
                            off      : DomA-less SD (no p4 Android)
                            source   : build AAOS from AOSP source (heavy: ~360 GiB of disk
-                                      incl. the SD image, hours; see docs/BUILD.md '0. Check the host')
+                                      incl. the SD image, hours; see docs/BUILD.md '0. Check the host').
+                                      x86_64 hosts only
                            prebuilt : consume a prebuilt AAOS bundle; NO AOSP build (fast)
                            auto     : prebuilt if a bundle is found, else source if an
                                       AOSP checkout is found, else off
@@ -482,6 +483,15 @@ fi
 if [ "$GPU" = gl ] && [ "$ENABLE_DOMU" = yes ] && [ "$(uname -m)" = aarch64 ]; then
   echo "ERROR: -u with --gpu=gl is not supported on an aarch64 build host;" >&2
   echo "       use --gpu=vulkan (the default) or an x86_64 host." >&2
+  exit 1
+fi
+# AOSP builds only on x86_64 hosts: its prebuilt toolchains (prebuilts/*/linux-x86)
+# have no arm64 build. Checked after auto resolution, so auto -> source is caught too,
+# before any repo sync starts.
+if [ "$AAOS_MODE" = source ] && [ "$(uname -m)" = aarch64 ]; then
+  echo "ERROR: building DomA from AOSP source (--aaos=source) is not supported on an" >&2
+  echo "       aarch64 build host; AOSP builds only on x86_64. Use an x86_64 host, or a" >&2
+  echo "       prebuilt bundle (--aaos=prebuilt; not yet tested on aarch64 hosts)." >&2
   exit 1
 fi
 echo ">> AAOS mode: $AAOS_MODE  (ENABLE_ANDROID=$ENABLE_ANDROID)"
