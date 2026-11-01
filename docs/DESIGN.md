@@ -22,10 +22,32 @@ from the R-Car V4H AGL SoDeV reference it came from.
 | Domain | vCPUs | pCPU pin | Role |
 |---|---|---|---|
 | Dom0 | 1 | 0 | zephyr: xenstore server only / linux: xl toolstack + SD block backend |
-| DomD | 2 | 0–1 | dom0less, direct-mapped; GPU + RP1 (+ SDHCI with zephyr Dom0); qemu virtio backends; toolstack (zephyr flavour) |
-| DomU | 1 | 1 | AGL cluster guest (virtio-pci, grant DMA) |
-| DomA | 2 | 2–3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
+| DomD | 2 | vCPU 0 → 0, vCPU 1 → 1 | dom0less, direct-mapped; GPU + RP1 (+ SDHCI with zephyr Dom0); qemu virtio backends; toolstack (zephyr flavour). credit2 weight 512 (the others 256) |
+| DomU | 1 | 1 (Raspberry Pi 4: 2–3) | AGL cluster guest (virtio-pci, grant DMA) |
+| DomA | 2 | vCPU 0 → 2, vCPU 1 → 3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
 | DomZ | 1 | 0 | Zephyr RTOS guest (`xenvm` board); no virtio at all — PV console only |
+
+`domain-cpu-pin.service` in DomD pins DomD and sets its weight; the guests pin
+themselves through `cpus` in their xl cfgs. Inside DomD on the Raspberry Pi 5, the
+qemu wrapper keeps DomA's device model on CPU 0 -- the vCPU that shares pCPU 0 only
+with Dom0 and DomZ -- and DomU's on CPU 1 (`XT_QEMU_DM_PLACEMENT`; the Raspberry Pi
+4 leaves its device models on both CPUs); the H.264 decoder's frame threads run on
+both. weston starts at nice -19 on CPU 0 on both boards (the board layers'
+weston-init drop-ins): DomA's device model waits for the V3D locks weston holds, and
+on the Raspberry Pi 5, kept to CPU 1, it went
+without CPU for 20 minutes behind DomU's busy Venus ring thread. DomA's
+device-model main loop holds the BQL while it answers DomA's ioreqs and gives its
+sound buffers back, and it was measured (2026-10-24, Raspberry Pi 5, Zephyr Dom0,
+virtio-snd's tx-no-bql on) to be held off its vCPU by Xen, the BQL held, while
+DomD's vCPUs shared pCPU 1 with DomU: the BQL held over 50 ms 194 times in 10
+minutes of H.264 1080p60 in a WebView beside the HMI, 52 and 37 times with this
+map and weston then kept on CPU 1 too. Interrupts are not placed: DomD's device
+interrupts land on CPU 0 and the device models' event channels on CPU 1, and
+swapping them at run time (41 and 15) was too few runs to settle it.
+
+The Raspberry Pi 4 runs DomA and DomU one at a time on the 4 GiB board, so its DomU
+takes DomA's pCPUs; an 8 GiB board running both shares them. The Raspberry Pi 4 map
+has not been measured.
 
 BCM2712 has **no IOMMU**, so DomD is direct-mapped (`xen,static-mem` + libxl
 direct-map). DomU virtio uses grant-based DMA; DomA virtio uses foreign mapping
@@ -45,6 +67,109 @@ ARMv8 Xen-guest board, so the same image is a valid guest under Xen on an RPi4 �
 verified on both boards, in both Dom0 flavours. On the RPi4 that was the 4 GiB board,
 with images built before `build.sh` began refusing `-z` on `--ram=4g`; this tree builds
 DomZ for the RPi4 only with `--ram=8g`, a map that has not been booted.
+
+## Thread priorities on the audio and video path (RPi4)
+
+Measured on the RPi4 4 GiB board on 2026-10-23/24 (DomD and DomA on 2 vCPUs each; a test build of
+qemu 11.1.2 with q11-097's change on the series as of 2026-10-23, without q11-085 for the 10-minute
+ALSA counts (to 10-24 09:40) and with it from 10-24 10:51 on (the BQL-wait and perf runs), and none
+of q11-086 to q11-096; the vc4 underlay and plane-sand on) while a streamed or local H.264 video
+played in a WebView with sound, before the settings of 2026-10-28 at the end of this section. The
+Raspberry Pi 5's threads were listed on 2026-10-23 and five priority changes compared on 2026-10-24
+(none had an effect); their run_delay was not taken this way. Thread names are the kernel's
+`comm`; PIDs change at every boot and are left out.
+
+**Xen**: credit2 (ratelimit 1000 µs), every domain at weight 256 and no cap (DomD is at 512 since
+then, by domain-cpu-pin). DomA has pCPUs 2-3 to itself; DomD's pCPU 0 is shared with Dom0 (and DomZ
+where it is built).
+
+**DomD** (Linux; nice -20..19, FIFO rtprio 1..99)
+
+| Role | Thread | Policy / priority | Set by |
+|---|---|---|---|
+| DomA device model: main loop (virtio-gpu, virtio-media, the audio timer that writes ALSA while the mixing engine is on) | qemu `qemu-system-aar` | OTHER, nice -19 | the qemu wrapper's `renice -19` (`rpi5-image-xt-domd-vc4.bb`, inherited by every thread and the virgl render server) |
+| ioreq (answers DomA's MMIO) | qemu `xen-ioreq` | OTHER, nice -19 | same |
+| virtio-snd TX (guest buffers into qemu's mixing buffer) | qemu `virtio-snd-tx` | OTHER, nice -19 | same |
+| vhost-net / vhost-vsock | qemu `vhost-<pid>` | OTHER, nice -19 | same |
+| virgl sync, aio workers | qemu `vrend-sync`, `worker` | OTHER, nice -19 | same |
+| Mesa shader disk cache | `qemu-sy:disk$0`, `weston:disk$0` | BATCH, nice 19 | Mesa |
+| Compositor (puts the guests' outputs on HVS planes, KMS commits) | `weston` | OTHER, nice 0 | `weston.service` default |
+| VideoCore decode transport (bcm2835-codec) | `vchiq-slot/0`, `vchiq-recy/0`, `vchiq-sync/0`; `kworker/R-mmal-vchiq` | OTHER, nice -19 / -19 / -20; workqueue -20 | kernel |
+| V3D jobs | `kworker/R-v3d_*` (rescuers, -20); the jobs run on `kworker/u8:*` | OTHER, nice -20 / 0 | kernel |
+| HDMI hpd/cec, SD interrupts | `irq/*-vc4 hdmi *`, `irq/34-mmc0` | FIFO 50 | kernel (threaded IRQ default) |
+| HDMI audio | no thread (DMA) | — | — |
+
+**DomA** (AAOS; Android nice, FIFO where noted)
+
+| Role | Thread (process) | Policy / priority |
+|---|---|---|
+| Composition | `surfaceflinger`, `RE Completion`, `BckgrndExec HP`, `HwcAsyncWorker` (surfaceflinger) | FIFO 2 |
+| | `RegionSampling`, `BckgrndExec LP` | OTHER, nice -8 |
+| HWC (DRM commit to virtio-gpu) | main thread of `android.hardware.composer.hwc3-service.drm` | FIFO 2 |
+| HW decode front end (v4l2 codec2 over virtio-media) | `DecodeComponent`, `V4L2DeviceThrea`, `VideoFramePoolF` (`c2@1.2-service-v4l2-64`) | OTHER, nice 0 (the C2 service's default) |
+| Chromium media | `MediaCodec_loop` (browser) nice -10; `CodecLooper` nice -16; `Media` (renderer) nice 0 | OTHER |
+| Chromium rendering | `CrRendererMain`, `Compositor`, `VideoFrameCompo` (renderer); `VizWebView`, `Chrome_InProcGp` (browser) | OTHER, nice -4 |
+| Chromium audio | `AudioOutputDevi` (renderer), `AudioTrack` (browser) | OTHER, nice -16 |
+| AudioFlinger mixer (no FastMixer on this HAL) | `AudioOut_D` and the other `AudioOut_*` (audioserver) | OTHER, nice -19 |
+| Audio HAL writer to virtio-snd / car mixer | `out_write`; `car_mixer_loop`, `bus*_out` (android.hardware.audio.service) | OTHER, nice -19; -16 |
+| cpusets | top-app, foreground, background, system-background, restricted | all CPUs 0-1 (no split on 2 vCPUs) |
+
+**Are they right?** A priority only matters when a thread is runnable and not running, so the check
+is `run_delay` from `/proc/<pid>/task/<tid>/schedstat` over 10-minute plays (a streamed 1080p60 and
+720p60 H.264 video, fullscreen and in the HMI, and a local 1080p60 clip):
+
+- DomD: every thread on the path waits at most 0.3 ms per time slice (qemu main 0.08-0.13 ms,
+  `virtio-snd-tx` 0.09-0.23 ms, weston 0.15-0.30 ms). DomD scheduling adds nothing measurable, and
+  weston at nice 0 under a nice -19 qemu costs it nothing.
+- DomA audio: `AudioTrack`, `AudioOut_D`, `out_write` and `car_mixer_loop` wait 0.25-0.8 ms per
+  slice (2-5% of a CPU in all), against a 20 ms ALSA period and a 40 ms mixer buffer. The negative
+  nice values do their job.
+- DomA video: Chromium's `Media` and `CrRendererMain` wait 1.5-3.1 ms per slice, 30-58% of a CPU.
+  DomA's two vCPUs are close to full (the threads of the play alone run about 136% of 200%) and on
+  average several threads wait for a CPU at once (their waits add up to about 550% in the streamed
+  1080p fullscreen play), so this is a lack of CPU, not an ordering problem: raising one of them
+  takes the time from another thread of the same pipeline.
+
+DomA's vCPU time in the streamed plays is user 45-48%, system 28-31%, interrupts 8-14%, idle 5-7%
+and steal 6-7% (of both vCPUs), so the device model's waits (steal) are a small part of it.
+
+So the measurement gave no reason to change a priority. On this board DomD's ALSA restarts a
+10-minute streamed play 7-13 times at 1080p60 and 1-2 times at 720p60 (a local clip 0-3; the
+Raspberry Pi 5 before tx-no-bql (q11-092), as measured on 2026-10-23: 138-454), counted as
+`trigger_time` changes in `/proc/asound/card0/pcm0p/sub0/status` -- qemu's ALSA backend recovers
+inside the write, so the XRUN state itself is rarely seen. Two kinds:
+
+- with DomA's audio HAL reporting "Not supplying enough data" in the same second: the guest fell
+  behind (the DomA CPU limit above);
+- with no guest warning: in a 580 s 1080p play every one of them (3 of 3) came within 80 ms after
+  qemu's `virtio-snd-tx` had waited 37-39 ms for the BQL while the main loop ran (1.2% for a random
+  instant). The main loop holds the BQL long enough for the audio timer to miss the 60 ms ALSA
+  buffer -- the Raspberry Pi 5's symptom, but not its cause: there it was mostly Xen descheduling
+  DomD's vCPUs (steal) while the main loop held the lock (and, before q11-088, CPU used on the main
+  loop), here the main loop is running -- perf on that thread shows virtio-gpu work inside the
+  holds: zeroing and faulting in new shmem pages for GEM buffers, Xen mapcache hypercalls
+  (`HYPERVISOR_memory_op`) mapping guest memory, and Mesa's CPU tiling (`v3d_store_utile`) of a
+  texture upload, plus waits on GPU fences. Over a 580 s 1080p HMI play the steal was 0 in all 24
+  waits of 15 ms or more (DomD's steal overall under 1%; this board has no DomU sharing DomD's
+  pCPUs), and in the one 76 ms hold that preceded an XRUN the main loop used 70 ms of CPU.
+  `virtio-snd-tx` waits 15 ms or more 24-55 times in 580 s here (longest 44-76 ms), against 38
+  times a minute (longest 66 ms) on the Raspberry Pi 5.
+
+Neither is a priority problem: the first is a lack of CPU in DomA, the second a lock.
+
+Set since (2026-10-28), to keep the two boards alike: weston at nice -19 on DomD's CPU 0
+(meta-xt-rpi4's weston-init drop-in), the device models' ioreq thread at SCHED_FIFO 49
+(`XT_QEMU_IOREQ_FIFO`), and DomD's vCPUs one per pCPU at weight 512 (domain-cpu-pin). The first
+two, set at run time with the device models left on both of DomD's CPUs, made nothing better or
+worse in a WebView's 720p60 H.264, full screen and beside the HMI (the numbers are at
+`XT_QEMU_IOREQ_FIFO` in the DomD image recipe). The qemu wrapper's CPU placement of the device
+models (`XT_QEMU_DM_PLACEMENT`) is left off on this board. Later than these measurements too came
+the BQL and sound changes of qemu 11.1.2 (q11-086 to q11-093, and q11-098 to q11-104 with the main
+loop's time budgets the DomD image recipe sets), DomA's sound card writing without the BQL on this
+board (`RPI4_DOMA_SND_TX_NO_BQL`), DomA's block read-ahead at 512 KiB (xenvm-cf 0012), the QUIC
+drop and threaded NAPI; the counts above predate them. q11-099 adds a `mapcache-unmap` thread to
+the device model, at its nice value (-19), and the qemu wrapper a `cat` per device model that
+writes its log, at nice 0.
 
 ## Board RAM size
 
@@ -71,9 +196,10 @@ image expects. It is a heap allocation, so no `xen,static-mem` bank moves and
 `0x1c0000000` (7 GiB), so on an 8 GB board every address in the map still exists —
 what does not fit is the total. The 8 GB map drops bank4 (`0x180000000` +1 GiB) and
 leaves the rest alone, giving DomD 3072 MiB: `0x50000000` is bank[0], where Xen's
-`place_modules()` puts the DomD kernel and DTB, and `0x20000000`/`0x80000000` are
-inside the VPU's 32-bit DMA window that carries vc4's CMA. The highest static-mem
-address drops to `0x180000000` (6 GiB). DomA gives back the other 1024 MiB, which
+`place_modules()` puts the DomD kernel and DTB, and `0x68000000` holds DomD's CMA
+(`cma=640M@0x68000000` with the Zephyr Dom0; that bank is 896 MiB, up to Dom0's
+`0xa0000000`, and bank3 is 1664 MiB). The highest static-mem
+address drops to `0x168000000`. DomA gives back the other 1024 MiB, which
 `xt-xen-cfg-doma` substitutes into `doma.cfg` from `BOARD_RAM`. Note that
 `meta-xt-doma` installs that recipe into **both** rootfs images, and the flavours
 differ in which copy `xl create` actually reads: DomD's in the zephyr flavour, Dom0's
@@ -320,7 +446,9 @@ identical and what this port changes:
 - **Networking**: flat L2 bridge in DomD (`xenbr0` 192.168.10.10; DomU .10.12,
   DomA .10.13 via dnsmasq static leases) + a Dom0<->DomD p2p vif for routed
   Dom0 SSH (192.168.0.1, linux flavour). All reachable from the bench PC
-  through one NIC.
+  through one NIC. DomD also holds 192.168.97.1/30 on `xenbr0`: the gateway of
+  DomA's emulated cellular data link (DomA's `buried_eth0`, .2), NATed out of
+  `wlan0` and, for a wired upstream, onto `xenbr0`.
 - **Display routing**: DomD weston kiosk-shell routes qemu windows by app-id
   (WMCLASS). The window size propagates to the guest via virtio-gpu
   ui_info/EDID, so the panel mode defines the guest mode.
@@ -336,11 +464,13 @@ identical and what this port changes:
   disabled): wrynose's Mesa 26.0.5 already covers the BCM2712-D0 V3D support
   they were pinned for, and a V3D-D0 regression fallback would mean re-vendoring
   the 24.2.7 recipes. DomD's Mesa is pinned again now, ahead of wrynose, to
-  26.2.2: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
+  26.2.4: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
   `meta-xt-driver-domain`'s `mesa.bbappend` carries the pin (in both `--gpu`
-  lanes), glvnd, and two source patches of its own: egl/wayland allocating a
-  client's scanout buffers on the display device, and v3d filling its tiled blit
-  temporary with the TFU.
+  lanes), glvnd, and four source patches of its own: egl/wayland allocating a
+  client's scanout buffers on the display device, v3d filling its tiled blit
+  temporary with the TFU, v3dv building a submit's signal fence once instead
+  of once per signal, and v3dv sizing explicitly laid out planes from their own
+  offset.
 
 ## DomD compositor startup and rootfs (V4H-aligned)
 

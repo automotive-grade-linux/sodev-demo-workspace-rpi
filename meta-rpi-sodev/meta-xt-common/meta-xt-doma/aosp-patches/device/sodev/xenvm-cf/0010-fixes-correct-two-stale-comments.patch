@@ -1,0 +1,60 @@
+From d3f30754daad67c770df937267f75be6c775b169 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 19 Oct 2026 01:20:41 +0900
+Subject: [PATCH] fixes: correct two stale comments
+
+- init.xenvm-buried-eth0.rc said eth1 keeps .13, the address adb
+  connects to; eth1 becomes a port of the shadow AP's bridge, so DomA
+  takes its lease on wlan0 (as init.xenvm-hwsim.rc says). Its "There is
+  no wlan0 to protect" meant virtwifi's; say so, since the shadow AP's
+  station is a wlan0.
+- sepolicy/file_contexts said the two scripts' denials can be told
+  apart by domain; both run as doma_shadow_ap, so by pid.
+The Raspberry Pi 5's copies in the AGL layer get the same text.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ init.xenvm-buried-eth0.rc | 7 ++++---
+ sepolicy/file_contexts    | 5 +++--
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/init.xenvm-buried-eth0.rc b/init.xenvm-buried-eth0.rc
+index 3830385..67c4eb2 100644
+--- a/init.xenvm-buried-eth0.rc
++++ b/init.xenvm-buried-eth0.rc
+@@ -89,13 +89,14 @@
+ #     service only runs `cmd wifi set-wifi-enabled` / `connect-network VirtWifi`
+ #     (the product installs an empty virtwifi.rc over it), and cuttlefish's
+ #     setup_wifi, which is what creates the interface, is gated on
+-#     ro.boot.wifi_impl=virt_wifi -- empty here. There is no wlan0 to protect.
++#     ro.boot.wifi_impl=virt_wifi -- empty here. There is no virtwifi wlan0 to
++#     protect (this product's wlan0 is the shadow AP's mac80211_hwsim station).
+ #   - doma.cfg gives DomA two vifs on the same bridge, so eth0 and eth1 were both
+ #     taking a lease out of 192.168.10.0/24 (.14 and .13) and
+ #     ConnectivityService carried two ETHERNET networks, one of which never
+ #     validated. Spending one of them on the radio HAL removes that duplication.
+-#     eth1 keeps .13, which is the address dnsmasq reserves for DomA and the one
+-#     adb connects to.
++#     eth1 then becomes a port of the shadow AP's bridge, so DomA takes its lease
++#     on wlan0, not on eth1's .13 reservation (see init.xenvm-hwsim.rc).
+ # Clearing the property instead of starting the service was considered and
+ # rejected: aosp_trout_common.mk sets it with an unconditional `+=` into
+ # PRODUCT_VENDOR_PROPERTIES, so a later assignment does not remove it.
+diff --git a/sepolicy/file_contexts b/sepolicy/file_contexts
+index 6070380..a8eaceb 100644
+--- a/sepolicy/file_contexts
++++ b/sepolicy/file_contexts
+@@ -9,8 +9,9 @@
+ # objects -- $CONF_DIR, hostapd.conf, the hostapd binary -- so a second domain would
+ # need a duplicate of every rule in doma_shadow_ap.te for no gain, and inventing a
+ # domain is where the neverallow risk lives.
+-# Attribution stays useful because the two run at different times: doma_shadow_ap is
+-# oneshot at bring-up, doma_wifi_relay is the long-lived loop.
++# Both therefore run as doma_shadow_ap and their avc lines name the same domain; tell
++# them apart by pid (doma-shadow-ap is the oneshot at bring-up, doma-wifi-relay the
++# long-lived loop).
+ /vendor/bin/doma-wifi-relay      u:object_r:doma_shadow_ap_exec:s0
+ 
+ # /data/vendor/wifi/shadow holds the generated hostapd.conf, the AP list

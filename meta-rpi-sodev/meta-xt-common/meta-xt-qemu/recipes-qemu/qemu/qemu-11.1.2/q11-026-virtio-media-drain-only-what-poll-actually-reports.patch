@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-media: drain only what poll() actually reports
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0223-v10-virtio-media-drain-only-what-poll-reports.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c | 90 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 82 insertions(+), 8 deletions(-)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 7d02c5430..85a3e5018 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -294,13 +294,9 @@ static void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
+  * before allocating capture buffers. A decoder with no event path stalls at the
+  * first frame with nothing in the log to say why.
+  */
+-static void virtio_media_host_readable(void *opaque)
++/* Called only when POLLPRI is set. Drains every pending V4L2 event. */
++static void virtio_media_drain_events(VirtIOMediaSession *s)
+ {
+-    VirtIOMediaSession *s = opaque;
+-    VirtIOMedia *vm = s->vm;
+-    int i;
+-
+-    /* V4L2 events first: a SOURCE_CHANGE tells the guest to re-negotiate. */
+     for (;;) {
+         struct virtio_media_event_event evt = {
+             .hdr = { .event = VIRTIO_MEDIA_EVT_EVENT, .session_id = s->id },
+@@ -309,16 +305,94 @@ static void virtio_media_host_readable(void *opaque)
+         if (ioctl(s->fd, VIDIOC_DQEVENT, &evt.event) < 0) {
+             break;
+         }
+-        virtio_media_send_event(vm, &evt, sizeof(evt));
++        virtio_media_send_event(s->vm, &evt, sizeof(evt));
+     }
++}
++
++static void virtio_media_host_readable(void *opaque)
++{
++    VirtIOMediaSession *s = opaque;
++    VirtIOMedia *vm = s->vm;
++    struct pollfd pfd = { .fd = s->fd, .events = POLLIN | POLLOUT | POLLPRI };
++    short revents;
++    int i;
+ 
+-    /* Then completed buffers, on both queues. */
++    /*
++     * NOTE: establish with one poll what actually happened, and issue only
++     * the ioctls that correspond to it.
++     *
++     * qemu_set_fd_handler() does not tell the callback which event woke it
++     * (util/aio-posix.c:158 only arms G_IO_IN|G_IO_HUP|G_IO_ERR for read and
++     * G_IO_OUT|G_IO_ERR for write). A blind drain -- DQEVENT until EAGAIN plus
++     * DQBUF until EAGAIN on both queues, every time -- is not justified by the
++     * argument that "vb2 only raises POLLOUT while done_list is non-empty, so
++     * draining clears the level and it cannot spin": measurement disagrees
++     * with that.
++     *
++     * strace of qemu during HW-decoded playback on RPi4 (2026-09-04, 8 s, ~128 frames):
++     *
++     *   VIDIOC_DQBUF   3818 calls, 96 % EAGAIN        = 30 per frame
++     *   VIDIOC_DQBUF   2675 calls, 95 % EAGAIN        = 21 per frame
++     *   VIDIOC_DQEVENT 2005 calls, 100 % ENOENT       = 16 per frame
++     *   VIDIOC_DQEVENT 1300 calls, 100 % ENOENT       = 10 per frame
++     *   VIDIOC_QBUF     248 calls, useful work        =  2 per frame
++     *
++     * = 77 wasted calls per frame; the useful QBUFs are just 2.
++     *
++     * Three reasons. (a) DQEVENT always fails unless POLLPRI is set, yet
++     * POLLPRI is not even watched. (b) Whichever queue caused the wakeup,
++     * DQBUF is issued on the other one too. (c) vb2 **raises POLLERR on a
++     * queue that holds no buffers**, and since qemu arms G_IO_ERR this
++     * function is called for POLLERR too, where again everything misses.
++     *
++     * A standalone m2m poll test measured both vicodec and the board's
++     * bcm2835-codec-decode:
++     *
++     *                 polls   ioctls now   with revents        saved
++     *   vicodec        8410        25230           8410       66.7 %
++     *   bcm2835        1810         5430           1810       66.7 %
++     *
++     * The test also confirms (c): the poll before REQBUFS and the poll after
++     * STREAMOFF both return revents=POLLERR. And "POLLOUT set but nothing on
++     * OUTPUT" was 0/8410 and 0/1810 = **the level does clear correctly**, so
++     * the bits that are set can be trusted as they are. Nothing is missed
++     * either: 0 (every successful DQBUF had its matching bit set).
++     *
++     * On the extra poll(): the main loop already polls this fd the same way
++     * every iteration, so the side effect of passing through vb2_poll() (the
++     * fileio emulation noted in the virtio_media_do_open() comment) is not
++     * increased. And this function is registered only while a queue is
++     * streaming, so it never hits fileio's trigger (a queue with no buffers).
++     */
++    if (poll(&pfd, 1, 0) <= 0) {
++        return;
++    }
++    revents = pfd.revents;
++
++    /* V4L2 events first: a SOURCE_CHANGE tells the guest to re-negotiate. */
++    if (revents & POLLPRI) {
++        virtio_media_drain_events(s);
++    }
++
++    /*
++     * Then completed buffers, on the queue poll() actually flagged.
++     *
++     * The mapping exactly as v4l2_m2m_poll() defines it:
++     *   src (= OUTPUT, index 0) done_list not empty -> EPOLLOUT
++     *   dst (= CAPTURE, index 1) done_list not empty -> EPOLLIN
++     * virtio_media_queue_index() maps OUTPUT to 0 and everything else to 1,
++     * so it agrees with this index.
++     */
+     for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
+         VirtIOMediaQueue *q = &s->queues[i];
++        const short want = (i == 0) ? POLLOUT : POLLIN;
+ 
+         if (!q->streaming || q->num_bufs == 0) {
+             continue;
+         }
++        if (!(revents & want)) {
++            continue;
++        }
+         for (;;) {
+             struct virtio_media_event_dqbuf evt = {
+                 .hdr = { .event = VIRTIO_MEDIA_EVT_DQBUF, .session_id = s->id },

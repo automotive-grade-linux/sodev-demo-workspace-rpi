@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 [Unit]
-Description=Pin Dom0 + dom0less DomD to the boot-time CPU map (DomU/DomA pin via xl cfg)
+Description=Pin Dom0 + dom0less DomD to the boot-time CPU map and weigh DomD (DomU/DomA pin via xl cfg)
 After=xencommons.service
 Wants=xencommons.service
+# DomD is pinned before DomA and DomU are created, so that the guests' parallel
+# boot already runs on the map.
+Before=xl-create-doma.service xl-create-domu.service
 ConditionPathExists=/proc/xen
 
 [Service]

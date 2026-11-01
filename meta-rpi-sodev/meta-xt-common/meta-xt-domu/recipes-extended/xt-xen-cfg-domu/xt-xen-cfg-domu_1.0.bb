@@ -29,8 +29,9 @@ S = "${UNPACKDIR}"
 # xt-xen-cfg-doma defaults BOARD_RAM.
 XT_VENUS_GPU_OPTS ??= ""
 # [qemu 10] The qemu version the guests' device model is built from. It comes from
-# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: 10.0.2 in the
-# default GPU=vulkan lane (meta-xt-qemu/qemu_10.0.2.bb, docs/VULKAN-VENUS.md),
+# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: in the default
+# GPU=vulkan lane 11.1.2 on both boards (qemu_11.1.2.bb; docs/VULKAN-VENUS.md), or
+# 10.0.2 where a board selects meta-xt-qemu/qemu_10.0.2.bb instead,
 # 7.0.0 for --gpu=gl -- which is the yaml's base value, left standing.
 #
 # The '7.0.0' fallback below is deliberately the OLDER of the two, because the
@@ -43,6 +44,28 @@ XT_VENUS_GPU_OPTS ??= ""
 # XT_DM_QEMU_VERSION itself. Inside moulin the variable is always set, so the
 # fallback only ever applies to a bare `bitbake` in this tree's own conf.
 XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
+
+# [overlay planes] How many overlay planes DomU's display gets, as for DomA
+# (xt-xen-cfg-doma's XT_DOMA_OVERLAY_PLANES): the device model's half is
+# overlay-planes=N on the virtio-gpu-gl -device line, DomU's half is
+# virtio_gpu.overlay_planes=N on its command line (linux-virtio-armv8's
+# 0002-drm-virtio-overlay-planes-on-output-0). The compositor can then scan a
+# window that sits over the cluster (xdg-cluster-receiver) out on an overlay
+# instead of composing both with the GPU.
+#
+# An overlay is a host GL texture, and a GL texture on the host's V3D is laid
+# out BROADCOM_UIF, which the Raspberry Pi 5's vc4 planes do not take (they
+# take LINEAR and T_TILED), so DomD's compositor would compose it with the GPU.
+# For a plane, the guest's linear scanout resource has to be a linear gbm buffer
+# object on the host, which needs a gbm device in the device model:
+# VIRGL_EXTERNAL_GBM=1 (virglrenderer 1.3.0). DomA's qemu already runs with it
+# (xt-xen-cfg-doma). On virglrenderer 1.2.0 (selected with qemu 10.0.2) the gbm
+# device would put every shared resource on a gbm bo, which halves a GL guest's
+# frame rate (see that bbappend): keep 0 there.
+#
+# 0 leaves domu.cfg as it is. The qemu 7 lane (--gpu=gl) has no overlay-planes
+# property, so it gets none whatever the value.
+XT_DOMU_OVERLAY_PLANES ??= "0"
 
 
 inherit systemd
@@ -104,6 +127,29 @@ do_install() {
         ;;
     esac
 
+    # [overlay planes] both halves of XT_DOMU_OVERLAY_PLANES and the host's gbm,
+    # or none of them.
+    case "${XT_DOMU_OVERLAY_PLANES}" in
+    0|1|2|3) ;;
+    *) bbfatal "XT_DOMU_OVERLAY_PLANES='${XT_DOMU_OVERLAY_PLANES}': expected 0..3" ;;
+    esac
+    case "${XT_DM_QEMU_VERSION}" in
+    7.*) domu_overlays=0 ;;
+    *)   domu_overlays="${XT_DOMU_OVERLAY_PLANES}" ;;
+    esac
+    if [ "$domu_overlays" != 0 ]; then
+        sed -i -e "s/'virtio-gpu-gl-pci,/&overlay-planes=$domu_overlays,/" \
+               -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.overlay_planes=$domu_overlays\"/" \
+               -e "s/^    'SDL_VIDEO_WAYLAND_WMCLASS=qemu-system-aarch64-domu',\$/&\n    'VIRGL_EXTERNAL_GBM=1',/" \
+            ${D}${sysconfdir}/xen/domu.cfg
+        grep -q "'virtio-gpu-gl-pci,overlay-planes=$domu_overlays," ${D}${sysconfdir}/xen/domu.cfg || \
+            bbfatal "domu.cfg: overlay-planes=$domu_overlays did not reach the virtio-gpu -device line"
+        grep -q "^extra = \".* virtio_gpu.overlay_planes=$domu_overlays\"\$" ${D}${sysconfdir}/xen/domu.cfg || \
+            bbfatal "domu.cfg: virtio_gpu.overlay_planes=$domu_overlays did not reach DomU's command line"
+        grep -qxF "    'VIRGL_EXTERNAL_GBM=1'," ${D}${sysconfdir}/xen/domu.cfg || \
+            bbfatal "domu.cfg: VIRGL_EXTERNAL_GBM=1 did not reach qemu_envs"
+    fi
+
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${UNPACKDIR}/xl-create-domu.service ${D}${systemd_system_unitdir}/xl-create-domu.service
 }
@@ -113,6 +159,7 @@ do_install() {
 do_install[vardeps] += "XT_VENUS_GPU_OPTS"
 # Same reason for the device-model version that selects the argument fixups.
 do_install[vardeps] += "XT_DM_QEMU_VERSION"
+do_install[vardeps] += "XT_DOMU_OVERLAY_PLANES"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/domu.cfg \

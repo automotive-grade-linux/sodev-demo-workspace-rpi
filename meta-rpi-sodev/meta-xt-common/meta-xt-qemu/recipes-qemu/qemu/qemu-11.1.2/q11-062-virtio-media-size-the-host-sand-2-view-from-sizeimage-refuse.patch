@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 5 Oct 2026 16:24:28 +0900
+Subject: [PATCH] virtio-media: size the host-sand=2 view from sizeimage,
+ refuse odd rows
+
+host-sand=2 sized its linear RGBA8 view of the SAND buffer from the
+dma-buf length. An allocator may round that length up, so it is not the
+size of the frame and need not be a multiple of the 2048-byte texture
+row. Pass the frame's own size instead: the sizeimage the codec returned
+for S_FMT. It is used only when it is non-zero and fits in the buffer.
+Otherwise 0 is passed, and the import refuses the geometry.
+
+Also refuse an odd number of luma rows. Chroma is luma_rows / 2 rows per
+column and the shader indexes it that way, so an odd count does not
+describe a valid NV12_COL128 frame.
+
+Only affects host-sand=2 (default off).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [fix-up of this layer's host-sand patch]
+---
+ hw/virtio/virtio-media-virgl.c |  3 ++-
+ hw/virtio/virtio-media.c       | 13 +++++++++++--
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 41bc35cae..6baf08ce4 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -652,7 +652,8 @@ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
+     GpuSaved sv;
+     VirtIOMediaGpuBuf *b;
+ 
+-    if (!len || len % 2048 || !luma_rows || col_height < luma_rows + luma_rows / 2 ||
++    if (!len || len % 2048 || !luma_rows || (luma_rows & 1) ||
++        col_height < luma_rows + luma_rows / 2 ||
+         (uint64_t)((src_width + 127) / 128) * 128 * col_height > len) {
+         qemu_log("virtio-media-diag: gpu_xfer: host-sand=2 geometry refused (len %u, "
+                  "w %u, luma %u, col %u)\n", len, src_width, luma_rows, col_height);
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index b1c88105a..f6c590ae6 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -784,8 +784,17 @@ static void virtio_media_host_readable_body(void *opaque)
+                                                 eb.fd, q->width, luma_rows,
+                                                 q->sand_col_height,
+                                                 dst_bpl / 4, dst_h, scale,
+-                                                q->host_len[idx][p], q->matrix,
+-                                                &e);
++                                                /*
++                                                 * The frame's own size (S_FMT
++                                                 * sizeimage), not the buffer
++                                                 * length an allocator may round
++                                                 * up; the buffer must hold it.
++                                                 */
++                                                q->host_sizeimage &&
++                                                q->host_sizeimage <=
++                                                    q->host_len[idx][p]
++                                                    ? q->host_sizeimage : 0,
++                                                q->matrix, &e);
+                                     } else
+                                     q->gpu_buf[idx] =
+                                         virtio_media_gpu_import_nv12(

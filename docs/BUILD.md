@@ -270,7 +270,7 @@ Dockerfile):
 ```sh
 docker build -f docker/Dockerfile.builder docker/ \
   --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
-  --build-arg https_proxy="$HTTPS_PROXY" --build-arg http_proxy="$HTTPS_PROXY" \
+  --build-arg https_proxy="$HTTPS_PROXY" --build-arg http_proxy="${HTTP_PROXY:-$HTTPS_PROXY}" \
   --network=host \
   -t sodev-builder-rpi
 ```
@@ -611,10 +611,11 @@ options:
                         (default: no)
   --GPU {gl,vulkan}     Which graphics stack the guests get. vulkan (default):
                         Venus (guest Vulkan over virtio-gpu) for DomA and DomU
-                        -- qemu 10.0.2-xt, virglrenderer's venus backend, the
-                        DomD/DomU Vulkan runtime and venus=true device-model
-                        options. gl: the pre-Venus OpenGL stack on qemu
-                        7.0.0-xt. See docs/VULKAN-VENUS.md. (default: vulkan)
+                        -- qemu 11.1.2, weston 16.0.0, virglrenderer 1.3.0's
+                        venus backend, the DomD/DomU Vulkan runtime and
+                        venus=true device-model options. gl: the pre-Venus
+                        OpenGL stack on qemu 7.0.0-xt. See docs/VULKAN-VENUS.md.
+                        (default: vulkan)
   --ENABLE_DEVEL {no,yes}
                         Add meta-rpi-sodev-devel to the DomD build: the Venus
                         phase 0-3 gate, the Vulkan reproducers, the VRAM tools
@@ -635,18 +636,20 @@ assemble the image:
 moulin rpi5-sodev.yaml                                        # defaults: DOM0_OS=zephyr, ENABLE_DOMU=no, ENABLE_ANDROID=no
 # moulin rpi5-sodev.yaml --DOM0_OS linux --ENABLE_ANDROID no  # other flavours
 # moulin rpi4-sodev.yaml --BOARD_RAM 8g                       # Raspberry Pi 4 (BOARD_RAM is 8g|4g there)
-ninja                # builds the configured domains (takes time and disk)
-ninja image-full     # assembles full.img (the GPT SD image)
+ninja dom0 domd      # the domains; add domu / domz / doma when enabled (takes time and disk)
+ninja image-full     # assembles full.img (the GPT SD image), building what it needs
 ```
 
-`ninja image-full` writes `full.img` into the build root (the directory you
+`ninja` with no goal builds only the components marked `default: true` in the
+product yaml, which for the zephyr flavour is Dom0 alone, so name the domains (or
+go straight to `ninja image-full`). `ninja image-full` writes `full.img` into the build root (the directory you
 ran moulin in). The descriptive name is `build.sh`'s doing, not rouge's, so on
 the manual path you get plain `full.img` and it is on you not to overwrite the
 previous one.
 
 Manual-path caveats (all handled automatically by `build.sh`):
-- stage the AAOS prebuilts **before** the first build (see *Staging the AAOS
-  prebuilts* below);
+- with `ENABLE_ANDROID=yes`, see *How the DomA artifacts are produced* and *AAOS
+  build modes* below for where the DomA artifacts come from;
 - with `DOM0_OS=zephyr`, populate the west workspace with a fetch-only pass and
   apply the patch series **before** building Dom0:
   `ninja fetch-dom0 && meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/apply-zephyr-patches.sh "$PWD/zephyr"`

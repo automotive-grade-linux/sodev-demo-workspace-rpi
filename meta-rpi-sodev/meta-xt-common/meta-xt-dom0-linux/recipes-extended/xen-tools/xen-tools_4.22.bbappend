@@ -110,22 +110,23 @@ SRC_URI:append = " \
     file://4.22-0005-build-honour-external-toolchain-vars.patch \
 "
 
-# [Venus / qemu 10.0.2 lane] gated so a --gpu=gl build's toolstack carries no
-# additions from us.
+# [Venus / qemu 10.0.2 and 11.1.2 lane] gated so a --gpu=gl build's toolstack
+# carries no additions from us.
 # 4.22-0008 first: 4.22-0009 reads the constants it moves.
 #
 # 4.22-0010 is in the same gate although it is not a Venus change: it hands out
 # one SPI per virtio-pci slot, which the guest DT and the device model have to
-# agree on. The device-model half is qemu's 0215 + 0122, and those only exist in
-# the 10.0.2 recipe -- the gl lane builds qemu 7.0.0-xt, whose Arm Xen machine
-# wires the four INTA-D lines. Gating it with the others is therefore what keeps
-# the two halves together; ungating it would give a gl-lane guest a DT declaring
-# sixteen lines against a device model that has four.
+# agree on. The device-model half is qemu's 0215 + 0122 (q11-022 + q11-047 for
+# 11.1.2), which only the 10.0.2 and 11.1.2 recipes carry -- the gl lane builds
+# qemu 7.0.0-xt, whose Arm Xen machine wires the four INTA-D lines. Gating it
+# with the others is therefore what keeps the two halves together; ungating it
+# would give a gl-lane guest a DT declaring sixteen lines against a device model
+# that has four.
 #
 # The hardware decoder needs 4.22-0010 (virtio-media lands at slot 09.0, which at
-# four or eight lines folds onto virtio-blk), and it needs virtio-media, which is
-# a 10.0.2-only device. So hardware decode implies this lane too -- there is no
-# --gpu=gl configuration that has it.
+# four or eight lines folds onto virtio-blk), and it needs virtio-media, which only
+# the 10.0.2 and 11.1.2 device models have. So hardware decode implies this lane
+# too -- there is no --gpu=gl configuration that has it.
 SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
     'file://4.22-0008-arm-move-the-guest-virtio-pci-prefetch-window.patch \
      file://4.22-0009-libxl-arm-give-a-virtio-pci-host-a-256M-prefetchable-.patch \

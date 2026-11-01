@@ -109,6 +109,16 @@ SRC_URI:append = " \
     file://0016-xen-swiotlb-translate-MMIO-resource-through-dma-ranges.patch \
 "
 
+# 0017: a zero-timeout DRM_IOCTL_V3D_WAIT_BO (Mesa's BO cache asking whether a BO
+# is idle) slept up to one jiffy, 4 ms at HZ=250, on a busy BO. QEMU draws DomA's
+# decoded frames with Mesa v3d on its main loop, so those sleeps were BQL holds:
+# up to 123 ms per iteration in a 1080p60 playback, 33 ms with 0017. Mainline
+# made the same change in 2266665 on top of a helper 6.18 does not have; drop
+# 0017 when the kernel moves past it.
+SRC_URI:append = " \
+    file://0017-drm-v3d-do-not-sleep-on-a-zero-timeout-wait-bo.patch \
+"
+
 # rpi5-0004: V4H Xen patchset for the Dom0/DomD kernel. The base meta-xt-rpi5
 # linux-raspberrypi_6.12.bbappend (pristine) does NOT carry these; they were
 # being applied by editing the base bbappend directly. Moved here so meta-xt-rpi5

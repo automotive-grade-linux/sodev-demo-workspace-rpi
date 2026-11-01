@@ -5,7 +5,8 @@
 # xt-xen-cfg-doma lives in meta-xt-common because DomA's xl configuration is
 # board-independent apart from its size, and this port keeps that layer's doma.cfg
 # byte-identical. Only the memory size, the virtio-gpu resolution, the
-# virtio-media backend's host-max-width and the HDMI audio card change here.
+# virtio-media backend's host-max-width and host-sand, DomA's overlay planes and
+# their scaling, the HDMI audio card and the sound card's tx-no-bql change here.
 #
 # WHY 2560 MiB
 # The 8 GiB Pi 4 has to fit four domains into what is left after the boot-time
@@ -56,8 +57,10 @@
 # /system/bin/extra_free_kbytes.sh pairs `grep "min" /proc/zoneinfo` lines with
 # zones -- the 6.x per-CPU `high_min:` lines match too -- and divides by
 # managed/10000, which is 2 for that small zone; it wrote watermark_scale_factor
-# 615 to 1777. kswapd then kept 734 MB free, re-read ~270 MB/s of evicted files
-# through the device model, and both DomD and DomA saturated (measured on the
+# 615 to 1777 (both defects are fixed since, in an AOSP source build, by
+# meta-xt-doma's aosp-patches/system/core 0001 and 0002). kswapd then kept 734 MB
+# free, re-read ~270 MB/s of evicted files through the device model, and both
+# DomD and DomA saturated (measured on the
 # board 2026-09-23: echo 10 into the sysctl took DomD from 200% to 32%). At 2048
 # the guest has DMA32 only and the script wrote 82. With 1080p30 playing, DomA
 # used 1420 MB and had ~570 MB available at 2048.
@@ -128,6 +131,41 @@ do_install[vardeps] += "RPI4_DOMA_GPU_RES_FROM RPI4_DOMA_GPU_RES"
 RPI4_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI4_DOMA_GPU_RES').split('xres=')[1].split(',')[0])}"
 XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = ",host-max-width=${RPI4_DOMA_HWDEC_MAX_W}"
 
+# host-sand=N (qemu 11 only, q11-059/061): 0 = the decoder's NV12 output, 1 = SAND128
+# detiled by DomD's Mesa, 2 = SAND sampled as one linear texture and detiled in the
+# shader. qemu 10 has no such property and would refuse to start the device model, so a
+# value other than 0 with any other device model stops the build, as XT_DOMA_PLANE_SCALING
+# does. On qemu 11 the default is 1, as this board's doma.cfg has run since its
+# display path was measured (2026-10-02 .. 10-13).
+RPI4_DOMA_HOST_SAND ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = "${@'' if d.getVar('RPI4_DOMA_HOST_SAND') == '0' else ',host-sand=' + d.getVar('RPI4_DOMA_HOST_SAND')}"
+do_install[vardeps] += "RPI4_DOMA_HOST_SAND"
+
+python () {
+    hs = d.getVar('RPI4_DOMA_HOST_SAND')
+    if hs not in ('0', '1', '2'):
+        bb.fatal("RPI4_DOMA_HOST_SAND='%s': expected 0, 1 or 2" % hs)
+    qv = d.getVar('XT_DM_QEMU_VERSION')
+    if hs != '0' and not qv.startswith('11.'):
+        bb.fatal("RPI4_DOMA_HOST_SAND=%s needs the qemu 11 device model (XT_DM_QEMU_VERSION='%s')" % (hs, qv))
+}
+
+# DomA's overlay planes and primary-plane scaling, as this board's doma.cfg has run
+# them since its display path was measured (2026-10-02 .. 10-13): three overlay planes
+# let drm_hwcomposer scan the app and the system bars out as DEVICE layers instead of
+# SurfaceFlinger compositing them on the GPU (with two planes on qemu 10.0.2, before the
+# kernel refused a plane not shown whole, a 640x360 video in a WebView dropped 25% of its
+# frames instead of 35%), and plane scaling lets
+# it put a scaled video on the primary plane (local 720p60 in the HMI 40 -> 52-55 fps).
+# Both halves come from the common recipe. Plane scaling needs the qemu 11.1.2 device
+# model, which this board's vulkan lane selects (rpi4-sodev.yaml); the common recipe
+# stops the build with any other, so the gl lane (qemu 7.0.0, which also gets no
+# overlays) keeps it at 0. The Raspberry Pi 5 sets the same. Defaults (?=), so a
+# local.conf can override them. For an A/B without the overlays, set both to 0: plane
+# scaling 1 with no overlay planes stops the build.
+XT_DOMA_OVERLAY_PLANES ?= "3"
+XT_DOMA_PLANE_SCALING ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+
 # DomA's HDMI audio card. doma.cfg's literal is out.dev=plughw:vc4hdmi1, HDMI-A-2;
 # on this board DomA and the panel are on HDMI-A-1, whose card is vc4hdmi0 (the
 # 440 Hz tone of 2026-09-23 reached the panel through vc4hdmi0). In the zephyr
@@ -162,3 +200,47 @@ rpi4_doma_hdmi_audio_card() {
 }
 
 do_install[vardeps] += "RPI4_DOMA_AUDIO_DEV_FROM RPI4_DOMA_AUDIO_DEV"
+
+# DomA's sound card writes its buffers out without the BQL (q11-092, the TX thread of
+# tx-poll-us), as on the Raspberry Pi 5: the main loop of DomA's device model holds the
+# BQL for the video's GPU work, and the thread waited behind it while the ALSA output ran
+# dry. tx-no-bql needs the ALSA audiodev with the mixing engine off, which also needs the
+# fixed frequency, channels and format gone (qemu refuses them without the mixing
+# engine). The ALSA buffer stays at 60 ms here: the Raspberry Pi 5's 100 ms with a 60 ms
+# start was not measured on this board. Measured on this board (2026-10-26, a WebView's
+# 720p60 H.264 full screen and beside the HMI, five 580 s runs with each of two builds of
+# the main loop's time budgets, the second with q11-104): no ALSA under-run, PCM restart
+# or HAL shortfall in any run. 0 leaves both lines as they are; qemu 10.0.2 and 7.0.0 have
+# no tx-no-bql, so the default is 0 there.
+RPI4_DOMA_SND_TX_NO_BQL ?= "${@'1' if d.getVar('XT_DM_QEMU_VERSION').startswith('11.') else '0'}"
+RPI4_DOMA_AUDIO_FIXED ?= "out.frequency=48000,out.channels=2,out.format=s16,"
+do_install[postfuncs] += "rpi4_doma_snd_tx_no_bql"
+do_install[vardeps] += "RPI4_DOMA_SND_TX_NO_BQL RPI4_DOMA_AUDIO_FIXED"
+
+rpi4_doma_snd_tx_no_bql:raspberrypi4-64() {
+    [ "${RPI4_DOMA_SND_TX_NO_BQL}" = 1 ] || return 0
+    case "${XT_DM_QEMU_VERSION}" in
+    11.*) ;;
+    *) bbfatal "RPI4_DOMA_SND_TX_NO_BQL=1 needs the qemu 11 device model (XT_DM_QEMU_VERSION is '${XT_DM_QEMU_VERSION}')" ;;
+    esac
+    cfg="${D}${sysconfdir}/xen/doma.cfg"
+    [ -f "$cfg" ] || bbfatal "xt-xen-cfg-doma.bbappend (rpi4): $cfg not installed"
+    a=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "${RPI4_DOMA_AUDIO_FIXED}" || true)
+    v=$(grep "^[[:space:]]*'-device', 'virtio-sound-pci," "$cfg" | grep -cF -- "tx-poll-us=10000," || true)
+    if [ "$a" != "1" ] || [ "$v" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): expected one '-audiodev' line with '${RPI4_DOMA_AUDIO_FIXED}' ($a) and one virtio-sound-pci line with tx-poll-us=10000, ($v) in $cfg"
+    fi
+    sed -i -e "/^[[:space:]]*'-audiodev',/s|${RPI4_DOMA_AUDIO_FIXED}|out.mixing-engine=off,|" \
+           -e "/^[[:space:]]*'-device', 'virtio-sound-pci,/s|tx-poll-us=10000,|tx-poll-us=10000,tx-no-bql=on,|" "$cfg"
+    a=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "out.mixing-engine=off," || true)
+    v=$(grep "^[[:space:]]*'-device', 'virtio-sound-pci," "$cfg" | grep -cF -- "tx-poll-us=10000,tx-no-bql=on," || true)
+    if [ "$a" != "1" ] || [ "$v" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): the tx-no-bql rewrite did not apply cleanly to $cfg"
+    fi
+    bbnote "xt-xen-cfg-doma.bbappend (rpi4): DomA's sound card writes without the BQL (tx-no-bql)"
+}
+
+# The default is a no-op, as for this file's other postfuncs.
+rpi4_doma_snd_tx_no_bql() {
+    :
+}

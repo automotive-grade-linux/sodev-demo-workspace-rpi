@@ -1,0 +1,32 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 13:19:52 +0900
+Subject: [PATCH] virgl: pass PIPE_BIND_LINEAR to the host
+
+pipe_to_virgl_bind() drops PIPE_BIND_LINEAR, so a buffer a client
+allocates with gbm SCANOUT | LINEAR reaches virglrenderer as a plain
+scanout resource, and the host gives it the layout its GL driver
+picks: BROADCOM_UIF on the Raspberry Pi 5's V3D. The guest compositor
+puts such a buffer on a plane (virtio-gpu has no modifiers, so to the
+guest it is linear), and the host compositor cannot scan the tiled
+texture out, so it composes it with the GPU.
+
+Pass the bit on as VIRGL_BIND_LINEAR, which virgl_hw.h defines.
+With virglrenderer's 0024 the host then allocates the resource as a
+linear gbm bo. The AAOS tree's newer Mesa has the same function
+without the line.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/gallium/drivers/virgl/virgl_resource.h
++++ b/src/gallium/drivers/virgl/virgl_resource.h
+@@ -149,6 +149,8 @@
+       outbind |= VIRGL_BIND_SCANOUT;
+    if (pbind & PIPE_BIND_SHARED)
+       outbind |= VIRGL_BIND_SHARED;
++   if (pbind & PIPE_BIND_LINEAR)
++      outbind |= VIRGL_BIND_LINEAR;
+    if (pbind & PIPE_BIND_SHADER_BUFFER)
+       outbind |= VIRGL_BIND_SHADER_BUFFER;
+    if (pbind & PIPE_BIND_QUERY_BUFFER)

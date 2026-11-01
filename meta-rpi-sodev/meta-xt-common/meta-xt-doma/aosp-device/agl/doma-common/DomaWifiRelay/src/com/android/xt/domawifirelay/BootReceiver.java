@@ -25,10 +25,10 @@ public final class BootReceiver extends BroadcastReceiver {
         if (!Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
             return;
         }
-        // Started UNCONDITIONALLY, and the service checks the property and the Settings
-        // Wi-Fi toggle on every sweep instead of at startup.
+        // Started UNCONDITIONALLY, and the service checks the daemon's state and the
+        // Settings Wi-Fi toggle on every sweep instead of at startup.
         //
-        // WHY: gating the start on the property would make a later setprop
+        // WHY: gating the start on the switch would make a later setprop
         // ineffective. The setprop starts or stops the DAEMON (init has
         // property triggers for it), but nothing would start this SERVICE --
         // BOOT_COMPLETED has already fired, and android:persistent starts the

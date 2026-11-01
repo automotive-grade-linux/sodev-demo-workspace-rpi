@@ -1,0 +1,925 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 17 Oct 2026 13:15:43 +0900
+Subject: [PATCH] virtio-media: decoder mode: decode H.264 straight into
+ dma-bufs
+
+The main loop converted every software-decoded H.264 frame from
+YUV420P to NV12 and copied it into a staging dma-buf for the GPU
+(sws_scale). At 1080p60 that cost DomD, whose two vCPUs the decode
+threads already fill, about a tenth of a core, and it kept the main
+loop, and so DomA's MMIO round trips, waiting.
+
+Give libavcodec a get_buffer2 that decodes into a pool of system heap
+dma-bufs laid out as I420 (Y stride a multiple of 128, every plane
+padded to a page, one more page after the last for Mesa's TFU
+readahead), and have the GPU sample the three planes as R8 textures
+with an I420 shader into the guest's resource. The CPU no longer
+touches the frame. The cache is synced on the decode thread after
+avcodec_receive_frame; the frame is held until the GPU fence, as the
+staged path does.
+
+All frames of a stream get the same layout: H.264 motion compensation
+uses the current picture's linesize for its references, so a pool that
+runs dry hands out heap buffers of that layout rather than libavcodec's
+own (a stride mix reads past them). Frames the GPU path cannot take go
+the staged NV12 path, counted by reason in a report every 3600 frames.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-17), the 1080p60 H.264
+stream from a local file in a WebView, with and without the HMI, three
+runs each: the main loop 32-33% -> 20-22% of a core, DomA's steal
+45-49 -> 25-28 (of 200), frames shown 40.6-47.1 (mean 43.1) -> 43.1-
+56.8 (mean 48.7) a second. Every frame went zero-copy (none staged),
+from a pool of 4-7 buffers. DomD stays busy (idle 11-20 of 200): the
+decode threads take the time freed. The cluster in DomU, HEVC (-T
+60.5/61.1) and VP9 (decoded in DomA) are unchanged.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c       | 530 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media-virgl.c         | 162 ++++++++
+ include/hw/virtio/virtio-media-virgl.h |  12 +
+ 3 files changed, 703 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index e59e4d8..673b7cd 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -64,6 +64,7 @@
+ #include "qemu/timer.h"
+ #include "qemu/thread.h"
+ #include "qemu/main-loop.h"
++#include "qemu/memalign.h"     /* q11-dec-zero-copy: the heap fallback */
+ #include "ui/direct-scanout.h"
+ 
+ #ifdef CONFIG_VIRTIO_MEDIA_DECODER
+@@ -262,6 +263,51 @@ typedef struct DecSwSlot {
+     void *handle;    /* the GL import (owns a dup of fd) */
+ } DecSwSlot;
+ 
++/*
++ * q11-dec-zero-copy: libavcodec decodes the software frames straight into
++ * dma-bufs of a pool of these (dec_zc_get_buffer), and the GPU converts the
++ * three planes from there (dec_zc_gpu_write): no CPU conversion or copy. The
++ * dec_sw_gpu_write staging took about half of the main loop's CPU at H.264
++ * 1080p60 on the Raspberry Pi 5. The pool grows to what the decoder holds at
++ * once (references, frame threads, DEC_THR_OUT, DEC_GPU_HOLD) and no further
++ * than DEC_ZC_MAX; past that a frame takes libavcodec's own buffer and the
++ * staging path. It is laid out for one coded size and format: another one
++ * starts a new pool, and an old pool lives on until its last buffer is
++ * released, whichever thread that is on.
++ *
++ * "Zero-copy" is the CPU's: Mesa v3d samples a linear plane through a tiled
++ * shadow it fills with the TFU at every draw, so the GPU still copies the
++ * three planes (as it copied the two of the staged NV12), and each import has
++ * its shadow too. A change of the imports' key (matrix, guest size) waits for
++ * the frames held after their blit before the imports are made again.
++ */
++#define DEC_ZC_MAX 32
++/* frames between two reports of the zero-copy counters */
++#define DEC_ZC_LOG_EVERY 3600
++
++typedef struct DecZcPool DecZcPool;
++
++typedef struct DecZcSlot {
++    DecSwSlot buf;    /* fd, map, size; handle unused */
++    DecZcPool *pool;
++    bool busy;        /* a frame of libavcodec's is in it */
++    bool synced;      /* the CPU's writes were flushed since it was taken */
++} DecZcSlot;
++
++struct DecZcPool {
++    QemuMutex lock;       /* busy, synced, n, refs, fallback_n */
++    unsigned refs;        /* the decoder's, and one per busy slot */
++    uint64_t gen;         /* tells the GPU imports of two pools apart */
++    int format, width, height;
++    uint32_t y_stride, c_stride;
++    uint32_t off[3];
++    size_t len;
++    unsigned n;
++    uint64_t fallback_n;  /* frames that found no free slot */
++    AVBufferPool *heap;   /* those frames' buffers, of the same layout */
++    DecZcSlot slot[DEC_ZC_MAX];
++};
++
+ /*
+  * q11-dec-thread: a codec without the hwaccel (H.264) is decoded on a thread
+  * of its own; HEVC stays on the main loop, also when it falls back to
+@@ -444,6 +490,19 @@ struct VirtIOMediaDec {
+     bool sw_logged;
+     struct SwsContext *sws_nv12;
+ 
++    /* q11-dec-zero-copy (dec_zc_get_buffer, dec_zc_gpu_write) */
++    QemuMutex zc_lock;      /* zc and zc_gen: the frame threads swap the pool */
++    DecZcPool *zc;
++    uint64_t zc_gen;
++    void *zc_gpu[DEC_ZC_MAX]; /* main loop: the GL import of each slot */
++    uint64_t zc_gpu_gen;
++    uint32_t zc_gpu_key[9];   /* what the imports were made for */
++    bool zc_off;            /* the GPU could not take a frame: staging until dec_gpu_reset */
++    bool zc_logged;
++    uint64_t zc_n;
++    /* staged frames: not in the pool, -ERANGE, -EAGAIN, zc_off; and their sum */
++    uint64_t zc_st[4], zc_st_n;
++
+     /* q11-dec-thread (dec_thr_run) */
+     bool thr_on;
+     QemuThread thr;
+@@ -707,6 +766,8 @@ static void dec_gpu_clear(VirtIOMediaDec *d)
+  * old buffers, so they do not pin the old pool's CMA while the new one is
+  * allocated, and give the GPU path another try.
+  */
++static void dec_zc_gpu_clear(VirtIOMediaDec *d);
++
+ static void dec_gpu_reset(VirtIOMediaDec *d)
+ {
+     dec_gpu_clear(d);
+@@ -715,6 +776,13 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+     d->gpu_off = false;
+     d->sw_off = false;
+     d->gpu_again = 0;
++    /*
++     * q11-dec-zero-copy: the imports go and the GPU path gets another try.
++     * The pool stays: a stream of the same size (after a seek, say) takes it
++     * again, and one of another size replaces it at its first frame.
++     */
++    dec_zc_gpu_clear(d);
++    qatomic_set(&d->zc_off, false);
+ }
+ 
+ /*
+@@ -1481,6 +1549,308 @@ static void dec_sw_sync(int fd, uint64_t flags)
+     }
+ }
+ 
++/* ------------------------------------------------------------------------- */
++/* q11-dec-zero-copy                                                         */
++/* ------------------------------------------------------------------------- */
++
++static void dec_zc_destroy(DecZcPool *p)
++{
++    unsigned i;
++
++    for (i = 0; i < p->n; i++) {
++        munmap(p->slot[i].buf.map, p->slot[i].buf.size);
++        close(p->slot[i].buf.fd);
++    }
++    /* buffers still out of it keep it until they are let go */
++    av_buffer_pool_uninit(&p->heap);
++    qemu_mutex_destroy(&p->lock);
++    g_free(p);
++}
++
++/* Drop one reference; the last one frees the pool. Any thread. */
++static void dec_zc_unref(DecZcPool *p)
++{
++    bool last;
++
++    qemu_mutex_lock(&p->lock);
++    last = --p->refs == 0;
++    qemu_mutex_unlock(&p->lock);
++    if (last) {
++        dec_zc_destroy(p);
++    }
++}
++
++/* libavcodec let go of a frame's buffer: the slot is free again. Any thread. */
++static void dec_zc_buf_free(void *opaque, uint8_t *data)
++{
++    DecZcSlot *sl = opaque;
++    DecZcPool *p = sl->pool;
++
++    qemu_mutex_lock(&p->lock);
++    sl->busy = false;
++    qemu_mutex_unlock(&p->lock);
++    dec_zc_unref(p);
++}
++
++/* A buffer laid out as the pool's, from the heap, for p->heap. */
++static void dec_zc_heap_free(void *opaque, uint8_t *data)
++{
++    qemu_vfree(data);
++}
++
++static AVBufferRef *dec_zc_heap_alloc(size_t size)
++{
++    uint8_t *m = qemu_try_memalign(64, size);
++    AVBufferRef *b = m ? av_buffer_create(m, size, dec_zc_heap_free, NULL, 0)
++                       : NULL;
++
++    if (!b) {
++        qemu_vfree(m);
++    }
++    return b;
++}
++
++/* A pool laid out as avcodec_default_get_buffer2() would lay out this frame. */
++static DecZcPool *dec_zc_new(AVCodecContext *avctx, const AVFrame *f,
++                             uint64_t gen)
++{
++    int w = f->width, h = f->height, align[AV_NUM_DATA_POINTERS];
++    DecZcPool *p;
++    size_t ysize, csize;
++
++    avcodec_align_dimensions2(avctx, &w, &h, align);
++    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
++        return NULL;
++    }
++    p = g_new0(DecZcPool, 1);
++    qemu_mutex_init(&p->lock);
++    p->refs = 1;
++    p->gen = gen;
++    p->format = f->format;
++    p->width = f->width;
++    p->height = f->height;
++    /*
++     * Y's stride a multiple of 128, so the chroma's (half of it) is one of 64:
++     * more than libavcodec's linesize alignment, and what the GL import of a
++     * linear plane takes. Each plane is followed by the padding libavcodec's
++     * own pool gives (16 + STRIDE_ALIGN - 1, here rounded up to a page), and
++     * the buffer ends with one more page: DomD's Mesa may read up to 64 bytes
++     * past an image it copies with the TFU.
++     */
++    p->y_stride = ROUND_UP((uint32_t)w, 128);
++    p->c_stride = p->y_stride / 2;
++    ysize = (size_t)p->y_stride * h;
++    csize = (size_t)p->c_stride * ((h + 1) / 2);
++    p->off[0] = 0;
++    p->off[1] = ROUND_UP(ysize + 128, 4096);
++    p->off[2] = p->off[1] + ROUND_UP(csize + 128, 4096);
++    p->len = p->off[2] + ROUND_UP(csize + 128, 4096) + 4096;
++    p->heap = av_buffer_pool_init(p->len, dec_zc_heap_alloc);
++    return p;
++}
++
++/*
++ * get_buffer2 for the software decoder. Called on libavcodec's frame threads,
++ * so everything it touches is under zc_lock or the pool's lock; the dma-heap
++ * allocation (zero-filled, milliseconds for 3 MB) is made with neither held.
++ *
++ * NOTE: EVERY FRAME OF A POOL'S SIZE GETS THE POOL'S LAYOUT. H.264 motion
++ * compensation reads the references with the current picture's linesize
++ * (h264_slice.c takes it from cur_pic only), so a frame in a buffer of
++ * libavcodec's own -- its stride rounded to STRIDE_ALIGN, not to 128 -- among
++ * the pool's would read its references out of bounds at a width that is not
++ * a multiple of 128 (720, 854, 426). A frame that finds no free slot gets a
++ * heap buffer of the same layout instead, and goes by the staging path.
++ */
++static int dec_zc_get_buffer(AVCodecContext *avctx, AVFrame *f, int flags)
++{
++    VirtIOMediaDec *d = avctx->opaque;
++    DecZcPool *p, *old = NULL;
++    DecZcSlot *sl = NULL;
++    DecSwSlot fresh = { .fd = -1 };
++    bool grow = false;
++    uint8_t *heap;
++    unsigned i;
++
++    if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
++        return avcodec_default_get_buffer2(avctx, f, flags);
++    }
++    qemu_mutex_lock(&d->zc_lock);
++    p = d->zc;
++    if (!p || p->format != f->format || p->width != f->width ||
++        p->height != f->height) {
++        old = p;
++        p = d->zc = dec_zc_new(avctx, f, ++d->zc_gen);
++    }
++    if (p) {
++        qemu_mutex_lock(&p->lock);
++        for (i = 0; i < p->n && p->slot[i].busy; i++) {
++        }
++        if (i < p->n) {
++            sl = &p->slot[i];
++            sl->busy = true;
++            sl->synced = false;
++        } else {
++            grow = p->n < DEC_ZC_MAX;
++        }
++        p->refs++;   /* for the slot, the heap buffer, or the allocation */
++        qemu_mutex_unlock(&p->lock);
++    }
++    qemu_mutex_unlock(&d->zc_lock);
++    if (old) {
++        dec_zc_unref(old);
++    }
++    if (!p) {
++        /* no pool for this size: every frame of it is libavcodec's own */
++        return avcodec_default_get_buffer2(avctx, f, flags);
++    }
++    if (grow && dec_sw_alloc(&fresh, p->len) == 0) {
++        qemu_mutex_lock(&p->lock);
++        if (p->n < DEC_ZC_MAX) {
++            sl = &p->slot[p->n++];
++            sl->buf = fresh;
++            sl->pool = p;
++            sl->busy = true;
++            sl->synced = false;
++            fresh.fd = -1;
++        }
++        qemu_mutex_unlock(&p->lock);
++        if (fresh.fd >= 0) {   /* another thread filled the pool meanwhile */
++            munmap(fresh.map, fresh.size);
++            close(fresh.fd);
++        }
++    }
++    if (sl) {
++        f->buf[0] = av_buffer_create(sl->buf.map, sl->buf.size,
++                                     dec_zc_buf_free, sl, 0);
++        if (!f->buf[0]) {
++            dec_zc_buf_free(sl, NULL);
++            return AVERROR(ENOMEM);
++        }
++        dec_sw_sync(sl->buf.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
++        heap = sl->buf.map;
++    } else {
++        qemu_mutex_lock(&p->lock);
++        p->fallback_n++;
++        qemu_mutex_unlock(&p->lock);
++        /* recycled: a pool that stays full would allocate 3 MB a frame */
++        f->buf[0] = p->heap ? av_buffer_pool_get(p->heap) : NULL;
++        if (!f->buf[0]) {
++            dec_zc_unref(p);
++            return AVERROR(ENOMEM);
++        }
++        heap = f->buf[0]->data;
++    }
++    for (i = 0; i < 3; i++) {
++        f->data[i] = heap + p->off[i];
++        f->linesize[i] = (int)(i ? p->c_stride : p->y_stride);
++    }
++    if (!sl) {
++        dec_zc_unref(p);   /* the heap buffer does not hold the pool */
++    }
++    return 0;
++}
++
++/*
++ * The slot this frame was decoded into, or NULL for a frame in a buffer of
++ * libavcodec's own, or of a pool that has been replaced. *gen is the slot's
++ * pool and *idx its index there.
++ */
++static DecZcSlot *dec_zc_slot_of(VirtIOMediaDec *d, const AVFrame *f,
++                                 uint64_t *gen, unsigned *idx)
++{
++    DecZcSlot *sl = NULL;
++    DecZcPool *p;
++    unsigned i;
++
++    if (!f->buf[0] || f->buf[1]) {
++        return NULL;
++    }
++    qemu_mutex_lock(&d->zc_lock);
++    p = d->zc;
++    if (p) {
++        qemu_mutex_lock(&p->lock);
++        for (i = 0; i < p->n; i++) {
++            if (p->slot[i].buf.map == f->buf[0]->data) {
++                sl = &p->slot[i];
++                *gen = p->gen;
++                *idx = i;
++                break;
++            }
++        }
++        qemu_mutex_unlock(&p->lock);
++    }
++    qemu_mutex_unlock(&d->zc_lock);
++    return sl;
++}
++
++/* The CPU's writes to the slot out to memory, once per frame. */
++static void dec_zc_flush(DecZcSlot *sl)
++{
++    DecZcPool *p = sl->pool;
++    bool todo;
++
++    qemu_mutex_lock(&p->lock);
++    todo = !sl->synced;
++    sl->synced = true;
++    qemu_mutex_unlock(&p->lock);
++    if (todo) {
++        dec_sw_sync(sl->buf.fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
++    }
++}
++
++/*
++ * A frame came out of libavcodec: flush its pixels out of the CPU's caches
++ * for the GPU here, on the decode thread, not on the main loop. A frame is
++ * not written again once it is out; libavcodec only reads it as a reference.
++ */
++static void dec_zc_done(VirtIOMediaDec *d, const AVFrame *f)
++{
++    uint64_t gen;
++    unsigned idx;
++    DecZcSlot *sl = dec_zc_slot_of(d, f, &gen, &idx);
++
++    /* staging reads the frame on the CPU: nothing to flush (zc_write would) */
++    if (sl && !qatomic_read(&d->zc_off)) {
++        dec_zc_flush(sl);
++    }
++}
++
++/*
++ * The decoder lets go of its pool (codec switch, close): the frames still out
++ * keep it alive until they are released.
++ */
++static void dec_zc_drop_pool(VirtIOMediaDec *d)
++{
++    DecZcPool *p;
++
++    qemu_mutex_lock(&d->zc_lock);
++    p = d->zc;
++    d->zc = NULL;
++    qemu_mutex_unlock(&d->zc_lock);
++    if (p) {
++        dec_zc_unref(p);
++    }
++}
++
++/* Main loop: the GL imports of the slots, after the GPU is done with them. */
++static void dec_zc_gpu_clear(VirtIOMediaDec *d)
++{
++    unsigned i;
++
++    /* a held frame's wait uses its import */
++    while (d->gpu_held_n) {
++        dec_gpu_unhold_oldest(d);
++    }
++    for (i = 0; i < DEC_ZC_MAX; i++) {
++        if (d->zc_gpu[i]) {
++            virtio_media_gpu_release(d->zc_gpu[i]);
++            d->zc_gpu[i] = NULL;
++        }
++    }
++    d->zc_gpu_gen = 0;
++}
++
+ /*
+  * q11-dec-sw-gpu: a software frame (YUV420P) to the guest's RGBA resource on
+  * the GPU. The CPU path converted it to RGBA with swscale -- no NEON path for
+@@ -1598,6 +1968,125 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     return 0;
+ }
+ 
++/*
++ * The counters, at the first zero-copy frame and then every DEC_ZC_LOG_EVERY
++ * software frames: what went zero-copy, and what was staged and why, so that
++ * a stream silently on the staging path shows in the log.
++ */
++static void dec_zc_report(VirtIOMediaDec *d)
++{
++    unsigned n = 0;
++    uint64_t fb = 0;
++    DecZcPool *p;
++
++    if (d->zc_logged && (d->zc_n + d->zc_st_n) % DEC_ZC_LOG_EVERY) {
++        return;
++    }
++    d->zc_logged = true;
++    qemu_mutex_lock(&d->zc_lock);
++    p = d->zc;
++    if (p) {
++        qemu_mutex_lock(&p->lock);
++        n = p->n;
++        fb = p->fallback_n;
++        qemu_mutex_unlock(&p->lock);
++    }
++    qemu_mutex_unlock(&d->zc_lock);
++    info_report("virtio-media/dec: zero-copy: %s: %" PRIu64 " frames from the "
++                "decoder's buffers, %" PRIu64 " staged (%" PRIu64 " not in "
++                "the pool, %" PRIu64 " layout or guest buffer, %" PRIu64
++                " no GL, %" PRIu64 " off); pool %u buffers, %" PRIu64
++                " decodes found none free", d->codec->desc, d->zc_n,
++                d->zc_st_n, d->zc_st[0], d->zc_st[1], d->zc_st[2], d->zc_st[3],
++                n, fb);
++}
++
++/*
++ * q11-dec-zero-copy: a frame in a slot of the pool straight to the guest's
++ * RGBA resource, converted by the GPU from its three planes. Returns 0 when
++ * the resource holds the frame; -ENOENT for a frame not in the pool, -ERANGE
++ * for a buffer this path does not write (as dec_sw_gpu_write) and -EAGAIN
++ * without a GL context: then the frame goes by dec_sw_gpu_write. Another
++ * negative errno when the GPU cannot take the pool's frames.
++ */
++static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
++                            const AVFrame *fr, uint32_t w, uint32_t h)
++{
++    VirtIOMediaDec *d = s->dec;
++    uint32_t fw = (uint32_t)fr->width, fh = (uint32_t)fr->height;
++    bool scaled = fw != w || fh != h;
++    float scale = scaled ? (float)fw / w : 1.0f;
++    int matrix = dec_gpu_matrix(fr);
++    uint32_t off[3], key[9];
++    DecZcSlot *sl;
++    DecZcPool *p;
++    uint64_t gen = 0;
++    unsigned idx = 0, i;
++    int err = 0, r;
++    uint32_t tex;
++
++    if (!gb->virgl_res || gb->num_planes != 1 ||
++        (scaled && !dec_scaled_ok(d, fw, fh, w, h))) {
++        return -ERANGE;
++    }
++    sl = dec_zc_slot_of(d, fr, &gen, &idx);
++    if (!sl) {
++        return -ENOENT;
++    }
++    /* the frame holds the slot, and the slot its pool */
++    p = sl->pool;
++    for (i = 0; i < 3; i++) {
++        ptrdiff_t o = fr->data[i] - sl->buf.map;
++
++        /* cropping moves the planes' starts; the import wants them aligned */
++        if (o < 0 || (size_t)o >= sl->buf.size || (o & 63) ||
++            fr->linesize[i] != (int)(i ? p->c_stride : p->y_stride)) {
++            return -ERANGE;
++        }
++        off[i] = (uint32_t)o;
++    }
++    dec_zc_flush(sl);   /* done on the decode thread already, normally */
++    key[0] = fw; key[1] = fh; key[2] = w; key[3] = h; key[4] = (uint32_t)matrix;
++    key[5] = off[0]; key[6] = off[1]; key[7] = off[2];
++    key[8] = (uint32_t)(gen >> 32) ^ (uint32_t)gen;
++    if (d->zc_gpu_gen != gen || memcmp(d->zc_gpu_key, key, sizeof(key))) {
++        dec_zc_gpu_clear(d);
++        d->zc_gpu_gen = gen;
++        memcpy(d->zc_gpu_key, key, sizeof(key));
++    }
++    if (!d->zc_gpu[idx]) {
++        int fd = fcntl(sl->buf.fd, F_DUPFD_CLOEXEC, 0);
++
++        if (fd < 0) {
++            return -errno;
++        }
++        d->zc_gpu[idx] = virtio_media_gpu_import_i420(fd, fw, fh, p->y_stride,
++                                                      p->c_stride, off, w, h,
++                                                      scale, (uint32_t)p->len,
++                                                      matrix, &err);
++        if (!d->zc_gpu[idx]) {
++            return err ? err : -EINVAL;
++        }
++    }
++    r = virtio_media_gpu_blit(d->zc_gpu[idx], gb->virgl_res);
++    if (r == -EINVAL) {
++        return -ERANGE;   /* this guest buffer (its size, or no resource) */
++    }
++    if (r) {
++        return r;
++    }
++    /* the decoder may write the slot again once the frame is let go */
++    dec_gpu_hold(d, fr, d->zc_gpu[idx]);
++
++    tex = virtio_media_gpu_res_tex(gb->virgl_res);
++    if (d->ds_epoch && tex) {
++        direct_scanout_forget_tex(tex);
++    }
++    d->zc_n++;
++    dec_zc_report(d);
++    return 0;
++}
++
+ /*
+  * Write one decoded frame into the guest's pages as RGBA.
+  *
+@@ -1685,7 +2174,24 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+     /* q11-dec-sw-gpu: a software frame to the GPU, as dec_gpu_write does */
+     if ((fr->format == AV_PIX_FMT_YUV420P || fr->format == AV_PIX_FMT_YUVJ420P) &&
+         s->vm->gpu_xfer && !d->sw_off) {
+-        int r = dec_sw_gpu_write(s, gb, fr, w, h);
++        bool off = qatomic_read(&d->zc_off);
++        int r = off ? -ECANCELED : dec_zc_gpu_write(s, gb, fr, w, h);
++
++        if (r == 0) {
++            *bytesused = need;
++            return true;
++        }
++        if (r != -EAGAIN && r != -ERANGE && r != -ENOENT && !off) {
++            qatomic_set(&d->zc_off, true);
++            dec_zc_gpu_clear(d);
++            warn_report("virtio-media/dec: zero-copy: the GPU cannot take the "
++                        "decoder's buffers (%d); staging the frames until the "
++                        "stream changes", r);
++        }
++        d->zc_st[r == -ENOENT ? 0 : r == -ERANGE ? 1 : r == -EAGAIN ? 2 : 3]++;
++        d->zc_st_n++;
++        dec_zc_report(d);
++        r = dec_sw_gpu_write(s, gb, fr, w, h);
+ 
+         if (r == 0) {
+             *bytesused = need;
+@@ -1928,6 +2434,9 @@ static void *dec_thr_run(void *opaque)
+             }
+             qemu_mutex_unlock(&d->thr_lock);
+             r = avcodec_receive_frame(d->avctx, f);
++            if (r == 0) {
++                dec_zc_done(d, f);
++            }
+             qemu_mutex_lock(&d->thr_lock);
+             if (d->thr_flush || d->thr_quit) {
+                 av_frame_unref(f);
+@@ -2602,6 +3111,11 @@ static int dec_codec_open(VirtIOMediaSession *s)
+     if (!d->codec->hwaccel) {
+         d->avctx->thread_count = 2;
+         d->avctx->thread_type = FF_THREAD_FRAME;
++        /* q11-dec-zero-copy: only the GPU path reads the pool's planes in place */
++        if (s->vm->gpu_xfer) {
++            d->avctx->opaque = d;
++            d->avctx->get_buffer2 = dec_zc_get_buffer;
++        }
+     }
+ 
+     /*
+@@ -2654,9 +3168,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+     dec_thr_stop(d);
+     dec_gpu_reset(d);
+     dec_sw_clear(d);
++    dec_zc_gpu_clear(d);
+     dec_backlog_clear(d);
+     av_frame_free(&d->held);
+     avcodec_free_context(&d->avctx);
++    dec_zc_drop_pool(d);
++    qatomic_set(&d->zc_off, false);
+     d->stream_fmt_known = false;
+     d->awaiting_reconfig = false;
+     d->draining = false;
+@@ -2683,6 +3200,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+     for (unsigned i = 0; i < DEC_SW_RING; i++) {
+         d->sw[i].fd = -1;
+     }
++    qemu_mutex_init(&d->zc_lock);
+     d->backlog = g_queue_new();
+     d->coded_w = DEC_MIN_W;
+     d->coded_h = DEC_MIN_H;
+@@ -2717,6 +3235,10 @@ fail:
+     av_buffer_unref(&d->hwdev);
+     dec_backlog_clear(d);
+     g_queue_free(d->backlog);
++    if (d->zc) {
++        dec_zc_unref(d->zc);
++    }
++    qemu_mutex_destroy(&d->zc_lock);
+     g_free(d);
+     return ENOMEM;
+ }
+@@ -2731,6 +3253,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     dec_thr_stop(d);
+     dec_gpu_clear(d);
+     dec_sw_clear(d);
++    dec_zc_gpu_clear(d);
+     sws_freeContext(d->sws_nv12);
+     av_buffer_unref(&d->gpu_fctx);
+     if (d->avctx) {
+@@ -2744,6 +3267,11 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     dec_backlog_clear(d);
+     g_queue_free(d->backlog);
+     sws_freeContext(d->sws);
++    /* frames still out (none after the above) keep the pool alive */
++    if (d->zc) {
++        dec_zc_unref(d->zc);
++    }
++    qemu_mutex_destroy(&d->zc_lock);
+     g_free(d);
+     s->dec = NULL;
+ }
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index fa90965..3fe379c 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -78,6 +78,9 @@ typedef struct VirtIOMediaGpuBuf {
+     float scale_x, scale_y;   /* source pixels per destination pixel */
+     GLuint tex_uv;
+     int matrix;
++    /* q11-dec-zero-copy: three R8 planes (Y, Cb, Cr): tex, tex_uv = Cb, tex_v = Cr */
++    bool i420;
++    GLuint tex_v;
+     bool sand;                /* planes are SAND128 external textures (host-sand) */
+     bool sand_linear;         /* host-sand=2: tex is the whole buffer as linear RGBA8 */
+     uint32_t col_height;      /* host-sand=2: lines per 128-byte column */
+@@ -124,6 +127,10 @@ static struct {
+     GLuint prog_sl;
+     GLint s_t, s_geom, s_scale, s_yoff, s_yscale, s_coef;
+     bool prog_sl_failed;
++    /* q11-dec-zero-copy: YUV420P (three planes) -> RGBA. */
++    GLuint prog_i4;
++    GLint i_y, i_u, i_v, i_src_size, i_scale, i_yoff, i_yscale, i_coef;
++    bool prog_i4_failed;
+ } gpu;
+ 
+ typedef struct GpuSaved {
+@@ -154,6 +161,9 @@ static void gpu_free_buf(VirtIOMediaGpuBuf *b)
+     if (b->tex_uv) {
+         glDeleteTextures(1, &b->tex_uv);
+     }
++    if (b->tex_v) {
++        glDeleteTextures(1, &b->tex_v);
++    }
+     glDeleteTextures(1, &b->tex);
+     g_free(b);
+ }
+@@ -405,6 +415,31 @@ static const char *nv12_fs_ext =
+     "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
+     "}\n";
+ 
++/* q11-dec-zero-copy: the same maths, Cb and Cr from planes of their own. */
++static const char *i420_fs =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "uniform sampler2D u_y;\n"
++    "uniform sampler2D u_u;\n"
++    "uniform sampler2D u_v;\n"
++    "uniform vec2 u_src_size;\n"
++    "uniform vec2 u_scale;\n"
++    "uniform float u_yoff;\n"
++    "uniform float u_yscale;\n"
++    "uniform vec4 u_coef;\n"
++    "out vec4 o;\n"
++    "void main() {\n"
++    "  vec2 uv = gl_FragCoord.xy * u_scale / u_src_size;\n"
++    "  float y = (texture(u_y, uv).r - u_yoff) * u_yscale;\n"
++    /* chroma by its own size: (w + 1) / 2 texels are not half of w when w is odd */
++    "  vec2 cuv = gl_FragCoord.xy * u_scale * 0.5 / vec2(textureSize(u_u, 0));\n"
++    "  vec2 c = vec2(texture(u_u, cuv).r, texture(u_v, cuv).r) - vec2(0.5);\n"
++    "  float r = y + u_coef.x * c.y;\n"
++    "  float g = y + u_coef.y * c.x + u_coef.z * c.y;\n"
++    "  float b = y + u_coef.w * c.x;\n"
++    "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
++    "}\n";
++
+ /*
+  * host-sand=2. The buffer is NV12_COL128: 128-byte-wide columns of u_geom.y lines, each luma
+  * rows of Y (u_geom.z) then luma/2 rows of interleaved CbCr. It is bound as a linear RGBA8
+@@ -530,6 +565,33 @@ static bool gpu_build_sand_program(void)
+     return true;
+ }
+ 
++static bool gpu_build_i420_program(void)
++{
++    GLuint p;
++
++    if (gpu.prog_i4) {
++        return true;
++    }
++    if (gpu.prog_i4_failed) {
++        return false;
++    }
++    p = gpu_link_nv12_program(i420_fs);
++    if (!p) {
++        gpu.prog_i4_failed = true;
++        return false;
++    }
++    gpu.prog_i4 = p;
++    gpu.i_y = glGetUniformLocation(p, "u_y");
++    gpu.i_u = glGetUniformLocation(p, "u_u");
++    gpu.i_v = glGetUniformLocation(p, "u_v");
++    gpu.i_src_size = glGetUniformLocation(p, "u_src_size");
++    gpu.i_scale = glGetUniformLocation(p, "u_scale");
++    gpu.i_yoff = glGetUniformLocation(p, "u_yoff");
++    gpu.i_yscale = glGetUniformLocation(p, "u_yscale");
++    gpu.i_coef = glGetUniformLocation(p, "u_coef");
++    return true;
++}
++
+ static bool gpu_build_nv12_program(bool ext)
+ {
+     GLuint p;
+@@ -643,6 +705,75 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+     return b;
+ }
+ 
++void *virtio_media_gpu_import_i420(int dmabuf_fd, uint32_t src_width,
++                                   uint32_t src_height, uint32_t y_stride,
++                                   uint32_t c_stride, const uint32_t offset[3],
++                                   uint32_t dst_width, uint32_t dst_height,
++                                   float scale, uint32_t len, int matrix,
++                                   int *err)
++{
++    GpuSaved sv;
++    VirtIOMediaGpuBuf *b;
++    bool scaled = scale != 1.0f;
++    uint32_t cw = (src_width + 1) / 2, ch = (src_height + 1) / 2;
++
++    if (!gpu_enter(&sv)) {
++        close(dmabuf_fd);
++        if (err) {
++            *err = gpu.tried && gpu.ctx == EGL_NO_CONTEXT ? -ENOTSUP : -EAGAIN;
++        }
++        return NULL;
++    }
++    if (!gpu_build_i420_program()) {
++        gpu_leave(&sv);
++        close(dmabuf_fd);
++        if (err) {
++            *err = -ENOTSUP;
++        }
++        return NULL;
++    }
++    b = g_new0(VirtIOMediaGpuBuf, 1);
++    b->sync_fd = -1;
++    b->fd = dmabuf_fd;
++    b->nv12 = true;           /* takes the gpu_draw_nv12() path in the blit */
++    b->i420 = true;
++    b->width = dst_width;
++    b->height = dst_height;
++    b->src_width = src_width;
++    b->src_height = src_height;
++    b->scale_x = scale;
++    b->scale_y = scale;
++    b->stride = y_stride;
++    b->len = len;
++    b->matrix = matrix;
++    b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, src_width,
++                              src_height, y_stride, offset[0], scaled,
++                              VM_DRM_FORMAT_MOD_LINEAR, false);
++    b->tex_uv = b->tex ? gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, cw, ch,
++                                          c_stride, offset[1], scaled,
++                                          VM_DRM_FORMAT_MOD_LINEAR, false) : 0;
++    b->tex_v = b->tex_uv ? gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, cw,
++                                            ch, c_stride, offset[2], scaled,
++                                            VM_DRM_FORMAT_MOD_LINEAR, false) : 0;
++    if (!b->tex_v) {
++        if (b->tex_uv) {
++            glDeleteTextures(1, &b->tex_uv);
++        }
++        if (b->tex) {
++            glDeleteTextures(1, &b->tex);
++        }
++        gpu_leave(&sv);
++        close(dmabuf_fd);
++        g_free(b);
++        if (err) {
++            *err = -EINVAL;
++        }
++        return NULL;
++    }
++    gpu_leave(&sv);
++    return b;
++}
++
+ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
+                                           uint32_t luma_rows, uint32_t col_height,
+                                           uint32_t dst_width, uint32_t dst_height,
+@@ -775,6 +906,37 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+         return 0;
+     }
++    if (b->i420) {
++        if (!gpu_build_i420_program()) {
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++            return -EIO;
++        }
++        glUseProgram(gpu.prog_i4);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, b->tex);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, b->tex_uv);
++        glActiveTexture(GL_TEXTURE2);
++        glBindTexture(GL_TEXTURE_2D, b->tex_v);
++        glUniform1i(gpu.i_y, 0);
++        glUniform1i(gpu.i_u, 1);
++        glUniform1i(gpu.i_v, 2);
++        glUniform2f(gpu.i_src_size, (float)b->src_width, (float)b->src_height);
++        glUniform2f(gpu.i_scale, b->scale_x, b->scale_y);
++        glUniform1f(gpu.i_yoff, yoff);
++        glUniform1f(gpu.i_yscale, yscale);
++        glUniform4fv(gpu.i_coef, 1, c);
++        glBindVertexArray(0);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glUseProgram(0);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        return 0;
++    }
+     if (!gpu_build_nv12_program(b->sand)) {
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+         return -EIO;
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 701595d..4776cd0 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -77,6 +77,18 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t dst_height, float scale,
+                                    uint32_t len, int matrix,
+                                    uint32_t sand_col_height, int *err);
++/*
++ * q11-dec-zero-copy: the same conversion from a linear YUV420P buffer: Y at
++ * offset[0] with `y_stride`, Cb and Cr at offset[1] and offset[2] with
++ * `c_stride`, each plane half the size of Y (rounded up). The other arguments
++ * are those of virtio_media_gpu_import_nv12().
++ */
++void *virtio_media_gpu_import_i420(int dmabuf_fd, uint32_t src_width,
++                                   uint32_t src_height, uint32_t y_stride,
++                                   uint32_t c_stride, const uint32_t offset[3],
++                                   uint32_t dst_width, uint32_t dst_height,
++                                   float scale, uint32_t len, int matrix,
++                                   int *err);
+ /*
+  * host-sand=2: the same conversion from a SAND (NV12_COL128) buffer of `len` bytes, read as
+  * one linear RGBA8 texture 512 texels (2048 bytes) wide. `luma_rows` lines of Y then

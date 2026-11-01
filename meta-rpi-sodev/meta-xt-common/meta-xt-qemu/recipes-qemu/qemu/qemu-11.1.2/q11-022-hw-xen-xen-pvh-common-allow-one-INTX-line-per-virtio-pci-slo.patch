@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] hw/xen/xen-pvh-common: allow one INTX line per virtio-pci
+ slot
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0215-v10-xen-pvh-common-one-INTX-line-per-virtio-pci-slot.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [needs the fork-only libxl change Xen 4.22-0010 (Inappropriate) to have a user]
+---
+ hw/xen/xen-pvh-common.c         | 117 ++++++++++++++++++++++++++++++++
+ include/hw/xen/xen-pvh-common.h |   6 ++
+ 2 files changed, 123 insertions(+)
+
+diff --git a/hw/xen/xen-pvh-common.c b/hw/xen/xen-pvh-common.c
+index 2ae195251..b9a187506 100644
+--- a/hw/xen/xen-pvh-common.c
++++ b/hw/xen/xen-pvh-common.c
+@@ -12,6 +12,8 @@
+ #include "qapi/visitor.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/irq.h"
++#include "hw/pci/pci.h"
++#include "hw/pci/pci_host.h"
+ #include "system/tpm.h"
+ #include "system/tpm_backend.h"
+ #include "system/runstate.h"
+@@ -214,6 +216,66 @@ static void xen_enable_tpm(XenPVHMachineState *s)
+ }
+ #endif
+ 
++/*
++ * Number of INTX interrupt lines the virtio PCI host hands out.
++ *
++ * The GPEX default is the four INTA-D lines, and libxl's interrupt-map wraps
++ * them as irq = irq_first + ((pin + slot) % num_irqs). With four lines and
++ * eight virtio devices that pairs slot 1&5, 2&6, 3&7 and 4&8 onto one
++ * level-triggered SPI each. Measured in DomA on RPi5/AAOS17 (2026-08-24):
++ *
++ *     14: 14437  Level  virtio0, virtio4   (blk 01   + tablet 05)
++ *     15:   599  Level  virtio1, virtio5   (vsock 02 + net1 06)
++ *     16: 30570  Level  virtio2, virtio6   (serial 03 + gpu 07)
++ *     17:   155  Level  virtio7, virtio3   (net0 04  + snd 08)
++ *
++ * virtio-snd needs one completion interrupt per period and that completion is
++ * its ONLY wake-up source: a single lost interrupt stalls playback forever
++ * (unlike blk/net, which recover on the next kick). The guest cannot fall back
++ * to MSI -- this SoC has a GIC-400 (GICv2, no ITS) and Xen emulates no GICv2m
++ * frame -- so the fix is to widen the line count instead.
++ *
++ * libxl's 4.22-0010 hands out 16 lines and keeps four slot bits in the
++ * interrupt-map-mask, so every slot from 01.0 to 15.0 has an SPI of its own.
++ * Sixteen and not eight because virtio-media sits at slot 09.0, which with
++ * eight lines would fold onto slot 01.0, virtio-blk.
++ *
++ * A file-static is used because map_irq() is handed only (PCIDevice *, pin)
++ * and there is exactly one PVH machine per qemu process, the same reason the
++ * 7.0.0-xt fork's hw/arm/xen_arm.c keeps its layout in file-statics.
++ */
++#define XEN_PVH_PCI_MAX_INTX_IRQS 16
++static unsigned int xenpvh_pci_intx_irq_count = PCI_NUM_PINS;
++
++static int xenpvh_pci_map_irq(PCIDevice *pci_dev, int pin)
++{
++    /*
++     * Must match libxl's interrupt-map exactly:
++     *   irq = irq_first + ((pin + slot) % num_irqs)
++     * With num_irqs == PCI_NUM_PINS this is pci_swizzle_map_irq_fn().
++     */
++    return (pin + PCI_SLOT(pci_dev->devfn)) % xenpvh_pci_intx_irq_count;
++}
++
++/*
++ * The route callback must be replaced together with map_irq.
++ * pci_device_route_intx_to_irq() applies map_irq() FIRST and only then calls
++ * route_intx_to_irq() with the result, and GPEX's own callback indexes
++ * GPEXHost::irq_num[PCI_NUM_PINS] -- a four-entry array -- so leaving it in
++ * place while map_irq() can return more than 3 would read out of bounds.
++ * Compute the GSI directly instead; it is the same value
++ * xen_pvh_set_pci_intx_irq() drives.
++ */
++static PCIINTxRoute xenpvh_pci_route_intx(void *opaque, int line)
++{
++    XenPVHMachineState *s = XEN_PVH_MACHINE(opaque);
++
++    return (PCIINTxRoute) {
++        .mode = PCI_INTX_ENABLED,
++        .irq = s->cfg.pci_intx_irq_base + line,
++    };
++}
++
+ /*
+  * We use the GPEX PCIe controller with its internal INTX PCI interrupt
+  * swizzling. This swizzling is emulated in QEMU and routes all INTX
+@@ -270,6 +332,28 @@ static inline void xenpvh_gpex_init(XenPVHMachineState *s,
+             xpc->set_pci_link_route(i, s->cfg.pci_intx_irq_base + i);
+         }
+     }
++
++    /*
++     * Replace the GPEX default (four INTA-D lines with a mod-4 swizzle) so the
++     * line count follows pci-intx-irq-count. When the property is unset -- or
++     * set to PCI_NUM_PINS -- this is behaviourally identical to what
++     * gpex_host_realize() installed, so there is a single code path.
++     */
++    if (s->cfg.pci_intx_irq_count) {
++        if (s->cfg.pci_intx_irq_count > XEN_PVH_PCI_MAX_INTX_IRQS) {
++            error_report("pci-intx-irq-count %u exceeds the maximum of %u",
++                         s->cfg.pci_intx_irq_count,
++                         XEN_PVH_PCI_MAX_INTX_IRQS);
++            exit(EXIT_FAILURE);
++        }
++        xenpvh_pci_intx_irq_count = s->cfg.pci_intx_irq_count;
++    }
++
++    pci_bus_irqs(PCI_HOST_BRIDGE(dev)->bus, xpc->set_pci_intx_irq, s,
++                 xenpvh_pci_intx_irq_count);
++    pci_bus_map_irqs(PCI_HOST_BRIDGE(dev)->bus, xenpvh_pci_map_irq);
++    pci_bus_set_route_irq_fn(PCI_HOST_BRIDGE(dev)->bus,
++                             xenpvh_pci_route_intx);
+ }
+ 
+ static void xen_pvh_init(MachineState *ms)
+@@ -407,6 +491,30 @@ static void xen_pvh_set_pci_intx_irq_base(Object *obj, Visitor *v,
+     xp->cfg.pci_intx_irq_base = value;
+ }
+ 
++static void xen_pvh_set_pci_intx_irq_count(Object *obj, Visitor *v,
++                                           const char *name, void *opaque,
++                                           Error **errp)
++{
++    XenPVHMachineState *xp = XEN_PVH_MACHINE(obj);
++    uint32_t value;
++
++    if (!visit_type_uint32(v, name, &value, errp)) {
++        return;
++    }
++
++    xp->cfg.pci_intx_irq_count = value;
++}
++
++static void xen_pvh_get_pci_intx_irq_count(Object *obj, Visitor *v,
++                                           const char *name, void *opaque,
++                                           Error **errp)
++{
++    XenPVHMachineState *xp = XEN_PVH_MACHINE(obj);
++    uint32_t value = xp->cfg.pci_intx_irq_count;
++
++    visit_type_uint32(v, name, &value, errp);
++}
++
+ static void xen_pvh_get_pci_intx_irq_base(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+@@ -475,6 +583,15 @@ do {                                                                      \
+                                   NULL, NULL);
+         object_class_property_set_description(oc, "pci-intx-irq-base",
+                                   "Set PCI INTX interrupt base line.");
++
++        object_class_property_add(oc, "pci-intx-irq-count", "uint32_t",
++                                  xen_pvh_get_pci_intx_irq_count,
++                                  xen_pvh_set_pci_intx_irq_count,
++                                  NULL, NULL);
++        object_class_property_set_description(oc, "pci-intx-irq-count",
++                                  "Number of PCI INTX interrupt lines "
++                                  "(default 4). Must match libxl's "
++                                  "interrupt-map.");
+     }
+ 
+ #ifdef CONFIG_TPM
+diff --git a/include/hw/xen/xen-pvh-common.h b/include/hw/xen/xen-pvh-common.h
+index 0209b798f..a660eac7e 100644
+--- a/include/hw/xen/xen-pvh-common.h
++++ b/include/hw/xen/xen-pvh-common.h
+@@ -86,6 +86,12 @@ struct XenPVHMachineState {
+         uint32_t pci_intx_irq_base;
+ 
+         bool mapcache;
++        /*
++         * Number of INTX interrupt lines the PCIe host hands out. 0 means
++         * "use the GPEX default of PCI_NUM_PINS". See the comment on
++         * xenpvh_pci_intx_irq_count in hw/xen/xen-pvh-common.c.
++         */
++        uint32_t pci_intx_irq_count;
+     } cfg;
+ };
+ 

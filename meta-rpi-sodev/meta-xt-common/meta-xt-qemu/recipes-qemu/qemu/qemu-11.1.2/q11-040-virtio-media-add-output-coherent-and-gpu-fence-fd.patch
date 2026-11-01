@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-media: add output-coherent and gpu-fence-fd
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0242-v10-virtio-media-output-coherent-and-gpu-fence-fd.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-virgl-stub.c    |   4 +
+ hw/virtio/virtio-media-virgl.c         | 120 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media.c               |  23 +++++
+ include/hw/virtio/virtio-media-virgl.h |   6 ++
+ include/hw/virtio/virtio-media.h       |  17 ++++
+ 5 files changed, 169 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+index b58febb59..6494912ad 100644
+--- a/hw/virtio/virtio-media-virgl-stub.c
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -45,6 +45,10 @@ int virtio_media_gpu_wait(void *handle)
+     return 0;
+ }
+ 
++void virtio_media_gpu_set_fence_fd(bool on)
++{
++}
++
+ void virtio_media_gpu_release(void *handle)
+ {
+ }
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index b7a8b49ca..9bdc3f498 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -11,6 +11,12 @@
+ #include <virglrenderer.h>
+ #include <epoxy/egl.h>
+ #include <epoxy/gl.h>
++#include <poll.h>
++
++#ifndef EGL_SYNC_NATIVE_FENCE_ANDROID
++#define EGL_SYNC_NATIVE_FENCE_ANDROID       0x3144
++#define EGL_NO_NATIVE_FENCE_FD_ANDROID      -1
++#endif
+ 
+ /* drm_fourcc.h values, spelled out to avoid a libdrm dependency. */
+ #define VM_DRM_FORMAT_ABGR8888  0x34324241u   /* 'AB24': R,G,B,A byte order */
+@@ -54,6 +60,17 @@ typedef struct VirtIOMediaGpuBuf {
+     GLuint tex;
+     GLuint read_fbo;          /* the blit's read FBO, made on first use */
+     GLsync sync;              /* last copy that read this buffer, or NULL */
++    /*
++     * NOTE: Same fence, as a sync_file fd (gpu-fence-fd). The point is not the
++     * wait -- in 289,000 frames the fence was always already signalled by the
++     * time the guest re-queued the buffer -- it is that checking a GLsync
++     * needs a current GL context, and virtio_media_gpu_wait() therefore paid
++     * eglMakeCurrent twice per CAPTURE QBUF: 449 us wall / 435 us CPU measured
++     * on RPi4 2026-09-07, about 0.45 ms of every 21 ms frame. A sync_file fd
++     * is checked with poll(), which needs no context at all, and it is created
++     * inside the blit's existing GL section where it costs almost nothing.
++     */
++    int sync_fd;              /* -1 when unused */
+     /* host-nv12: two planes of one NV12 buffer, converted by a shader. */
+     bool nv12;
+     uint32_t src_width;
+@@ -163,6 +180,19 @@ static bool gpu_create_context(EGLDisplay dpy, EGLContext share)
+     return true;
+ }
+ 
++/*
++ * gpu-fence-fd, and whether the driver can actually do it. Set from the device
++ * property at realize; the extension is probed once, the first time a fence is
++ * created, because that is the first point where a display is known.
++ */
++static bool gpu_fence_fd_want;
++static int gpu_fence_fd_ok = -1;   /* -1 = not probed yet */
++
++void virtio_media_gpu_set_fence_fd(bool on)
++{
++    gpu_fence_fd_want = on;
++}
++
+ /*
+  * Switch to the bridge context. false = nothing current (virgl idle or not
+  * initialised) or the context could not be created: caller falls back.
+@@ -403,6 +433,7 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+         return NULL;
+     }
+     b = g_new0(VirtIOMediaGpuBuf, 1);
++    b->sync_fd = -1;
+     b->fd = dmabuf_fd;
+     b->nv12 = true;
+     b->width = dst_width;
+@@ -527,6 +558,7 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+     }
+ 
+     b = g_new0(VirtIOMediaGpuBuf, 1);
++    b->sync_fd = -1;
+     b->fd = dmabuf_fd;
+     b->width = width;
+     b->height = height;
+@@ -602,6 +634,14 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+         glDeleteSync(b->sync);
+         b->sync = NULL;
+     }
++    if (b->sync_fd >= 0) {
++        /*
++         * Same reason, and it must be closed rather than leaked: one fd per
++         * capture buffer per frame would exhaust the process in seconds.
++         */
++        close(b->sync_fd);
++        b->sync_fd = -1;
++    }
+ 
+     if (b->nv12) {
+         ret = gpu_draw_nv12(b, info.tex_id);
+@@ -638,6 +678,42 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+         ret = -EIO;
+         goto out;
+     }
++    /*
++     * NOTE: We are inside the aux GL section here, so making the fence exportable
++     * is nearly free -- and it is what lets virtio_media_gpu_wait() skip
++     * eglMakeCurrent entirely later on.
++     */
++    if (gpu_fence_fd_want && gpu_fence_fd_ok != 0) {
++        EGLSyncKHR es;
++
++        if (gpu_fence_fd_ok < 0) {
++            gpu_fence_fd_ok = epoxy_has_egl_extension(
++                gpu.dpy, "EGL_ANDROID_native_fence_sync") ? 1 : 0;
++            qemu_log("virtio-media-diag: gpu_xfer: native fence fd %s\n",
++                     gpu_fence_fd_ok ? "available" : "NOT available");
++        }
++        if (gpu_fence_fd_ok) {
++            es = eglCreateSyncKHR(gpu.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
++            if (es != EGL_NO_SYNC_KHR) {
++                /* The fd must be duped before the sync object goes away. */
++                glFlush();
++                b->sync_fd = eglDupNativeFenceFDANDROID(gpu.dpy, es);
++                eglDestroySyncKHR(gpu.dpy, es);
++                if (b->sync_fd == EGL_NO_NATIVE_FENCE_FD_ANDROID) {
++                    b->sync_fd = -1;
++                } else {
++                    goto out;
++                }
++            }
++            /*
++             * One failure is enough: fall back for the rest of the run rather
++             * than retrying an extension the driver clearly will not give us.
++             */
++            gpu_fence_fd_ok = 0;
++            qemu_log("virtio-media-diag: gpu_xfer: native fence fd failed "
++                     "(0x%x), using GLsync\n", eglGetError());
++        }
++    }
+     b->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+     /* Submit now so virgl's next draw (other context) orders behind it. */
+     glFlush();
+@@ -653,7 +729,41 @@ int virtio_media_gpu_wait(void *handle)
+     GLenum r;
+     int ret;
+ 
+-    if (!b || !b->sync) {
++    if (!b) {
++        return 0;
++    }
++    /*
++     * NOTE: THE WHOLE POINT OF gpu-fence-fd: no GL context is touched here.
++     *
++     * A sync_file fd becomes readable when the fence signals, so a zero-timeout
++     * poll() is the same test glClientWaitSync(sync, 0, 0) was doing -- without
++     * the two eglMakeCurrent calls that made this function cost 449 us wall /
++     * 435 us CPU per CAPTURE QBUF (RPi4, 2026-09-07). The blocking retry keeps
++     * the same 200 ms bound as the GLsync path, and the return value keeps the
++     * same meaning: 0 = was already done, 1 = had to wait, negative = broken.
++     */
++    if (b->sync_fd >= 0) {
++        struct pollfd pfd = { .fd = b->sync_fd, .events = POLLIN };
++        int r_poll;
++
++        do {
++            r_poll = poll(&pfd, 1, 0);
++        } while (r_poll < 0 && errno == EINTR);
++        ret = 0;
++        if (r_poll == 0) {
++            do {
++                r_poll = poll(&pfd, 1, 200);
++            } while (r_poll < 0 && errno == EINTR);
++            ret = 1;
++        }
++        if (r_poll <= 0) {
++            ret = -EIO;
++        }
++        close(b->sync_fd);
++        b->sync_fd = -1;
++        return ret;
++    }
++    if (!b->sync) {
+         return 0;
+     }
+     if (!gpu_enter(&sv)) {
+@@ -683,6 +793,14 @@ void virtio_media_gpu_release(void *handle)
+         return;
+     }
+     close(b->fd);
++    if (b->sync_fd >= 0) {
++        /* Needs no context, so it is closed before the gpu_enter branch. */
++        struct pollfd pfd = { .fd = b->sync_fd, .events = POLLIN };
++
++        poll(&pfd, 1, 200);
++        close(b->sync_fd);
++        b->sync_fd = -1;
++    }
+     if (gpu_enter(&sv)) {
+         gpu_free_buf(b);
+         gpu_leave(&sv);
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 4de592d4c..faac3cdc5 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -991,6 +991,26 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+      */
+     if (s->vm->gpu_xfer && virtio_media_queue_index(rb->type) == 1) {
+         host_rb.flags = 0;
++    } else if (s->vm->output_coherent) {
++        /*
++         * NOTE: output-coherent: ask for a COHERENT (Normal-NC) OUTPUT buffer too.
++         *
++         * The cacheable request above buys a fast CPU write in
++         * virtio_media_sg_copy, but it makes every QBUF pay vb2's cache
++         * maintenance -- and vb2_dc_prepare syncs the WHOLE sgt, not
++         * bytesused. The host's H.264 OUTPUT sizeimage is 524288 while a
++         * 1080p60 access unit is about 8 KB (measured average 8006 bytes),
++         * so the maintenance covers 64x more memory than the copy touches.
++         * Measured 2026-09-07: this device's host VIDIOC_QBUF costs 593 us
++         * wall / 444 us CPU against 84 us / 60 us for the same ioctl issued
++         * by a native V4L2 client on DomD that REQBUFS both queues coherent.
++         *
++         * The trade is a Normal-NC copy of ~8 KB, about 12 us at the 678 MB/s
++         * measured for uncached writes on this board, against however much of
++         * that 500 us gap is the 512 KB sync. Off by default; the RPi4's DomA
++         * cfg turns it on.
++         */
++        host_rb.flags = 0;
+     } else {
+         host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
+     }
+@@ -1802,6 +1822,7 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+     vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
+     vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
+     vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
++    virtio_media_gpu_set_fence_fd(vm->gpu_fence_fd);
+ 
+     info_report("virtio-media: proxying %s (device_caps 0x%08x)",
+                 vm->v4l2_device, vm->device_caps);
+@@ -1841,6 +1862,8 @@ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+     DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
+     DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
++    DEFINE_PROP_BOOL("output-coherent", VirtIOMedia, output_coherent, false),
++    DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
+ };
+ 
+ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 6917d37de..07b2e0069 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -70,6 +70,12 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t len, int matrix, int *err);
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id);
+ int virtio_media_gpu_wait(void *handle);
++/*
++ * gpu-fence-fd: track the GPU copy with an EGL_ANDROID_native_fence_sync fd so
++ * virtio_media_gpu_wait() can poll() it instead of needing a current GL
++ * context. Set once from the device property at realize.
++ */
++void virtio_media_gpu_set_fence_fd(bool on);
+ void virtio_media_gpu_release(void *handle);
+ 
+ #endif
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 0731dacd2..78b14da9d 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -274,6 +274,23 @@ struct VirtIOMedia {
+      * cannot take the GPU path are converted on the CPU (slow, correct).
+      */
+     bool host_nv12;
++    /*
++     * output-coherent: REQBUFS the host OUTPUT queue coherent instead of
++     * cacheable, trading a Normal-NC bitstream copy (~8 KB) for vb2's cache
++     * maintenance over the whole 512 KB buffer on every QBUF. See the comment
++     * at the flags assignment in virtio_media_reqbufs().
++     */
++    bool output_coherent;
++    /*
++     * gpu-fence-fd: track the GPU copy with an EGL_ANDROID_native_fence_sync
++     * fd instead of a GLsync, so the QBUF-time check is a poll() on that fd
++     * rather than eglMakeCurrent -> glClientWaitSync -> eglMakeCurrent.
++     * Measured 2026-09-07: that GL round trip is 449 us wall / 435 us CPU per
++     * CAPTURE QBUF, and in 289,000 frames the fence never had to be waited
++     * for, so nearly all of it is spent confirming an already-signalled fence.
++     * DomD's Mesa advertises the extension (checked 2026-09-07).
++     */
++    bool gpu_fence_fd;
+ 
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;

@@ -56,7 +56,8 @@ overlay.
   2048 MiB**. DomA gives up 128 MiB more than DomD takes, so that its RAM stays in one
   memory zone -- at 2176 the 82 MB ZONE_NORMAL made AOSP's `extra_free_kbytes.sh` write a
   `watermark_scale_factor` of 615-1777 and kswapd saturated both domains (see
-  `xt-xen-cfg-doma_%.bbappend`).
+  `xt-xen-cfg-doma_%.bbappend`; the script's two defects are fixed since, in an
+  AOSP source build, by `meta-xt-doma`'s `aosp-patches/system/core` 0001 and 0002).
   The direction follows from the asymmetry -- if DomD runs out, weston loses DRM master and
   both guests' device models die with it, whereas AAOS at 2048 is the size upstream
   gives it. Sized at three times the 128 MiB `hostmem` of the time (the hard ceiling on
@@ -73,13 +74,14 @@ overlay.
   numbers cannot drift apart (it fails if DomA gives up less than DomD gains or if the
   condition is ever inverted).
 
-  `--gpu=vulkan` selects qemu 10.0.2-xt, which version-gates off the six 7.0.0-only
+  `--gpu=vulkan` selects qemu 11.1.2, which version-gates off the six 7.0.0-only
   device-model patches. `0111` (virtio-tablet `BTN_TOUCH`) is among them, and Android
   classifies an ABS_X/ABS_Y device as a touchscreen only when it also reports `BTN_TOUCH`;
-  that fix is rebased for 10.0.2 as `meta-xt-qemu`'s `0118`, so the Vulkan lane keeps the touch
-  this SKU's hardware run verified. `0110` is rebased too (as `0120`), `0112` and `0113`
-  do not apply to 10.0.2 at all, and `0101`/`0103` guard a failure that does not
-  reproduce on it -- the per-patch evidence is in `meta-xt-driver-domain`'s
+  that fix is carried for 11.1.2 as `meta-xt-qemu`'s `q11-017` (for the selectable
+  10.0.2-xt as `0118`), so the Vulkan lane keeps the touch this SKU's hardware run
+  verified. `0110` is carried too (`q11-019`; `0120` for 10.0.2), `0101`/`0103` are
+  forward-ported as `q11-021` (`0201` for 10.0.2), and `0112` and `0113` do not apply
+  -- the per-patch evidence against 10.0.2 is in `meta-xt-driver-domain`'s
   `qemu_%.bbappend`. `--gpu=gl` rebuilds the 7.0.0-xt device model with all six.
   See `docs/VULKAN-VENUS.md`.
 
@@ -107,6 +109,11 @@ overlay.
 * **No SCMI, no MIP, no IOMMU.** Clocks and power come from the VideoCore firmware
   mailbox; PCIe MSI is inside the root complex. The SCMI overlays, the SCMI Kconfig
   fragment and the MIP MSI Xen patch are absent rather than remapped.
+* **Xen's console is the mini UART** (`/soc/serial@7e215040`), because the pl011 goes
+  to Bluetooth. `4.22-0014` (rpi4 only) makes Xen leave its divisor as the boot loader
+  programmed it: the automatic baud read returned 0 on some boots, the 16550 fallback
+  then wrote divisor 1 (~31 Mbaud on this UART) and the console was garbage from the
+  first line.
 * **`pixelvalve2` and `pixelvalve4` are the CRTCs** (HDMI0 and HDMI1), per
   `vc4_crtc.c`'s `bcm2711_pv2_data` / `bcm2711_pv4_data` — not pixelvalve0/1 as on
   BCM2712. `pixelvalve1` shares SPI 110 with pixelvalve4 and is deliberately left with
@@ -183,8 +190,9 @@ fetch; the Pi 5 checkout has no such project and skips it.
 board; `build.sh` still runs it between `ninja fetch-doma` and `ninja doma`, where it
 checks that the project, its board config, `init.xenvm-buried-eth0.rc`, the overlay's
 `defaults.xml` and the dialer's `config.xml` are present, that every XML under the
-overlay is well formed, and that `DomaWifiRelay` and `DomaSettingsProviderRRO` are each
-defined by exactly one `Android.bp` under `device/`. A forgotten group flag otherwise
+overlay and the device's `media_codecs_c2.xml` and audio policy XML are well formed,
+and that `DomaWifiRelay`, `DomaSettingsProviderRRO`, `DomaWifiOverlay` and
+`DomaNoSafeAreaRRO` are each defined by exactly one `Android.bp` under `device/`. A forgotten group flag otherwise
 surfaces as `lunch` reporting "Can't find a product spec", which points at neither the
 manifest nor the flag. Nothing under `device/epam/aosp-xenvm-trout` is modified either
 way, so `repo sync` has nothing to reset and the pinned manifest revision can move
@@ -203,6 +211,35 @@ Two consequences worth knowing:
 
 The Yocto-built DomD host services need no equivalent: meta-raspberrypi's own
 `DEFAULTTUNE = "cortexa72-nocrypto"` for raspberrypi4-64 already keeps them A72-safe.
+
+## DomA's display path with the qemu 11.1.2 device model
+
+The vulkan lane selects the qemu 11.1.2 device model (rpi4-sodev.yaml). These act only
+with it:
+
+* **`xt-qemu-display-toggles`**, installed in the DomD image on this board, is a
+  tmpfiles.d entry that creates the `/run/qemu-*` switches at boot: the ISP direct
+  scanout of the decoded video (`media-isp`, `isp-scanout`, `isp-skip-copy`,
+  `media-sg-rw`, `fb-invalidate`, and `isp-scanout-depth` at 2 instead of the code's
+  4), the SAND buffer on a weston overlay plane without the ISP (`sand-scanout`,
+  `sand-skip-isp`), the guest's planes on weston subsurfaces in the HMI case
+  (`plane-handoff`), and the decoder's SAND buffer as such a plane's buffer, scaled by
+  the HVS (`plane-sand`, with `q11-097` for the proxy). Only qemu 11.1.2 reads them
+  (`q11-063`, `q11-066`, `q11-081`); qemu 10.0.2
+  does nothing with them. Removing a file turns its feature off (`isp-scanout-depth`:
+  back to 4).
+* **`RPI4_DOMA_HOST_SAND`** (`xt-xen-cfg-doma`'s bbappend; `1` by default with qemu
+  11, `0` otherwise) adds
+  `host-sand=N` to DomA's virtio-media decoder: `0` is the decoder's NV12 output,
+  `1` SAND128 detiled by DomD's Mesa, `2` SAND sampled as one linear texture and
+  detiled in the shader. `sand-scanout` and `sand-skip-isp` need a value other than
+  `0`. Any value but `0`, `1` and `2`, or a value other than `0` with any other device
+  model, stops the build, because qemu 10.0.2 has no such property and would not
+  start DomA's device model.
+* **`XT_DOMA_OVERLAY_PLANES`** `3` and **`XT_DOMA_PLANE_SCALING`** `1` with qemu 11
+  (`xt-xen-cfg-doma`'s bbappend): three overlay planes for drm_hwcomposer and the
+  scaled primary plane, as on this board's doma.cfg since its display path was
+  measured.
 
 ## Known limitations and open items
 
@@ -327,6 +364,7 @@ recipes-core/images/                    rpi5-image-{minimal,xt}-domd wrappers (r
 recipes-extended/rp1-touch-forward/     retarget the touch panel to the attached output
 recipes-extended/xen/                   Xen 4.22 series + hypervisor Kconfig + BCM2711 passthrough quirks
 recipes-extended/xt-aaos-host-services/ widen COMPATIBLE_MACHINE for the AAOS host services
+recipes-extended/xt-qemu-display-toggles/ /run/qemu-* display-path switches for qemu 11.1.2
 recipes-extended/xt-rpi5-domain/        per-domain CPU pinning (recipe name shared with meta-xt-common)
 recipes-extended/xt-xen-cfg-{doma,domu}/ DomA memory and 1280x720 display, DomU vcpu pinning
 recipes-graphics/wayland/               weston output map and the HDMI-A-1 modeline

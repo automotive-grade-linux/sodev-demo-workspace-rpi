@@ -1,4 +1,4 @@
-# RPi4: pin DomU's vcpu to pcpu 2 instead of pcpu 1.
+# RPi4: pin DomU's vcpu to pcpu 2-3 instead of pcpu 1.
 #
 # WHY
 # The shared domu.cfg pins DomU to pcpu 1, and its comment states the intent:
@@ -23,18 +23,20 @@
 # remaining ~33% "steal" is NOT pcpu contention -- it persists with DomU alone on
 # a core -- see review/FIX-STATUS.md. Do not expect this change to fix frame rate.
 #
-# G4 CONSEQUENCE -- READ BEFORE ADDING DomA
-# pcpu 2-3 are the cores the upstream layout reserves for AAOS. With this append,
-# a 4-domain bring-up puts DomU and DomA on the same core unless DomA is moved to
-# 3 only (doma.cfg `cpus`). Revisit both files together at G4; do not discover
-# this by watching the two guests thrash.
+# PCPU 2-3 (2026-10-24)
+# DomD's two vcpus are now pinned one per pcpu, 0 and 1 (domain-cpu-pin), so
+# pcpu 1 would be DomD's vcpu 1 shared with DomU, the contention a Raspberry Pi 5
+# measurement showed holding DomA's device-model main loop off its vcpu. DomU
+# takes pcpu 2-3 instead, DomA's pcpus (doma.cfg: vcpu 0 on 2, vcpu 1 on 3): on
+# this board DomA and DomU are not run at once, so the two do not share them in
+# use. On an 8 GiB board running both, they would.
 #
 # NOTE: no backticks anywhere below. In a bb shell function a backtick is command
 # substitution even inside a bbfatal message string, so "re-derive it from
 # `xl vcpu-list`" would try to RUN xl on the build host.
 
 RPI4_DOMU_CPUS_FROM ?= 'cpus = "1"'
-RPI4_DOMU_CPUS_TO ?= 'cpus = "2"'
+RPI4_DOMU_CPUS_TO ?= 'cpus = "2-3"'
 
 do_install[postfuncs] += "rpi4_domu_cpu_pin"
 do_install[vardeps] += "RPI4_DOMU_CPUS_FROM RPI4_DOMU_CPUS_TO"
@@ -49,7 +51,7 @@ rpi4_domu_cpu_pin() {
     # the upstream pinning while every note claims otherwise.
     if ! grep -qxF '${RPI4_DOMU_CPUS_FROM}' "$cfg"; then
         if grep -qxF '${RPI4_DOMU_CPUS_TO}' "$cfg"; then
-            bbnote "xt-xen-cfg-domu.bbappend (rpi4): DomU already pinned to pcpu 2"
+            bbnote "xt-xen-cfg-domu.bbappend (rpi4): DomU already pinned to pcpu 2-3"
             return
         fi
         bbfatal "xt-xen-cfg-domu.bbappend (rpi4): expected '${RPI4_DOMU_CPUS_FROM}' in \

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- See Android.bp. -->
+<resources>
+    <integer translatable="false" name="config_wifiDisableReasonNoInternetPermanentDurationMs">600000</integer>
+</resources>

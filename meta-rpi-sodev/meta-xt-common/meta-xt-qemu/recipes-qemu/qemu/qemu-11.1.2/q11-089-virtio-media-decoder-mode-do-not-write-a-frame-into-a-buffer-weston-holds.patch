@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 26 Oct 2026 15:17:04 +0900
+Subject: [PATCH] virtio-media: decoder mode: do not write a frame into a
+ buffer weston holds
+
+The plane handoff (sdl2-wl-scanout.c) gives weston each guest plane's
+texture as a dma-buf and does not hold the guest meanwhile: the guest's
+next write into a buffer and weston's GPU composition of it are both
+V3D jobs, ordered by implicit sync. A direct scanout on an HVS plane is
+not a job, and nothing orders the decoder mode's next write into a
+buffer with the display reading it. On a Raspberry Pi 5 (2026-10-26,
+H.264 1080p60 in a WebView beside the HMI) 28-38% of the decoder's
+writes went into a buffer weston had not released since its last
+attach, and block noise showed in the video when the guest's scanout
+buffers were linear and DomD's priorities raised.
+
+The plane handoff now listens for weston's release of the textures it
+exports (not the guest dma-bufs of blob_buf) and answers, through
+q11_plane_res_held_cb (ui/console.c, like q11_resource_gone_cb, so that
+a modular build keeps it), whether weston holds a buffer of a resource.
+It no longer evicts a held entry, and forgets a gone resource's id. A
+release read after the same buffer was attached again still marks it
+released until the next attach.
+
+The decoder mode writes a frame into a queued CAPTURE buffer whose
+resource weston does not hold. When every queued one is held, the frame
+waits and a timer pumps again every 2 ms; a frame that has waited 50 ms
+is written into the first of them anyway. The zero-copy report counts,
+since the open, the frames that waited and those written into a held
+buffer.
+
+Measured on the board (diagnostic builds, same layout, 3 minutes
+each): with this patch no frame waited and none was written into a
+held buffer, and 5.6% of the frames were dropped (3.3% with an earlier
+form, in which 1 frame waited), against 23-26% with the same settings
+before. With the earlier form the block noise was not seen.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's q11 plane handoff and decoder mode]
+---
+ hw/virtio/virtio-media-decoder.c | 123 +++++++++++++++++++++++++++++--
+ include/ui/console.h             |   2 +
+ ui/console.c                     |   1 +
+ ui/sdl2-wl-scanout.c             |  55 +++++++++++++-
+ 4 files changed, 173 insertions(+), 8 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 1c85db061..4dfb4054d 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -65,6 +65,7 @@
+ #include "qemu/thread.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/memalign.h"     /* q11-dec-zero-copy: the heap fallback */
++#include "ui/console.h"
+ #include "ui/direct-scanout.h"
+ 
+ #ifdef CONFIG_VIRTIO_MEDIA_DECODER
+@@ -174,6 +175,12 @@ static const DecCodec dec_codecs[] = {
+  * (DEC_ZC_MAX), which grows by them.
+  */
+ #define DEC_GPU_HOLD_MAX 8
++/*
++ * q11-dec-plane-held: how long a frame waits for weston to release the CAPTURE buffers
++ * it holds on a plane before it is written into one anyway, and how often it looks again.
++ */
++#define DEC_PLANE_HELD_MAX_MS 50
++#define DEC_PLANE_HELD_POLL_MS 2
+ /* -EAGAIN (no GL context) this many frames in a row is reported once. */
+ #define DEC_GPU_AGAIN_WARN 120
+ 
+@@ -542,6 +549,15 @@ struct VirtIOMediaDec {
+     GQueue *thr_out;        /* DecThrOut * */
+     bool thr_quit, thr_flush, thr_eof;
+     QEMUBH *thr_bh;
++    /*
++     * q11-dec-plane-held (dec_cap_for_frame): since when a frame has waited for weston,
++     * the timer that looks again, and since the open: frames that waited, and frames
++     * written into a held buffer after DEC_PLANE_HELD_MAX_MS
++     */
++    int64_t plane_wait_ns;
++    bool plane_wait_counted;
++    QEMUTimer *plane_timer;
++    uint64_t plane_waits, plane_late;
+     int thr_reorder;        /* avctx->has_b_frames after the last frame (thr_lock) */
+     unsigned thr_out_max;   /* decoded ahead at most (2 with the hwaccel's device) */
+ };
+@@ -757,6 +773,93 @@ static int dec_next_cap_buffer(VirtIOMediaSession *s)
+     return -1;
+ }
+ 
++static void dec_pump(VirtIOMediaSession *s);
++
++static void dec_plane_timer_cb(void *opaque)
++{
++    VirtIOMediaSession *s = opaque;
++
++    if (s->dec->thr_on) {
++        qemu_bh_schedule(s->dec->thr_bh);
++    } else {
++        dec_pump(s);
++    }
++}
++
++/* q11-dec-plane-held: no frame waits for weston any more (a new codec, the end) */
++static void dec_plane_wait_stop(VirtIOMediaDec *d)
++{
++    if (d->plane_timer) {
++        timer_del(d->plane_timer);
++    }
++    d->plane_wait_ns = 0;
++    d->plane_wait_counted = false;
++}
++
++/*
++ * q11-dec-plane-held: the CAPTURE buffer to write the next frame into. A queued buffer
++ * whose resource weston still holds on a plane (q11_plane_res_held_cb) is passed over:
++ * the guest has it back, but it may still be on screen. When every queued buffer is held,
++ * -1, and the timer looks again in DEC_PLANE_HELD_POLL_MS; a frame that has waited
++ * DEC_PLANE_HELD_MAX_MS takes the first of them anyway, so a weston that does not release
++ * cannot stop the stream. take: the frame is written into the buffer returned (the wait
++ * is counted and ends); otherwise only whether there would be one.
++ */
++static int dec_cap_for_frame(VirtIOMediaSession *s, bool take)
++{
++    VirtIOMediaDec *d = s->dec;
++    VirtIOMediaQueue *q = &s->queues[1];
++    int64_t now;
++    int held = -1;
++    uint32_t i;
++
++    for (i = 0; i < q->num_bufs; i++) {
++        VirtIOMediaBuffer *gb = &q->guest[i];
++
++        if (!gb->queued) {
++            continue;
++        }
++        if (!q11_plane_res_held_cb || !gb->virgl_res ||
++            !q11_plane_res_held_cb(gb->virgl_res)) {
++            if (take) {
++                d->plane_wait_ns = 0;
++                d->plane_wait_counted = false;
++            }
++            return (int)i;
++        }
++        if (held < 0) {
++            held = (int)i;
++        }
++    }
++    if (held < 0) {
++        d->plane_wait_ns = 0;   /* nothing queued (STREAMOFF, a drain): no wait stands */
++        d->plane_wait_counted = false;
++        return -1;
++    }
++    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    if (!d->plane_wait_ns) {
++        d->plane_wait_ns = now;
++    }
++    if (take && !d->plane_wait_counted) {
++        d->plane_wait_counted = true;
++        d->plane_waits++;
++    }
++    if (now - d->plane_wait_ns >= DEC_PLANE_HELD_MAX_MS * SCALE_MS) {
++        if (take) {
++            d->plane_wait_ns = 0;
++            d->plane_wait_counted = false;
++            d->plane_late++;
++        }
++        return held;
++    }
++    if (!d->plane_timer) {
++        d->plane_timer = timer_new_ms(QEMU_CLOCK_REALTIME, dec_plane_timer_cb, s);
++    }
++    timer_mod(d->plane_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + DEC_PLANE_HELD_POLL_MS);
++    return -1;
++}
++
+ /* ------------------------------------------------------------------------- */
+ /* host-sand: hardware frames on the GPU                                     */
+ /* ------------------------------------------------------------------------- */
+@@ -2188,9 +2291,10 @@ static void dec_zc_report(VirtIOMediaDec *d)
+                 "decoder's buffers, %" PRIu64 " staged (%" PRIu64 " not in "
+                 "the pool, %" PRIu64 " layout or guest buffer, %" PRIu64
+                 " no GL, %" PRIu64 " off); pool %u buffers, %" PRIu64
+-                " decodes found none free", d->codec->desc, d->zc_n,
++                " decodes found none free; %" PRIu64 " waits for weston to release a "
++                "buffer, %" PRIu64 " written still held", d->codec->desc, d->zc_n,
+                 d->zc_st_n, d->zc_st[0], d->zc_st[1], d->zc_st[2], d->zc_st[3],
+-                n, fb);
++                n, fb, d->plane_waits, d->plane_late);
+ }
+ 
+ /*
+@@ -2553,7 +2657,7 @@ static void dec_fail(VirtIOMediaSession *s, int err)
+ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+ {
+     uint32_t bytesused = 0;
+-    int index = dec_next_cap_buffer(s);
++    int index = dec_cap_for_frame(s, true);
+ 
+     if (index < 0) {
+         return false;
+@@ -2691,8 +2795,6 @@ static void *dec_thr_run(void *opaque)
+     return NULL;
+ }
+ 
+-static void dec_pump(VirtIOMediaSession *s);
+-
+ /* Frames came out of the thread: deliver them, as a QBUF would. */
+ static void dec_thr_bh(void *opaque)
+ {
+@@ -2708,7 +2810,7 @@ static void dec_thr_bh(void *opaque)
+     more = o && o->err != AVERROR_EOF;
+     qemu_mutex_unlock(&d->thr_lock);
+     /* dec_pump delivers DEC_PUMP_MAX_FRAMES a call; the rest on the next turn */
+-    if (more && !d->failed && dec_next_cap_buffer(s) >= 0 &&
++    if (more && !d->failed && dec_cap_for_frame(s, false) >= 0 &&
+         !d->awaiting_reconfig) {
+         qemu_bh_schedule(d->thr_bh);
+     }
+@@ -3144,7 +3246,9 @@ static void dec_pump(VirtIOMediaSession *s)
+ 
+         if (!dec_deliver(s, d->frame)) {
+             /*
+-             * No buffer after all (a race with STREAMOFF); keep the frame.
++             * No buffer after all: every queued one is still held by weston
++             * (q11-dec-plane-held; the timer pumps again), or a race with
++             * STREAMOFF. Keep the frame.
+              * av_frame_free first: d->held should be NULL by the reasoning at
+              * the top of this function, but an assignment over a non-NULL held
+              * frame is a silent leak and the guard costs nothing.
+@@ -3362,6 +3466,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+         return EBUSY;
+     }
+     dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
++    dec_plane_wait_stop(d);
+     dec_thr_stop(d);
+     dec_gpu_reset(d);
+     dec_sw_clear(d);
+@@ -3447,6 +3552,10 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+         return;
+     }
+     dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
++    if (d->plane_timer) {
++        timer_free(d->plane_timer);
++        d->plane_timer = NULL;
++    }
+     dec_thr_stop(d);
+     dec_gpu_clear(d);
+     dec_sw_clear(d);
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 6afeefaec..d89cf1a57 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -325,6 +325,8 @@ void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
+ extern uint32_t q11_scanout0_resource_id;
+ extern uint32_t q11_overlay_resource_id[3];        /* the same for the overlay planes */
+ extern void (*q11_resource_gone_cb)(uint32_t res); /* the guest unref'd res */
++/* q11-plane-held: weston still holds a plane buffer of res (ui/sdl2-wl-scanout.c) */
++extern bool (*q11_plane_res_held_cb)(uint32_t res);
+ void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
+                                   uint32_t w, uint32_t h, uint32_t crtc_w,
+                                   uint32_t crtc_h); /* q11-primary-rect */
+diff --git a/ui/console.c b/ui/console.c
+index 86a07ce86..ffde46866 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1023,6 +1023,7 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+ uint32_t q11_scanout0_resource_id; /* q11-plane-handoff */
+ uint32_t q11_overlay_resource_id[3];
+ void (*q11_resource_gone_cb)(uint32_t res);
++bool (*q11_plane_res_held_cb)(uint32_t res); /* q11-plane-held */
+ 
+ void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
+                                   uint32_t w, uint32_t h, uint32_t crtc_w,
+diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
+index e459f7e1d..249029e67 100644
+--- a/ui/sdl2-wl-scanout.c
++++ b/ui/sdl2-wl-scanout.c
+@@ -608,6 +608,11 @@ typedef struct WlPlaneBuf {
+     ino_t ino;
+     uint32_t fourcc, stride;
+     bool ready, failed, pending;
++    /*
++     * q11-plane-held: an exported guest texture's buffer that weston has not
++     * released since it was last attached (watch: the release is listened to).
++     */
++    bool watch, wheld;
+ } WlPlaneBuf;
+ 
+ static struct {
+@@ -712,6 +717,47 @@ static bool plane_in_use(WlPlaneBuf *b)
+ 
+ static void pl_cache_add(WlPlaneBuf *b);
+ 
++/* q11-plane-held: weston has let go of an exported guest texture's buffer */
++static void plane_buf_release(void *data, struct wl_buffer *wb)
++{
++    WlPlaneBuf *b = data;
++
++    b->wheld = false;
++}
++
++static const struct wl_buffer_listener plane_buf_listener = { plane_buf_release };
++
++/*
++ * q11-plane-held (q11_plane_res_held_cb): whether weston still holds a plane buffer of
++ * virgl resource res (attached and not released), so that it may be on an HVS plane, read
++ * by the display without a fence. The decoder mode does not write a frame into such a resource then:
++ * its write and weston's GPU composition are ordered by implicit sync, but a direct
++ * scanout is not. On a Raspberry Pi 5 (2026-10-26, H.264 1080p60 in a WebView beside
++ * the HMI) 28-38% of the decoder's writes went into a buffer weston held, and block
++ * noise showed in the video when the guest's scanout buffers were linear (HVS direct)
++ * and DomD's priorities were raised. Main loop only.
++ *
++ * Not covered: a release weston sent for an earlier attach that is read only after the
++ * same buffer was attached again marks it released while weston holds it again, until
++ * the next attach; and guest dma-bufs (blob_buf) are not listened to.
++ */
++static bool plane_res_held(uint32_t res)
++{
++    if (!pl.cache || !res) {
++        return false;
++    }
++    /* releases already read from the socket (it is not read here) */
++    wl_display_dispatch_queue_pending(wl.dpy, wl.queue);
++    for (guint i = 0; i < pl.cache->len; i++) {
++        WlPlaneBuf *b = g_ptr_array_index(pl.cache, i);
++
++        if (b->res == res && b->watch && b->wheld) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+ {
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+@@ -763,6 +809,10 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+     b->used = now;
+     b->wb = zwp_linux_buffer_params_v1_create_immed(params, w, h, fourcc, 0);
+     zwp_linux_buffer_params_v1_destroy(params);
++    if (b->wb) {
++        wl_buffer_add_listener(b->wb, &plane_buf_listener, b);
++        b->watch = true;
++    }
+     for (int i = 0; i < np; i++) {
+         close(fd[i]);
+     }
+@@ -788,7 +838,7 @@ static void pl_cache_add(WlPlaneBuf *b)
+              * So the cache can grow past WL_PLANE_CACHE while every entry is on screen or
+              * waiting for weston; it shrinks again as they are answered.
+              */
+-            if (o->used < t && !plane_in_use(o) && !o->pending) {
++            if (o->used < t && !plane_in_use(o) && !o->pending && !o->wheld) {
+                 t = o->used;
+                 lru = i;
+             }
+@@ -955,6 +1005,7 @@ static void pl_resource_gone(uint32_t res)
+         }
+         b->tex = 0; /* the LRU frees it once it is off screen */
+         b->ino = 0;
++        b->res = 0; /* q11-plane-held: the id may come back as another resource */
+     }
+ }
+ 
+@@ -1078,6 +1129,7 @@ static bool planes_create(void)
+         wl_subsurface_set_sync(pl.ss[i]);
+     }
+     q11_resource_gone_cb = pl_resource_gone;
++    q11_plane_res_held_cb = plane_res_held;
+     info_report("sdl2: plane-handoff: %d subsurfaces on the window", WL_PLANES);
+     return true;
+ }
+@@ -1162,6 +1214,7 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
+     wl_surface_attach(pl.s[i], b->wb, 0, 0);
+     wl_surface_damage_buffer(pl.s[i], 0, 0, INT32_MAX, INT32_MAX);
+     wl_surface_commit(pl.s[i]);
++    b->wheld = b->watch;
+     pl.cur[i] = b;
+ }
+ 
+-- 
+2.43.0
+

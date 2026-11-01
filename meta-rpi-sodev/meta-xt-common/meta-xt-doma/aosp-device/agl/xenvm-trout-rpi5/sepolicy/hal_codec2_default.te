@@ -10,8 +10,9 @@
 # local hardware. Only the far side of the device model differs:
 #
 #     RPi4   virtio-media -> DomD /dev/video10 -> bcm2835-codec (H.264, stateful)
-#     RPi5   virtio-media -> qemu's own stateful HEVC shim (patch 0217), which
-#            drives rpi-hevc-dec (stateless) with libavcodec inside DomD
+#     RPi5   virtio-media -> qemu's own stateful HEVC shim (q11-041; 0217 on 10.0.2),
+#            which drives rpi-hevc-dec (stateless) with libavcodec inside DomD,
+#            and H.264 in software with decoder=hevc+h264 (q11-072)
 #
 # From SELinux's point of view those are the same object with the same label.
 #
@@ -49,9 +50,9 @@ init_daemon_domain(hal_codec2_default)
 # The decoder itself. On this board /dev/video* is NOT local hardware: it is
 # whatever qemu's virtio-media device exports, so the node exists only when DomA
 # was created with the virtio-media device in its config (which on this board carries
-# decoder=hevc rather than a v4l2-device path, because the qemu side synthesises
-# the stateful decoder instead of proxying one). video_device is the platform
-# label for /dev/video[0-9]* (system/sepolicy/private/file_contexts).
+# decoder=hevc, or decoder=hevc+h264, rather than a v4l2-device path, because the
+# qemu side synthesises the stateful decoder instead of proxying one). video_device
+# is the platform label for /dev/video[0-9]* (system/sepolicy/private/file_contexts).
 #
 # Note that V4L2ComponentStore::Create() probes these nodes at service start to
 # decide which codecs to advertise, so a denial here does not look like a

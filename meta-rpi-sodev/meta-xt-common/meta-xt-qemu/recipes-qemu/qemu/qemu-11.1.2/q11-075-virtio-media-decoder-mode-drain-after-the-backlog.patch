@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 00:09:57 +0900
+Subject: [PATCH] virtio-media: decoder mode: drain after the backlog
+
+A drain (DECODER_CMD STOP, or an empty OUTPUT buffer) went to
+libavcodec at once, ahead of the packets still in the backlog. Their
+OUTPUT buffers had been completed when they were taken, so a guest
+that waits for its OUTPUT buffers before it stops, as v4l2_codec2
+does, stopped with them there: the stream ended before their frames,
+which never came out, and LAST came as if nothing were missing. On
+the Raspberry Pi 5, HEVC 1080p60 played to the end gave 886 to 890
+of its 896 frames (894 decoding only), H.264 880 to 890 without the
+decode thread.
+
+The drain now waits for the backlog: it is sent after the last
+packet in it, and a flush cancels it.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16, codec -T and -S,
+played to the end): HEVC 1080p60 and H.264 1080p60 and 720p60 give
+all 896 frames, HEVC at 61.0 and 61.1 fps.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index ed6a98a..3fbac88 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -352,6 +352,7 @@ struct VirtIOMediaDec {
+ 
+     /* Stateful drain, driven by VIDIOC_DECODER_CMD(V4L2_DEC_CMD_STOP). */
+     bool draining;
++    bool drain_pending;   /* q11-dec-drain: started, waiting for the backlog */
+     bool drain_done;
+ 
+     /* libavcodec. */
+@@ -2092,6 +2093,23 @@ static void dec_backlog_clear(VirtIOMediaDec *d)
+         av_packet_free(&p);
+     }
+     d->backlog_bytes = 0;
++    d->drain_pending = false;
++}
++
++/*
++ * q11-dec-drain: start a drain (DECODER_CMD STOP, or an empty OUTPUT buffer)
++ * after the backlog. The guest's OUTPUT buffers for the packets in it were
++ * completed when they were taken, so a guest that waits for its OUTPUT
++ * buffers before it stops does so with them still here; a drain sent ahead
++ * of them ended the stream before their frames, which never came out.
++ */
++static void dec_drain_start(VirtIOMediaDec *d)
++{
++    if (!g_queue_is_empty(d->backlog)) {
++        d->drain_pending = true;
++        return;
++    }
++    dec_av_send(d, NULL);
+ }
+ 
+ /*
+@@ -2112,11 +2130,20 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+         av_packet_free(&p);
+         if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r) &&
+             !dec_bad_data(r)) {
++            bool drain = d->drain_pending;
++
+             error_report_once("virtio-media/dec: backlog send_packet: %d", r);
+             dec_backlog_clear(d);
++            if (drain) {
++                dec_av_send(d, NULL);
++            }
+             return;
+         }
+     }
++    if (d->drain_pending) {
++        d->drain_pending = false;
++        dec_av_send(d, NULL);
++    }
+ }
+ 
+ /*
+@@ -2940,7 +2967,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+             if (!d->draining) {
+                 d->draining = true;
+                 d->drain_done = false;
+-                dec_av_send(d, NULL);
++                dec_drain_start(d);
+             }
+             dec_complete_buffer(s, 0, b->index, 0, 0, DEC_IN_PTS(b));
+             dec_pump(s);
+@@ -3137,7 +3164,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+         if (!d->draining) {
+             d->draining = true;
+             d->drain_done = false;
+-            dec_av_send(d, NULL);   /* flush packet */
++            dec_drain_start(d);   /* flush packet, after the backlog */
+         }
+         dec_pump(s);
+     } else {

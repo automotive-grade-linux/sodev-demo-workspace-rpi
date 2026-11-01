@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 18:33:29 +0900
+Subject: [PATCH] v4l2request: bound the wait for a free destination
+ buffer
+
+Once the destination queue cannot grow any more (VIDIOC_CREATE_BUFS
+fails at the driver's limit, 32 buffers for rpi-hevc-dec), a frame
+waits for a buffer to come free with no time limit. A buffer comes
+free only when the caller releases the frame that holds it. A caller
+that decodes and releases frames on one thread -- qemu's virtio-media
+decoder, thread_count 1, which keeps frames for its display -- then
+waits for itself, and its main loop stops for good.
+
+Give up after 300 ms instead: the frame fails with ENOMEM, and the
+caller can let frames go and carry on. The deadline is on
+CLOCK_MONOTONIC, the queue's condition variable set to that clock, so
+that a step of the wall clock neither cuts the wait short nor
+stretches it.
+
+That error path left the frame's entry on the decode queue: start_frame
+had added it, hevc_frame_start then frees the frame, and abort_frame
+finds no current frame to take it off. The next frame's end_frame
+waited behind the freed entry for ever. Take it off where the
+allocation fails.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -759,6 +759,10 @@ static int v4l2_request_hevc_start_frame(AVCodecContext *avctx,
+     {
+         if ((rd->qe_dst = mediabufs_dst_qent_alloc(ctx->mbufs, ctx->dbufs)) == NULL) {
+             av_log(avctx, AV_LOG_ERROR, "%s: Failed to get dst buffer\n", __func__);
++            // hevc_frame_start drops the frame (and rd with it) on this error,
++            // and abort_frame then finds no cur_frame: leave the decode Q here
++            // or the next frame waits behind this entry for ever.
++            decode_q_remove(&ctx->decode_q, &rd->decode_ent);
+             return AVERROR(ENOMEM);
+         }
+     }
+--- a/libavcodec/v4l2_req_media.c
++++ b/libavcodec/v4l2_req_media.c
+@@ -31,6 +31,7 @@
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ #include <linux/media.h>
+ #include <linux/mman.h>
+@@ -574,6 +575,38 @@ static struct qent_base *queue_get_free(struct buf_pool *const bp)
+     return buf;
+ }
+ 
++/*
++ * A destination buffer comes free when the frame that holds it is released,
++ * which is the caller's doing, not the decoder's. A caller that decodes and
++ * releases frames on one thread (qemu's virtio-media decoder, thread_count 1)
++ * would wait here for itself forever once it holds every buffer of a queue
++ * that cannot grow any more. Give up after DST_FREE_WAIT_MS instead: the
++ * frame then fails with ENOMEM and the caller can let some frames go.
++ */
++#define DST_FREE_WAIT_MS 300
++
++static struct qent_base *queue_get_free_timed(struct buf_pool *const bp,
++                                              const unsigned int ms)
++{
++    struct qent_base *buf;
++    struct timespec ts;
++    int rv = 0;
++
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    ts.tv_sec += ms / 1000;
++    ts.tv_nsec += (long)(ms % 1000) * 1000000;
++    if (ts.tv_nsec >= 1000000000) {
++        ts.tv_sec++;
++        ts.tv_nsec -= 1000000000;
++    }
++
++    pthread_mutex_lock(&bp->lock);
++    while ((buf = bq_get_free(bp)) == NULL && rv == 0)
++        rv = pthread_cond_timedwait(&bp->cond, &bp->lock, &ts);
++    pthread_mutex_unlock(&bp->lock);
++    return buf;
++}
++
+ static struct qent_base *queue_tryget_free(struct buf_pool *const bp)
+ {
+     struct qent_base *buf;
+@@ -611,10 +644,17 @@ static void queue_delete(struct buf_pool *const bp)
+ static struct buf_pool* queue_new(const int vfd)
+ {
+     struct buf_pool *bp = calloc(1, sizeof(*bp));
++    pthread_condattr_t ca;
++
+     if (!bp)
+         return NULL;
+     pthread_mutex_init(&bp->lock, NULL);
+-    pthread_cond_init(&bp->cond, NULL);
++    // queue_get_free_timed's deadline is on CLOCK_MONOTONIC, so that a step
++    // of the wall clock neither cuts the wait short nor stretches it
++    pthread_condattr_init(&ca);
++    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
++    pthread_cond_init(&bp->cond, &ca);
++    pthread_condattr_destroy(&ca);
+     return bp;
+ }
+ 
+@@ -1295,9 +1335,12 @@ struct qent_dst* mediabufs_dst_qent_alloc(struct mediabufs_ctl *const mbc, struc
+     }
+ 
+     if (mbc->dst_fixed) {
+-        be_dst = base_to_dst(queue_get_free(mbc->dst));
+-        if (!be_dst)
++        be_dst = base_to_dst(queue_get_free_timed(mbc->dst, DST_FREE_WAIT_MS));
++        if (!be_dst) {
++            request_err(mbc->dc, "No free dst buffer after %d ms\n",
++                        DST_FREE_WAIT_MS);
+             return NULL;
++        }
+     }
+     else {
+         be_dst = base_to_dst(queue_tryget_free(mbc->dst));

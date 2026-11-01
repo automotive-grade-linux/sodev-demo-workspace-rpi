@@ -1,0 +1,130 @@
+From 1682080b4c2dd00b69bbaf13e5f5993cde2b4443 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 09:05:20 +0900
+Subject: [PATCH] v4l2_codec2: run the decoder's threads at
+ ANDROID_PRIORITY_VIDEO
+
+The decoder thread, the frame pool's fetch thread and the device's
+poll thread are base::Threads, which start at the nice value of the
+process: 0, the default for a HAL service. The software codecs
+(SimpleC2Component) run their thread at ANDROID_PRIORITY_VIDEO (-10),
+so a frame decoded in hardware was handed on at a lower priority than
+one decoded in software, below the app's MediaCodec looper (-10) and
+WebView's compositor threads (-4). Measured on a Raspberry Pi 5
+(2026-10-24, H.264 1080p60 in a WebView): DecodeComponent at nice 0
+used 6-8% of a CPU, the most of the service's threads.
+
+Each of the three threads now sets ANDROID_PRIORITY_VIDEO as its first
+task, posted right after it starts and before any work.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ common/Common.cpp                          | 12 ++++++++++++
+ common/include/v4l2_codec2/common/Common.h |  3 +++
+ components/DecodeComponent.cpp             |  1 +
+ components/VideoFramePool.cpp              |  2 ++
+ v4l2/V4L2DevicePoller.cpp                  |  2 ++
+ 5 files changed, 20 insertions(+)
+
+diff --git a/common/Common.cpp b/common/Common.cpp
+index 24bb975..c5d95ef 100644
+--- a/common/Common.cpp
++++ b/common/Common.cpp
+@@ -2,9 +2,14 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#define LOG_TAG "Common"
++
+ #include <v4l2_codec2/common/Common.h>
+ 
+ #include <base/numerics/safe_math.h>
++#include <log/log.h>
++#include <system/thread_defs.h>
++#include <utils/AndroidThreads.h>
+ 
+ namespace android {
+ 
+@@ -50,4 +55,11 @@ bool isValidProfileForCodec(VideoCodec codec, C2Config::profile_t profile) {
+     }
+ }
+ 
++void setVideoThreadPriority() {
++    int err = androidSetThreadPriority(0, ANDROID_PRIORITY_VIDEO);
++    if (err != 0) {
++        ALOGW("Could not set the thread priority to ANDROID_PRIORITY_VIDEO: %d", err);
++    }
++}
++
+ }  // namespace android
+diff --git a/common/include/v4l2_codec2/common/Common.h b/common/include/v4l2_codec2/common/Common.h
+index ac55bd2..8194906 100644
+--- a/common/include/v4l2_codec2/common/Common.h
++++ b/common/include/v4l2_codec2/common/Common.h
+@@ -72,6 +72,9 @@ std::string toString(const ui::Size& size);
+ // Check whether specified profile can be used with specified codec
+ bool isValidProfileForCodec(VideoCodec codec, C2Config::profile_t profile);
+ 
++// Run the calling thread at ANDROID_PRIORITY_VIDEO, as the software codecs' threads are.
++void setVideoThreadPriority();
++
+ }  // namespace android
+ 
+ #endif  // ANDROID_V4L2_CODEC2_COMMON_COMMON_H
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index 5d0400f..fa2d525 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -160,6 +160,7 @@ c2_status_t DecodeComponent::start() {
+         return C2_CORRUPTED;
+     }
+     mDecoderTaskRunner = mDecoderThread.task_runner();
++    mDecoderTaskRunner->PostTask(FROM_HERE, ::base::BindOnce(&setVideoThreadPriority));
+     mWeakThis = mWeakThisFactory.GetWeakPtr();
+ 
+     c2_status_t status = C2_CORRUPTED;
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+index 85fd7f1..9ea1ddd 100644
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -19,6 +19,7 @@
+ #include <base/time/time.h>
+ #include <log/log.h>
+ 
++#include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/common/VideoTypes.h>
+ #include <v4l2_codec2/plugin_store/DmabufHelpers.h>
+ #include <v4l2_codec2/plugin_store/V4L2AllocatorId.h>
+@@ -153,6 +154,7 @@ bool VideoFramePool::initialize() {
+         return false;
+     }
+     mFetchTaskRunner = mFetchThread.task_runner();
++    mFetchTaskRunner->PostTask(FROM_HERE, ::base::BindOnce(&setVideoThreadPriority));
+ 
+     mClientWeakThis = mClientWeakThisFactory.GetWeakPtr();
+     mFetchWeakThis = mFetchWeakThisFactory.GetWeakPtr();
+diff --git a/v4l2/V4L2DevicePoller.cpp b/v4l2/V4L2DevicePoller.cpp
+index b4add7d..bb11a52 100644
+--- a/v4l2/V4L2DevicePoller.cpp
++++ b/v4l2/V4L2DevicePoller.cpp
+@@ -15,6 +15,7 @@
+ #include <base/threading/thread_checker.h>
+ #include <log/log.h>
+ 
++#include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/v4l2/V4L2Device.h>
+ 
+ namespace android {
+@@ -51,6 +52,7 @@ bool V4L2DevicePoller::startPolling(EventCallback eventCallback,
+ 
+     mPollBuffers.store(false);
+     mStopPolling.store(false);
++    mPollThread.task_runner()->PostTask(FROM_HERE, ::base::BindOnce(&setVideoThreadPriority));
+     mPollThread.task_runner()->PostTask(
+             FROM_HERE, base::BindOnce(&V4L2DevicePoller::devicePollTask, base::Unretained(this)));
+ 
+-- 
+2.43.0
+

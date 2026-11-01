@@ -1,0 +1,54 @@
+From 0d9dfebdbad0fa34106ca4f24a0b1e915100c7b6 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 28 Oct 2026 12:11:55 +0900
+Subject: [PATCH] net: threaded NAPI on DomA's uplink vif
+
+init.xenvm-hwsim.rc writes 1 to /sys/class/net/eth1/threaded, and to
+buried_eth1, the name setup_wifi may give the vif, once the boot has
+completed, so the vif's receive work runs in a kernel thread
+(napi/eth1-*, nice 0) instead of softirq, which preempts every thread
+whatever its nice value. The name that does not exist fails harmlessly.
+
+Measured on this board (2026-10-27): a video playing in a WebView,
+fetched over TCP, arrives in bursts of 4.6-6.5 MB/s; the softirq then
+took 35-57% of cpu0 at the XRUNs, both vCPUs busy, and DomA's audio HAL
+fell behind ("Not supplying enough data to HAL", and ALSA XRUNs in DomD,
+6 and 2 in two 580 s runs). With threaded=1, set at run time, cpu0's
+softirq during the bursts went 30 -> 15% on average (57 -> 39% at most)
+and a 580 s run had no XRUN. With the rc in a vendor image on this
+board, DomA's init wrote eth1's threaded=1 at boot (2026-10-27). The
+Raspberry Pi 5 product in the AGL layer gets the same lines.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc b/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
+index 5f2427e..2b4b2e5 100644
+--- a/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
++++ b/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
+@@ -211,6 +211,21 @@ on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=
+ on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=true
+     start doma_wifi_relay
+ 
++# Threaded NAPI on the uplink vif (virtio_net): its receive work runs in a kernel thread
++# (napi/eth1-*, nice 0) instead of softirq, which preempts every thread whatever its nice
++# value. MEASURED ON THE RPi4, 2026-10-27: a WebView video fetched over TCP arrives in
++# bursts of 4.6-6.5 MB/s, the softirq took 35-57% of cpu0 at the XRUNs, both vCPUs busy,
++# and DomA's audio HAL (out_write, CFS nice -19) fell behind: "Not supplying enough data
++# to HAL" and ALSA XRUNs in DomD (6 and 2 in two 580 s runs). With threaded=1 cpu0's
++# softirq during the bursts went 30 -> 15% on average (57 -> 39% at most), 0 XRUNs in
++# a 580 s run. On the RPi5 (2026-10-27, a WebView's H.264 1080p60 beside the HMI, 60 s
++# runs): cpu0's softirq went 2.8 -> 1.4%, displayed frames 45 -> 49-54/s, no XRUN either
++# way. setup_wifi may have renamed the vif buried_eth1 (see doma-shadow-ap.sh step 1),
++# and the attribute follows it: both names are tried, the absent one failing harmlessly.
++on property:sys.boot_completed=1
++    write /sys/class/net/eth1/threaded 1
++    write /sys/class/net/buried_eth1/threaded 1
++
+ on post-fs-data
+     # hostapd's ctrl_interface and the AP list live here. Same owner/mode as the
+     # hostapd directories cuttlefish's init.vendor.rc creates for its own hwsim path.

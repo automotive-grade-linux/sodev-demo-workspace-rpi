@@ -6,11 +6,11 @@ It is built for both boards.
 ```
 Xen 4.22 on Raspberry Pi 5 or 4
 |- Dom0 : Zephyr, xenstore only                        [1 vCPU @ pCPU 0]
-|- DomD : dom0less driver domain + xl toolstack         [2 vCPU @ pCPU 0-1]
+|- DomD : dom0less driver domain + xl toolstack         [2 vCPU @ pCPU 0, 1]
 |- DomU : AGL instrument cluster            (-u)        [1 vCPU @ pCPU 1]
-|         (pCPU 2 on rpi4 -- meta-xt-rpi4's xt-xen-cfg-domu bbappend moves it
-|          off DomD's cores; see the CPU map note in domz.cfg)
-|- DomA : Android Automotive OS             (-a)        [2 vCPU @ pCPU 2-3]
+|         (pCPU 2-3 on rpi4 -- meta-xt-rpi4's xt-xen-cfg-domu bbappend; see
+|          the CPU map note in domz.cfg)
+|- DomA : Android Automotive OS             (-a)        [2 vCPU @ pCPU 2, 3]
 |- DomZ : Zephyr RTOS domain                (-z)        [1 vCPU @ pCPU 0]   <- this
 ```
 

@@ -283,7 +283,7 @@ if test "${board_ram}" = "4g" ; then
     # thrashes its page cache during 1080p playback (measured on the board), so the
     # decode path needs this block's 1440 MiB. It is not gated separately
     # because it cannot be: the guest's decoder is a virtio-media device, which only
-    # the qemu 10.0.2 device model provides, and that is the venus lane. The board
+    # the venus lane's device models (qemu 10.0.2 and 11.1.2) provide. The board
     # yaml sets XT_DOMA_HWDEC from the same GPU parameter, and
     # tools/check-rpi4-memory-map.py asserts the two stay coupled. Do NOT widen this
     # condition to cover a gl-lane hardware-decode build: it would hand the gl lane a

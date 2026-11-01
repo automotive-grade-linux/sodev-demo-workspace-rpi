@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 18 Oct 2026 13:09:10 +0900
+Subject: [PATCH] init: extra_free_kbytes.sh: multiply before dividing the
+ margin
+
+When a zone's own margin wins, the script computes the new
+watermark_scale_factor as
+
+    base_margin / (managed / 10000) + watermark_delta
+
+in bc at scale 0, so managed / 10000 is truncated first: the term is
+inflated by up to a factor of two for a zone of under 20000 pages, and
+bc divides by zero for a zone of under 10000 pages, leaving an empty
+value that the following test cannot compare. watermark_scale_factor
+is a fraction of managed in units of 1/10000, so compute
+base_margin * 10000 / managed instead.
+
+Tried on a PC with the script reading saved files: the Raspberry Pi 5
+AAOS guest's /proc/zoneinfo (3 GiB, 2026-10-17) gives 119 against 120
+before; a zoneinfo with zones of 15000 and 9000 managed pages gave
+"Divide by zero" and a test error before, and a value without errors
+now.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ init/extra_free_kbytes.sh | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/init/extra_free_kbytes.sh b/init/extra_free_kbytes.sh
+index 0edaab2..1dcd379 100755
+--- a/init/extra_free_kbytes.sh
++++ b/init/extra_free_kbytes.sh
+@@ -136,7 +136,10 @@ do
+     then
+         watermark_scale_new=$(echo "$watermark_scale + $watermark_delta" | bc)
+     else
+-        watermark_scale_new=$(echo "$base_margin / (${managed[i]} / 10000) + $watermark_delta" | bc)
++        # Multiply before dividing: bc runs this at scale 0, and managed / 10000
++        # truncated first inflates the result (up to twice for a zone of under 20000
++        # pages) and divides by zero for one of under 10000.
++        watermark_scale_new=$(echo "$base_margin * 10000 / ${managed[i]} + $watermark_delta" | bc)
+     fi
+ 
+     if [ $max_watermark_scale -lt $watermark_scale_new ]

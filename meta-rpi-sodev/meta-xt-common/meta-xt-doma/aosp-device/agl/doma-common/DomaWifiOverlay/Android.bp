@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// DomaWifiOverlay -- a network AAOS found without internet is tried again after
+// 10 minutes instead of never.
+//
+// DomA's station joins the shadow AP at once, while DomD may still be joining the real
+// AP behind it, so the framework's first internet check can run with no route. A
+// network that has never passed that check is then disabled as NO_INTERNET_PERMANENT,
+// and config_wifiDisableReasonNoInternetPermanentDurationMs = -1
+// (packages/modules/Wifi/service/ServiceWifiResources/res/values/config.xml:636) keeps
+// it disabled for good: the AP works but is not joined again on its own. 600000 is the
+// value the temporary case has (:634). DomaWifiRelay undoes the verdict as soon as
+// DomD has the network; this is the fallback when it cannot. 10 minutes is the first
+// wait only: WifiBlocklistMonitor.calculateDisableEndTime doubles it with consecutive
+// failures, up to config_wifiDisableTemporaryMaximumDurationMs. A network a /data
+// already holds as permanently disabled, saved before this overlay, stays so (it has
+// no end time); only DomaWifiRelay or the user enables it.
+//
+// The target is overlayable for product (overlayable.xml, WifiCustomization:
+// odm|product|system|vendor), so no certificate is needed. CuttlefishWifiOverlay
+// (device/google/cuttlefish/shared/device.mk) is a vendor RRO on the same target with
+// priority 0 and does not set this value; static overlays are applied in partition order
+// (vendor before product, OverlayConfig.java), so this product one wins either way.
+runtime_resource_overlay {
+    name: "DomaWifiOverlay",
+    resource_dirs: ["res"],
+    product_specific: true,
+    sdk_version: "current",
+}

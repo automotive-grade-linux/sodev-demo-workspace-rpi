@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 26 Oct 2026 19:19:27 +0900
+Subject: [PATCH] drm/v3d: do not sleep on a zero-timeout WAIT_BO
+
+DRM_IOCTL_V3D_WAIT_BO with timeout_ns 0 asks whether the BO is idle.
+v3d's copy of nsecs_to_jiffies_timeout() adds a jiffy to every timeout,
+so 0 became a one jiffy wait, and a busy BO slept up to a tick (4 ms at
+HZ=250) before -ETIME. Pass a zero timeout through as 0, which
+drm_gem_dma_resv_wait() documents as "return immediately".
+
+Mainline fixed this in 2266665 ("drm/v3d: Use
+drm_timeout_rel_to_jiffies()") by moving v3d to a core helper that
+returns 0 for a zero timeout. That helper (drm_timeout.c) is not in
+6.18, so this patch makes the same change in place; non-zero timeouts
+convert as before.
+
+Mesa's v3d BO cache asks this for each cached BO it would reuse
+(v3d_bo_from_cache() -> v3d_bo_wait(bo, 0, NULL)), from
+v3d_cl_ensure_space() during a draw and alloc_tile_state() at job
+submit. In a Raspberry Pi 5 Xen driver domain, QEMU draws DomA's decoded
+video frames with Mesa v3d on its main loop, and perf put those sleeps
+under v3d_wait_bo_ioctl(): main-loop iterations held the BQL for up to
+85-123 ms while using 5-10 ms of CPU. With this patch the longest hold
+in a 560 s 1080p60 playback was 33 ms.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Backport [the effect of mainline 2266665, written for this kernel, not a cherry-pick: https://patch.msgid.link/20260915-drm-timeout-helpers-v3-4-f2ae987d861f@igalia.com]
+---
+--- a/drivers/gpu/drm/v3d/v3d_bo.c
++++ b/drivers/gpu/drm/v3d/v3d_bo.c
+@@ -280,8 +280,9 @@
+ 	struct drm_v3d_wait_bo *args = data;
+ 	ktime_t start = ktime_get();
+ 	u64 delta_ns;
+-	unsigned long timeout_jiffies =
+-		nsecs_to_jiffies_timeout(args->timeout_ns);
++	/* A zero timeout polls: it must not round up to a one jiffy wait. */
++	unsigned long timeout_jiffies = args->timeout_ns ?
++		nsecs_to_jiffies_timeout(args->timeout_ns) : 0;
+ 
+ 	if (args->pad != 0)
+ 		return -EINVAL;

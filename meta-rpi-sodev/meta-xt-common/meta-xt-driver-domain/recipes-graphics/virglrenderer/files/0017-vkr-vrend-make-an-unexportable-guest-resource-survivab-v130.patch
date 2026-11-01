@@ -1,0 +1,142 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 12 Oct 2026 18:46:01 +0900
+Subject: [PATCH] vkr, vrend: survive an unexportable guest resource, and say why
+
+With SurfaceFlinger and HWUI both on Venus in the AAOS guest,
+system_server dies every few minutes:
+
+    proxy: exported res 2641 to unexpected fd_type -1
+    vkr: failed to query resource props: invalid res_id 2641
+    vkr: vkGetMemoryResourcePropertiesMESA resulted in CS error
+    vkr: destroying context 18 (android framework) with a valid instance
+
+and in the guest, GrallocUploadThread aborts in vn_relax <-
+vn_ring_submit_command <- vn_get_memory_dma_buf_properties <-
+vn_GetMemoryFdPropertiesKHR while TaskSnapshotPersister uploads a
+hardware bitmap. The proxy only attaches a guest resource to a
+render-server context when it exports as a dma-buf; a resource vrend
+backed with a plain GL texture never gets there, and the guest's
+properties query for it is treated as a fatal stream error. It is not:
+the stream is fine, the buffer is merely not importable. Return
+VK_ERROR_INVALID_EXTERNAL_HANDLE exactly as the exists-but-not-dma-buf
+branch already does, so HWUI falls back instead of the process dying.
+
+Separately, log why vrend_resource_gbm_init() declined to give a
+resource GBM backing (format without a GBM equivalent, mipmaps/3D/MSAA,
+no GBM device or usable format/flags, bind flags without SCANOUT|SHARED,
+GBM layout feature not negotiated, gbm_device_is_format_supported()
+saying no, or gbm_bo_create() failing), with the resource's size, format
+and bind flags, so the next "unexpected fd_type -1" can be traced to its
+cause rather than guessed. It goes through virgl_debug(), so it prints
+only with VIRGL_LOG_LEVEL=debug (the message is formatted either way).
+
+This is the virglrenderer 1.3.0 version. In 1.3.0
+vrend_resource_gbm_init() gained another early return: a non-MINIGBM
+build gives a resource no GBM backing unless the GBM layout feature was
+negotiated (vrend_state.gbm_layout_feat, which needs
+VIRGL_GBM_LAYOUT_ENABLE or VIRGL_GBM_LAYOUT_FORCE_ENABLE). The
+diagnostic hunk follows the 1.3.0 function and names that reason too.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ src/venus/vkr_device_memory.c | 18 ++++++++++++++++--
+ src/vrend/vrend_renderer.c    | 28 +++++++++++++++++++++-------
+ 2 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index ffe621bc..d97b5c09 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -433,8 +433,22 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
+ 
+    struct vkr_resource *res = vkr_context_get_resource(ctx, args->resourceId);
+    if (!res) {
+-      vkr_log("failed to query resource props: invalid res_id %u", args->resourceId);
+-      vkr_context_set_fatal(ctx);
++      /*
++       * Not a stream error. With the render server, the proxy attaches a
++       * guest resource to this context only if it exports as a dma-buf
++       * (proxy_context.c: "exported res %d to unexpected fd_type"). A
++       * gralloc buffer the host backed with a plain GL texture therefore
++       * never reaches us, and the guest's next vkGetMemoryFdPropertiesKHR on
++       * it lands here. Killing the context for that aborts the guest process
++       * in vn_relax -- measured on RPi4: system_server's GrallocUploadThread
++       * dies importing a TaskSnapshot bitmap, and zygote restarts. Answer the
++       * way the exists-but-not-a-dma-buf case below already does, so the
++       * caller (HWUI) can fall back.
++       */
++      vkr_log("failed to query resource props: res_id %u not attached to this "
++              "context (not exportable as a dma-buf?), answering "
++              "VK_ERROR_INVALID_EXTERNAL_HANDLE", args->resourceId);
++      args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       return;
+    }
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4bf88e09..4f057dd6 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8590,19 +8590,32 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
+ #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+    uint32_t gbm_flags = virgl_gbm_convert_flags(gr->base.bind);
+    uint32_t gbm_format = 0;
++   /*
++    * Every early-out below leaves the resource as a plain GL texture, which
++    * cannot be exported as a dma-buf and therefore cannot be imported by a
++    * Venus (guest Vulkan) client. Name the reason, once per resource, so an
++    * "unexpected fd_type -1" in the proxy log can be traced to it.
++    */
++#define GBM_INIT_SKIP(why) \
++   do { \
++      virgl_debug("%s: res %ux%u virgl_format %u bind 0x%x: no GBM backing: %s\n", \
++                  __func__, gr->base.width0, gr->base.height0, format, \
++                  gr->base.bind, why); \
++      return; \
++   } while (0)
+    if (virgl_gbm_convert_format(&format, &gbm_format))
+-      return;
++      GBM_INIT_SKIP("format has no GBM equivalent");
+    if (vrend_winsys_different_gpu())
+       gbm_flags |= GBM_BO_USE_LINEAR;
+ 
+    if (gr->base.depth0 != 1 || gr->base.last_level != 0 || gr->base.nr_samples > 1)
+-      return;
++      GBM_INIT_SKIP("3D, mipmapped or multisampled");
+ 
+    if (!gbm || !gbm->device || !gbm_format || !gbm_flags)
+-      return;
++      GBM_INIT_SKIP("no gbm device, or no usable format/flags");
+ 
+    if (!virgl_gbm_external_allocation_preferred(gr->base.bind))
+-      return;
++      GBM_INIT_SKIP("bind flags have neither SCANOUT nor SHARED");
+ 
+ #if !defined(MINIGBM)
+    /*
+@@ -8610,7 +8623,7 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
+     * Skip GBM allocation when we don't actually need it.
+     */
+    if (!vrend_state.gbm_layout_feat)
+-      return;
++      GBM_INIT_SKIP("GBM layout feature not negotiated (1.3.0 skips GBM then)");
+ 
+    /*
+     * Kernel virtio-gpu driver doesn't support modifiers other than linear and
+@@ -8623,12 +8636,13 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
+ #endif
+ 
+    if (!gbm_device_is_format_supported(gbm->device, gbm_format, gbm_flags))
+-      return;
++      GBM_INIT_SKIP("gbm_device_is_format_supported() says no for this format/usage");
+ 
+    struct gbm_bo *bo = gbm_bo_create(gbm->device, gr->base.width0, gr->base.height0,
+                                      gbm_format, gbm_flags);
+    if (!bo)
+-      return;
++      GBM_INIT_SKIP("gbm_bo_create() failed");
++#undef GBM_INIT_SKIP
+ 
+    gr->gbm_bo = bo;
+    gr->storage_bits |= VREND_STORAGE_GBM_BUFFER;

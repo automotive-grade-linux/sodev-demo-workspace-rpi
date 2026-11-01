@@ -21,11 +21,13 @@
 # .bbappend, so plain '=' re-assignments and :append/:remove here win. Patch
 # files live in this layer's files/; meta-xt-qemu stays pristine.
 #
-# meta-xt-qemu now provides TWO qemu recipes -- 10.0.2 (the default, Vulkan lane)
-# and 7.0.0 (the `--gpu=gl` lane) -- and a qemu_%.bbappend applies to both, as
+# meta-xt-qemu now provides THREE qemu recipes -- 11.1.2 (both boards' Vulkan lane),
+# 10.0.2 (selectable instead) and 7.0.0 (the `--gpu=gl` lane) --
+# and a qemu_%.bbappend applies to all of them, as
 # well as to oe-core's own
-# qemu_10.2.0.bb which this layer's 10.0.2 recipe `require`s (bitbake-layers
-# show-appends confirms all three; qemu-system-native gets only
+# qemu_10.2.0.bb which meta-xt-qemu's 10.0.2 and 11.1.2 recipes `require` (bitbake-layers
+# show-appends confirmed it for 10.0.2, 7.0.0 and 10.2.0 before 11.1.2 was added,
+# whose name the same qemu_%.bbappend matches; qemu-system-native gets only
 # meta-virtualization's bbappend, so nothing here reaches a native build). The
 # source patches are 7.0.0-only and gated on PV accordingly, the gtk+/pixman pair
 # is Venus-only and gated on DISTRO_FEATURES, and the package split plus the vhost
@@ -41,11 +43,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # matching how the base qemu.inc appends cross.patch.
 #
 # ALL SIX patches below are written against 7.0.0 sources, so they are gated on
-# PV: meta-xt-qemu also carries qemu_10.0.2.bb -- the Venus-capable build, which is
-# what the DEFAULT lane (--gpu=vulkan) selects, see docs/VULKAN-VENUS.md -- and this
-# bbappend applies to both recipes. Applying a 7.0.0 patch to qemu 10 sources would
-# fail do_patch, so the 10.0.2 lane deliberately starts with none of them and gets
-# back only what it actually needs.
+# PV: meta-xt-qemu also carries the Venus-capable builds the DEFAULT lane
+# (--gpu=vulkan) selects -- qemu_11.1.2.bb on both boards, or qemu_10.0.2.bb where a
+# board selects it, see docs/VULKAN-VENUS.md -- and this bbappend applies to all
+# three recipes. Applying a 7.0.0 patch to qemu 10 or 11 sources would fail do_patch,
+# so those lanes deliberately start with none of them and get back only what they
+# actually need.
 #
 # Status of all six against v10.0.2-xt (SRCREV f460a035). None is open any more,
 # which is what allowed the default to move to the Vulkan lane:

@@ -1,9 +1,9 @@
 # ============================================================================
-# The rpi4 hypervisor series is the 32 patches listed in SRC_URI below, plus the
-# two the Vulkan lane adds further down: 34 fetched by default, 32 with
+# The rpi4 hypervisor series is the 33 patches listed in SRC_URI below, plus the
+# two the Vulkan lane adds further down: 35 fetched by default, 33 with
 # --gpu=gl.
 # It does NOT include 4.22-0002-route-msi-ranges (see the REMOVED note further
-# down). The rpi5 bbappend takes that one and not the rpi4-only 4.22-0011/0012,
+# down). The rpi5 bbappend takes that one and not the rpi4-only 4.22-0011/0012/0014,
 # which only a mini-UART console needs.
 # ============================================================================
 # This bbappend attaches to the STOCK meta-virtualization recipe
@@ -75,6 +75,11 @@
 #              SCMI back on rpi5 (Wi-Fi/Bluetooth pin control); nothing on this
 #              board forwards SCMI, so here it only keeps the two boards on the
 #              same SMCCC helper.
+#   4.22-0014  ns16550-leave-the-bcm2835-mini-UART-s-divisor-alone. rpi4 ONLY
+#              (the only board whose Xen console is the mini UART). Xen 4.22 reads
+#              the divisor through DLAB, which on the mini UART returned 0 on some
+#              boots, and then wrote divisor 1 (~31 Mbaud, computed): the console was garbage
+#              from the first line (measured 2026-10-04). Keeps the boot loader value.
 # NOTE on ThumbEE: [4.22] no longer relevant. In 4.21 the stock xen_4.21.bb SRC_URI carried
 # 0001-ARM-Drop-ThumbEE-support.patch (Andrew Cooper 5bbe1fe413, binutils/gcc15
 # fix), so it was NOT re-added here. That commit is IN 4.22, so the interim
@@ -180,6 +185,7 @@ SRC_URI:append = " \
     file://4.22-0011-vpl011-fall-back-to-the-guest-layout-when-the-Xen-UA.patch \
     file://4.22-0012-arm-carve-the-fallback-vpl011-out-of-the-extended-re.patch \
     file://4.22-0013-xen-arm-Fix-evaluation-of-parameters-for-SMCCC-calls.patch \
+    file://4.22-0014-ns16550-leave-the-bcm2835-mini-UART-s-divisor-alone.patch \
 "
 
 # [Venus] gated so a --gpu=gl build's hypervisor carries no additions from us.

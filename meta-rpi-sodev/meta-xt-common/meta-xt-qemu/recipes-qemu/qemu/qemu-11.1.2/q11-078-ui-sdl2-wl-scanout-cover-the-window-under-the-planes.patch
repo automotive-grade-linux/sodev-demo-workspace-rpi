@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 14:19:32 +0900
+Subject: [PATCH] ui/sdl2-wl-scanout: cover the window under the planes
+
+With the plane handoff, the guest's primary plane is a subsurface over
+qemu's own window. weston keeps that window in its scene: plane 0's
+buffer is ABGR8888 with no opaque region, and a primary scaled by
+SET_PRIMARY_RECT leaves the window showing around it. The window's
+buffer is BROADCOM_UIF, which cannot go on a KMS plane, so weston
+composed DomA's whole output on the GPU ("add fb failed", mixed
+state).
+
+Mark plane 0 opaque, and put an opaque black subsurface, a 64x64
+linear XRGB8888 dma-buf scaled to the window, under it while the
+primary is scaled. With the dma-buf heap missing there is no backdrop,
+as before.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16), a 1080p60 H.264
+stream in a WebView, DomA's buffers linear
+(vendor.minigbm.scanout_linear): weston's V3D time went from 66-81%
+to 0, and its drm-backend reported plane-only states only, both with
+the video in a window among the other HMI and with the video full
+screen.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ ui/sdl2-wl-scanout.c | 122 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 121 insertions(+), 1 deletion(-)
+
+diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
+index e7ae32e..b2ff49d 100644
+--- a/ui/sdl2-wl-scanout.c
++++ b/ui/sdl2-wl-scanout.c
+@@ -28,6 +28,9 @@
+ #include <wayland-client.h>
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
+ #include "viewporter-client-protocol.h" /* q11-plane-handoff */
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/dma-heap.h>
+ #include "ui/egl-helpers.h"
+ 
+ #define WL_DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' = V4L2 RGBA32 byte order */
+@@ -873,6 +876,103 @@ static void pl_resource_gone(uint32_t res)
+     }
+ }
+ 
++/*
++ * q11-plane-backdrop: an opaque black subsurface under the planes. When the
++ * guest's primary plane does not cover the window (a scaled primary,
++ * SET_PRIMARY_RECT), the window itself shows around it, and its buffer
++ * (BROADCOM_UIF) cannot go on a plane: weston then composes the output on the
++ * GPU. A 64x64 linear XRGB8888 buffer scaled to the window hides it. Without
++ * the dma-buf heap there is no backdrop, as before.
++ */
++#define WL_BACKDROP_SIZE 64
++#define WL_DRM_FORMAT_XRGB8888 0x34325258
++
++static struct {
++    struct wl_surface *s;
++    struct wl_subsurface *ss;
++    struct wp_viewport *vp;
++    struct wl_buffer *wb;
++    int w, h;
++    bool shown;
++} bd;
++
++static void backdrop_create(void)
++{
++    struct dma_heap_allocation_data a = {
++        .len = WL_BACKDROP_SIZE * WL_BACKDROP_SIZE * 4,
++        .fd_flags = O_RDWR | O_CLOEXEC,
++    };
++    struct zwp_linux_buffer_params_v1 *params;
++    struct wl_region *none;
++    int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
++    void *map;
++
++    if (heap < 0) {
++        return;
++    }
++    if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
++        close(heap);
++        return;
++    }
++    close(heap);
++    map = mmap(NULL, a.len, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
++    if (map == MAP_FAILED) {
++        close(a.fd);
++        return;
++    }
++    memset(map, 0, a.len);
++    munmap(map, a.len);
++    params = zwp_linux_dmabuf_v1_create_params(wl.dmabuf);
++    zwp_linux_buffer_params_v1_add(params, a.fd, 0, 0, WL_BACKDROP_SIZE * 4,
++                                   0, 0);
++    bd.wb = zwp_linux_buffer_params_v1_create_immed(params, WL_BACKDROP_SIZE,
++                                                     WL_BACKDROP_SIZE,
++                                                     WL_DRM_FORMAT_XRGB8888, 0);
++    zwp_linux_buffer_params_v1_destroy(params);
++    close(a.fd);
++    bd.s = wl_compositor_create_surface(wl.compositor);
++    bd.ss = wl_subcompositor_get_subsurface(wl.subcomp, bd.s, wl.surf);
++    bd.vp = wp_viewporter_get_viewport(wl.viewporter, bd.s);
++    none = wl_compositor_create_region(wl.compositor);
++    wl_surface_set_input_region(bd.s, none);
++    wl_region_destroy(none);
++    wl_subsurface_place_above(bd.ss, wl.surf);
++    wl_subsurface_set_sync(bd.ss);
++}
++
++static void backdrop_show(int ww, int wh)
++{
++    struct wl_region *r;
++
++    if (!bd.wb) {
++        return;
++    }
++    if (bd.shown && bd.w == ww && bd.h == wh) {
++        return;
++    }
++    wp_viewport_set_destination(bd.vp, ww, wh);
++    r = wl_compositor_create_region(wl.compositor);
++    wl_region_add(r, 0, 0, ww, wh);
++    wl_surface_set_opaque_region(bd.s, r);
++    wl_region_destroy(r);
++    wl_subsurface_set_position(bd.ss, 0, 0);
++    wl_surface_attach(bd.s, bd.wb, 0, 0);
++    wl_surface_damage_buffer(bd.s, 0, 0, INT32_MAX, INT32_MAX);
++    wl_surface_commit(bd.s);
++    bd.w = ww;
++    bd.h = wh;
++    bd.shown = true;
++}
++
++static void backdrop_hide(void)
++{
++    if (bd.shown) {
++        wl_surface_attach(bd.s, NULL, 0, 0);
++        wl_surface_commit(bd.s);
++        bd.shown = false;
++    }
++}
++
+ static bool planes_create(void)
+ {
+     if (pl.s[0]) {
+@@ -881,6 +981,7 @@ static bool planes_create(void)
+     if (!wl.compositor || !wl.subcomp || !wl.viewporter) {
+         return false;
+     }
++    backdrop_create(); /* q11-plane-backdrop: below plane 0 */
+     for (int i = 0; i < WL_PLANES; i++) {
+         struct wl_region *none = wl_compositor_create_region(wl.compositor);
+ 
+@@ -890,7 +991,8 @@ static bool planes_create(void)
+         /* no input on the planes: touches and pointer stay with the window (SDL) */
+         wl_surface_set_input_region(pl.s[i], none);
+         wl_region_destroy(none);
+-        wl_subsurface_place_above(pl.ss[i], i ? pl.s[i - 1] : wl.surf);
++        wl_subsurface_place_above(pl.ss[i], i ? pl.s[i - 1]
++                                             : bd.s ? bd.s : wl.surf);
+         wl_subsurface_set_sync(pl.ss[i]);
+     }
+     q11_resource_gone_cb = pl_resource_gone;
+@@ -960,6 +1062,21 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
+     pl.gw[i] = dw;
+     pl.gh[i] = dh;
+     wl_subsurface_set_position(pl.ss[i], dx, dy);
++    if (i == 0) {
++        /*
++         * q11-plane-opaque: the guest's primary plane is opaque on screen (a
++         * DRM primary plane is not blended with anything below it), but its
++         * buffer is ABGR8888, so without this weston keeps the window under
++         * it in the scene, and that window's buffer (BROADCOM_UIF) cannot go
++         * on a plane: weston then composes the output on the GPU ("add fb
++         * failed", mixed state).
++         */
++        struct wl_region *r = wl_compositor_create_region(wl.compositor);
++
++        wl_region_add(r, 0, 0, dw, dh);
++        wl_surface_set_opaque_region(pl.s[i], r);
++        wl_region_destroy(r);
++    }
+     wl_surface_attach(pl.s[i], b->wb, 0, 0);
+     wl_surface_damage_buffer(pl.s[i], 0, 0, INT32_MAX, INT32_MAX);
+     wl_surface_commit(pl.s[i]);
+@@ -1006,9 +1123,11 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+         int sh = scon->h ? (int)scon->h : scon->guest_fb.height;
+ 
+         if (rect) {
++            backdrop_show(ww, wh); /* q11-plane-backdrop */
+             plane_show(0, b[0], scon->y0_top, sx, sy, sw, sh, scon->prim_x * fx,
+                        scon->prim_y * fy, scon->prim_w * fx, scon->prim_h * fy, ww, wh);
+         } else {
++            backdrop_hide();
+             plane_show(0, b[0], scon->y0_top, sx, sy, sw, sh, 0, 0, ww, wh, ww, wh);
+         }
+     }
+@@ -1043,6 +1162,7 @@ void sdl2_wl_planes_off(void)
+     for (int i = 0; i < WL_PLANES; i++) {
+         plane_hide(i);
+     }
++    backdrop_hide();
+     wl_surface_commit(wl.surf);
+     wl_display_flush(wl.dpy);
+     pl.shown = false;

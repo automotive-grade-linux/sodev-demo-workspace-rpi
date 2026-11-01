@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] vhost: do not verify vring host mappings under Xen, it
+ abort()s the device model
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0119-vhost-do-not-verify-vring-host-mappings-under-Xen.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [not yet submitted to qemu-devel; the check it skips cannot succeed under Xen, where qemu never maps the whole of a guest's RAM. Note that the vhost backends this unblocks get their Xen address translation from the fork's own guest-side vhost-Xen work, which upstream does not have]
+---
+ hw/virtio/vhost.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index 371dca17d..74e53a066 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -29,6 +29,7 @@
+ #include "system/dma.h"
+ #include "system/memory.h"
+ #include "system/ramblock.h"
++#include "system/xen.h"
+ #include "trace.h"
+ 
+ /* enabled until disconnected backend stabilizes */
+@@ -586,6 +587,33 @@ static int vhost_verify_ring_mappings(struct vhost_dev *dev,
+         return 0;
+     }
+ 
++    /*
++     * Under Xen there is nothing here to verify, and verifying anyway is fatal.
++     *
++     * qemu does not map the whole of a Xen guest's RAM: the RAMBlock backing
++     * "xen.ram" has host == NULL and the vrings are reached on demand through
++     * the map cache (xen_map_cache()). memory_region_get_ram_ptr() therefore
++     * returns NULL for those sections, so the userspace_addr that
++     * vhost_commit() records in the vhost memory table is a pseudo-hva equal to
++     * the guest physical address -- while vq->desc holds a real map-cache
++     * pointer. The "ring's MemoryRegion wasn't replaced" comparison below can
++     * then never hold, so every ring looks "relocated" and vhost_commit()
++     * abort()s the device model on the FIRST memory topology change that
++     * happens after the device was started. vhost_dev_start() commits before it
++     * sets ->started, which is the only reason this is not hit at boot.
++     *
++     * On Arm that first post-start change is a virtio-gpu host-visible blob
++     * being mapped into the guest (Venus/Vulkan), so enabling Vulkan in a guest
++     * killed its device model as soon as Mesa created its first Venus context.
++     * Address translation for these backends is done by domid rather than by
++     * host VA, so the mapping identity this function tries to police is not the
++     * one actually in use. Skip it; vhost_commit() still updates the memory
++     * table itself below.
++     */
++    if (xen_enabled()) {
++        return 0;
++    }
++
+     for (i = 0; i < dev->nvqs; ++i) {
+         struct vhost_virtqueue *vq = dev->vqs + i;
+ 

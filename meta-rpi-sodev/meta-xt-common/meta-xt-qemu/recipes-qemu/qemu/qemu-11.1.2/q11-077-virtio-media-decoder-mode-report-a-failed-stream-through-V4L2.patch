@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 08:07:07 +0900
+Subject: [PATCH] virtio-media: decoder mode: report a failed stream
+ through V4L2
+
+When libavcodec failed, or a frame could not be written, decoder mode
+sent VIRTIO_MEDIA_EVT_ERROR. The guest driver frees the session on
+that event while the client still has the node open, so its next
+ioctl uses freed memory. On the Raspberry Pi 5 a second 4K HEVC
+stream ran DomD's CMA out (libavcodec: ENOMEM for a decoder buffer),
+and DomA's kernel panicked in virtio_media_qbuf().
+
+Report it the way a V4L2 decoder does instead: a queued CAPTURE
+buffer comes back with V4L2_BUF_FLAG_ERROR, so a client waiting on
+CAPTURE wakes, and QBUF and DECODER_CMD STOP fail with EIO from then
+on, which v4l2_codec2 turns into a component error. No further frame
+is delivered and the decode thread's bottom half stops rescheduling
+itself. STREAMOFF on OUTPUT, or a codec switch, starts over.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16): with two 4K HEVC
+streams at once, the first played to the end (55.8 fps), the second
+failed in the client, and DomA kept running; 4K then played at 59.9
+fps.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 61 ++++++++++++++++++++++++++++----
+ 1 file changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index e92f540..3aee470 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -381,8 +381,13 @@ struct VirtIOMediaDec {
+     int sws_src_w, sws_src_h;
+     int sws_w, sws_h;
+     int sws_matrix;
+-    /* errno for the error event when dec_write_frame() fails (0 = EFAULT) */
++    /* errno for dec_fail() when dec_write_frame() fails (0 = EFAULT) */
+     int write_err;
++    /*
++     * q11-dec-fail: the errno this stream broke with, 0 while it works. Set by
++     * dec_fail(), cleared by STREAMOFF on OUTPUT and a codec switch.
++     */
++    int failed;
+ 
+     /*
+      * v4l2request hwaccel. hwdev is NULL when it could not be opened, and
+@@ -1812,6 +1817,34 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+     return true;
+ }
+ 
++/*
++ * q11-dec-fail: the stream cannot go on (libavcodec failed, or a frame could
++ * not be written). VIRTIO_MEDIA_EVT_ERROR used to say so, and the guest
++ * driver frees the session on that event while the client still has the
++ * node open: its next ioctl used freed memory, and DomA's kernel panicked
++ * (virtio_media_qbuf, NULL dereference) when a second 4K stream ran DomD's
++ * CMA out. Answer through V4L2 instead: a queued CAPTURE buffer comes back
++ * with V4L2_BUF_FLAG_ERROR, so a client waiting on CAPTURE wakes, and QBUF
++ * fails with EIO from now on, which v4l2_codec2 turns into a component
++ * error. The session stays open until the client closes it.
++ */
++static void dec_fail(VirtIOMediaSession *s, int err)
++{
++    VirtIOMediaDec *d = s->dec;
++    int index;
++
++    if (d->failed) {
++        return;
++    }
++    d->failed = err;
++    warn_report("virtio-media/dec: the stream failed (%s); QBUF answers EIO "
++                "until STREAMOFF", strerror(err));
++    index = dec_next_cap_buffer(s);
++    if (index >= 0) {
++        dec_complete_buffer(s, 1, (uint32_t)index, 0, V4L2_BUF_FLAG_ERROR, -1);
++    }
++}
++
+ /* Deliver one frame if a buffer is free; returns false if it could not. */
+ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+ {
+@@ -1823,8 +1856,7 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+     }
+     s->dec->write_err = 0;
+     if (!dec_write_frame(s, index, fr, &bytesused)) {
+-        virtio_media_send_error_event(s, s->dec->write_err ? s->dec->write_err
+-                                                           : EFAULT);
++        dec_fail(s, s->dec->write_err ? s->dec->write_err : EFAULT);
+         return true;   /* consumed: the session is broken either way */
+     }
+     dec_complete_buffer(s, 1, (uint32_t)index, bytesused, 0, fr->pts);
+@@ -1968,7 +2000,8 @@ static void dec_thr_bh(void *opaque)
+     more = o && o->err != AVERROR_EOF;
+     qemu_mutex_unlock(&d->thr_lock);
+     /* dec_pump delivers DEC_PUMP_MAX_FRAMES a call; the rest on the next turn */
+-    if (more && dec_next_cap_buffer(s) >= 0 && !d->awaiting_reconfig) {
++    if (more && !d->failed && dec_next_cap_buffer(s) >= 0 &&
++        !d->awaiting_reconfig) {
+         qemu_bh_schedule(d->thr_bh);
+     }
+ }
+@@ -2214,7 +2247,7 @@ static void dec_pump(VirtIOMediaSession *s)
+     VirtIOMediaDec *d = s->dec;
+     int n;
+ 
+-    if (!d->avctx) {
++    if (!d->avctx || d->failed) {
+         return;
+     }
+ 
+@@ -2224,6 +2257,9 @@ static void dec_pump(VirtIOMediaSession *s)
+             return;
+         }
+         av_frame_free(&d->held);
++        if (d->failed) {
++            return;   /* q11-dec-fail: that frame broke the stream */
++        }
+     }
+ 
+     /*
+@@ -2284,7 +2320,7 @@ static void dec_pump(VirtIOMediaSession *s)
+                 continue;
+             }
+             error_report_once("virtio-media/dec: avcodec_receive_frame: %d", r);
+-            virtio_media_send_error_event(s, EIO);
++            dec_fail(s, EIO);
+             return;
+         }
+ 
+@@ -2313,7 +2349,7 @@ static void dec_pump(VirtIOMediaSession *s)
+             t = av_hwframe_transfer_data(d->swframe, d->frame, 0);
+             if (t < 0) {
+                 error_report_once("virtio-media/dec: hwframe transfer: %d", t);
+-                virtio_media_send_error_event(s, EIO);
++                dec_fail(s, EIO);
+                 return;
+             }
+             av_frame_copy_props(d->swframe, d->frame);
+@@ -2411,6 +2447,9 @@ static void dec_pump(VirtIOMediaSession *s)
+             return;
+         }
+         av_frame_unref(d->frame);
++        if (d->failed) {
++            return;   /* q11-dec-fail: that frame broke the stream */
++        }
+     }
+ }
+ 
+@@ -2613,6 +2652,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+     d->drain_done = false;
+     d->hw_logged = false;
+     d->gpu_logged = false;
++    d->failed = 0;
+     d->codec = c;
+     if (dec_codec_open(s) == 0) {
+         return 0;
+@@ -2994,6 +3034,9 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+     if (b->index >= q->num_bufs) {
+         return EINVAL;
+     }
++    if (d->failed) {
++        return EIO;   /* q11-dec-fail */
++    }
+ 
+     ret = virtio_media_qbuf_take_sg(s, payload, payload_len, &guest_planes);
+     if (ret) {
+@@ -3176,6 +3219,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+         }
+         if (qi == 0) {
+             /* Input stopped: the decoder's state is no longer meaningful. */
++            d->failed = 0;   /* q11-dec-fail: a new start */
+             dec_av_flush(d);
+             av_frame_free(&d->held);
+             dec_backlog_clear(d);
+@@ -3235,6 +3279,9 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+     }
+ 
+     if (cmd->cmd == V4L2_DEC_CMD_STOP) {
++        if (d->failed) {
++            return EIO;   /* q11-dec-fail: no LAST would come */
++        }
+         if (!d->draining) {
+             d->draining = true;
+             d->drain_done = false;

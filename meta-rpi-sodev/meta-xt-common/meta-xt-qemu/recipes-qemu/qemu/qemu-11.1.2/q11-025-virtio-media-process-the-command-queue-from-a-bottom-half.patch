@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-media: process the command queue from a bottom half
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0222-v10-virtio-media-defer-commands-to-a-bottom-half.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c         | 31 +++++++++++++++++++++++++++--
+ include/hw/virtio/virtio-media.h | 34 ++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index e4d1e609e..7d02c5430 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -942,9 +942,18 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+ /* command queue                                                             */
+ /* ------------------------------------------------------------------------- */
+ 
+-static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
++/*
++ * The real commandq work. **Called from the main loop's bottom half.**
++ * Why it must not be done directly in the vq handler is written in the
++ * comment on command_bh in struct VirtIOMedia (on Xen/Arm an ioreq blocks
++ * the guest vCPU even for an MMIO write, and qemu can only complete the
++ * ioreq from the main loop).
++ */
++static void virtio_media_command_bh(void *opaque)
+ {
+-    VirtIOMedia *vm = VIRTIO_MEDIA(vdev);
++    VirtIOMedia *vm = opaque;
++    VirtIODevice *vdev = VIRTIO_DEVICE(vm);
++    VirtQueue *vq = vm->command_vq;
+     VirtQueueElement *elem;
+ 
+     for (;;) {
+@@ -1146,6 +1155,22 @@ static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
+     virtio_notify(vdev, vq);
+ }
+ 
++/*
++ * The vq handler itself: on a doorbell it only wakes the BH, so the ioreq
++ * completes immediately.
++ *
++ * Ordering holds: the guest driver serialises all commands under vlock and
++ * waits for the response (driver/virtio_media_driver.c:
++ * mutex_lock(&vv->vlock) + wait_event_timeout(vv->wq, cb_param.done, 5 * HZ)),
++ * so commandq never holds 2+ commands; the BH's virtqueue_pop() order suffices.
++ */
++static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VirtIOMedia *vm = VIRTIO_MEDIA(vdev);
++
++    qemu_bh_schedule(vm->command_bh);
++}
++
+ /*
+  * The event queue only ever carries device-to-driver traffic. The driver posts
+  * empty buffers on it and this handler does nothing with the kick: buffers are
+@@ -1235,6 +1260,7 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+     virtio_init(vdev, VIRTIO_ID_MEDIA, 2 * sizeof(uint32_t));
+     vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
+     vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
++    vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
+ 
+     info_report("virtio-media: proxying %s (device_caps 0x%08x)",
+                 vm->v4l2_device, vm->device_caps);
+@@ -1250,6 +1276,7 @@ static void virtio_media_unrealize(DeviceState *dev)
+         QLIST_REMOVE(s, next);
+         virtio_media_session_free(s);
+     }
++    g_clear_pointer(&vm->command_bh, qemu_bh_delete);
+     g_free(vm->cmd_buf);
+     vm->cmd_buf = NULL;
+     virtio_delete_queue(vm->command_vq);
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index c990d788f..bba5b9a98 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -209,6 +209,40 @@ struct VirtIOMedia {
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;
+ 
++    /*
++     * Bottom half that processes commandq.
++     *
++     * NOTE: WHY THE VQ HANDLER MUST NOT DO THIS DIRECTLY (Xen/Arm specific)
++     *
++     * On Xen/Arm a guest MMIO access waits for ioreq completion **even for a
++     * write**: ioreq_needs_completion() (xen/include/xen/ioreq.h) excludes only
++     * PIO writes and Arm has no PIO, so even the virtio QueueNotify write (a
++     * pure doorbell) runs wait_for_io() (xen/common/ioreq.c) ->
++     * wait_on_xen_event_channel() -> _VPF_blocked_in_xen + SCHEDULE_SOFTIRQ,
++     * and **the vCPU is actually descheduled**.
++     *
++     * And qemu can only answer from the main loop: hw/xen/xen-hvm-common.c does
++     *   qemu_set_fd_handler(evtchn_fd, cpu_handle_ioreq, NULL, state)
++     * so an ioreq is **completed only there**. xen_io_listener has no
++     * .eventfd_add, so the Xen accelerator has no ioeventfd-equivalent fast
++     * path either (-device ...,ioeventfd=on only routes the kick through
++     * an eventfd that the same main loop polls).
++     *
++     * So doing a host V4L2 ioctl and one frame of virtio_media_sg_copy()
++     * (942,080 B for 360p RGBA) inside the vq handler blocks the guest vCPU
++     * for that whole time, and since cpu_handle_ioreq() cannot run,
++     * **the MMIO of DomA's disk / net / gpu / input stops as well**
++     * (head-of-line blocking).
++     *
++     * Measured (RPi4, 2026-09-04, counted in the guest): with a payload of
++     * tens of bytes VIDIOC_G_FMT took 1,754 us, REQBUFS 8,378 us, STREAMON
++     * 2,312 us. **Independent of size** = the fixed round-trip cost dominates.
++     *
++     * hw/display/virtio-gpu.c escapes to qemu_bh_schedule(g->ctrl_bh) for the
++     * same reason (:1022); this follows it.
++     */
++    QEMUBH *command_bh;
++
+     /*
+      * Config space, exactly as the driver reads it:
+      *   u32 @0  device_caps  (virtio_media_driver.c:895)

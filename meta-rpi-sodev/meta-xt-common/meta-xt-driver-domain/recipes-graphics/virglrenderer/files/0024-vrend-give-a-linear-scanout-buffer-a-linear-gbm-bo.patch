@@ -1,0 +1,41 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 13:19:54 +0900
+Subject: [PATCH] vrend: give a linear scanout buffer a linear gbm bo
+
+virglrenderer 1.3.0 allocates a resource as a gbm bo only when the
+guest negotiated the gbm-layout feature; otherwise it is a GL texture,
+whose layout is the driver's choice (BROADCOM_UIF on the Raspberry Pi
+5's V3D). A guest that asks for a linear scanout buffer
+(VIRGL_BIND_LINEAR | VIRGL_BIND_SCANOUT, which Mesa's virgl driver
+sends with the AGL layer's mesa 0004) puts it on a display plane, and
+the host compositor can take it from there only if it is linear.
+
+Allocate such resources as gbm bos even without gbm-layout. Both bits
+are required, so a resource that is only linear -- a texture the CPU
+writes -- stays a GL texture. There is a gbm device only when the
+device model runs with VIRGL_EXTERNAL_GBM=1: DomA's qemu does in the
+Venus lane, DomU's does with overlay planes (xt-xen-cfg-domu).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8622,7 +8622,15 @@
+     * GBM allocation may be less optimal compared to a regular GL allocation.
+     * Skip GBM allocation when we don't actually need it.
+     */
+-   if (!vrend_state.gbm_layout_feat)
++   /*
++    * Unless the guest asked for a linear scanout buffer: one it hands to a
++    * display plane needs that layout, and a GBM bo is the only way to get it
++    * (a GL texture's layout is the driver's choice, tiled on V3D). Both bits,
++    * so a buffer that is only linear (a CPU-written texture) stays as it was.
++    */
++   if (!vrend_state.gbm_layout_feat &&
++       (gr->base.bind & (VIRGL_BIND_LINEAR | VIRGL_BIND_SCANOUT)) !=
++          (VIRGL_BIND_LINEAR | VIRGL_BIND_SCANOUT))
+       GBM_INIT_SKIP("GBM layout feature not negotiated (1.3.0 skips GBM then)");
+ 
+    /*

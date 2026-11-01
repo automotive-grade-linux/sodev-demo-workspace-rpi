@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/arm: pass the virtio-pci INTX line count to the GPEX
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0122-hw-arm-pass-the-virtio-pci-INTX-line-count-to-the-GPEX.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / xenstore layout is fork-only]
+---
+ hw/arm/xen-pvh.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/xen-pvh.c b/hw/arm/xen-pvh.c
+index a542c2b15..bdb492d9e 100644
+--- a/hw/arm/xen-pvh.c
++++ b/hw/arm/xen-pvh.c
+@@ -91,7 +91,7 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
+     struct qemu_xs_handle *h;
+     bool ok = true;
+     uint64_t ecam_base, ecam_size, mem_base, mem_size;
+-    uint64_t pref_base, pref_size, irq_first;
++    uint64_t pref_base, pref_size, irq_first, num_irqs;
+ 
+     if (s->cfg.pci_ecam.size) {
+         return;         /* explicitly configured; nothing to do */
+@@ -120,6 +120,21 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
+     pref_base = xen_arm_xs_read_u64(h, "prefetch_mem_base", &ok);
+     pref_size = xen_arm_xs_read_u64(h, "prefetch_mem_size", &ok);
+     irq_first = xen_arm_xs_read_u64(h, "irq_first", &ok);
++    /*
++     * num_irqs is read on its own `ok`: libxl has published it since the
++     * virtio-pci host was introduced, but a DomD paired with an older libxl
++     * would have the other seven keys and not this one, and failing the whole
++     * layout over it would take PCI away from a guest that works without it.
++     * Absent or zero means "the GPEX default", which is what xen-pvh-common
++     * does with pci_intx_irq_count == 0.
++     */
++    {
++        bool have_num_irqs = true;
++        num_irqs = xen_arm_xs_read_u64(h, "num_irqs", &have_num_irqs);
++        if (!have_num_irqs) {
++            num_irqs = 0;
++        }
++    }
+     qemu_xen_xs_close(h);
+ 
+     if (!ok || !ecam_size) {
+@@ -130,6 +145,14 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
+     s->cfg.pci_mmio      = (MemMapEntry) { mem_base, mem_size };
+     s->cfg.pci_mmio_high = (MemMapEntry) { pref_base, pref_size };
+     s->cfg.pci_intx_irq_base = irq_first;
++    /*
++     * One INTX line per PCI slot instead of the four INTA-D lines. libxl's
++     * interrupt-map wraps as irq = irq_first + ((pin + slot) % num_irqs), so
++     * the guest DT and the GPEX have to agree on num_irqs or two slots share a
++     * level-triggered SPI -- fatal for virtio-snd and for a decode session,
++     * whose completion interrupt is their only wake-up source.
++     */
++    s->cfg.pci_intx_irq_count = num_irqs;
+ }
+ 
+ static void (*xen_pvh_common_machine_init)(MachineState *ms);

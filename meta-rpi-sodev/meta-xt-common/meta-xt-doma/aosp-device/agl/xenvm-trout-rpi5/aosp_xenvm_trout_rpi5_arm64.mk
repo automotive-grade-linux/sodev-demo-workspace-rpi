@@ -191,8 +191,8 @@ PRODUCT_COPY_FILES += \
 #
 # THE SCAN RELAY. doma-shadow-ap only beacons what is in
 # /data/vendor/wifi/shadow/aps.conf, and with nothing keeping that file current it
-# stays at the seeded doma-shadow-aps.conf below, so the AAOS Wi-Fi screen lists a
-# fixed set of SSIDs regardless of what DomD can see. doma-wifi-relay consumes the
+# stays at the seeded doma-shadow-aps.conf below, which lists no AP, so the AAOS
+# Wi-Fi screen shows none, whatever DomD can see. doma-wifi-relay consumes the
 # DomD agent's scan feed on /dev/hvc4 and the companion app's PSK drop-box, and keeps
 # aps.conf in sync with the current scan. init.xenvm-hwsim.rc declares it `disabled`
 # and starts it at sys.boot_completed; it follows the Settings Wi-Fi toggle, and
@@ -212,24 +212,32 @@ PRODUCT_COPY_FILES += \
 # passphrase the user typed. NETWORK_SETTINGS is signature-level, but
 # READ_WIFI_CREDENTIAL is signature|privileged, so the module ships a privapp
 # allowlist entry (its Android.bp). It installs to /system_ext/priv-app, not
-# /vendor: soong rejects platform_apis on a vendor module. It reads the same
-# persist.vendor.doma.wifi_relay property and the same Settings Wi-Fi toggle as
-# the shell daemon: `false` stops both.
+# /vendor: soong rejects platform_apis on a vendor module. It follows the shell
+# daemon's init state (the property itself is a vendor one, which the app may not
+# read) and the same Settings Wi-Fi toggle: `false` stops both.
 PRODUCT_PACKAGES += \
     DomaWifiRelay
 
-# WHY doma-shadow-aps.conf IS SHIPPED AT ALL.
-# doma-shadow-ap dies with "$APS is empty" if /data/vendor/wifi/shadow/aps.conf
-# has no content, and /data is empty on a first boot, so on a freshly flashed
-# card the AAOS Wi-Fi screen would list nothing and there would be nothing to
-# select. The script merges this file into aps.conf on every boot, adding only
-# the SSIDs aps.conf lacks, so a row the relay or the user has written is never
-# overwritten.
-#
-# IT CARRIES ONE PLACEHOLDER ROW, EXAMPLE-SSID, AND NO REAL PASSPHRASE: this
-# file is in the source tree and in the vendor image. A real AP's passphrase is
-# typed on the Wi-Fi screen and reaches the shadow AP through DomaWifiRelay; the
-# file's own header says how, and why a shadow AP cannot learn it any other way.
+# The scripts run in a vendor domain, which may not execute /system's programs, so
+# they use /vendor/bin/iw (iw_vendor); the rest is toybox_vendor and cuttlefish's apexes.
+PRODUCT_PACKAGES += iw_vendor
+
+# A network AAOS found without internet -- DomA's station is on the shadow AP before
+# DomD has the real one -- is tried again after 10 minutes instead of never. Why the
+# value and the ordering are as they are is in its Android.bp
+# (device/agl/doma-common/DomaWifiOverlay).
+PRODUCT_PACKAGES += DomaWifiOverlay
+
+# doma-shadow-aps.conf: the seed. doma-shadow-ap merges it into
+# /data/vendor/wifi/shadow/aps.conf on every boot, adding only the SSIDs aps.conf
+# lacks, so a row the relay or the user has written is never overwritten. It ships
+# with NO data rows -- nothing would be listed that is not a real, reachable AP --
+# and an empty aps.conf is fine: hostapd then runs one hidden idle BSS until DomD's
+# first scan arrives. A build may add rows naming a real AP's SSID only (with the
+# relay's placeholder passphrase, or an empty one for an open AP); it must never
+# hold a real passphrase, since it is in the source tree and in the vendor image.
+# A real AP's passphrase is typed on the Wi-Fi screen and reaches the shadow AP
+# through DomaWifiRelay; the file's own header says how.
 
 # wificond. WifiNative talks to it over binder to do the nl80211 setup of wlan0, so
 # without it enabling Wi-Fi fails at exactly one line -- "Failed to setup iface in
@@ -379,7 +387,10 @@ PRODUCT_SOONG_NAMESPACES += external/v4l2_codec2
 #         (0217-v10) therefore presents a STATEFUL HEVC decoder to the guest and
 #         drives the stateless side with libavcodec in DomD, so the codec2 entry is
 #         c2.v4l2.hevc.decoder and nothing in v4l2_codec2 is HEVC- or
-#         stateless-specific.
+#         stateless-specific. With qemu 11.1.2 and RPI5_DOMA_H264=1 (meta-xt-rpi5)
+#         decoder mode also offers H.264 (q11-072), decoded by libavcodec in
+#         SOFTWARE in DomD, as c2.v4l2.avc.decoder: not hardware, but faster
+#         than DomA's own software decoder.
 #
 # Everything here is gated on XT_DOMA_HWDEC=true, which rpi5-sodev.yaml sets on
 # the vulkan lane with the zephyr Dom0 only, for the same reason as on the RPi4:
@@ -401,7 +412,8 @@ PRODUCT_PACKAGES += \
 # extended policy is never read and the V4L2 ioctls are killed by seccomp. No
 # SELinux denial is emitted, so the cause is invisible.
 # Codec2InfoBuilder reads media_codecs_c2.xml to describe vendor C2 components.
-# Decoders only, HEVC only, up to 1920x1088: the file itself says why.
+# Decoders only, HEVC up to 3840x2176 and H.264 up to 1920x1088: the file itself
+# says why.
 PRODUCT_COPY_FILES += \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml \
     device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/codec2.vendor.ext.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/android.hardware.media.c2-extended-seccomp_policy
@@ -500,27 +512,99 @@ DEVICE_PACKAGE_OVERLAYS += device/agl/common/overlay
 # this one win is in its Android.bp (device/agl/doma-common/DomaSettingsProviderRRO).
 PRODUCT_PACKAGES += DomaSettingsProviderRRO
 
-# Render with Vulkan (Venus) by default: SurfaceFlinger's RenderEngine and HWUI in every
-# app. Both are debug.* properties, which is the only switch either has -- SurfaceFlinger
-# reads debug.renderengine.backend in chooseRenderEngineType() and has no ro.* variant;
-# HWUI reads debug.hwui.renderer (Properties::peekRenderPipelineType) ahead of
+# Render with GL by default: SurfaceFlinger's RenderEngine and HWUI in every app. Both
+# are debug.* properties, which is the only switch either has -- SurfaceFlinger reads
+# debug.renderengine.backend in chooseRenderEngineType() and has no ro.* variant; HWUI
+# reads debug.hwui.renderer (Properties::peekRenderPipelineType) ahead of
 # ro.hwui.use_vulkan. A vendor build.prop is allowed to carry debug.* (cuttlefish does the
-# same for debug.sf.vsync_reactor_ignore_present_fences), and the alternative -- a
-# hand-written /data/local.prop -- is lost by a factory reset or a fresh userdata.
+# same for debug.sf.vsync_reactor_ignore_present_fences).
 #
-# These two lines only make sense together with the DomD-side device model this series
-# adds (virglrenderer 0017/0018/0021 and VKR_DEVICE_HEAP_MIB); without it the Vulkan
-# path is not safe to switch on.
-#
-# The measurement behind choosing Vulkan over the GL default was taken on the RPi4 4 GiB
-# board (2026-09-13: Settings cold start 18.8-24.0 s on Vulkan against 34.5-44.2 s on GL,
-# and the GL runs fell into a VHAL/SystemUI crash cascade the Vulkan runs did not).
-# NOT re-measured on a Raspberry Pi 5: the guest is the same virtio VM on both boards and
-# the Venus path is board-independent, but this default is being set for rpi5 on the rpi4
-# result. docs/VULKAN-VENUS.md records what was and was not verified on which board.
+# WHY GL and not Vulkan (Venus) on this board. The Raspberry Pi 5 board has run GL since
+# 2026-10-14 for every video measurement (a hand-written /data/local.prop), and on the
+# Raspberry Pi 4 GL was the final choice for video too: switching from Vulkan to GL
+# alone took a 1080p H.264 playback from 7-10% dropped frames to 3.6% (2026-10-05).
+# Vulkan here also needs DomD's /etc/qemu-gbm-layout: without it
+# SurfaceFlinger fails in vkCreateInstance and no home screen comes up. The measurement
+# that once chose Vulkan was app start on the RPi4 4 GiB board (2026-09-13: Settings cold
+# start 18.8-24.0 s on Vulkan against 34.5-44.2 s on GL, and the GL runs fell into a
+# VHAL/SystemUI crash cascade the Vulkan runs did not). That measurement was taken
+# while DomA's watermark_scale_factor was miscomputed to 1777 and kswapd kept DomD busy;
+# it has not been repeated since, on either board.
 PRODUCT_VENDOR_PROPERTIES += \
-    debug.renderengine.backend=skiavkthreaded \
-    debug.hwui.renderer=skiavk
+    debug.renderengine.backend=skiaglthreaded \
+    debug.hwui.renderer=skiagl
+
+# No per-app frame rate overrides: SurfaceFlinger then keeps the display's 60 Hz for a
+# 30 fps video instead of dropping the app's render rate to 30 and back. Measured on the
+# Raspberry Pi 4 (xenvm-cf 0005): 1080p30 played at 27.1-28.8 frames a second where it
+# had swung between 14.7 and 28.4; on this board a runtime test (2026-09-24) took
+# 1080p30 in a VideoView from 15-16 to 19 frames a second.
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.surface_flinger.enable_frame_rate_override=false
+
+# SurfaceFlinger wakes 8 ms after the vsync instead of 1 ms (phase offsets, app 1 ms and
+# SF 1 ms by default; the early offsets follow the SF one when unset). A WebView hands
+# each video frame over in a transaction and, as its trace reads, sends the next one
+# once that is acknowledged; with SurfaceFlinger waking at the moment the WebView's
+# BeginFrame came, a frame a little late probably waited a whole vsync. Measured on this
+# board (2026-10-19, 4K60 HEVC in a WebView, two runs each, qemu q11-081..083, set by
+# hand): 55.2 and 51.4 -> 57.4 and 57.9 frames shown a second among the HMI; full screen
+# no change, 56.1 and 53.0 -> 56.6 and 52.7 (with q11-083 before its last changes,
+# 54.4-57.0 -> 57.1-58.3). SurfaceFlinger's composition took about 1 ms a frame there
+# (timestats' frameDuration), against 8.7 ms left before the vsync now. Not measured:
+# heavier GPU composition (screenshots, animations, a busy HMI), which past 8.7 ms would
+# now be a vsync late.
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.surface_flinger.vsync_sf_event_phase_offset_ns=8000000
+
+# Linear scanout buffers (aosp-patches/external/minigbm 0003, virglrenderer 0024 in
+# DomD): the client target and the app layers the composer is handed become linear GBM
+# bos on the host, which vc4's RGB planes take (LINEAR or T_TILED only, not UIF), so
+# weston puts DomA's layers on planes instead of composing them with the GPU. Measured on
+# this board (2026-10-19, qemu's plane-sand and sand-scaled on, DomD's CMA 384 MiB then):
+# HEVC 1080p60 in a WebView among the HMI, V3D render 58.5% -> 18.6% at 57-58 frames
+# shown a second, weston's GPU time 86% -> 0, five planes; a 4K60 stream full screen goes
+# on two (the decoder's SAND frame and the app's window). A decoder's output buffer the
+# composer is handed is linear too, so an H.264 frame decoded in qemu goes on the primary
+# plane itself (2026-10-23, 1080p60 in a WebView, ten minutes a run, against the
+# decoder's buffers left tiled): V3D render 80-84% -> about 50-57%, full screen 58.7-59.1
+# frames shown a second in three runs of four (51.2 in the fourth) against 40.2 and 55.9,
+# among the HMI 59.2 and 59.3 against 56.6; HEVC was shown at the same rates within 0.3
+# fps. The costs: decoding as fast as the GPU allows is slower (codec -S of HEVC 1080p
+# fell about 5% with the scanout buffers linear, 2026-10-15, and from 178-182 in four
+# runs to 105-157 in six with the decoder's too, 2026-10-23), and a layer that weston or
+# SurfaceFlinger does compose with the GPU after all is sampled through a tiled shadow
+# copy on every draw (V3D cannot sample linear). The bos are v3d's, in system memory
+# mapped through the HVS's IOMMU; they take no CMA. gralloc reads it once, when it
+# initialises. The Raspberry Pi 4 product leaves it off: its HVS has no IOMMU, so these
+# bos are not expected to go on a plane there and only the shadow copies would remain
+# (not measured).
+PRODUCT_VENDOR_PROPERTIES += \
+    vendor.minigbm.scanout_linear=true
+
+# Full screen without CarSystemUI's per-display safe area, so a WebView's video can go on
+# its own plane (see DomaNoSafeAreaRRO/Android.bp), and the WebView switches that make
+# the video its own layer (init.xenvm-webview.rc).
+PRODUCT_PACKAGES += DomaNoSafeAreaRRO
+PRODUCT_COPY_FILES += \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/init.xenvm-webview.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-webview.rc
+
+# The Wi-Fi relay restarts hostapd for a changed AP list only rate-limited (below), not
+# on every change (doma-wifi-relay.sh reads both on every notification; BOUNCE_ON_APS
+# and BOUNCE_MIN_S in its environment win). The restarts were background noise in every
+# measurement: on the Raspberry Pi 4 the restarts and the helpers around them took 17%
+# (of 200%) of DomA's CPU during playback, and DomA's idle went from 1.8% to 10% with
+# them off (2026-10-11).
+# bounce_min_s=300 lets it restart for a changed list at most once every 300 s, and only
+# while no station is associated, so a network that appears in DomD's scan reaches the
+# screen within 5 minutes of DomA not being connected, instead of at the next boot. A
+# network DomA's station is on that DomD loses, or cannot join for a reason other than
+# its key, is taken off the list whatever these say (the agent's LOST and FAILED
+# reports); one whose passphrase DomD rejects stays, with its key undone.
+PRODUCT_VENDOR_PROPERTIES += \
+    persist.vendor.doma.wifi_relay_bounce_on_aps=false \
+    persist.vendor.doma.wifi_relay_bounce_min_s=300
+
 # Install the ICD. BOARD_MESA3D_VULKAN_DRIVERS only DEFINES the module --
 # Mesa's android/Android.mk expands it to vulkan.virtio with an install path of
 # /vendor/lib64/hw/vulkan.virtio.so -- and a module no product asks for is never
@@ -530,9 +614,10 @@ PRODUCT_VENDOR_PROPERTIES += \
 PRODUCT_PACKAGES += \
     vulkan.virtio
 
-# ro.hardware.vulkan is the other half of the pair above, and without it the two
-# properties above ask for a Vulkan backend the loader will never find one for:
-# empty means the loader looks for no driver at all. BOARD_MESA3D_VULKAN_DRIVERS
-# in this device's BoardConfig.mk builds the ICD this names.
+# ro.hardware.vulkan is the other half of the pair above: it names the ICD the loader
+# loads for every Vulkan user -- apps on Vulkan, and RenderEngine and HWUI if the
+# debug.* backends above are set back to skiavk; empty means the loader looks for no
+# driver at all. BOARD_MESA3D_VULKAN_DRIVERS in this device's BoardConfig.mk builds
+# the ICD this names.
 PRODUCT_VENDOR_PROPERTIES += \
     ro.hardware.vulkan=virtio

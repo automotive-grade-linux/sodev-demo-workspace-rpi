@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-media: request non-coherent (cacheable) host MMAP
+ buffers
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0227-v10-virtio-media-request-non-coherent-host-buffers.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index c7f70c38a..cc3398146 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -662,6 +662,16 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+      * carries whatever its own header version put there.
+      */
+     memset(host_rb.reserved, 0, sizeof(host_rb.reserved));
++    /*
++     * Ask for cacheable host buffers. A coherent vb2 MMAP buffer is Normal-NC
++     * on arm64 and this device reads every decoded frame out of one with the
++     * CPU: 678 MB/s against 3469 MB/s for cached memory on RPi4, 1.4 ms per
++     * 942 KB frame instead of 0.3 ms (perf: 10 % of the device model's CPU).
++     * vb2 honours the flag only if the driver sets allow_cache_hints, and
++     * clears it otherwise, so on a driver without it nothing changes; the
++     * cache maintenance then happens in vb2's buf_prepare/buf_finish.
++     */
++    host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
+     if (ioctl(s->fd, VIDIOC_REQBUFS, &host_rb) < 0) {
+         int err = errno;
+         struct v4l2_format fmt = { .type = rb->type };
+@@ -682,8 +692,10 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+         }
+         return err;
+     }
+-    info_report("virtio-media: host REQBUFS type=%u -> count=%u caps=0x%x (fd %d)",
+-                host_rb.type, host_rb.count, host_rb.capabilities, s->fd);
++    info_report("virtio-media: host REQBUFS type=%u -> count=%u caps=0x%x "
++                "non_coherent=%u (fd %d)", host_rb.type, host_rb.count,
++                host_rb.capabilities,
++                !!(host_rb.flags & V4L2_MEMORY_FLAG_NON_COHERENT), s->fd);
+     if (host_rb.count > VIRTIO_MEDIA_MAX_BUFFERS) {
+         /*
+          * Give the surplus back rather than silently tracking fewer buffers

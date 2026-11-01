@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 18:04:41 +0900
+Subject: [PATCH] virtio-media: decoder mode: wait for the GPU with the BQL let
+ go
+
+q11-086 holds up to 8 frames of a software codec whose GPU copies are
+not done instead of waiting at the third one. When the GPU is more than
+that many frames behind, the main loop still waited for the oldest
+copy's fence, in a poll() of up to 200 ms, with the BQL held. Measured
+on a Raspberry Pi 5 (2026-10-24, H.264 1080p60 in a WebView beside the
+HMI, DomD's vcpu 0 alone with the device model on its own pcpu, perf
+sched_switch on DomD's CPU 0 for 40 seconds): the main loop slept there
+for up to 56.5 ms, the only sleeps over 20 ms with the BQL held; the
+sound card's TX thread, which gives DomA's buffers back under the BQL,
+waited behind it.
+
+That wait is now made with the BQL let go: it is a poll() on the
+copy's fence fd, which needs neither the BQL nor a GL context. Only the
+zero-copy path (dec_zc_gpu_write, from the decoder's bottom halves)
+asks for it; the paths that run on display callbacks keep the BQL. Only
+the main loop's bottom halves and handlers touch the decoder's state,
+and the main loop is the thread waiting. The Xen ioreq thread answers
+an ISR read itself only when the main loop is not inside an ioreq: a
+new flag, ioreq_busy, marks handle_ioreq() on the main loop, so that
+such a read does not overtake an ioreq whose device let the BQL go.
+
+Measured the same way, 10 minutes twice, with a test build that also
+wrote virtio-snd's TX buffers out without the BQL: the waits made
+with the BQL let go came to 127 and 81 a run, up to 97 ms, and the
+sound buffers were given back to DomA within 26 and 17 ms in 99 cases
+of 100 (54 and 54 ms before), 24 and 10 of them over 30 ms (73 and 55).
+The ALSA underruns qemu saw went from 2 and 2 to 2 and 1, one of each
+at the start of playback.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
+---
+ hw/virtio/virtio-media-decoder.c | 57 +++++++++++++++++++++++++++++---
+ hw/xen/xen-hvm-common.c          |  8 ++++-
+ include/hw/xen/xen-hvm-common.h  |  8 +++++
+ 3 files changed, 67 insertions(+), 6 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 4dc8431c8..1c85db061 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -778,6 +778,44 @@ static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
+     dec_gpu_drop_oldest(d);
+ }
+ 
++/*
++ * q11-dec-gpu-unlocked: the oldest held frame, waited for with the BQL let go.
++ * Only for a copy with a fence fd: the wait is then a poll() on that fd, which
++ * needs neither the BQL nor a GL context, and nothing else touches the fd. Only
++ * the main loop's bottom halves and handlers touch the decoder's state (the
++ * frame threads and the decode thread go through thr_lock and zc_lock, not the
++ * BQL), and the main loop is the thread waiting here, so nothing reaches that
++ * state meanwhile. What the BQL lets in is other threads' work: the sound
++ * card's TX thread giving DomA's buffers back, the ioreq thread answering ISR
++ * reads (not while the main loop is inside an ioreq: ioreq_busy), call_rcu's
++ * callbacks and the dummy vCPU threads' run_on_cpu work. Only the zero-copy
++ * path asks for it (dec_gpu_hold's may_unlock): the others run on display
++ * callbacks, in the middle of the display's own work.
++ */
++static void dec_gpu_unhold_oldest_unlocked(VirtIOMediaDec *d)
++{
++    void *h = d->gpu_held[0].handle;
++    /* dec_gpu_reap() found it not done; it may have finished since */
++    int r = virtio_media_gpu_poll(h);
++
++    if (r == 1 && bql_locked()) {
++        bql_unlock();
++        r = virtio_media_gpu_wait(h);
++        bql_lock();
++        if (r < 0) {
++            warn_report_once("virtio-media/dec: host-sand: GPU wait failed "
++                             "(BQL let go)");
++        }
++        dec_gpu_drop_oldest(d);
++        return;
++    }
++    if (r == 0) {
++        dec_gpu_drop_oldest(d);
++        return;
++    }
++    dec_gpu_unhold_oldest(d);
++}
++
+ /*
+  * q11-dec-gpu-poll: let go of the held frames whose GPU copies are done,
+  * without waiting. Each frame is tested on its own buffer's fence, so none goes
+@@ -888,8 +926,13 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+  * hardware codec (HEVC), and a copy without a fence fd (GLsync), still waits
+  * for the oldest one at DEC_GPU_HOLD: HEVC's buffers come from v4l2request's
+  * pool, in CMA.
++ *
++ * q11-dec-gpu-unlocked: when DEC_GPU_HOLD_MAX copies are not done either, the
++ * GPU is more than that many frames behind, and the wait for the oldest one is
++ * made with the BQL let go (dec_gpu_unhold_oldest_unlocked).
+  */
+-static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
++static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle,
++                         bool may_unlock)
+ {
+     AVFrame *ref = av_frame_alloc();
+ 
+@@ -905,7 +948,11 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
+     }
+     if (dec_gpu_reap(d) && !d->codec->hwaccel) {
+         if (d->gpu_held_n >= DEC_GPU_HOLD_MAX) {
+-            dec_gpu_unhold_oldest(d);
++            if (may_unlock) {
++                dec_gpu_unhold_oldest_unlocked(d);
++            } else {
++                dec_gpu_unhold_oldest(d);
++            }
+         }
+     } else if (d->gpu_held_n >= DEC_GPU_HOLD) {
+         dec_gpu_unhold_oldest(d);
+@@ -1026,7 +1073,7 @@ static void dec_ds_settle_slot(VirtIOMediaDec *d, unsigned slot)
+         if (dec_ds_current(d, slot, p->seq) &&
+             virtio_media_gpu_blit(d->gpu[slot].handle, p->res) == 0) {
+             /* the decoder must not write the buffer before the GPU read it */
+-            dec_gpu_hold(d, d->gpu[slot].ref, d->gpu[slot].handle);
++            dec_gpu_hold(d, d->gpu[slot].ref, d->gpu[slot].handle, false);
+             d->ds_catch_n++;
+         } else {
+             d->ds_lost_n++;
+@@ -1582,7 +1629,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+             }
+             return r;
+         }
+-        dec_gpu_hold(d, fr, e->handle);
++        dec_gpu_hold(d, fr, e->handle, false);
+         dec_ds_unpend(d, gb->virgl_res);
+     }
+     if (show) {
+@@ -2221,7 +2268,7 @@ static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         return r;
+     }
+     /* the decoder may write the slot again once the frame is let go */
+-    dec_gpu_hold(d, fr, d->zc_gpu[idx]);
++    dec_gpu_hold(d, fr, d->zc_gpu[idx], true);   /* q11-dec-gpu-unlocked */
+ 
+     tex = virtio_media_gpu_res_tex(gb->virgl_res);
+     if (d->ds_epoch && tex) {
+diff --git a/hw/xen/xen-hvm-common.c b/hw/xen/xen-hvm-common.c
+index 343f290bb..453754eab 100644
+--- a/hw/xen/xen-hvm-common.c
++++ b/hw/xen/xen-hvm-common.c
+@@ -727,6 +727,9 @@ static bool xen_ioreq_is_virtio_isr_read(const ioreq_t *r)
+  * none can start until the BQL is dropped: the ioreqs keep the handler's order. A bottom
+  * half an earlier ioreq scheduled may not have run yet; the read then at worst sees an
+  * interrupt not raised yet, which that bottom half raises. Queued ahead -> normal path.
++ * One more case: the handler may be inside an ioreq it took off the FIFO when a
++ * device it reaches lets the BQL go (virtio-media's decoder mode, waiting for the
++ * GPU); ioreq_busy says so, and the read then takes the normal path too.
+  *
+  * SAFETY. The ISR read handler (virtio_pci_isr_read) only exchanges vdev->isr and
+  * lowers the INTx line -- what a KVM vCPU thread does for the same register under
+@@ -757,7 +760,8 @@ static bool xen_ioreq_isr_inline(XenIOState *state, ioreq_t *req, int vcpu)
+     qemu_mutex_lock(&state->ioreq_lock);
+     empty = QSIMPLEQ_EMPTY(&state->ioreq_fifo);
+     qemu_mutex_unlock(&state->ioreq_lock);
+-    if (!empty || qemu_shutdown_requested_get() || qemu_reset_requested_get()) {
++    if (!empty || qatomic_read(&state->ioreq_busy) ||
++        qemu_shutdown_requested_get() || qemu_reset_requested_get()) {
+         bql_unlock();
+         return false;
+     }
+@@ -803,7 +807,9 @@ static void xen_ioreq_notified(void *opaque)
+     if (more) {
+         event_notifier_set(&state->ioreq_notifier);
+     }
++    qatomic_set(&state->ioreq_busy, true);
+     handle_ioreq(state, &it->copy);
++    qatomic_set(&state->ioreq_busy, false);
+     if (it->req) {
+         it->req->data = it->copy.data;
+         if (it->req->state != STATE_IOREQ_INPROCESS) {
+diff --git a/include/hw/xen/xen-hvm-common.h b/include/hw/xen/xen-hvm-common.h
+index c713c0356..f3524dbde 100644
+--- a/include/hw/xen/xen-hvm-common.h
++++ b/include/hw/xen/xen-hvm-common.h
+@@ -91,6 +91,14 @@ typedef struct XenIOState {
+     uint64_t ioreq_early;
+     uint64_t ioreq_queued;
+     uint64_t ioreq_isr_inline;
++    /*
++     * q11-dec-gpu-unlocked: the main loop is inside handle_ioreq() for an
++     * ioreq it took off the FIFO. A device it reaches may let the BQL go there
++     * (virtio-media's decoder mode, while it waits for the GPU), and the ISR
++     * read must not overtake that ioreq. Written by the main loop, read by the
++     * ioreq thread, with qatomic.
++     */
++    bool ioreq_busy;
+ 
+     Notifier exit;
+ } XenIOState;
+-- 
+2.43.0
+

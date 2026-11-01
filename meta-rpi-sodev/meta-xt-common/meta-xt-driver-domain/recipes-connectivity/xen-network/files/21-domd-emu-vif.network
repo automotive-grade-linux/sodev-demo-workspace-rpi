@@ -14,9 +14,8 @@
 # reach DomD at all, and `ping -I eth1 192.168.10.10` from the guest gave "+2 errors".
 #
 # networkd handles the recreate case for free, because it acts on every device
-# that appears. xl-create-doma.service also re-runs domd-flatbridge-up; the two
-# overlap deliberately -- both converge on the same state and both are
-# idempotent.
+# that appears. At boot it overlaps with domd-flatbridge-up, harmlessly: both
+# converge on the same state, and enslaving is idempotent.
 #
 # WHY Name= AND NOT Driver=
 # 20-domd-vif.network matches `Driver=vif xen-netfront`, and the emulated taps are

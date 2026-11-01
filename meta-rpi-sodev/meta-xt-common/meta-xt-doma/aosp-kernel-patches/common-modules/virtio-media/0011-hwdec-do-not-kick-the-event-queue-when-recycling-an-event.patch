@@ -4,22 +4,26 @@ Date: Sat, 5 Sep 2026 16:45:28 +0900
 Subject: [PATCH] virtio-media: do not kick the event queue when recycling an
  event buffer
 
-The device pops the event queue only when it has an event to send and
-drops the event if the queue is empty; it never waits for a
-notification. On Xen the kick is an MMIO ioreq that blocks the event
-work item for 1-6 ms under load, delaying delivery of the next DQBUF
-event. Measured on the board, 2026-09-05 (RPi4 DomA, HW 720p60):
-eventq kicks 167 -> 3 per 5 s, fps within noise (21.9 -> 22.6). The
-probe-time fill keeps its kick.
+The device pops the event queue only when it has an event to send; it
+never waits for a notification. With the empty queue it holds the event
+(q11-085 in meta-xt-qemu) and sends it with its next event or command,
+or from a timer. On Xen, without the device model's ioreq thread, the
+kick is an MMIO ioreq that blocked the event work item for 1-6 ms under
+load, delaying delivery of the next DQBUF event. Measured on the board,
+2026-09-05 (RPi4 DomA, HW 720p60, before the ioreq thread): eventq
+kicks 167 -> 3 per 5 s, fps within noise (21.9 -> 22.6). The probe-time
+fill keeps its kick.
 
 This relies on how the device model used here consumes the event
-queue. A device that parks an event until it is notified of a new
-event buffer would deliver that event late, so the change is specific
-to that device model; other virtio-media implementations have not been
-checked.
+queue. Without the kick, an event the device held for want of a buffer
+waits for its next event or command, or for its timer (1 ms at first,
+up to 100 ms while the guest takes none); a device that sends a held
+event only on a notification would never send it. The change is
+specific to that device model; other virtio-media implementations have
+not been checked.
 
 Change-Id: I2289ad7088ceb4cc29967026af2618d32368ae0d
-Assisted-by: Claude Code:claude-opus-5
+Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
@@ -51,14 +55,14 @@ index 071396a..36acfa5 100644
 +	 * Do not kick when recycling an event buffer.
 +	 *
 +	 * The device pops the event queue only when it has an event to send
-+	 * and drops the event if the queue is empty; it never waits for a
-+	 * notification to retry. virtqueue_add_sgs() already publishes the
-+	 * new available entry with a write barrier, so a kick tells the
-+	 * device nothing it needs. On Xen the kick is not free either: it is
-+	 * an MMIO ioreq that blocks this vCPU until qemu's main loop gets to
-+	 * it (measured 1-6 ms under load, 2026-09-05), and it runs in the
-+	 * event work item, so every DQBUF event delayed the delivery of the
-+	 * next one by that much. ~70 of the ~180 media kicks per second at
++	 * and never waits for a notification: with the queue empty it holds
++	 * the event (qemu q11-085) and sends it with its next event or
++	 * command, or from a timer, so it can do without the kick. On Xen
++	 * the kick is not free either: without the device model's ioreq
++	 * thread it is an MMIO ioreq that blocks this vCPU until qemu's main
++	 * loop gets to it (measured 1-6 ms under load, 2026-09-05), and it
++	 * runs in the event work item, so every DQBUF event delayed the next
++	 * one by that much. ~70 of the ~180 media kicks per second at
 +	 * 1080p60 were these. The initial fill at probe keeps the kick so the
 +	 * device sees the queue populated before the first session opens.
 +	 */

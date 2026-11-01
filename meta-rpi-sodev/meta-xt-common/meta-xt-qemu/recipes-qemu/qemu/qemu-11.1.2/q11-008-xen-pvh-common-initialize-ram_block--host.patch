@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Date: Thu, 5 Feb 2026 23:04:31 +0200
+Subject: [PATCH] xen-pvh-common: initialize ram_block->host
+
+The host should be initialized properly for grants with an appropriate
+address. Without that, QEMU will report an error, stating that grants
+are not mapped while creating an instance for xen-pvh VM.
+
+(cherry picked from commit f4713d591e414ccb7f9c6f1eaf82c6c9b42410f4)
+
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: ported to qemu 11.1.2, where exec/ramblock.h is system/ramblock.h and the assignment sits inside the if (s->cfg.mapcache) block
+Origin: https://github.com/xen-troops/qemu commit f4713d591e414ccb7f9c6f1eaf82c6c9b42410f4
+---
+ hw/xen/xen-pvh-common.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/hw/xen/xen-pvh-common.c b/hw/xen/xen-pvh-common.c
+index 458bd9239..2ae195251 100644
+--- a/hw/xen/xen-pvh-common.c
++++ b/hw/xen/xen-pvh-common.c
+@@ -18,6 +18,7 @@
+ #include "system/xen.h"
+ #include "hw/xen/xen-pvh-common.h"
+ #include "trace.h"
++#include "system/ramblock.h"
+ 
+ static const MemoryListener xen_memory_listener = {
+     .region_add = xen_region_add,
+@@ -143,6 +144,7 @@ static void xen_pvh_init_ram(XenPVHMachineState *s,
+         /* Setup support for grants.  */
+         memory_region_init_ram(&xen_grants, NULL, "xen.grants", block_len,
+                 &error_fatal);
++        xen_grants.ram_block->host = (void *)XEN_GRANT_ADDR_OFF;
+         memory_region_add_subregion(sysmem, XEN_GRANT_ADDR_OFF, &xen_grants);
+     }
+ }

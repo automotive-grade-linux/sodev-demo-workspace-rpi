@@ -51,9 +51,9 @@ include device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk
 TARGET_ARCH_VARIANT := armv8-a
 TARGET_CPU_VARIANT := cortex-a76
 
-# The shadow-AP sepolicy. Same content as the RPi4 board's; see
-# ../sepolicy/doma_shadow_ap.te for why it exists even though this product boots
-# permissive.
+# The Wi-Fi path's sepolicy: the shadow AP and the relay (doma_shadow_ap.te), and
+# DomaWifiRelay's drop-box (system_app.te), written so that the path works enforcing
+# although this product boots permissive. Same content as the RPi4 board's.
 BOARD_VENDOR_SEPOLICY_DIRS += device/agl/xenvm-trout-rpi5/sepolicy
 
 # ---------------------------------------------------------------------------

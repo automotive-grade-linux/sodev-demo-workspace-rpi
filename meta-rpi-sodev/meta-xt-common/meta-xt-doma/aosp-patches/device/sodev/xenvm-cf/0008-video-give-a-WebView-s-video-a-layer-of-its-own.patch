@@ -1,0 +1,174 @@
+From 3df261503882636045c170ecea196a0267e23fba Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 28 Oct 2026 10:46:09 +0900
+Subject: [PATCH] video: give a WebView's video a layer of its own
+
+init.xenvm-webview.rc writes the WebView's command line with
+WebViewSurfaceControl and WebViewThreadSafeMedia, which make a <video>
+element's video a SurfaceControl of its own, so drm_hwcomposer can put
+it on a plane instead of SurfaceFlinger drawing it into the app's
+window: dropped frames 16% -> 1.7% for a local 1080p30 H.264 video on
+this board over 5 minutes (2026-10-03, the file put there by hand). The
+product makefile installs the rc, and README.md lists it.
+
+It works only while the product boots permissive: creating a file in
+/data/local/tmp is a neverallow for vendor_init and for init itself
+(system/sepolicy/private/vendor_init.te:365, init.te:853), so no init
+script on any partition can write it in enforcing; the rc says what
+to do then (write it once with adb shell; it stays in /data). Not yet
+run from this makefile on a board.
+
+DomaNoSafeAreaRRO, a product RRO on CarSystemUI, sets
+config_enableSafeAreaAndToolbarPerDisplay to false, as the Raspberry Pi
+5 product in the AGL layer does. AAOS 17 puts an app that does not
+declare itself automotive in the safe region with a letterbox around it,
+and SurfaceFlinger then composes every layer on the GPU, so the video's
+own layer is no use. On this board's 1280x720 display the safe region is
+as wide as the screen but leaves a band above and below, so the
+letterbox is there too. With the value false (a runtime test overlay),
+all of SurfaceFlinger's layers became DEVICE on the Raspberry Pi 5
+(2026-10-16); a full-screen app then covers the whole display, with no
+band. On this board, with the RRO in DomA's image, a WebView's 720p
+video full screen was composed as three DEVICE layers (2026-10-23); no
+run without the RRO was compared here.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ DomaNoSafeAreaRRO/Android.bp                 | 27 ++++++++++++++++++++
+ DomaNoSafeAreaRRO/AndroidManifest.xml        |  9 +++++++
+ DomaNoSafeAreaRRO/res/values/config.xml      |  6 +++++
+ README.md                                    |  2 ++
+ aosp_xenvm_trout_rpi4_arm64.mk               |  8 ++++++
+ xenvm_trout_rpi4_arm64/init.xenvm-webview.rc | 26 +++++++++++++++++++
+ 6 files changed, 78 insertions(+)
+ create mode 100644 DomaNoSafeAreaRRO/Android.bp
+ create mode 100644 DomaNoSafeAreaRRO/AndroidManifest.xml
+ create mode 100644 DomaNoSafeAreaRRO/res/values/config.xml
+ create mode 100644 xenvm_trout_rpi4_arm64/init.xenvm-webview.rc
+
+diff --git a/DomaNoSafeAreaRRO/Android.bp b/DomaNoSafeAreaRRO/Android.bp
+new file mode 100644
+index 0000000..416fad6
+--- /dev/null
++++ b/DomaNoSafeAreaRRO/Android.bp
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// DomaNoSafeAreaRRO -- no per-display safe area and toolbar in CarSystemUI.
++//
++// With config_enableSafeAreaAndToolbarPerDisplay=true (CarSystemUI's default,
++// packages/apps/Car/SystemUI/res/values/config.xml) a full-screen app is kept out
++// of a band by ShellLetterboxSurface, and SurfaceFlinger then composes every layer
++// on the GPU (CLIENT): a WebView's video can no longer go on its own plane.
++// Measured on the Raspberry Pi 5 (2026-10-16, an H.264 1080p60 video playing in a
++// WebView, with this value set by a runtime test overlay): all of SurfaceFlinger's
++// layers became DEVICE. This board's 1280x720 display takes values/'s safe region
++// (0,144 to 1408,696 dp at density 160), as wide as the screen but with a band
++// above and below, so the same letterbox is there. With the value false a
++// full-screen app covers the whole display, with no band; with this RRO in DomA's
++// image, a WebView's 720p video full screen was composed as three DEVICE layers
++// on this board (2026-10-23; no run without the RRO was compared here).
++//
++// A static product overlay, signed with the platform key like Car's own RROs. The
++// priority only orders it among static overlays of the same target in product. No
++// RRO this product installs sets this value (car_product's CarSystemUIDewdUIRRO does,
++// but it is installed only with HAS_SCALABLEUI=true, which this product does not set).
++runtime_resource_overlay {
++    name: "DomaNoSafeAreaRRO",
++    resource_dirs: ["res"],
++    certificate: "platform",
++    product_specific: true,
++}
+diff --git a/DomaNoSafeAreaRRO/AndroidManifest.xml b/DomaNoSafeAreaRRO/AndroidManifest.xml
+new file mode 100644
+index 0000000..1f5dd42
+--- /dev/null
++++ b/DomaNoSafeAreaRRO/AndroidManifest.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.agl.doma.rpi4.nosafearea">
++    <overlay android:targetPackage="com.android.systemui"
++        android:isStatic="true"
++        android:priority="10" />
++    <application android:hasCode="false" />
++</manifest>
+diff --git a/DomaNoSafeAreaRRO/res/values/config.xml b/DomaNoSafeAreaRRO/res/values/config.xml
+new file mode 100644
+index 0000000..032ba7e
+--- /dev/null
++++ b/DomaNoSafeAreaRRO/res/values/config.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<resources>
++    <!-- See Android.bp: a full-screen app covers the display, so its video can be a plane. -->
++    <bool name="config_enableSafeAreaAndToolbarPerDisplay">false</bool>
++</resources>
+diff --git a/README.md b/README.md
+index 9aa104b..1ec9be0 100644
+--- a/README.md
++++ b/README.md
+@@ -44,6 +44,8 @@ reuse object files built for the other CPU.
+ | `xenvm_trout_rpi4_arm64/doma-shadow-aps.conf` | Placeholder seed for the AP list. Never commit a real SSID or passphrase into it |
+ | `xenvm_trout_rpi4_arm64/doma-wifi-relay.sh` | Keeps the AP list the shadow AP beacons in step with DomD's scan, and is the vendor half of the passphrase relay: reconfigures hostapd and forwards the passphrase to DomD |
+ | `DomaWifiRelay/` | The framework half of that relay: a platform app that, while the Settings Wi-Fi toggle is on, reads the passphrase the user typed and asks the vendor half to use it |
++| `xenvm_trout_rpi4_arm64/init.xenvm-webview.rc` | Writes the WebView's command line (its video as a layer of its own); works only while the product boots permissive |
++| `DomaNoSafeAreaRRO/` | Product RRO on CarSystemUI: no per-display safe area and toolbar, so a full-screen app covers the display and a WebView's video can go on a plane (the same as the Raspberry Pi 5 product's) |
+ | `xenvm_trout_rpi4_arm64/media_codecs_c2.xml` | Describes the vendor C2 decoder to the media framework: decoders only, H.264 only, 1080p max |
+ | `xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy` | The extended seccomp policy the C2 service needs for its V4L2 ioctls |
+ 
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 6232f0c..1da9543 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -196,6 +196,14 @@ PRODUCT_VENDOR_PROPERTIES += \
+ PRODUCT_VENDOR_PROPERTIES += \
+     ro.surface_flinger.enable_frame_rate_override=false
+ 
++# Full screen without CarSystemUI's per-display safe area, so a WebView's video can go on
++# its own plane (see DomaNoSafeAreaRRO/Android.bp), and the WebView switches that make a
++# <video> element's video its own layer, so drm_hwcomposer can put it on a plane of its
++# own (init.xenvm-webview.rc). The same as the Raspberry Pi 5 product in the AGL layer.
++PRODUCT_PACKAGES += DomaNoSafeAreaRRO
++PRODUCT_COPY_FILES += \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/init.xenvm-webview.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-webview.rc
++
+ # Start the interface rename that minradio's data call depends on. cuttlefish already
+ # ships the service and a trigger for it, but trout sets ro.vendor.disable_rename_eth0
+ # so that trigger never fires; overriding that is deliberate and argued in the .rc.
+diff --git a/xenvm_trout_rpi4_arm64/init.xenvm-webview.rc b/xenvm_trout_rpi4_arm64/init.xenvm-webview.rc
+new file mode 100644
+index 0000000..89f2754
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/init.xenvm-webview.rc
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Let the WebView hand decoded video to SurfaceFlinger as its own layer.
++#
++# With WebViewSurfaceControl the video of a <video> element becomes a child
++# SurfaceControl (webview_overlay_content) instead of being drawn into the app's
++# window every frame; drm_hwcomposer can then put the video and the app on
++# separate planes. Measured on this board (local 1080p30 H.264, full screen):
++# dropped frames 16% -> 1.7% over 5 minutes, app CPU 48 -> 38 (2026-10-03, set by
++# hand on the board).
++#
++# WebView takes Chromium switches only from this file, and reads it only when
++# ro.debuggable=1 (userdebug, as this product is); it is read at app start, so a
++# WebView app started before the first boot completes runs without the switches (the
++# file then stays in /data). It applies to every WebView app.
++#
++# SELinux: works only while the product boots permissive. Creating a file in
++# /data/local/tmp (shell_data_file) is a neverallow for vendor_init and for init itself
++# (system/sepolicy/private/vendor_init.te:365, init.te:853), so no init script on any
++# partition can write it in enforcing; only adb's shell, adbd and dumpstate may. In
++# enforcing the write fails (init logs it) and WebView runs without the switches; put
++# the file there once with `adb shell` (it stays in /data). Not yet verified on a
++# board that init writes it (the boards' files were put there by hand).
++on property:sys.boot_completed=1
++    write /data/local/tmp/webview-command-line "_ --enable-features=WebViewSurfaceControl,WebViewThreadSafeMedia"
++    chmod 0644 /data/local/tmp/webview-command-line

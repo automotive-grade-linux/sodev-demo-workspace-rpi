@@ -80,29 +80,32 @@ fatload mmc 0 0x2200000 bcm2712-raspberrypi5-xen.dtbo
 fdt apply 0x2200000
 
 # -----------------------------------------------------------------------------
-# 8 GiB SKU: shrink DomD from 4096 to 2048 MiB.
+# 8 GiB SKU: shrink DomD from 4096 to 3072 MiB.
 # -----------------------------------------------------------------------------
 # Must come AFTER `fdt apply`: /chosen/domD is created by the overlay, so a
 # `fdt set` before this point would fail with FDT_ERR_NOTFOUND.
 #
-# Only the two HIGH banks change; the three low banks are untouched, which
+# Only the high bank4 is dropped; the low banks are those of the 16 GiB map
+# (bcm2712-raspberrypi5-xen.dtso) and the same as the zephyr flavour's, which
 # matters for two reasons:
 #   * bank[0] = 0x50000000 is where Xen's place_modules() puts the DomD kernel and
 #     DTB. Keeping it preserves the sizing that was verified on the 16 GiB board.
-#   * 0x20000000 and 0x80000000 are inside the VPU's 32-bit DMA window and carry
-#     vc4's CMA. Moving them would take CMA out of that window.
+#   * 0x20000000 is ZONE_DMA (the mailbox bus's dma-ranges end it at 0x28000000),
+#     where DomD's cma=128M lands.
+# The 896 MiB bank at 0x68000000 is the zephyr flavour's CMA bank; it ends at this
+# flavour's initramfs load address, 0xa0000000. This flavour was not booted with it.
 # No U-Boot module load lives in the freed range either -- every fatload in this
 # script targets below 4 GiB (xen@0x2000000, Dom0 Image@0x4000000,
-# domd.dtb@0xa000000, DomD Image@0xc000000), so dropping bank4 and halving bank3
-# cannot collide with a load address. The highest static-mem address drops from
-# 0x1c0000000 (7 GiB) to 0x140000000 (5 GiB).
+# domd.dtb@0xa000000, DomD Image@0xc000000), so dropping bank4 cannot collide
+# with a load address. The highest static-mem address drops from 0x1c0000000
+# (7 GiB) to 0x168000000 (5.6 GiB).
 #
 #   0x50000000  +0x18000000  ( 384 MiB)  kept
 #   0x20000000  +0x08000000  ( 128 MiB)  kept
-#   0x80000000  +0x20000000  ( 512 MiB)  kept
-#   0x100000000 +0x40000000  (1024 MiB)  bank3: 2 GiB -> 1 GiB
+#   0x68000000  +0x38000000  ( 896 MiB)  kept
+#   0x100000000 +0x68000000  (1664 MiB)  bank3: kept
 #   0x180000000 +0x40000000  (1024 MiB)  bank4: dropped
-#                             = 2048 MiB  -> memory = <0x0 0x200000> (KiB)
+#                             = 3072 MiB  -> memory = <0x0 0x300000> (KiB)
 #
 # `test` is always available: cmd/Makefile has `obj-$(CONFIG_HUSH_PARSER) += test.o`,
 # and the u-boot this build produces really does set it -- verified in the built
@@ -115,7 +118,7 @@ fdt apply 0x2200000
 if test "${board_ram}" = "8g" ; then
     echo "board_ram=8g: DomD 3072 MiB (bank4 dropped)"
     fdt set /chosen/domD memory <0x0 0x300000>
-    fdt set /chosen/domD xen,static-mem <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x80000000 0x0 0x20000000 0x1 0x0 0x0 0x80000000>
+    fdt set /chosen/domD xen,static-mem <0x0 0x50000000 0x0 0x18000000 0x0 0x20000000 0x0 0x8000000 0x0 0x68000000 0x0 0x38000000 0x1 0x0 0x0 0x68000000>
 fi
 echo "board_ram=${board_ram} dom0_mem=512M (placement-driven, board-independent)"
 
@@ -445,17 +448,6 @@ fdt rm /framebuffer@3f800000
 # RAN WESTON, which this thin image no longer does, and the value additionally
 # decides where bank[0] lands (0xa0000000 at 512M, MEASURED), which the zephyr
 # flavour's SRAM relink depends on -- so both scripts must carry the same value.
-#
-# For reference, if a high-memory reservation is combined with this, Xen's
-# allocate_memory_11() splits the allocation into 3 low banks + 1 high bank:
-#  - BANK[0] 0x10000000-0x18000000 (128 MiB, ex-Zephyr-Dom0 slot)
-#  - BANK[1] 0x20000000-0x28000000 (128 MiB)
-#  - BANK[2] 0x30000000-0x38000000 (128 MiB)
-#  - BANK[3] 0x1e8000000-0x1f0000000 (128 MiB at 8 GiB area)
-#
-# The 3 low-memory banks are within the VPU 32-bit DMA window, so the mailbox keeps
-# working. The 4th bank is VPU-accessible only via the IOMMU (high address).
-# All weston / vc4 buffers are allocated from low memory.
 # ------------------------------------------------------------------
 # Individual arguments:
 #
@@ -514,8 +506,9 @@ fdt set /chosen/dom0 reg <0x0 0x4000000 0x0 0x${filesize}>
 # ------------------------------------------------------------------
 # Load the DomD Image (linux-domd-vc4) and the DomD partial DT as multiboot modules.
 # Set xen,direct-map + xen,static-mem on /chosen/domD to force 1:1 mapping.
-# DomD memory range: host phys 0x100000000-0x140000000 (1 GiB, high address).
-# Since it is direct-map, the guest gfn is the same 0x100000000-0x140000000 = mfn.
+# DomD memory: the overlay's xen,static-mem banks -- five, 4 GiB in all on the 16g SKU;
+# on 8g the board_ram block above sets four (3 GiB). Since it is direct-map, every
+# bank's guest gfn is the same as its mfn.
 
 # First-boot graceful handling.
 # If the DomD kernel / DTB are not yet placed on the SD boot partition (mmcblk0p1
@@ -554,7 +547,7 @@ fdt set /chosen/dom0 reg <0x0 0x4000000 0x0 0x${filesize}>
 # are permitted). It works, but not with a direct-mapped GPU domain, which this
 # board needs.
 # The overlay's (bcm2712-raspberrypi5-xen.dtbo) /chosen/domD already has `direct-map;`
-# + xen,static-mem (3 banks, 1 GB total) + memory/cpus/vpl011/xen,enhanced, so here we
+# + xen,static-mem (the banks above) + memory/cpus/vpl011/xen,enhanced, so here we
 # add only module@0/1/2 + bootargs + domain-id (leave direct-map/static-mem to the
 # overlay = do not hand-write the `xen,direct-map` prefix spelling that is invalid on xt0.2).
 # Rootfs in this flavour: the thin Linux Dom0 is the hardware domain and keeps the
@@ -628,9 +621,9 @@ if fatload mmc 0 0xc000000 Image ; then
     # (console_loglevel=4, KERN_WARNING+ only) suppresses the early flood so the ring
     # does not overflow. Avoids the backpressure spin on both pl011/PV console.
     # cma=128M: originally 256M, halved to leave headroom for the RAM initramfs to
-    # unpack. That reason is gone now that the root is p2 over PV-block, but the value
-    # is kept because 128M is ample for the 1080p weston desktop and raising it back
-    # would be an unmeasured change to the GPU allocator.
+    # unpack. That reason is gone now that the root is p2 over PV-block; the value is
+    # kept because this flavour has not been measured with another one (the zephyr
+    # flavour's 640M@0x68000000 has, for DomA's HEVC hardware decoding).
     # xen_privcmd.unrestricted=1: Linux 6.18's drivers/xen/privcmd.c restricts
     # hypercalls by default (auto-runs restrict_driver() when !xen_initial_domain()).
     # A dom0less DomD has no xenstore target node and is treated as DOMID_IDLE -> the
@@ -656,36 +649,12 @@ fi
 # ------------------------------------------------------------------
 
 # ------------------------------------------------------------------
-# DomU = AGL Cluster IC (dom0less + xen,enhanced)
+# DomU = AGL Cluster IC
 # ------------------------------------------------------------------
-# The node follows the same pattern as DomD's in the Xen DT overlay, including
-# xen,enhanced = "enabled" (which turns on the dom0less xenstore and virtio paths)
-# and xen,domain-p2m-iommu. Memory is given in KB, so <0x0 0x80000> is 512 MB.
-#
-# The DomU payload is a combined kernel + initramfs image.
-# Load target: 0x40000000 (does not collide with DomD kernel 0xc000000 nor its dtb
-# 0xa000000; 0x10000000, the old DomD initramfs slot, is now unused)
-# Network: xen-netfront -> 192.168.10.12/24 via Dom0 xenbr0
-#
-# DomU is graceful: if the binary is absent, skip DomU startup and the rest (Dom0+DomD) still runs
-#
-# The DomU image load address is load-bearing. At 0x40000000 the image (326 MiB)
-# runs to 0x5468b008 and overlaps DomD's xen,static-mem bank1
-# (0x50000000-0x68000000) by 70.5 MiB. Xen's add_boot_module then fails
-# check_reserved_regions_overlap, the module is not registered, create_domUs panics
-# and the board hangs silently with no message.
-#
-# 0xa0000000 is used instead: it starts immediately after DomD's last static-mem
-# bank (0x80000000-0xa0000000), ends at 0xb468b008 which is below the 4 GB boundary
-# U-Boot can address, and overlaps none of DomD's banks (0x50000000-0x68000000,
-# 0x20000000-0x28000000, 0x80000000-0xa0000000).
-#
 # DomU and DomA are created by the toolstack (`xl create`) rather than as dom0less
 # domains: the dom0less path cannot be completed here because the qemu xenpvh
 # backend attach needs Xen event-channel routing and a dom0less console pty in
 # xenconsoled, and neither is available.
-# (The dom0less DomU node construction that used to live here is removed: the
-#  toolstack creates DomU, so the block was unreachable by construction.)
 
 # ------------------------------------------------------------------
 # Linux Dom0 bootargs:
@@ -719,8 +688,8 @@ fdt set /chosen/dom0 bootargs "console=hvc0 earlycon=xen earlyprintk=xen rdinit=
 # on SD p1 as initramfs-xt-dom0-thin.cpio.gz.
 #
 # It loads at 0xa0000000. 0x8000000 does not work: the initramfs is large enough to
-# run past 0xc000000 and into the DomD/DomU reserved range (0xc000000-0x40000000),
-# and fatload then refuses with "Reading file would overwrite reserved memory".
+# run past 0xc000000, the DomD kernel's load address, into the range reserved from
+# there, and fatload then refuses with "Reading file would overwrite reserved memory".
 # 0xa0000000 is below the 4 GB boundary U-Boot can address.
 fatload mmc 0 0xa0000000 initramfs-xt-dom0-thin.cpio.gz
 setenv dom0_initramfs_size ${filesize}

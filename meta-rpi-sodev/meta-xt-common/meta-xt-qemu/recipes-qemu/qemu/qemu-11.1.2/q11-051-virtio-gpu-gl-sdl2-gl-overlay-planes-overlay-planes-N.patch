@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-gpu-gl + sdl2-gl: overlay planes (overlay-planes=N)
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0250-v10-virtio-gpu-gl-sdl2-overlay-planes.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same overlay planes; the new console helper is named
+qemu_console_gl_overlay() instead of dpy_gl_overlay(), following qemu
+11's qemu_console_* naming.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command (SET_OVERLAY_POS) that is not in the virtio specification]
+---
+ hw/display/virtio-gpu-base.c   | 11 ++++-
+ hw/display/virtio-gpu-gl.c     |  2 +
+ hw/display/virtio-gpu-virgl.c  | 87 ++++++++++++++++++++++++++++++++++
+ include/hw/virtio/virtio-gpu.h | 22 +++++++++
+ include/ui/console.h           |  8 ++++
+ include/ui/sdl2.h              |  9 ++++
+ ui/console.c                   | 18 +++++++
+ ui/sdl2-gl.c                   | 58 +++++++++++++++++++++++
+ ui/sdl2.c                      |  1 +
+ 9 files changed, 215 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 42d632f..9ce9038 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -241,7 +241,16 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
+         }
+     }
+ 
+-    g->virtio_config.num_scanouts = cpu_to_le32(g->conf.max_outputs);
++    if (g->conf.overlay_planes > VIRTIO_GPU_MAX_OVERLAYS ||
++        g->conf.max_outputs + g->conf.overlay_planes > VIRTIO_GPU_MAX_SCANOUTS) {
++        error_setg(errp, "invalid overlay-planes %u (max %d, and max_outputs + "
++                   "overlay-planes <= %d)", g->conf.overlay_planes,
++                   VIRTIO_GPU_MAX_OVERLAYS, VIRTIO_GPU_MAX_SCANOUTS);
++        return false;
++    }
++    /* overlay planes are extra scanouts without a console of their own */
++    g->virtio_config.num_scanouts =
++        cpu_to_le32(g->conf.max_outputs + g->conf.overlay_planes);
+     virtio_init(VIRTIO_DEVICE(g), VIRTIO_ID_GPU,
+                 sizeof(struct virtio_gpu_config));
+ 
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 05edc1b..eb5e125 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -201,6 +201,8 @@ static const Property virtio_gpu_gl_properties[] = {
+                     VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
+     DEFINE_PROP_BIT("drm_native_context", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_DRM_ENABLED, false),
++    DEFINE_PROP_UINT32("overlay-planes", VirtIOGPU,
++                       parent_obj.conf.overlay_planes, 0),
+ };
+ 
+ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 8b13bbf..25d3156 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -728,6 +728,83 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
+         }
+         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+     }
++    /* an overlay changed: present scanout 0 again, the display blends it in */
++    for (i = 0; i < g->parent_obj.conf.overlay_planes; i++) {
++        uint32_t id = g->parent_obj.conf.max_outputs + i;
++
++        if (g->parent_obj.overlay[i].on &&
++            g->parent_obj.scanout[id].resource_id == rf.resource_id) {
++            virtio_gpu_rect_update(g, 0, 0, 0, g->parent_obj.scanout[0].width,
++                                   g->parent_obj.scanout[0].height);
++            break;
++        }
++    }
++}
++
++static void virgl_overlay_publish(VirtIOGPU *g, unsigned int k)
++{
++    VirtIOGPUBase *b = &g->parent_obj;
++
++    qemu_console_gl_overlay(b->scanout[0].con, k, b->overlay[k].on,
++                            b->overlay[k].tex_id, b->overlay[k].y0_top,
++                            b->overlay[k].tex_w, b->overlay[k].tex_h,
++                            b->overlay[k].x, b->overlay[k].y);
++}
++
++/* SET_SCANOUT on one of the extra scanouts: bind (or drop) overlay plane k */
++static void virgl_cmd_set_overlay(VirtIOGPU *g,
++                                  struct virtio_gpu_ctrl_command *cmd,
++                                  struct virtio_gpu_set_scanout *ss)
++{
++    VirtIOGPUBase *b = &g->parent_obj;
++    unsigned int k = ss->scanout_id - b->conf.max_outputs;
++
++    b->overlay[k].on = false;
++    if (ss->resource_id && ss->r.width && ss->r.height) {
++        struct virgl_renderer_resource_info info;
++
++        memset(&info, 0, sizeof(info));
++        if (virgl_renderer_resource_get_info(ss->resource_id, &info)) {
++            qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal resource specified %d\n",
++                          __func__, ss->resource_id);
++            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++            return;
++        }
++        b->overlay[k].tex_id = info.tex_id;
++        b->overlay[k].tex_w = info.width;
++        b->overlay[k].tex_h = info.height;
++        b->overlay[k].y0_top = info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP;
++        b->overlay[k].on = true;
++    }
++    b->scanout[ss->scanout_id].resource_id = b->overlay[k].on ? ss->resource_id : 0;
++    virgl_renderer_force_ctx_0();
++    virgl_overlay_publish(g, k);
++    if (!b->overlay[k].on && b->scanout[0].width && b->scanout[0].height) {
++        /* nothing else will present the output without the overlay */
++        virtio_gpu_rect_update(g, 0, 0, 0, b->scanout[0].width,
++                               b->scanout[0].height);
++    }
++}
++
++static void virgl_cmd_set_overlay_pos(VirtIOGPU *g,
++                                      struct virtio_gpu_ctrl_command *cmd)
++{
++    VirtIOGPUBase *b = &g->parent_obj;
++    struct virtio_gpu_set_overlay_pos op;
++    unsigned int k;
++
++    VIRTIO_GPU_FILL_CMD(op);
++    if (op.scanout_id < b->conf.max_outputs ||
++        op.scanout_id >= b->conf.max_outputs + b->conf.overlay_planes) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
++        return;
++    }
++    k = op.scanout_id - b->conf.max_outputs;
++    b->overlay[k].x = op.x;
++    b->overlay[k].y = op.y;
++    if (b->overlay[k].on) {
++        virgl_overlay_publish(g, k);
++    }
+ }
+ 
+ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+@@ -740,6 +817,13 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
+                                      ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+ 
++    if (ss.scanout_id >= g->parent_obj.conf.max_outputs &&
++        ss.scanout_id < g->parent_obj.conf.max_outputs +
++                        g->parent_obj.conf.overlay_planes) {
++        virgl_cmd_set_overlay(g, cmd, &ss);
++        return;
++    }
++
+     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
+                       __func__, ss.scanout_id);
+@@ -1281,6 +1365,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+     case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+         virgl_cmd_resource_flush(g, cmd);
+         break;
++    case VIRTIO_GPU_CMD_SET_OVERLAY_POS:
++        virgl_cmd_set_overlay_pos(g, cmd);
++        break;
+     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
+         virgl_cmd_resource_unref(g, cmd, &cmd_suspended);
+         break;
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 6e44b9f..7970bdb 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -138,6 +138,22 @@ struct virtio_gpu_base_conf {
+      * default. The guest's SurfaceFlinger derives its vsync from this.
+      */
+     uint32_t refresh_rate;
++    /* extra scanouts the guest drives as overlay planes of scanout 0 (0..3) */
++    uint32_t overlay_planes;
++};
++
++#define VIRTIO_GPU_MAX_OVERLAYS 3
++/*
++ * Device-specific command (only with overlay-planes > 0): place overlay plane
++ * scanout_id (one of the extra scanouts) at x, y on scanout 0.
++ */
++#define VIRTIO_GPU_CMD_SET_OVERLAY_POS 0x0120
++struct virtio_gpu_set_overlay_pos {
++    struct virtio_gpu_ctrl_hdr hdr;
++    uint32_t scanout_id;
++    int32_t x;
++    int32_t y;
++    uint32_t padding;
+ };
+ 
+ struct virtio_gpu_ctrl_command {
+@@ -178,6 +194,12 @@ struct VirtIOGPUBase {
+     MemoryRegion hostmem;
+ 
+     struct virtio_gpu_scanout scanout[VIRTIO_GPU_MAX_SCANOUTS];
++    /* overlay-planes: what overlay k currently shows and where */
++    struct {
++        int32_t x, y;
++        uint32_t tex_id, tex_w, tex_h;
++        bool y0_top, on;
++    } overlay[VIRTIO_GPU_MAX_OVERLAYS];
+ 
+     int enabled_output_bitmask;
+     struct virtio_gpu_requested_state req_state[VIRTIO_GPU_MAX_SCANOUTS];
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 3634956..be5a94f 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -229,6 +229,11 @@ typedef struct DisplayChangeListenerOps {
+     /* optional */
+     void (*dpy_gl_cursor_position)(DisplayChangeListener *dcl,
+                                    uint32_t pos_x, uint32_t pos_y);
++    /* optional: overlay plane idx over the scanout (premultiplied alpha) */
++    void (*dpy_gl_overlay)(DisplayChangeListener *dcl, unsigned int idx,
++                           bool on, uint32_t tex_id, bool y0_top,
++                           uint32_t tex_w, uint32_t tex_h,
++                           int32_t x, int32_t y);
+     /* optional */
+     void (*dpy_gl_release_dmabuf)(DisplayChangeListener *dcl,
+                                   QemuDmaBuf *dmabuf);
+@@ -309,6 +314,9 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+                                    bool have_hot, uint32_t hot_x, uint32_t hot_y);
+ void qemu_console_gl_cursor_position(QemuConsole *con,
+                                      uint32_t pos_x, uint32_t pos_y);
++void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
++                             uint32_t tex_id, bool y0_top, uint32_t tex_w,
++                             uint32_t tex_h, int32_t x, int32_t y);
+ void qemu_console_gl_release_dmabuf(QemuConsole *con,
+                                     QemuDmaBuf *dmabuf);
+ void qemu_console_gl_update(QemuConsole *con,
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index 9daf5ec..6509ef9 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -52,6 +52,12 @@ struct sdl2_console {
+     egl_fb win_fb;
+     bool y0_top;
+     bool scanout_mode;
++    /* overlay planes blended over the scanout (see sdl2_gl_overlay) */
++    struct {
++        egl_fb fb;
++        int32_t x, y;
++        bool y0_top, on;
++    } ovl[3];
+ #endif
+ };
+ 
+@@ -95,6 +101,9 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                              uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h,
+                              void *d3d_tex2d);
++void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
++                     uint32_t tex_id, bool y0_top, uint32_t tex_w,
++                     uint32_t tex_h, int32_t x, int32_t y);
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+diff --git a/ui/console.c b/ui/console.c
+index a8a2a24..c9b872f 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1019,6 +1019,24 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+     }
+ }
+ 
++void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
++                             uint32_t tex_id, bool y0_top, uint32_t tex_w,
++                             uint32_t tex_h, int32_t x, int32_t y)
++{
++    DisplayState *s = con->ds;
++    DisplayChangeListener *dcl;
++
++    QLIST_FOREACH(dcl, &s->listeners, next) {
++        if (con != dcl->con) {
++            continue;
++        }
++        if (dcl->ops->dpy_gl_overlay) {
++            dcl->ops->dpy_gl_overlay(dcl, idx, on, tex_id, y0_top,
++                                     tex_w, tex_h, x, y);
++        }
++    }
++}
++
+ void qemu_console_gl_cursor_position(QemuConsole *con,
+                                      uint32_t pos_x, uint32_t pos_y)
+ {
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 1547ad2..62a65dc 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -230,6 +230,63 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                          backing_id, false);
+ }
+ 
++void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
++                     uint32_t tex_id, bool y0_top, uint32_t tex_w,
++                     uint32_t tex_h, int32_t x, int32_t y)
++{
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    if (idx >= ARRAY_SIZE(scon->ovl)) {
++        return;
++    }
++    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    if (scon->ovl[idx].fb.texture != tex_id || !on) {
++        egl_fb_destroy(&scon->ovl[idx].fb);
++    }
++    scon->ovl[idx].on = on && tex_id;
++    if (scon->ovl[idx].on && !scon->ovl[idx].fb.framebuffer) {
++        egl_fb_setup_for_tex(&scon->ovl[idx].fb, tex_w, tex_h, tex_id, false);
++    }
++    scon->ovl[idx].x = x;
++    scon->ovl[idx].y = y;
++    scon->ovl[idx].y0_top = y0_top;
++}
++
++/*
++ * Blend the enabled overlays over what egl_fb_blit() just put in the window.
++ * Coordinates are in scanout pixels, origin top-left; the window may be scaled.
++ * The guest composer hands premultiplied buffers, hence GL_ONE.
++ */
++static void sdl2_gl_draw_overlays(struct sdl2_console *scon, int ww, int wh)
++{
++    double sx = scon->w ? (double)ww / scon->w : 1.0;
++    double sy = scon->h ? (double)wh / scon->h : 1.0;
++
++    for (int i = 0; i < ARRAY_SIZE(scon->ovl); i++) {
++        if (!scon->ovl[i].on || !scon->ovl[i].fb.texture) {
++            continue;
++        }
++        int w = scon->ovl[i].fb.width * sx;
++        int h = scon->ovl[i].fb.height * sy;
++        int x = scon->ovl[i].x * sx;
++        int y = scon->ovl[i].y * sy;
++
++        glBindFramebuffer(GL_FRAMEBUFFER_EXT, scon->win_fb.framebuffer);
++        glViewport(x, wh - h - y, w, h);
++        glEnable(GL_TEXTURE_2D);
++        glBindTexture(GL_TEXTURE_2D, scon->ovl[i].fb.texture);
++        glEnable(GL_BLEND);
++        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++        /*
++         * NOT !y0_top as for egl_fb_blit(): qemu_gl_run_texture_blit's flip
++         * has the opposite sense, and !y0_top drew the system bars upside down
++         * (RPi4 DomA, 2026-10-02).
++         */
++        qemu_gl_run_texture_blit(scon->gls, scon->ovl[i].y0_top);
++        glDisable(GL_BLEND);
++    }
++}
++
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+@@ -249,6 +306,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+     SDL_GetWindowSize(scon->real_window, &ww, &wh);
+     egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
+     egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++    sdl2_gl_draw_overlays(scon, ww, wh);
+ 
+     SDL_GL_SwapWindow(scon->real_window);
+ }
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 1c97d23..4b0e1af 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -834,6 +834,7 @@ static const DisplayChangeListenerOps dcl_gl_ops = {
+ 
+     .dpy_gl_scanout_disable  = sdl2_gl_scanout_disable,
+     .dpy_gl_scanout_texture  = sdl2_gl_scanout_texture,
++    .dpy_gl_overlay          = sdl2_gl_overlay,
+     .dpy_gl_update           = sdl2_gl_scanout_flush,
+ 
+ #ifdef CONFIG_GBM

@@ -34,6 +34,11 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # only here, so the shipped EGL flutter-auto is untouched.
 SRC_URI += "file://0001-wayland_vulkan-build-against-Vulkan-Headers-before-1.3.296.patch"
 
+# Mesa's Wayland WSI (24.0) asks for a new swapchain only through vkAcquireNextImageKHR's
+# VK_SUBOPTIMAL_KHR, which this backend ignored, so the cluster kept the tiled images it
+# started with and the compositor composed them with the GPU every frame. See the patch.
+SRC_URI += "file://0002-wayland_vulkan-rebuild-the-swapchain-when-acquiring-says-suboptimal.patch"
+
 SUMMARY = "Toyota IVI Homescreen v2.0, Vulkan backend"
 DESCRIPTION = "flutter-auto built against BUILD_BACKEND_WAYLAND_VULKAN. This is the \
 embedder the Vulkan lane runs the AGL instrument cluster on (the systemd drop-in in \

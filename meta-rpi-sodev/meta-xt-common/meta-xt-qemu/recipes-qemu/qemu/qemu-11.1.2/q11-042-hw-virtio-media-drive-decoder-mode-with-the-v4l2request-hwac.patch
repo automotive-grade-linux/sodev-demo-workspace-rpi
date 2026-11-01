@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: drive decoder mode with the v4l2request
+ hwaccel
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0218-v10-hw-virtio-media-drive-decoder-mode-with-the-v4l2request-hwaccel.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216) and on the v4l2request hwaccel that only rpidistro-ffmpeg carries]
+---
+ hw/virtio/virtio-media-decoder.c | 107 +++++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 4e724f1a5..322f56cfd 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -62,6 +62,8 @@
+ 
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/imgutils.h>
++#include <libavutil/hwcontext.h>   /* av_hwdevice_ctx_create, transfer */
++#include <libavutil/pixdesc.h>     /* av_get_pix_fmt_name, for the diag */
+ #include <libswscale/swscale.h>
+ 
+ /*
+@@ -148,6 +150,16 @@ struct VirtIOMediaDec {
+     int sws_src_fmt;
+     int sws_src_w, sws_src_h;
+     int sws_w, sws_h;
++
++    /*
++     * v4l2request hwaccel. hwdev is NULL when it could not be opened, and
++     * everything below then behaves exactly as it did before: libavcodec
++     * decodes HEVC in software. swframe is the destination of
++     * av_hwframe_transfer_data(); it is reused, not reallocated per frame.
++     */
++    AVBufferRef *hwdev;
++    AVFrame *swframe;
++    bool hw_logged;
+ };
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -527,6 +539,45 @@ static void dec_pump(VirtIOMediaSession *s)
+             return;
+         }
+ 
++        /*
++         * A hardware frame is a DRM_PRIME handle, not pixels this device can
++         * memcpy into the guest pages, so bring it back to the CPU and carry on
++         * with the frame the rest of this file already knows how to handle.
++         *
++         * The download lands in the sw_format the driver produced, which on this
++         * SoC is rpi4_8 (SAND/COL128), NOT NV12 -- measured, see dec_get_format.
++         * That is exactly the case the sws path in dec_write_frame exists for,
++         * and the libswscale in the fork detiles it with its AArch64 NEON code.
++         * The fork's ffmpeg ran this conversion end to end on the board:
++         *   ffmpeg -hwaccel drm -i <clip> -pix_fmt nv12 -f rawvideo  -> 300 frames
++         * So no COL128-specific code is needed here, and none is added.
++         *
++         * move_ref rather than a second AVFrame everywhere: downstream holds
++         * d->frame (dec_deliver, d->held), and swapping in place keeps all of
++         * that ownership unchanged.
++         */
++        if (d->frame->format == AV_PIX_FMT_DRM_PRIME) {
++            int t;
++
++            av_frame_unref(d->swframe);
++            t = av_hwframe_transfer_data(d->swframe, d->frame, 0);
++            if (t < 0) {
++                error_report_once("virtio-media/dec: hwframe transfer: %d", t);
++                virtio_media_send_error_event(s, EIO);
++                return;
++            }
++            av_frame_copy_props(d->swframe, d->frame);
++            av_frame_unref(d->frame);
++            av_frame_move_ref(d->frame, d->swframe);
++
++            if (!d->hw_logged) {
++                d->hw_logged = true;
++                info_report("virtio-media/dec: hardware decode active "
++                            "(v4l2request, host format %s)",
++                            av_get_pix_fmt_name(d->frame->format));
++            }
++        }
++
+         /*
+          * First frame, or a mid-stream resolution change: tell the guest and
+          * stop until it has re-negotiated. The frame itself is kept -- dropping
+@@ -642,6 +693,34 @@ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
+     return true;
+ }
+ 
++/*
++ * Take the hwaccel when libavcodec offers it.
++ *
++ * The RPi fork wires its V4L2 Request API HEVC hwaccel to AV_HWDEVICE_TYPE_DRM
++ * and surfaces it as AV_PIX_FMT_DRM_PRIME, so choosing that format here is what
++ * moves the decode onto codec@800000. Measured in DomD on 2026-09-21 with the
++ * fork own CLI, which takes the same path:
++ *   $ ffmpeg -hwaccel drm -i bbb_hevc_640x360_1600kbps_30fps.hevc -f null -
++ *   Hwaccel V4L2 HEVC stateless V4; devices: /dev/media0,/dev/video19;
++ *   buffers: src DMABuf, dst DMABuf; swfmt=rpi4_8
++ *   300 frames decoded; 0 decode errors; speed=69.2x   (software: 10.9x)
++ *
++ * Falling through to fmts[0] is not a failure path: it is what libavcodec would
++ * have picked on its own, so a host without the hwaccel keeps decoding.
++ */
++static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
++                                         const enum AVPixelFormat *fmts)
++{
++    const enum AVPixelFormat *p;
++
++    for (p = fmts; *p != AV_PIX_FMT_NONE; p++) {
++        if (*p == AV_PIX_FMT_DRM_PRIME) {
++            return *p;
++        }
++    }
++    return fmts[0];
++}
++
+ int virtio_media_dec_open(VirtIOMediaSession *s)
+ {
+     VirtIOMediaDec *d;
+@@ -675,6 +754,30 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+      * across calls in a way the buffer accounting here does not model.
+      */
+     d->avctx->thread_count = 1;
++
++    /*
++     * Hardware decode, FAIL-SOFT. A board whose /dev/mediaN is missing, busy or
++     * not permitted must still play video, just slower, so a failure here only
++     * warns. This ordering matters: hw_device_ctx and get_format have to be set
++     * before avcodec_open2(), because that is when libavcodec binds the hwaccel.
++     *
++     * av_hwdevice_ctx_create() with a NULL device lets the /dev/mediaN discovery
++     * in the fork choose, which is what the CLI does; naming a node here would
++     * hard-code a number that udev is free to move.
++     */
++    d->swframe = av_frame_alloc();
++    if (!d->swframe) {
++        goto fail;
++    }
++    if (av_hwdevice_ctx_create(&d->hwdev, AV_HWDEVICE_TYPE_DRM,
++                               NULL, NULL, 0) == 0) {
++        d->avctx->hw_device_ctx = av_buffer_ref(d->hwdev);
++        d->avctx->get_format = dec_get_format;
++    } else {
++        warn_report("virtio-media/dec: no DRM device for the v4l2request "
++                    "hwaccel; decoding HEVC in software");
++    }
++
+     if (avcodec_open2(d->avctx, codec, NULL) < 0) {
+         goto fail;
+     }
+@@ -689,6 +792,8 @@ fail:
+     }
+     av_packet_free(&d->pkt);
+     av_frame_free(&d->frame);
++    av_frame_free(&d->swframe);
++    av_buffer_unref(&d->hwdev);
+     g_free(d);
+     return ENOMEM;
+ }
+@@ -706,6 +811,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     av_packet_free(&d->pkt);
+     av_frame_free(&d->frame);
+     av_frame_free(&d->held);
++    av_frame_free(&d->swframe);
++    av_buffer_unref(&d->hwdev);
+     sws_freeContext(d->sws);
+     g_free(d);
+     s->dec = NULL;

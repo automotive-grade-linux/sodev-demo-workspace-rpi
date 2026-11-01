@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 09:40:19 +0900
+Subject: [PATCH] virtio-media: keep a session the device reported an error
+ for
+
+On VIRTIO_MEDIA_EVT_ERROR the driver closed and freed the session at
+once, while user space still had the node open. The next ioctl on that
+file used freed memory: on the Raspberry Pi 5 a second 4K HEVC stream
+ran DomD's CMA out, the device model reported an error, and DomA's
+kernel took a NULL pointer dereference in virtio_media_qbuf() and
+panicked.
+
+Mark the session instead and wake a DQBUF or poll() waiting on it. From
+then on its ioctls fail with -EIO, and a blocking DQBUF returns -EIO,
+but for a VIDIOC_DQEVENT that has an event to take or does not block: it
+only reads the file's event queue, so the events still pending can be
+taken, while a blocking one with nothing pending would sleep holding the
+device's lock for an event that will not come. That is decided under the
+device's lock, which every DQEVENT takes, and by the command's number,
+so the 32-bit VIDIOC_DQEVENT is let through as well. poll() asked for
+EPOLLIN/EPOLLOUT reports EPOLLERR with that readiness, so a client that
+acts only on those, as v4l2_codec2 does, dequeues and sees the -EIO;
+asked for neither, it reports no EPOLLERR, as vb2 does, rather than
+waking a client that polls for events at once. A pending V4L2 event is
+reported either way. The session is freed, and CLOSE sent to the device,
+when the file is closed, as for any other session.
+
+Change-Id: I0404443d8a94547b693b70b0f3cd254e01d4b85b
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/driver/session.h
++++ b/driver/session.h
+@@ -133,6 +133,9 @@ struct virtio_media_queue_state {
+  * virtio_media_queue_state`.
+  * @dqbuf_wait: waitqueue for dequeued buffers, if ``VIDIOC_DQBUF`` needs to
+  * block or when polling.
++ * @errored: the device sent ``VIRTIO_MEDIA_EVT_ERROR`` for this session. The
++ * session stays allocated until its file is closed; ioctls but a VIDIOC_DQEVENT
++ * that has an event to take, or does not block, fail with -EIO.
+  * @list: link into the list of sessions for the device.
+  */
+ struct virtio_media_session {
+@@ -160,6 +163,7 @@ struct virtio_media_session {
+ 	struct virtio_media_queue_state queues[VIRTIO_MEDIA_LAST_QUEUE + 1];
+ 	struct mutex queues_lock; /* protects queues array and states */
+ 	wait_queue_head_t dqbuf_wait;
++	bool errored;
+ 
+ 	struct list_head list;
+ };
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -661,7 +661,17 @@ process_bufs:
+ 			v4l2_err(&vv->v4l2_dev,
+ 				 "received error %d for session %d",
+ 				 error_evt->errno, error_evt->hdr.session_id);
+-			virtio_media_session_close(vv, session);
++			/*
++			 * Do not free the session here: its file is still
++			 * open, and the next ioctl or poll on it would use
++			 * freed memory (a NULL dereference in
++			 * virtio_media_qbuf() took DomA's kernel down). Mark
++			 * it, wake a DQBUF or poll() waiting on it, and let the
++			 * close of the file free it.
++			 */
++			WRITE_ONCE(session->errored, true);
++			wake_up_all(&session->dqbuf_wait);
++			wake_up_all(&session->fh.wait);
+ 			break;
+ 
+ 		/*
+@@ -824,6 +834,25 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
+ 	poll_wait(file, &session->dqbuf_wait, wait);
+ 	poll_wait(file, &session->fh.wait, wait);
+ 
++	/*
++	 * An errored session (VIRTIO_MEDIA_EVT_ERROR). Asked for IN/OUT:
++	 * EPOLLERR and that readiness, so that a client that acts only on
++	 * IN/OUT (v4l2_codec2) dequeues and gets the -EIO. Not asked for them:
++	 * no EPOLLERR, as vb2_core_poll() answers, or a client polling only
++	 * for events would be woken at once, for good. A pending V4L2 event
++	 * is reported either way, as below.
++	 */
++	if (READ_ONCE(session->errored)) {
++		__poll_t io = req_events & (EPOLLIN | EPOLLRDNORM |
++					    EPOLLOUT | EPOLLWRNORM);
++
++		if (io)
++			rc = EPOLLERR | io;
++		if (v4l2_event_pending(&session->fh))
++			rc |= EPOLLPRI;
++		return rc;
++	}
++
+ 	mutex_lock(&session->queues_lock);
+ 	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
+ 		/*
+--- a/driver/virtio_media_ioctls.c
++++ b/driver/virtio_media_ioctls.c
+@@ -1181,10 +1181,13 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
+ 	 */
+ 	mutex_unlock(&vv->vlock);
+ 	ret = wait_event_interruptible(session->dqbuf_wait,
+-				       !list_empty(buffer_queue));
++				       !list_empty(buffer_queue) ||
++				       READ_ONCE(session->errored));
+ 	mutex_lock(&vv->vlock);
+ 	if (ret)
+ 		return -EINTR;
++	if (READ_ONCE(session->errored))
++		return -EIO;
+ 
+ 	mutex_lock(&session->queues_lock);
+ 	dqbuf = list_first_entry(buffer_queue, struct virtio_media_buffer,
+@@ -1505,6 +1508,24 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
+ 
+ 	mutex_lock(&vv->vlock);
+ 
++	/*
++	 * The device gave this session up (VIRTIO_MEDIA_EVT_ERROR). DQEVENT
++	 * still works while it cannot block: it only reads this file's event
++	 * queue, and poll() keeps reporting EPOLLPRI until the pending events
++	 * are taken. A blocking one with nothing pending would sleep with
++	 * vv->vlock held for an event that will not come. Checked under
++	 * vv->vlock, which every DQEVENT here takes, so a pending event seen
++	 * here is still there for the dequeue; compared by number, so that
++	 * the 32-bit command (VIDIOC_DQEVENT32) is let through too.
++	 */
++	if (vfh && READ_ONCE(fh_to_session(vfh)->errored) &&
++	    (_IOC_TYPE(cmd) != 'V' ||
++	     _IOC_NR(cmd) != _IOC_NR(VIDIOC_DQEVENT) ||
++	     (!v4l2_event_pending(vfh) && !(file->f_flags & O_NONBLOCK)))) {
++		mutex_unlock(&vv->vlock);
++		return -EIO;
++	}
++
+ 	/*
+ 	 * We need to handle a few ioctls manually because their result
+ 	 * rely on vfd->tvnorms, which is normally updated by the driver

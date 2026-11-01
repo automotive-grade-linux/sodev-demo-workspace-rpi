@@ -1,0 +1,99 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 25 Oct 2026 00:30:03 +0900
+Subject: [PATCH] vulkan: sleep between the polls of spin_wait_for_sync_file()
+
+A driver without timeline syncobjs (v3dv) waits for a binary syncobj to
+get a fence in spin_wait_for_sync_file(): a sync_file export and a
+zero-timeout wait, then sched_yield(), until the signal operation has
+been submitted. The loop never sleeps, so while that submission is held
+up it keeps its CPU and runs again whenever the CPU is free.
+
+On a Raspberry Pi 5 Xen DomD (2026-10-24) a Venus ring thread of the AGL
+cluster's context held a whole CPU for 20 minutes the way this loop
+does: 80% of it in the kernel, and 1.66 million context switches, all
+but 12,000 of them involuntary (a yield leaves the task runnable). Its
+context's other ring thread was blocked on the V3D mutex, held by weston
+inside a V3D submit on the same CPU; weston stayed queued there with the
+lowest vruntime and did not run again, and the device model of the
+Android guest, whose main loop waits for the same mutex, stopped the
+guest the whole time. The ring thread's stack was not sampled. That ring
+waiting for the other is what this loop is for (see 0003); nothing else
+in the Vulkan runtime or v3dv yields in a loop, and the render server's
+ring yields no more with VKR_RING_RELAX="0,100".
+
+Yield for the first 8 polls, as before, then sleep, from 10 us doubling
+up to 1 ms and no longer than the time left (rounded up to a whole
+microsecond, plus the timer slack). A wait that ends within the first
+polls costs what it did; a longer one gives the CPU up between polls, at
+most doubling the time the signal took to arrive, and up to 1 ms more.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/vulkan/runtime/vk_drm_syncobj.c
++++ b/src/vulkan/runtime/vk_drm_syncobj.c
+@@ -237,6 +237,31 @@
+    }
+ }
+ 
++/* Between two polls of spin_wait_for_sync_file(): yield the first 8 times,
++ * then sleep, from 10 us doubling up to 1 ms and no longer than the time left.
++ *
++ * A yield-only loop never sleeps, so while the signal operation it waits for
++ * is held up it keeps its CPU and runs again as soon as the CPU is free. When
++ * whatever holds that up needs the same CPU, it stalls both: a Venus ring
++ * thread waiting here for its context's other ring, which was itself blocked
++ * on the V3D mutex, kept the CPU from the compositor that held the mutex, on a
++ * Raspberry Pi 5 DomD for 20 minutes.
++ */
++static void
++spin_wait_relax(uint32_t *iter, uint64_t abs_timeout_ns)
++{
++   if (++*iter <= 8) {
++      sched_yield();
++      return;
++   }
++
++   uint64_t sleep_ns = MIN2(10000ull << MIN2(*iter - 9, 7), 1000000ull);
++   const uint64_t now = os_time_get_nano();
++   if (now < abs_timeout_ns)
++      sleep_ns = MIN2(sleep_ns, abs_timeout_ns - now);
++   os_time_sleep(DIV_ROUND_UP(sleep_ns, 1000));
++}
++
+ static VkResult
+ spin_wait_for_sync_file(struct vk_device *device,
+                         uint32_t wait_count,
+@@ -245,6 +270,8 @@
+                         uint64_t abs_timeout_ns)
+ {
+    if (wait_flags & VK_SYNC_WAIT_ANY) {
++      uint32_t iter = 0;
++
+       while (1) {
+          for (uint32_t i = 0; i < wait_count; i++) {
+             VkResult result = sync_has_sync_file(device, waits[i].sync);
+@@ -255,10 +282,12 @@
+          if (os_time_get_nano() >= abs_timeout_ns)
+             return VK_TIMEOUT;
+ 
+-         sched_yield();
++         spin_wait_relax(&iter, abs_timeout_ns);
+       }
+    } else {
+       for (uint32_t i = 0; i < wait_count; i++) {
++         uint32_t iter = 0;
++
+          while (1) {
+             VkResult result = sync_has_sync_file(device, waits[i].sync);
+             if (result == VK_SUCCESS)
+@@ -270,7 +299,7 @@
+             if (os_time_get_nano() >= abs_timeout_ns)
+                return VK_TIMEOUT;
+ 
+-            sched_yield();
++            spin_wait_relax(&iter, abs_timeout_ns);
+          }
+       }
+    }

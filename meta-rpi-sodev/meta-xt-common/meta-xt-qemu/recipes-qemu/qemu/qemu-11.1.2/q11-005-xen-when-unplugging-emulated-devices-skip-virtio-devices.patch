@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrii <andrii_chepurnyi@epam.com>
+Date: Mon, 18 Aug 2025 15:13:59 +0000
+Subject: [PATCH] xen: when unplugging emulated devices skip virtio devices
+
+Virtio devices should never be unplugged at boot time, as they are
+similar to pci passthrough devices.
+
+(cherry picked from commit 84221e82ed738956b6fc8a8060738aa039c4a0e1)
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Origin: https://github.com/xen-troops/qemu commit 84221e82ed738956b6fc8a8060738aa039c4a0e1
+---
+ hw/i386/xen/xen_platform.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/hw/i386/xen/xen_platform.c b/hw/i386/xen/xen_platform.c
+index c8b852be0..5f5949561 100644
+--- a/hw/i386/xen/xen_platform.c
++++ b/hw/i386/xen/xen_platform.c
+@@ -27,6 +27,7 @@
+ #include "qapi/error.h"
+ #include "hw/ide/pci.h"
+ #include "hw/pci/pci.h"
++#include "hw/virtio/virtio-bus.h"
+ #include "migration/vmstate.h"
+ #include "net/net.h"
+ #include "trace.h"
+@@ -132,7 +133,8 @@ static void unplug_nic(PCIBus *b, PCIDevice *d, void *o)
+     /* We have to ignore passthrough devices */
+     if (pci_get_word(d->config + PCI_CLASS_DEVICE) ==
+             PCI_CLASS_NETWORK_ETHERNET
+-            && !pci_device_is_passthrough(d)) {
++            && !pci_device_is_passthrough(d)
++            && !qdev_get_child_bus(&d->qdev, TYPE_VIRTIO_BUS)) {
+         object_unparent(OBJECT(d));
+     }
+ }
+@@ -235,6 +237,11 @@ static void unplug_disks(PCIBus *b, PCIDevice *d, void *opaque)
+     if (pci_device_is_passthrough(d))
+         return;
+ 
++    /* Ignore virtio devices */
++    if (qdev_get_child_bus(&d->qdev, TYPE_VIRTIO_BUS)) {
++        return;
++    }
++
+     switch (pci_get_word(d->config + PCI_CLASS_DEVICE)) {
+     case PCI_CLASS_STORAGE_IDE:
+     case PCI_CLASS_STORAGE_SATA:

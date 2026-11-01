@@ -1,0 +1,474 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 19 Oct 2026 21:24:05 +0900
+Subject: [PATCH] virtio-media: decoder mode: decode the hwaccel on the decode
+ thread
+
+Decoder mode decoded HEVC on rpi-hevc-dec (the v4l2request hwaccel) on
+the main loop, and only a codec without the hwaccel (H.264) on the
+decode thread (q11-074). Each 4K frame's decode held the main loop while
+the hardware worked, so DomA's virtqueue kicks and display commands
+waited behind it: DomA saw the frames come out in bursts with gaps of
+28-170 ms, and a WebView playing a 4K60 stream decoded 57 of them a
+second, dropped 15 and showed 42. The device model's display commands
+themselves were quick: with QEMU_LAT_DIAG, still on the main loop,
+every RESOURCE_FLUSH and SET_SCANOUT was answered within 2 ms.
+
+Every codec is decoded on the thread now:
+  - The hwaccel keeps one libavcodec thread, as on the main loop (frame
+    threads with it were not tried), and when the hwaccel's DRM device
+    is open the thread keeps at most 2 frames decoded ahead instead of
+    4: a hardware frame waiting there holds a pool buffer the display
+    could use. An HEVC profile the hwaccel does not take is decoded in
+    software on the thread too, with the same bound.
+  - The display path reads the decoder's reordering depth from the
+    thread's last view (thr_reorder) instead of the AVCodecContext the
+    thread owns. The main loop's branches for a codec without the
+    thread go, and the comments that assumed one follow.
+  - Stopping the input, a START that ends a drain, switching the codec
+    and closing first let go of what holds pool buffers on this side
+    (the display's references to frames not on the display, the frame
+    held across a format change, the frames the GPU conversion holds),
+    then wait for the thread, which may be waiting for a free pool
+    buffer. A frame on the display stays referenced until weston
+    releases it, which only the main loop hears, so such a wait ends at
+    rpidistro-ffmpeg 0002's bound (300 ms).
+
+The bound on the frames kept for the display (ds_refs_cap, q11-071) was
+the references held when the pool came near its end plus one. On the
+thread the decoder runs ahead of the display at the start of a stream:
+in one of two runs that came out at 12 and a 4K60 WebView showed 41.5
+frames a second (56.9 in the other). The bound is now at least
+DEC_POOL_MAX - 2 less what the decoder holds on its side (the
+reordering depth and the frames waiting on the thread), 26 with a
+reordering depth of 2, the value the main loop gave for 1080p60, and
+it is set two buffers earlier, as those frames are not seen yet either.
+
+Measured on a 16 GB Raspberry Pi 5 running the 8g image, DomD's CMA
+640 MiB, DomA's scanout buffers linear, with q11-081/082 (2026-10-19),
+on a 60 s HEVC clip measured for 30 s with nothing else polling the
+board. (The 15 s test clip's loop restarts the decoder: on the thread
+it showed 48 frames a second where the 60 s clip showed 58. Polling
+DomA's processes over adb meanwhile took a run down to 27-28.)
+  - 4K60 full screen in a WebView: 42.1 frames shown a second on the
+    main loop. With this as it is and SurfaceFlinger's SF phase at 8 ms
+    (the rpi5 product): 57.0 and 56.9, and 56.5 and 57.7 among the HMI.
+    A build before q11-081's last change gave 56.1 and 53.0 full screen
+    and 55.2 and 51.4 among the HMI without the phase, 56.6 and 52.7,
+    57.4 and 57.9 with it; one before the last changes here gave
+    53.2-58.1 full screen with the phase in five runs.
+  - 1080p60 among the HMI: 59.7 (the build before the last changes).
+  - codec -T 60.7 fps for the 4K stream and for H.264 1080p60
+    (software); -S (decode alone) of the 4K stream 67.7 -> 69.4 fps
+    with 4 frames ahead and the old bound.
+  - In the fourteen runs of these two builds the bound was set in six,
+    at 26 (and in two of the six stop tries); in the others the pool did
+    not reach 26 buffers and none was set. 1659-1970 conversions were
+    skipped in each 4K run, none was lost, no pool wait was given up,
+    hvs_underrun stayed 0 and the HDMI audio's position moved (once it
+    went back, the stream restarting). CmaFree's lowest during 4K was
+    23-111 MB; the build before the last changes here took it to 0 kB
+    and 40 kB in two runs, with nothing lost and no allocation failure
+    in qemu's log.
+  - Stopping the app during 4K playback returned in 172-297 ms in six
+    tries, and the next playback showed 56.7 and 57.4 frames a
+    second.
+  - Not run: two decoders at once (the case the flush rule of q11-081
+    is for).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 173 +++++++++++++++++++------------
+ 1 file changed, 109 insertions(+), 64 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 986311b..e7fcc05 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -48,9 +48,9 @@
+  * ONE THING DECODER MODE GETS FOR FREE. The proxy path has to poll a host fd
+  * for events, which is where the vb2_poll()/file-I/O-emulation trap lives (see
+  * virtio_media_update_fd_handler). Here there is no host fd and no poll:
+- * completions and SOURCE_CHANGE are produced by the QBUF that caused them, or,
+- * for a codec decoded on its own thread (q11-dec-thread), by a bottom half when
+- * frames come out of it, so that entire failure mode does not exist.
++ * completions and SOURCE_CHANGE are produced by the QBUF that caused them, or
++ * by a bottom half when frames come out of the decode thread (q11-dec-thread),
++ * so that entire failure mode does not exist.
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+@@ -200,7 +200,8 @@ typedef struct DecGpuEntry {
+  * (dec_ds_keep says which), and that frame is shown from the guest's copy
+  * instead. 384 MiB lets the pool's bound decide (ds_refs_cap; for frames of
+  * 12 MB or less it is the tighter one -- a 4K frame is 12.4 MB, and the
+- * Raspberry Pi 5 kept 24 of them): a WebView playing a 4K60 stream
++ * Raspberry Pi 5 kept 24 of them, 26 on the decode thread with
++ * q11-dec-hw-thread's bound): a WebView playing a 4K60 stream
+  * shows a frame some 21-24 frames after its decode, and with 256 MiB (21 frames)
+  * it showed 25.6-42.4 frames a second, swinging between runs -- each frame
+  * shown after its reference went needs the late conversion, which delays the
+@@ -228,19 +229,24 @@ typedef struct DecGpuEntry {
+ /*
+  * libavcodec's pool is rpi-hevc-dec's CAPTURE queue, which takes VB2_MAX_FRAME
+  * (32) buffers and no more. Past that v4l2request waits for a buffer to come
+- * free, and only this thread frees them: with every buffer referenced here
+- * that wait would never end (rpidistro-ffmpeg 0002 bounds it, dec_ds_starved).
++ * free, on the decode thread, and only the main loop letting a reference here
++ * go can end that wait: with every buffer referenced here it lasts until
++ * rpidistro-ffmpeg 0002's bound (dec_ds_starved).
+  * The pool grows only when no buffer is free, and a buffer is seen here only
+- * when its frame comes out, up to has_b_frames frames after it was taken. So
+- * when the import of the (DEC_DS_POOL_SOFT - has_b_frames)-th buffer appears,
+- * every buffer of the DEC_DS_POOL_SOFT is in use, and the references held then
+- * plus one more is how many the pool has room for: they are not let grow past
+- * that (ds_refs_cap) for as long as the pool lives, which leaves the last
+- * buffer for the decoder's own references varying. Should the decoder run out
+- * even so (dec_ds_starved), the bound comes down by two. (The Raspberry Pi 5,
+- * HEVC 1080p60 with has_b_frames 2: set at the 28th import, 26 frames. With
+- * the held references alone, 23 or 24 at that point, a bound of 24 let frames
+- * the compositor still held go, 25 did not.)
++ * when its frame comes out, up to has_b_frames frames after it was taken, and
++ * thr_out_max more on the decode thread. So when the import of the
++ * (DEC_DS_POOL_SOFT - has_b_frames - thr_out_max)-th buffer appears,
++ * the pool is nearly full, and the references are not let grow past
++ * DEC_POOL_MAX - 2 less what the decoder holds on its side (has_b_frames, and
++ * the frames waiting on the decode thread, thr_out_max), or the references
++ * held then plus one more if that is higher (ds_refs_cap), for as long as the
++ * pool lives. Should the decoder run out even so (dec_ds_starved), the bound
++ * comes down by two. (The Raspberry Pi 5, HEVC 1080p60 with has_b_frames 2:
++ * 26 frames. A bound of 24 let frames the compositor still held go, 25 did
++ * not. Taken from the references held alone, the bound came out at 12 in one
++ * of two runs once HEVC was decoded on the thread, which runs ahead of the
++ * display at the start of a stream; a 4K60 WebView then showed 41.5 frames a
++ * second, against 56.9 in the other run.)
+  */
+ #define DEC_POOL_MAX 32
+ #define DEC_DS_POOL_SOFT (DEC_POOL_MAX - 2)
+@@ -316,18 +322,27 @@ struct DecZcPool {
+ };
+ 
+ /*
+- * q11-dec-thread: a codec without the hwaccel (H.264) is decoded on a thread
+- * of its own; HEVC stays on the main loop, also when it falls back to
+- * software. On the main loop H.264 1080p60 took 96 to 98% of a core on the
+- * Raspberry Pi 5, with DomA's virtio-blk served by the same loop; with the
+- * thread the main loop takes 28 to 29% and the thread 72 to 73%.
++ * q11-dec-thread: every codec is decoded on a thread of its own. On the main
++ * loop H.264 1080p60 took 96 to 98% of a core on the Raspberry Pi 5, with
++ * DomA's virtio-blk served by the same loop; with the thread the main loop
++ * takes 28 to 29% and the thread 72 to 73%. q11-dec-hw-thread: the hwaccel
++ * (HEVC on rpi-hevc-dec) is there too. On the main loop each 4K frame's
++ * decode held the loop while the hardware worked, so the guest's virtqueue
++ * kicks and display commands waited behind it and frames came out in bursts
++ * with gaps of 28-170 ms; a WebView playing 4K60 decoded 57 of them a second,
++ * dropped 15 and showed 42. On the thread it decoded 57.6-60.3 and showed
++ * 51.4-57.9 a second, full screen and among the HMI (Raspberry Pi 5,
++ * 2026-10-19).
+  * The thread owns avctx; the main loop hands it packets and takes decoded
+  * frames (dec_av_send / dec_av_receive / dec_av_flush), and everything else --
+  * the guest's buffers, events, GL -- stays on the main loop. Bounded both
+- * ways: DEC_THR_IN packets waiting, DEC_THR_OUT frames decoded ahead.
++ * ways: DEC_THR_IN packets waiting, thr_out_max frames decoded ahead
++ * (DEC_THR_OUT; 2 with the hwaccel's DRM device open).
+  */
+ #define DEC_THR_IN  DEC_MAX_BACKLOG_PKTS_THR
+ #define DEC_THR_OUT 4
++/* dec_ds_keep's bound stays above zero with the deepest reordering it allows (16) */
++QEMU_BUILD_BUG_ON(DEC_THR_OUT + 16 >= DEC_DS_POOL_SOFT);
+ 
+ typedef struct DecThrOut {
+     AVFrame *frame;   /* NULL: err below */
+@@ -519,6 +534,8 @@ struct VirtIOMediaDec {
+     GQueue *thr_out;        /* DecThrOut * */
+     bool thr_quit, thr_flush, thr_eof;
+     QEMUBH *thr_bh;
++    int thr_reorder;        /* avctx->has_b_frames after the last frame (thr_lock) */
++    unsigned thr_out_max;   /* decoded ahead at most (2 with the hwaccel's device) */
+ };
+ 
+ static AVPacket dec_thr_eos;   /* the drain request in thr_in */
+@@ -1007,7 +1024,8 @@ static bool dec_ds_keep(VirtIOMediaDec *d, unsigned slot, unsigned index,
+ {
+     DecGpuEntry *e = &d->gpu[slot];
+     unsigned max = dec_ds_max_refs(bytes);
+-    unsigned soft = DEC_DS_POOL_SOFT - (unsigned)MIN(MAX(reorder, 0), 16);
++    unsigned soft = DEC_DS_POOL_SOFT - (unsigned)MIN(MAX(reorder, 0), 16) -
++                    d->thr_out_max;
+ 
+     /*
+      * Normally a no-op: the decoder could write fr into this buffer only once
+@@ -1018,10 +1036,13 @@ static bool dec_ds_keep(VirtIOMediaDec *d, unsigned slot, unsigned index,
+     dec_ds_unref(d, slot);
+     if (!d->ds_refs_cap && d->gpu_n >= soft) {
+         /* fr, in the buffer that just appeared, is one of them; one more */
+-        d->ds_refs_cap = d->ds_refs + 2;
++        d->ds_refs_cap = MAX(d->ds_refs + 2,
++                             DEC_POOL_MAX - 2 - (unsigned)MIN(MAX(reorder, 0), 16) -
++                             d->thr_out_max);
+         info_report("virtio-media/dec: sand-scanout: %u of the decoder's "
+-                    "buffers seen, up to %d more decoded ahead: keeping %u "
+-                    "frames at most", d->gpu_n, reorder, d->ds_refs_cap);
++                    "buffers seen, %d held for reordering and up to %u decoded "
++                    "ahead: keeping %u frames at most", d->gpu_n, reorder,
++                    d->thr_out_max, d->ds_refs_cap);
+     }
+     if (d->ds_refs_cap) {
+         /* near the end of the pool: replace one, do not add */
+@@ -1092,6 +1113,21 @@ static void dec_ds_release(VirtIOMediaDec *d)
+     }
+ }
+ 
++/*
++ * Before waiting for the decode thread, which may wait for a free pool buffer:
++ * let go of what holds pool buffers on this side. A frame on the display stays
++ * referenced until the display lets it go, which only the main loop hears, so a
++ * wait for one ends at rpidistro-ffmpeg 0002's bound (300 ms).
++ */
++static void dec_let_go(VirtIOMediaDec *d)
++{
++    dec_ds_release(d);
++    av_frame_free(&d->held);
++    while (d->gpu_held_n) {
++        dec_gpu_unhold_oldest(d);
++    }
++}
++
+ /* Offer the decoder's buffers now? See DEC_DS_PROBE_MS. */
+ static bool dec_ds_wanted(VirtIOMediaDec *d)
+ {
+@@ -1159,6 +1195,17 @@ static bool dec_ds_catch_up(void *owner)
+     return !d->ds_pend_n;
+ }
+ 
++/* frames libavcodec holds back for reordering (the decode thread's last view) */
++static int dec_reorder(VirtIOMediaDec *d)
++{
++    int r;
++
++    qemu_mutex_lock(&d->thr_lock);
++    r = d->thr_reorder;
++    qemu_mutex_unlock(&d->thr_lock);
++    return r;
++}
++
+ /* Every entry goes (dec_gpu_clear): the display forgets this owner's buffers. */
+ static void dec_ds_drop(VirtIOMediaDec *d)
+ {
+@@ -1439,7 +1486,6 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     }
+ 
+     /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
+-    assert(!d->thr_on);   /* avctx below: a hwaccel codec has no decode thread */
+     tex = virtio_media_gpu_res_tex(gb->virgl_res);
+     /* q11-dec-sand-scaled: a scaled frame too, at its size (the display scales) */
+     show = (!scaled || dec_ds_scaled_on()) && tex && dec_ds_on() &&
+@@ -1450,7 +1496,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     show = show && e->show_fd >= 0 &&
+            dec_ds_keep(d, (unsigned)(e - d->gpu),
+                        (unsigned)(gb - s->queues[1].guest), fr,
+-                       desc->objects[0].size, d->avctx->has_b_frames);
++                       desc->objects[0].size, dec_reorder(d));
+     skip = show && dec_ds_skip_on() && direct_scanout_skip_copy(d);
+ 
+     if (!skip) {
+@@ -2456,7 +2502,7 @@ static void *dec_thr_run(void *opaque)
+             qemu_cond_broadcast(&d->thr_cond);
+             continue;
+         }
+-        while (!d->thr_eof && g_queue_get_length(d->thr_out) < DEC_THR_OUT) {
++        while (!d->thr_eof && g_queue_get_length(d->thr_out) < d->thr_out_max) {
+             if (!f) {
+                 f = av_frame_alloc();
+                 if (!f) {
+@@ -2469,6 +2515,7 @@ static void *dec_thr_run(void *opaque)
+                 dec_zc_done(d, f);
+             }
+             qemu_mutex_lock(&d->thr_lock);
++            d->thr_reorder = d->avctx->has_b_frames;
+             if (d->thr_flush || d->thr_quit) {
+                 av_frame_unref(f);
+                 break;
+@@ -2552,6 +2599,12 @@ static void dec_thr_start(VirtIOMediaSession *s)
+ 
+     d->thr_in = g_queue_new();
+     d->thr_out = g_queue_new();
++    /*
++     * With the hwaccel's DRM device open (an HEVC profile it does not take is
++     * decoded in software, on this thread too, and gets the same bound): a
++     * hardware frame waiting here holds a pool buffer the display could use.
++     */
++    d->thr_out_max = d->codec->hwaccel && d->hwdev ? 2 : DEC_THR_OUT;
+     d->thr_quit = d->thr_flush = d->thr_eof = false;
+     qemu_mutex_init(&d->thr_lock);
+     qemu_cond_init(&d->thr_cond);
+@@ -2561,7 +2614,11 @@ static void dec_thr_start(VirtIOMediaSession *s)
+     d->thr_on = true;
+ }
+ 
+-/* Waits for the packet being decoded, at most one frame's decode. */
++/*
++ * Waits for the packet being decoded: one frame's decode, or, for a hardware
++ * decode waiting for a free pool buffer, until rpidistro-ffmpeg 0002's bound
++ * (the callers let the display's references go first).
++ */
+ static void dec_thr_stop(VirtIOMediaDec *d)
+ {
+     if (!d->thr_on) {
+@@ -2592,9 +2649,6 @@ static int dec_av_send(VirtIOMediaDec *d, const AVPacket *pkt)
+     if (!d->avctx) {
+         return AVERROR(ENODEV);
+     }
+-    if (!d->thr_on) {
+-        return avcodec_send_packet(d->avctx, pkt);
+-    }
+     qemu_mutex_lock(&d->thr_lock);
+     /* the drain request is never refused: its callers cannot resend it */
+     if (pkt && g_queue_get_length(d->thr_in) >= DEC_THR_IN) {
+@@ -2621,9 +2675,6 @@ static int dec_av_receive(VirtIOMediaDec *d, AVFrame *frame)
+     if (!d->avctx) {
+         return AVERROR(ENODEV);
+     }
+-    if (!d->thr_on) {
+-        return avcodec_receive_frame(d->avctx, frame);
+-    }
+     qemu_mutex_lock(&d->thr_lock);
+     o = g_queue_peek_head(d->thr_out);
+     if (!o) {
+@@ -2652,10 +2703,6 @@ static void dec_av_flush(VirtIOMediaDec *d)
+     if (!d->avctx) {
+         return;
+     }
+-    if (!d->thr_on) {
+-        avcodec_flush_buffers(d->avctx);
+-        return;
+-    }
+     qemu_mutex_lock(&d->thr_lock);
+     g_queue_clear_full(d->thr_in, dec_thr_in_free);
+     d->thr_flush = true;
+@@ -2669,8 +2716,9 @@ static void dec_av_flush(VirtIOMediaDec *d)
+ /*
+  * THE INPUT BACKLOG EXISTS BECAUSE VIDIOC_QBUF MUST NOT FAIL.
+  *
+- * Decoding happens inside the OUTPUT QBUF that carries the packet, so
+- * without a backlog libavcodec being full surfaces as QBUF returning -EAGAIN.
++ * The OUTPUT QBUF that carries the packet hands it to the decode thread, so
++ * without a backlog the thread's queue being full surfaces as QBUF returning
++ * -EAGAIN.
+  * No V4L2 client expects that. v4l2_codec2 fails the decode outright
+  * (pumpDecodeRequest -> Failed to QBUF to input queue -> state Error); on the
+  * board a 1080p HEVC stream died that way on its fourth input buffer, while
+@@ -2683,8 +2731,7 @@ static void dec_av_flush(VirtIOMediaDec *d)
+  * So take the bytes and hold them. A real driver does the same -- the OUTPUT
+  * buffer completes once its data has been copied out, long before any frame
+  * comes back -- and the backlog is drained from dec_pump(), i.e. from the next
+- * QBUF on either queue, or for a codec on the decode thread from dec_thr_bh,
+- * once there is room.
++ * QBUF on either queue, or from dec_thr_bh, once there is room.
+  *
+  * ORDER IS THE WHOLE POINT. Everything that feeds libavcodec has to go through
+  * the queue once the queue is non-empty; see dec_qbuf.
+@@ -2779,8 +2826,8 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+  *
+  * Called from every path that can change either side of that condition: an
+  * OUTPUT QBUF (new input), a CAPTURE QBUF (new space) and DECODER_CMD(STOP)
+- * (end of input), and, for a codec decoded on the thread (q11-dec-thread),
+- * dec_thr_bh when frames come out of it.
++ * (end of input), and dec_thr_bh when frames come out of the decode thread
++ * (q11-dec-thread).
+  */
+ static void dec_pump(VirtIOMediaSession *s)
+ {
+@@ -2813,12 +2860,12 @@ static void dec_pump(VirtIOMediaSession *s)
+     /*
+      * BOUNDED. This runs on the QEMU main loop from a virtqueue handler, and the
+      * guest can have 32 CAPTURE buffers queued, so an unbounded loop let one
+-     * OUTPUT QBUF perform 32 software decodes plus 32 colour conversions plus 32
+-     * SG copies before the main loop turned again -- at 4K that is hundreds of
+-     * megabytes of memory traffic, during which DomA's virtio-blk (served by
+-     * this same QEMU) is stopped. Bounding it per call costs nothing in
+-     * throughput because the next QBUF pumps again. (A codec on the decode
+-     * thread decodes there; this loop only takes its frames.)
++     * OUTPUT QBUF perform 32 decodes (when they were made here) plus 32 colour
++     * conversions plus 32 SG copies before the main loop turned again -- at 4K
++     * that is hundreds of megabytes of memory traffic, during which DomA's
++     * virtio-blk (served by this same QEMU) is stopped. Bounding it per call
++     * costs nothing in throughput because the next QBUF pumps again. (The
++     * decode thread decodes; this loop only takes its frames.)
+      */
+     for (n = 0; n < DEC_PUMP_MAX_FRAMES; n++) {
+         int r;
+@@ -3126,12 +3173,11 @@ static int dec_codec_open(VirtIOMediaSession *s)
+         return ENOMEM;
+     }
+     /*
+-     * One libavcodec thread for a codec decoded on the main loop (HEVC):
+-     * completions there are produced by the QBUF that caused them, and frame
+-     * threads would make libavcodec hold frames across those calls.
++     * One libavcodec thread for the hwaccel (HEVC), as when it was decoded on
++     * the main loop (frame threads with the hwaccel were not tried).
+      *
+-     * q11-dec-frame-threads: a codec on the decode thread (H.264) gets two
+-     * frame threads. Its frames already come out of that thread in decode
++     * q11-dec-frame-threads: a software codec (H.264) gets two frame
++     * threads. Its frames already come out of that thread in decode
+      * order and are completed by the bottom half, so the one frame libavcodec
+      * holds back is only latency. A 1080p60 H.264 stream played in a WebView
+      * (High, one slice a picture, so slice threads would not help) needs about
+@@ -3176,10 +3222,8 @@ static int dec_codec_open(VirtIOMediaSession *s)
+         avcodec_free_context(&d->avctx);
+         return ENOMEM;
+     }
+-    /* q11-dec-thread: a codec without the hwaccel decodes off the main loop */
+-    if (!d->codec->hwaccel) {
+-        dec_thr_start(s);
+-    }
++    /* q11-dec-thread: decoded off the main loop */
++    dec_thr_start(s);
+     return 0;
+ }
+ 
+@@ -3196,12 +3240,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+         s->queues[1].streaming) {
+         return EBUSY;
+     }
++    dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
+     dec_thr_stop(d);
+     dec_gpu_reset(d);
+     dec_sw_clear(d);
+     dec_zc_gpu_clear(d);
+     dec_backlog_clear(d);
+-    av_frame_free(&d->held);
+     avcodec_free_context(&d->avctx);
+     dec_zc_drop_pool(d);
+     qatomic_set(&d->zc_off, false);
+@@ -3281,6 +3325,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     if (!d) {
+         return;
+     }
++    dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
+     dec_thr_stop(d);
+     dec_gpu_clear(d);
+     dec_sw_clear(d);
+@@ -3790,8 +3835,8 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+         if (qi == 0) {
+             /* Input stopped: the decoder's state is no longer meaningful. */
+             d->failed = 0;   /* q11-dec-fail: a new start */
++            dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
+             dec_av_flush(d);
+-            av_frame_free(&d->held);
+             dec_backlog_clear(d);
+             dec_gpu_reset(d);
+             dec_sw_clear(d);
+@@ -3866,8 +3911,8 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+          * corruption from the next frame on.
+          */
+         if (d->draining) {
++            dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
+             dec_av_flush(d);
+-            av_frame_free(&d->held);
+             dec_backlog_clear(d);
+             d->draining = false;
+             d->drain_done = false;

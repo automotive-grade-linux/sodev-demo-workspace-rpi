@@ -30,11 +30,12 @@ was kept identical.
   DOM0_OS=zephyr (default — disaggregated control plane)
   |- Dom0 : Zephyr, xenstore server only (no toolstack, no drivers)      [1 vCPU  @ pCPU 0]
   |- DomD : dom0less direct-mapped driver domain — vc4/v3d GPU, RP1,
-  |         SDHCI, Mesa 26.2.2 + weston 15.0.0 + qemu 10.0.2-xt device-models
-  |         (7.0.0-xt with --gpu=gl), AND the xl toolstack that creates
-  |         DomU/DomA/DomZ                                               [2 vCPUs @ pCPU 0-1]
-  |- DomU : AGL instrument cluster (Flutter cluster demo) -> HDMI-A-1    [1 vCPU  @ pCPU 1]
-  |- DomA : Android Automotive OS (trout/xenvm)           -> HDMI-A-2    [2 vCPUs @ pCPU 2-3]
+  |         SDHCI, Mesa 26.2.4 + weston 16.0.0 + qemu 11.1.2 device-models
+  |         (weston 15.0.0 + qemu 7.0.0-xt with --gpu=gl),
+  |         AND the xl toolstack that creates
+  |         DomU/DomA/DomZ                                         [2 vCPUs @ pCPU 0, 1 (one each)]
+  |- DomU : AGL instrument cluster (Flutter cluster demo) -> HDMI-A-1    [1 vCPU  @ pCPU 1; RPi4: 2-3]
+  |- DomA : Android Automotive OS (trout/xenvm)           -> HDMI-A-2    [2 vCPUs @ pCPU 2, 3 (one each)]
   |- DomZ : Zephyr RTOS domain (xenvm board)                             [1 vCPU  @ pCPU 0]
 
   DOM0_OS=linux (alternative — classic control plane)
@@ -99,7 +100,8 @@ Before you build:
   bundle instead and skips the AOSP build (minutes). See *How the DomA artifacts are
   produced* (`docs/BUILD.md`).
 - **Behind an HTTP(S) proxy / restricted network?** Set `HTTPS_PROXY` (that is the
-  variable `build.sh` reads; `--proxy=<url>` does the same) and you will usually also
+  variable `build.sh` reads, and it fills the other proxy variables that are not set;
+  `--proxy=<url>` sets all four) and you will usually also
   need `CONNECTIVITY_CHECK_URIS=""` and `REPO_SKIP_SELF_UPDATE=1` (see *Docker
   usage*).
 - **Proxy on the host's loopback (`127.0.0.1:3128`, `localhost`)?** A bridged container
@@ -153,7 +155,7 @@ disables the heavy Android/Flatcar guests by default).
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
 | `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. **Refused on the 4 GiB RPi4** (`--board=rpi4 --ram=4g`), whose budget is Dom0 + DomD + one guest. See [`meta-xt-domz/README.md`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
-| `--gpu=<stack>` (`GPU`) | **vulkan** | Which graphics stack the guests get. **`vulkan`** (default): DomA and DomU render with Vulkan through Venus — device model qemu 10.0.2-xt, virglrenderer's venus backend plus `render-server`/`minigbm_allocation`, `hostmem=256M,blob=true,venus=true` on the guests' `virtio-gpu-gl`, the Vulkan runtime in the DomD and DomU rootfs, DomA compositing with SkiaVk and the DomU cluster on the Vulkan (Impeller) embedder. On the rpi4 4g SKU it also moves memory from DomA to DomD (sizes in *meta-xt-rpi4/README.md*), because a host-visible blob window is unreclaimable device-model memory. **`gl`**: the pre-Venus OpenGL stack — qemu 7.0.0-xt with its six device-model patches, no venus backend, no blob window, the pre-Venus memory split (rpi4 4g SKU only). Two things it does **not** revert: DomD's mesa is 26.2.2 in both lanes (the pin is a v3dv fix both lanes use), and DomA's AOSP-side settings (the Venus ICD and SkiaVk compositing), which this tree applies whatever `--gpu` says, so a pre-Venus DomA needs them reverted. [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) has the authoritative per-lane table |
+| `--gpu=<stack>` (`GPU`) | **vulkan** | Which graphics stack the guests get. **`vulkan`** (default): DomA and DomU render with Vulkan through Venus — device model qemu 11.1.2 with weston 16.0.0 and virglrenderer 1.3.0 on both boards, virglrenderer's venus backend plus `render-server`/`minigbm_allocation`, `hostmem=256M,blob=true,venus=true` on the guests' `virtio-gpu-gl`, the Vulkan runtime in the DomD and DomU rootfs, DomA compositing with GL (both products; Vulkan compositing on virglrenderer 1.3.0 needs `/etc/qemu-gbm-layout` in DomD) and the DomU cluster on the Vulkan (Impeller) embedder. On the rpi4 4g SKU it also moves memory from DomA to DomD (sizes in *meta-xt-rpi4/README.md*), because a host-visible blob window is unreclaimable device-model memory. **`gl`**: the pre-Venus OpenGL stack — qemu 7.0.0-xt with its six device-model patches, no venus backend, no blob window, the pre-Venus memory split (rpi4 4g SKU only). Two things it does **not** revert: DomD's mesa is 26.2.4 in both lanes (the pin is a v3dv fix both lanes use), and DomA's AOSP-side settings (the Venus ICD), which this tree applies whatever `--gpu` says, so a pre-Venus DomA needs them reverted. [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) has the authoritative per-lane table |
 | `--devel` (`ENABLE_DEVEL`) | **off** | Add `meta-rpi-sodev-devel` to the DomD build: the Venus phase 0–3 gate (`sodev-venus-gate.sh`), the three Vulkan reproducers, the VRAM/CMA tools, and the **diagnostic** virglrenderer and Xen patches (command-stream dump with a live sanity assert, a log line per guest allocation ≥ 64 MiB, and Xen's injected-abort paths made loud on a release hypervisor). Diagnostics only — never part of a shipping image |
 | `--accept-synaptics-killswitch` (`ACCEPT_SYNAPTICS_KILLSWITCH`) | **off** | Accept the `synaptics-killswitch` licence flag of `linux-firmware-rpidistro`, the recipe that carries the BCM43455 Wi-Fi firmware. Off, the DomD image is built without Wi-Fi firmware and DomD has no `wlan0`. See *Wi-Fi firmware licence* below |
 | `--aaos=<mode>` (`AAOS_MODE`) | off (`-a`⇒auto) | `off` \| `auto` \| `source` \| `prebuilt`. **auto** = prebuilt if a bundle is found (default probe `<workspace>/aaos-prebuilt-<board>`, then `<workspace>/aaos-prebuilt`), else source if an AOSP checkout is found, else off (or a hard error when DomA was required via `-a`) |
@@ -162,9 +164,10 @@ disables the heavy Android/Flatcar guests by default).
 | (`AAOS_GUEST_ANDROID`) / (`AAOS_GUEST_KERNEL`) | **17** / **6.18.32** | The DomA guest generation this tree builds and stages. A prebuilt bundle's `android=` / `guest_kernel=` are checked against them; the kernel version also names the staged kernel artifact (`aaos-android-kernel-xenbuilt-<ver>`, the recipe reads the same variable). Override only for a bundle whose p4 images were built against that other kernel |
 | (`AAOS_KERNEL_MD5`) / (`AAOS_RAMDISK_MD5`) | — (no check) | Expected md5 of the staged DomA guest kernel / vendor-boot ramdisk. **Opt-in and off by default**: set them only to pin one validated prebuilt bundle, and a mismatch then fails the `aaos-guest-binaries` recipe. `build.sh` says so when a bundle ships no `MANIFEST.md5` |
 | `--aaos-src=<dir>` (`AAOS_SRC_DIR`) | — | Reuse an existing AOSP checkout for `source` mode (skip the repo sync; still builds AOSP from it) |
-| `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from `rpi5-sodev.yaml`, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
+| `--aaos-ref=<dir>` (`XT_AAOS_REF`) / `--aaos-kernel-ref=<dir>` (`XT_AAOS_KERNEL_REF`) | — | Repo **object mirrors** for the AOSP and AAOS-guest-kernel trees. `build.sh` seeds each checkout with `repo init --reference=<dir>` (manifest URL/rev/depth read from the board's yaml, so nothing is pinned twice) and moulin preserves the reference, so the syncs stay local. Accepts a repo client or a bare `*-project-objects` export. The AAOS analogue of `--west-cache` — see *Starting with no AOSP checkout* (`docs/BUILD.md`) |
 | (`XT_AAOS_SYNC_JOBS`) | 4 | Parallelism of the **reference-mirror pre-sync** (only with `--aaos-ref`/`--aaos-kernel-ref`); raise it on a fast link, lower it behind a rate-limited proxy. The plain `source`-mode sync is moulin's own `repo` fetch and is not affected |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
+| `--proxy=<url>` | — | HTTP(S) proxy for the docker builds and the fetches. `--proxy` sets all four proxy variables; without it `HTTPS_PROXY` (or `https_proxy`) fills the ones that are not set, and an HTTP proxy set apart is kept. A proxy change does not need `--rebuild-images` |
 | `--rebuild-images` | off | Force-rebuild the `XT_DOCKER` image (`sodev-builder-rpi`). It never touches the V4H workspace's `sodev-builder` -- the two workspaces use different Dockerfiles and, since this series, different tags. Not needed for the Zephyr SDK 1.0.1 / python3.12 move that this series makes: the new tag has no pre-existing image, so the first build creates it already up to date. You need it only when `XT_DOCKER` points at an older image (a pre-rename `sodev-builder`, say), which fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` (Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12`) |
 | `--west-cache=<dir>` (`XT_WEST_CACHE_DIR`) | — | Point the Zephyr west fetches at a pre-populated reference workspace, so `west update` runs offline (the AAOS analogue is `--aaos-ref`). Used for both west workspaces: Dom0's and DomZ's |
 | `--memory=<size>` (`XT_DOCKER_MEMORY`) | — (unlimited) | Cap each build container's RAM via docker `--memory` **and** `--memory-swap` (equal ⇒ no host-swap spill, so an unbounded moulin/AOSP/Yocto build cannot OOM the host), e.g. `24g` |
@@ -203,6 +206,57 @@ Accept it with `--accept-synaptics-killswitch` (or
 still builds, but DomD has no Wi-Fi firmware and no `wlan0`, so DomA's shadow-AP
 Wi-Fi has nothing to relay. The Bluetooth firmware (`bluez-firmware-rpidistro`)
 declares no licence flag and is installed either way.
+
+### DomA's Wi-Fi
+
+DomD owns the only radio. DomA's Wi-Fi screen lists what DomD scans: DomD's
+Wi-Fi agent (`xt-doma-wifi-agent`) publishes the 20 strongest SSIDs over a
+virtio-serial port, and DomA's relay (`doma-wifi-relay.sh`) beacons each as a
+shadow access point on `mac80211_hwsim`. Joining one in AAOS makes DomD join the
+real one; DomA reaches the internet through DomD's NAT.
+
+- **Security.** Open, WPA/WPA2-Personal and WPA3-Personal (SAE, and the
+  WPA2/WPA3 transition mode) access points are listed. Enterprise-only (EAP), OWE,
+  WEP and the other kinds are not. An open one is listed without a lock and
+  joined with no passphrase; for the others the passphrase the user types is
+  forwarded to DomD, which joins with SAE where the access point offers it
+  (a 64-hex PSK joins a WPA2/WPA3 transition access point with WPA2).
+- **No sample access point.** The image ships no access point in the list; the
+  shadow AP starts with one hidden BSS (its beacon carries no SSID) that AAOS
+  does not list.
+- **Captive portals** are left to AAOS's NetworkStack, which offers its
+  standard sign-in screen for one (tried on the Raspberry Pi 5 with a test
+  portal: the notification, the sign-in screen and the consent worked).
+- **A network that goes away.** When DomD loses the network DomA is on, or
+  cannot join it for a reason other than its passphrase, DomA's relay takes
+  it off the list, so the screen does not keep showing it as connected; one
+  DomD could not join stays off the list for 5 minutes or until its access point
+  leaves DomD's scans and returns, and one DomD lost stays off it until the
+  access point is back (DomD rejoins it, or its scans see it again after losing
+  it) or 5 minutes have passed, rather than coming back
+  while DomD's scans still report the vanished access point. When DomD rejects the
+  passphrase, the network stays listed, as saved rather than connected. The
+  relay restarts its access points for a changed list at most once every 5
+  minutes and only while DomA is not connected, so a new network appears
+  within 5 minutes of DomA not being connected.
+- **"No internet" before DomD has joined.** DomA joins the shadow access point
+  at once, so AAOS may check it for internet access while DomD is still joining
+  the real one, and a network that has never passed that check would then not be
+  joined again on its own. While DomD reports it has joined, DomA enables
+  the saved network again; without that report, AAOS tries such a network again
+  after 10 minutes (longer after repeated failures) instead of never.
+- **MSS cap.** DomD caps the MSS of forwarded TCP at 1360, a mitigation for
+  upstream paths with a smaller MTU that drop the ICMP path-MTU discovery needs.
+- **Cellular link.** DomD answers as the gateway of DomA's emulated cellular
+  data link (192.168.97.0/30) and NATs it, so DomA has a way out with its own
+  Wi-Fi off.
+
+The passphrase crosses the virtio-serial port in clear (see *Security note*),
+and DomA keeps the passphrases typed for it in plain files under
+`/data/vendor/wifi/shadow/`: the shadow AP's hostapd needs them, and
+`learned.conf` keeps up to 64 so that a network joined before works again when
+its access point returns. A typed passphrase goes into `learned.conf` only once
+DomD has joined with it; one DomD's access point rejects is not kept.
 
 ## Build — details & options
 The *Quick start* above is the happy path (`./build.sh` → `full.img`); *Build
@@ -287,9 +341,9 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | Virtualization layer | **meta-virtualization, pinned** (`781735b9`) — fetched by moulin at build time, not vendored. It supplies `xen.inc`/`xen-hypervisor.inc`/`xen-tools.inc` but **not** a 4.22 version recipe, so `xen_4.22.bb` / `xen-tools_4.22.bb` (PV `4.22.0+stable` / `4.22+stable`, xenbits `stable-4.22` @ `d45d5687f1`) are carried locally in `meta-xt-common/meta-xt-domx` and selected via `PREFERRED_VERSION_xen` / `PREFERRED_VERSION_xen-tools`. Both are interim, pending upstream acceptance |
 | Dom0 (zephyr) | Zephyr xenstore server (patch series under `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`, applied on the upstream Zephyr Dom0 tree) |
 | Dom0 (linux) / DomD kernel | Linux 6.18.33 (`linux-raspberrypi`) |
-| DomD graphics | Mesa 26.2.2 (pinned ahead of wrynose's 26.0.5 by `meta-xt-driver-domain`'s `mesa.bbappend`, in both `--gpu` lanes), weston 15.0.0 (kiosk-shell), libdrm 2.4.131 |
-| DomD device-model | QEMU 10.0.2-xt (`--gpu=vulkan`, the default) or 7.0.0-xt (`--gpu=gl`); Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock |
-| DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch, plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
+| DomD graphics | Mesa 26.2.4 (pinned ahead of wrynose's 26.0.5 by `meta-xt-driver-domain`'s `mesa.bbappend`, in both `--gpu` lanes, with four source patches of its own), weston (kiosk-shell): 16.0.0 from `meta-xt-driver-domain` on both boards' `vulkan` lane, poky's 15.0.0 on `gl`; libdrm 2.4.131; virglrenderer: 1.3.0 from `meta-xt-driver-domain` on both boards' `vulkan` lane, poky's 1.2.0 on `gl`. 1.3.0 wants `/etc/qemu-gbm-layout` for a Venus-compositing DomA, see [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) |
+| DomD device-model | `--gpu=vulkan` (the default): QEMU 11.1.2 (the upstream release with the 10.0.2-xt patches ported onto it) on both boards; `--gpu=gl`: 7.0.0-xt. Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock. The fork's 10.0.2-xt recipe stays in `meta-xt-qemu` and is selected by setting `PREFERRED_VERSION_qemu` to `"10.0.2"` on the `vulkan` lane's DomD conf line of the board yaml (with weston and virglrenderer back to 15.% and 1.2.%) and, for `--dom0=linux`, `XT_DOM0_QEMU_VERSION` to the same value (that Dom0 writes the guest cfgs). [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) section 4 lists what only 11.1.2 has |
+| DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch and the overlay-plane patch DomA's kernel has (`virtio_gpu.overlay_planes`, set by `XT_DOMU_OVERLAY_PLANES`), plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
 | DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). The virtio contract is the V4H one: a complete V4H-built AAOS image (kernel, ramdisk and p4 from one build) boots unmodified -- measured in 2026-07 with a V4H Android 17 image on this stack while it was still Android 15. `build.sh` nevertheless accepts only prebuilt bundles that declare this tree's own generation (Android 17 / GKI 6.18.32, `BUNDLE-INFO`): the failure it guards against is a *mixed* set, a guest kernel and a `vendor_dlkm` from different builds, which share no `module_layout` and boot to a black panel |
 | DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`meta-xt-domz/zephyr-apps/domz/`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 
@@ -319,14 +373,17 @@ See also:
 │   │   │                            #   Zephyr application (zephyr-apps/domz/), plus its README
 │   │   ├── meta-xt-doma/            # DomA xl cfg + AAOS host services + guest binaries
 │   │   ├── meta-xt-domx/            # shared cross-guest recipes (libc-headers, base-files, ...)
-│   │   ├── meta-xt-qemu/            # vendored upstream, plus this tree's qemu_10.0.2.bb
-│   │   │                            #   (the Vulkan lane's device model) and its patches
+│   │   ├── meta-xt-qemu/            # vendored upstream, plus this tree's qemu_11.1.2.bb
+│   │   │                            #   (the Vulkan lane's device model), the selectable
+│   │   │                            #   qemu_10.0.2.bb, and their patches
 │   │   ├── meta-xt-security/        # vendored upstream
 │   │   └── recipes-extended/xen-common/   # shared Xen 4.22 hypervisor patch series (both Dom0 flavours)
 │   ├── meta-xt-rpi5/                # RPi5 BSP: u-boot/TFA/boot.scr, Xen 4.22 bbappend + patch series, xen dtso, kernel DT/cfg
 │   ├── meta-xt-rpi4/                # RPi4 BSP, the sibling of the above (BCM2711). Mutually exclusive with it
 │   ├── meta-agl-venus/              # the AGL guest's layer for the Vulkan lane (AGL build only):
-│   │                                #   its Mesa 24.0.7 patches and the Vulkan (Impeller) cluster
+│   │                                #   its Mesa 24.0.7 patches, the Vulkan (Impeller) cluster,
+│   │                                #   the cluster's 1920x720 output (weston-ini-conf), libweston's
+│   │                                #   LINEAR scanout on virtio-gpu and the receiver's dma-buf window
 │   ├── xt-prod-devel-rpi5-domd/     # vendored upstream DomD product layer
 │   ├── meta-rpi-sodev-devel/        # opt-in diagnostic/debug/prototype layer (NOT in the shipping build; p4-tool etc.)
 │   └── scripts/                     # helpers: guest-pin sync (sync-guest-pins)
@@ -335,10 +392,14 @@ See also:
     │                            more than one layer, so they are NOT under
     │                            meta-rpi-sodev/scripts/ (which is layer-scoped). No
     │                            recipe references them; they are developer/CI tools.
+    ├── check-all.sh                # runs the checks below that need no build (and bash -n
+    │                               #   build.sh) in one command; exit status = failed checks
     ├── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
     ├── check-rpi4-memory-map.py    # the same for the RPi4, per --ram and --gpu lane: static-mem
     │                               #   banks, boot-script overrides and domain sizes against the
     │                               #   files that define them
+    ├── check-net-macs.py           # the guests' NIC MACs in doma.cfg / domu.cfg against the
+    │                               #   copies sodev-net.inc gives DomD's dnsmasq
     ├── check-yaml-drift.py         # the two product yamls share ~750 lines by copy; fails on
     │                                   unrecorded divergence (yaml-drift-baseline.txt records the
     │                                   differences that are there by design)
@@ -386,7 +447,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — what this port changed relative 
 | DomD | **SSH** (primary): `ssh root@192.168.10.10` — DomD runs the toolstack, so `xl list` / `xl console <domU/domA>` run from here. **UART**: DomD is a dom0less **vpl011** domain (console → hypervisor ring), so `xl console 1` / `xu console 1` cannot attach it (no PV console ring/evtchn is allocated for dom0less vpl011). On the debug UART press `Ctrl-A` three times to cycle input to `DOM1` (`raspberrypi5-domd login:`); or read its log with `xl dmesg \| grep DOM1`. |
 | DomU (AGL) | `ssh root@192.168.10.12`; or `xl console 3` from the toolstack domain (`domu login:`) |
 | DomZ (Zephyr) | **`xl console DomZ`** from the toolstack domain (DomD in the zephyr flavour, Dom0 in the linux one) — Zephyr's Xen **PV console**, which is why the `xenvm` board is used rather than a vpl011 dom0less domain. `xenconsole` needs a tty, so over ssh use `ssh -tt root@192.168.10.10 'xl console DomZ'`. No network, no display: this console is the only interface. Exit with `Ctrl-]` |
-| DomA (AAOS) | `adb connect 192.168.10.13:5555` (Android has no sshd); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The `virtconsole` sockets in `doma.cfg` are **inert** — see the note below. |
+| DomA (AAOS) | `adb connect <DomA's wlan0 address>:5555` (Android has no sshd; the address of DomA's Wi-Fi station, 192.168.10.15 when the framework uses the MAC dnsmasq lists, otherwise from the range: see `sodev-net.inc`); `adb logcat` for logcat. Serial console: **`xl console 2`** from the toolstack domain — DomA's `hvc0` is the Xen **PV console**, and AAOS init's `console` service puts a shell on it (prompt `console:/ $`, uid 2000 `shell`). `xenconsole` calls `tcsetattr()` on stdin, so it needs a tty: over ssh use `ssh -tt root@192.168.10.10 'xl console 2'`. The shell is not on the `virtconsole` sockets in `doma.cfg`: two of them carry DomA's Wi-Fi and Bluetooth links and the rest are inert — see the note below. |
 
 
 See also:
@@ -431,7 +492,7 @@ RPi5 guest**, and touch input was not exercised. The per-item list:
 - Xen 4.21 boots (0 panics); all 4 domains auto-start; qemu device-models auto-spawn.
 - Dual display + native touch, no scanout artifacts.
 - SSH from the PC to DomD/DomU, adb to DomA; consoles for all domains.
-- DomA management IP (192.168.10.13) via dnsmasq static lease — no manual step.
+- DomA's Wi-Fi station takes its address from DomD's dnsmasq (a static lease where its MAC is listed) — no manual step.
 - Full 4-domain + hypervisor log audit performed; the actionable items are
   fixed in-tree (legacy Dom0 qdisk unit masked; prebuilt dumpstate backend not
   auto-enabled until rebuilt against wrynose libxml2).
@@ -511,14 +572,19 @@ not password-protected at all:
   can reach DomD's loopback has full control of that guest's device model, including
   the ability to terminate it. Bind it to a permission-restricted unix socket, or
   remove it, before any non-lab deployment.
-- **DomA console.** `doma.cfg` exposes six `virtconsole` backends as unauthenticated
-  UNIX sockets in DomD (`/run/android_vm_virtconsole*`). They currently carry no data
-  (the Xen PV console takes `hvc0` first — see *Serial console* (`docs/TROUBLESHOOTING.md`) above), so they are not
-  a live exposure today, but nothing authenticates a connection and the intended
-  mapping was an in-guest shell. Remove them, or move them to a permission-restricted
-  path, before any non-lab deployment. Note that DomA's actual shell — `xl console 2`,
+- **DomA virtio-serial ports.** `doma.cfg` exposes four `virtconsole` backends as
+  unauthenticated UNIX sockets in DomD (`/run/android_vm_virtconsole{1,2,4,5}`), and DomA's
+  Bluetooth HCI port connects to DomD's `/run/bt-hci.sock`. `virtconsole5` is DomA's
+  Wi-Fi link: it carries the passphrase the user types for an access point, in clear,
+  to DomD's Wi-Fi agent; nothing authenticates the client, so whatever connects to that
+  socket in DomD receives it and can send DomA an access-point list of its own. `bt-hci.sock` carries DomA's Bluetooth traffic
+  as raw HCI. The other virtconsoles carry no data (the Xen PV console takes `hvc0`
+  first — see *Serial console* (`docs/TROUBLESHOOTING.md`) above) and the intended
+  mapping was an in-guest shell. Move the sockets to a permission-restricted path, and
+  remove the unused ones (re-verifying DomA, as `doma.cfg` explains), before any
+  non-lab deployment. Note that DomA's actual shell — `xl console 2`,
   prompt `console:/ $` — is reachable by anything that can run the toolstack in DomD,
-  and `adb` is open on `192.168.10.13:5555` with no authentication.
+  and `adb` is open on port 5555 of DomA's wlan0 address with no authentication.
 
 `xen,static-mem`-related hypervisor hardening is also relaxed for the demo: the
 `4.22-0003` patch reverts an upstream restriction on buffered ioreq for Arm so the
@@ -534,13 +600,14 @@ licenses in order to be used in a commercial product". Accepting a flag only let
 the recipe build; it says nothing about which licences, if any, apply.
 
 **What is included.** DomA's hardware HEVC decode runs through DomD: the device
-model (qemu 10.0.2) drives the BCM2712 HEVC decoder (`rpi-hevc-dec`) with
-libavcodec's V4L2 request-API hwaccel. Upstream FFmpeg, and so poky's `ffmpeg`, does
-not have that hwaccel; Raspberry Pi's FFmpeg fork does. meta-raspberrypi builds the
-fork as `rpidistro-ffmpeg`, from the RPi-Distro/ffmpeg tree that Raspberry Pi OS
-packages as `ffmpeg`. Like poky's `ffmpeg`, the recipe declares
-`LICENSE_FLAGS = "commercial"`. The Raspberry Pi 5 DomD image contains its libraries
-and the `ffmpeg` command-line tools.
+model (qemu 10.0.2 or 11.1.2) drives the BCM2712 HEVC decoder (`rpi-hevc-dec`) with
+libavcodec's V4L2 request-API hwaccel. With qemu 11.1.2 the same libavcodec also
+decodes DomA's H.264, in software (`RPI5_DOMA_H264`, on by default there).
+Upstream FFmpeg, and so poky's `ffmpeg`, does not have that hwaccel; Raspberry
+Pi's FFmpeg fork does. meta-raspberrypi builds the fork as `rpidistro-ffmpeg`,
+from the RPi-Distro/ffmpeg tree that Raspberry Pi OS packages as `ffmpeg`. Like
+poky's `ffmpeg`, the recipe declares `LICENSE_FLAGS = "commercial"`. The Raspberry
+Pi 5 DomD image contains its libraries and the `ffmpeg` command-line tools.
 
 **Accepted by default, as Raspberry Pi OS does.** Raspberry Pi OS installs the same
 FFmpeg fork by default in its desktop image, and hardware HEVC decode on
@@ -555,7 +622,7 @@ DomD `conf:` list in `rpi5-sodev.yaml` writes
 The Dom0 `conf:` list of the `linux` flavour writes the same three lines into
 `yocto/build-dom0/conf/moulin.conf`: that Dom0's image installs no qemu, but its
 build makes the qemu xen-tools recommends, and on the `vulkan` lane that is the
-10.0.2 one, which needs this FFmpeg.
+11.1.2 one, which needs this FFmpeg.
 `meta-xt-rpi5` itself does not accept the flag, so a build that adds the layer
 without this configuration stops with "Has a restricted license 'commercial' which
 is not listed in your LICENSE_FLAGS_ACCEPTED" until its own configuration accepts
@@ -573,7 +640,8 @@ needs FFmpeg, or the build stops at `Nothing PROVIDES 'rpidistro-ffmpeg'`:
   `vulkan` choice of the `GPU` parameter gives `XT_DOMA_HWDEC`), which takes the
   virtio-media decoder out of `doma.cfg` and the codec2 HAL out of DomA;
 - remove `rpidistro-ffmpeg` from `DEPENDS:append:raspberrypi5` in
-  `meta-xt-common/meta-xt-qemu/recipes-qemu/qemu/qemu_10.0.2.bb`;
+  `meta-xt-common/meta-xt-qemu/recipes-qemu/qemu/qemu_11.1.2.bb` (and in
+  `qemu_10.0.2.bb`, if that one is selected);
 - remove `ffmpeg` from `DOMD_HEVC_PACKAGES:raspberrypi5` in
   `meta-xt-rpi5/recipes-core/images/rpi5-image-xt-domd-v4h.bbappend`.
 

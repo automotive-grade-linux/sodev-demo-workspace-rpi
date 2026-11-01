@@ -177,16 +177,17 @@ a plain `ssh root@192.168.10.10 'xl console 2'` hangs with no output; use `ssh -
 earlier revision of this README recorded DomA as having no PV console on the strength of
 such a run — that was the missing tty, not a missing console.
 
-> **The `virtconsole` sockets in `doma.cfg` do not work, by design conflict.** The V4H
+> **Most of the `virtconsole` sockets in `doma.cfg` carry nothing, by design conflict.** The V4H
 > layout this configuration mirrors intended guest `hvc0` to be the first
 > `virtconsole` (`/run/android_vm_virtconsole1`) and `hvc2` to carry logcat
 > (`/run/android_vm_virtconsole4`). Under Xen that cannot happen: `xl` gives DomA a PV
 > console ring whose frontend registers at **0.000425 s**, long before the PCI bus is
-> walked, so `hvc0` is already taken when `virtio_console` probes. The six ports then
-> appear as generic virtio-serial ports (`/sys/class/virtio-ports/vport2p0..p5`) and
-> nothing in the guest opens them. The sockets go `st=01` LISTENING → `st=03` on connect
-> and qemu holds them, but `socat` reads **0 bytes** — the transport is fine, there is
-> simply no writer. Use `xl console 2` for the shell and `adb logcat` for logcat (the
+> walked, so `hvc0` is already taken when `virtio_console` probes, and the five
+> virtconsoles land on `hvc1..hvc5` in port order. The guest opens two of them:
+> `/dev/hvc4` (`virtconsole5`) is DomA's Wi-Fi link to DomD's Wi-Fi agent and
+> `/dev/hvc5` is its Bluetooth HCI. Nothing opens the others. Their sockets go
+> `st=01` LISTENING → `st=03` on connect and qemu holds them, but `socat` reads
+> **0 bytes** — the transport is fine, there is simply no writer. Use `xl console 2` for the shell and `adb logcat` for logcat (the
 > `seriallogging` service is `stopped` in this AAOS image, so `/dev/hvc2` is idle too).
 > The devices are kept for V4H parity; deleting them changes DomA's virtio device count
 > and PCI `addr` layout, which are proven values.

@@ -16,6 +16,10 @@
          sendConfiguredNetworkChangedBroadcast()). -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- CHANGE_WIFI_STATE: enableNetwork() and setWifiEnabled() (enforceChangePermission
+         in WifiServiceImpl), for a network disabled for no internet and the Wi-Fi cycle
+         doma-shadow-ap asks for. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
 
     <!-- android:persistent keeps the process alive so the RUNTIME-registered
          CONFIGURED_NETWORKS_CHANGED receiver stays live; a runtime receiver dies with

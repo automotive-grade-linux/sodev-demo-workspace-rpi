@@ -1,0 +1,514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 00:46:03 +0900
+Subject: [PATCH] virtio-media: decoder mode: decode in software on a
+ thread
+
+Software decoding ran on the main loop, inside the QBUF that carried
+the packet: 96 to 98% of a core at H.264 1080p60 on the Raspberry Pi
+5, with every other device the loop serves waiting behind it. In a
+measurement with an earlier revision of these patches, DomA's
+virtio-blk, served by the same loop, read 28 MB/s during playback.
+
+A codec without the hwaccel (H.264) now gets a thread, "vmedia-dec",
+that owns its AVCodecContext; HEVC stays on the main loop, also when
+it falls back to software. The main loop hands the thread packets, 8
+queued at most (past that the backlog holds them, as when libavcodec
+is full, and the thread wakes the loop when room appears), and takes
+decoded frames, 4 ahead at most, through dec_av_send, dec_av_receive
+and dec_av_flush, which call libavcodec directly when there is no
+thread. A bottom half runs dec_pump when frames come out. The drain
+request (the NULL packet) is never refused; after its AVERROR_EOF
+every receive answers EOF until a flush, and the bottom half stops
+there. A flush (STREAMOFF on OUTPUT, or DECODER_CMD START after a
+drain) drops the queued packets and waits for the one being decoded.
+The thread stops on a codec switch and on close.
+
+Measured with the next patch on the Raspberry Pi 5 8GB (2026-10-16,
+codec -T): H.264 1080p60 at 60.6 and 60.8 fps with the main thread
+at 28 to 29% of a core and the decode thread at 72 to 73%; 720p60 at
+61.1 fps with 20% and 27 to 29%. DomA's disk read 65 to 96 MB/s
+during 1080p60 playback (112 and 231 MB/s idle). Seeks in Gallery,
+aborted playbacks and H.264 720p60 next to HEVC 1080p60 (60.3 and
+60.9 fps) kept qemu up. Two H.264 streams at once, 720p60 and
+1080p60, played at 58.0 and 50.4 fps: DomD's CPU is the limit.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 317 +++++++++++++++++++++++++++++--
+ 1 file changed, 298 insertions(+), 19 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 053cea7..ed6a98a 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -48,8 +48,9 @@
+  * ONE THING DECODER MODE GETS FOR FREE. The proxy path has to poll a host fd
+  * for events, which is where the vb2_poll()/file-I/O-emulation trap lives (see
+  * virtio_media_update_fd_handler). Here there is no host fd and no poll:
+- * completions and SOURCE_CHANGE are produced synchronously by the QBUF that
+- * caused them, so that entire failure mode does not exist.
++ * completions and SOURCE_CHANGE are produced by the QBUF that caused them, or,
++ * for a codec decoded on its own thread (q11-dec-thread), by a bottom half when
++ * frames come out of it, so that entire failure mode does not exist.
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+@@ -61,6 +62,8 @@
+ #include "hw/virtio/virtio-media.h"
+ #include "hw/virtio/virtio-media-virgl.h"
+ #include "qemu/timer.h"
++#include "qemu/thread.h"
++#include "qemu/main-loop.h"
+ #include "ui/direct-scanout.h"
+ 
+ #ifdef CONFIG_VIRTIO_MEDIA_DECODER
+@@ -258,6 +261,25 @@ typedef struct DecSwSlot {
+     void *handle;    /* the GL import (owns a dup of fd) */
+ } DecSwSlot;
+ 
++/*
++ * q11-dec-thread: a codec without the hwaccel (H.264) is decoded on a thread
++ * of its own; HEVC stays on the main loop, also when it falls back to
++ * software. On the main loop H.264 1080p60 took 96 to 98% of a core on the
++ * Raspberry Pi 5, with DomA's virtio-blk served by the same loop; with the
++ * thread the main loop takes 28 to 29% and the thread 72 to 73%.
++ * The thread owns avctx; the main loop hands it packets and takes decoded
++ * frames (dec_av_send / dec_av_receive / dec_av_flush), and everything else --
++ * the guest's buffers, events, GL -- stays on the main loop. Bounded both
++ * ways: DEC_THR_IN packets waiting, DEC_THR_OUT frames decoded ahead.
++ */
++#define DEC_THR_IN  DEC_MAX_BACKLOG_PKTS_THR
++#define DEC_THR_OUT 4
++
++typedef struct DecThrOut {
++    AVFrame *frame;   /* NULL: err below */
++    int err;          /* AVERROR_EOF at the end of a drain, or an error */
++} DecThrOut;
++
+ /* A blitted hardware frame and the import whose GPU work reads it. */
+ typedef struct DecGpuHeld {
+     AVFrame *frame;
+@@ -299,6 +321,8 @@ typedef struct DecGpuHeld {
+  */
+ #define DEC_MAX_BACKLOG_PKTS 32
+ #define DEC_MAX_BACKLOG_BYTES (16 * 1024 * 1024)
++/* q11-dec-thread: packets queued for the decode thread at most */
++#define DEC_MAX_BACKLOG_PKTS_THR 8
+ 
+ struct VirtIOMediaDec {
+     const DecCodec *codec;          /* the OUTPUT format (S_FMT picks it) */
+@@ -405,8 +429,20 @@ struct VirtIOMediaDec {
+     bool sw_off;      /* the GPU path failed for this stream: CPU from now on */
+     bool sw_logged;
+     struct SwsContext *sws_nv12;
++
++    /* q11-dec-thread (dec_thr_run) */
++    bool thr_on;
++    QemuThread thr;
++    QemuMutex thr_lock;
++    QemuCond thr_cond;      /* input, flush or quit for the thread; output taken */
++    GQueue *thr_in;         /* AVPacket *, or &dec_thr_eos */
++    GQueue *thr_out;        /* DecThrOut * */
++    bool thr_quit, thr_flush, thr_eof;
++    QEMUBH *thr_bh;
+ };
+ 
++static AVPacket dec_thr_eos;   /* the drain request in thr_in */
++
+ /* ------------------------------------------------------------------------- */
+ /* helpers                                                                   */
+ /* ------------------------------------------------------------------------- */
+@@ -1254,6 +1290,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     }
+ 
+     /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
++    assert(!d->thr_on);   /* avctx below: a hwaccel codec has no decode thread */
+     tex = virtio_media_gpu_res_tex(gb->virgl_res);
+     show = tex && dec_ds_on() && direct_scanout_sand_usable() && dec_ds_wanted(d);
+     if (show && e->show_fd < 0) {
+@@ -1738,6 +1775,182 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+     return true;
+ }
+ 
++/* ------------------------------------------------------------------------- */
++/* q11-dec-thread                                                             */
++/* ------------------------------------------------------------------------- */
++
++static void dec_thr_out_free(gpointer p)
++{
++    DecThrOut *o = p;
++
++    av_frame_free(&o->frame);
++    g_free(o);
++}
++
++static void dec_thr_in_free(gpointer p)
++{
++    AVPacket *pkt = p;
++
++    if (pkt != &dec_thr_eos) {
++        av_packet_free(&pkt);
++    }
++}
++
++static void dec_thr_push_out(VirtIOMediaDec *d, AVFrame *f, int err)
++{
++    DecThrOut *o = g_new0(DecThrOut, 1);
++
++    o->frame = f;
++    o->err = err;
++    g_queue_push_tail(d->thr_out, o);
++}
++
++/*
++ * The decode thread. Takes frames out of libavcodec while there is room for
++ * them, then feeds it the next packet; sleeps when it has neither room nor
++ * input. Called with thr_lock released around every libavcodec call.
++ */
++static void *dec_thr_run(void *opaque)
++{
++    VirtIOMediaDec *d = opaque;
++    AVFrame *f = NULL;
++
++    qemu_mutex_lock(&d->thr_lock);
++    while (!d->thr_quit) {
++        bool want_input = false, woke = false;
++        AVPacket *pkt;
++        int r;
++
++        if (d->thr_flush) {
++            qemu_mutex_unlock(&d->thr_lock);
++            avcodec_flush_buffers(d->avctx);
++            qemu_mutex_lock(&d->thr_lock);
++            g_queue_clear_full(d->thr_out, dec_thr_out_free);
++            d->thr_eof = false;
++            d->thr_flush = false;
++            qemu_cond_broadcast(&d->thr_cond);
++            continue;
++        }
++        while (!d->thr_eof && g_queue_get_length(d->thr_out) < DEC_THR_OUT) {
++            if (!f) {
++                f = av_frame_alloc();
++                if (!f) {
++                    break;
++                }
++            }
++            qemu_mutex_unlock(&d->thr_lock);
++            r = avcodec_receive_frame(d->avctx, f);
++            qemu_mutex_lock(&d->thr_lock);
++            if (d->thr_flush || d->thr_quit) {
++                av_frame_unref(f);
++                break;
++            }
++            if (r == 0) {
++                dec_thr_push_out(d, f, 0);
++                f = NULL;
++                woke = true;
++                continue;
++            }
++            if (dec_bad_data(r)) {
++                continue;   /* that frame is lost, as on the main loop */
++            }
++            if (r == AVERROR(EAGAIN)) {
++                want_input = true;
++            } else {
++                /* AVERROR_EOF ends a drain; anything else is the caller's */
++                d->thr_eof = r == AVERROR_EOF;
++                dec_thr_push_out(d, NULL, r);
++                woke = true;
++            }
++            break;
++        }
++        if (woke) {
++            qemu_bh_schedule(d->thr_bh);
++        }
++        if (d->thr_flush || d->thr_quit) {
++            continue;
++        }
++        pkt = want_input ? g_queue_pop_head(d->thr_in) : NULL;
++        if (pkt) {
++            /* was full: the backlog may hold packets that now have room */
++            if (g_queue_get_length(d->thr_in) == DEC_THR_IN - 1) {
++                qemu_bh_schedule(d->thr_bh);
++            }
++            qemu_cond_broadcast(&d->thr_cond);   /* room for the next packet */
++            qemu_mutex_unlock(&d->thr_lock);
++            r = avcodec_send_packet(d->avctx, pkt == &dec_thr_eos ? NULL : pkt);
++            dec_thr_in_free(pkt);
++            qemu_mutex_lock(&d->thr_lock);
++            if (r < 0 && r != AVERROR_EOF && !dec_bad_data(r) &&
++                !d->thr_flush) {
++                dec_thr_push_out(d, NULL, r);
++                qemu_bh_schedule(d->thr_bh);
++            }
++            continue;
++        }
++        qemu_cond_wait(&d->thr_cond, &d->thr_lock);
++    }
++    qemu_mutex_unlock(&d->thr_lock);
++    av_frame_free(&f);
++    return NULL;
++}
++
++static void dec_pump(VirtIOMediaSession *s);
++
++/* Frames came out of the thread: deliver them, as a QBUF would. */
++static void dec_thr_bh(void *opaque)
++{
++    VirtIOMediaSession *s = opaque;
++    VirtIOMediaDec *d = s->dec;
++    DecThrOut *o;
++    bool more;
++
++    dec_pump(s);
++    qemu_mutex_lock(&d->thr_lock);
++    o = g_queue_peek_head(d->thr_out);
++    /* the EOF of a drain stays at the head until a flush: nothing follows it */
++    more = o && o->err != AVERROR_EOF;
++    qemu_mutex_unlock(&d->thr_lock);
++    /* dec_pump delivers DEC_PUMP_MAX_FRAMES a call; the rest on the next turn */
++    if (more && dec_next_cap_buffer(s) >= 0 && !d->awaiting_reconfig) {
++        qemu_bh_schedule(d->thr_bh);
++    }
++}
++
++static void dec_thr_start(VirtIOMediaSession *s)
++{
++    VirtIOMediaDec *d = s->dec;
++
++    d->thr_in = g_queue_new();
++    d->thr_out = g_queue_new();
++    d->thr_quit = d->thr_flush = d->thr_eof = false;
++    qemu_mutex_init(&d->thr_lock);
++    qemu_cond_init(&d->thr_cond);
++    d->thr_bh = virtio_bh_new_guarded(DEVICE(s->vm), dec_thr_bh, s);
++    qemu_thread_create(&d->thr, "vmedia-dec", dec_thr_run, d,
++                       QEMU_THREAD_JOINABLE);
++    d->thr_on = true;
++}
++
++/* Waits for the packet being decoded, at most one frame's decode. */
++static void dec_thr_stop(VirtIOMediaDec *d)
++{
++    if (!d->thr_on) {
++        return;
++    }
++    qemu_mutex_lock(&d->thr_lock);
++    d->thr_quit = true;
++    qemu_cond_broadcast(&d->thr_cond);
++    qemu_mutex_unlock(&d->thr_lock);
++    qemu_thread_join(&d->thr);
++    qemu_bh_delete(d->thr_bh);
++    g_queue_free_full(d->thr_in, dec_thr_in_free);
++    g_queue_free_full(d->thr_out, dec_thr_out_free);
++    qemu_cond_destroy(&d->thr_cond);
++    qemu_mutex_destroy(&d->thr_lock);
++    d->thr_on = false;
++}
++
+ /*
+  * q11-dec-h264: libavcodec's send, receive and flush. avctx is NULL only when
+  * dec_codec_switch could not open a decoder again.
+@@ -1745,28 +1958,83 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+ /* avcodec_send_packet; pkt NULL starts a drain. */
+ static int dec_av_send(VirtIOMediaDec *d, const AVPacket *pkt)
+ {
++    AVPacket *c;
++
+     if (!d->avctx) {
+         return AVERROR(ENODEV);
+     }
+-    return avcodec_send_packet(d->avctx, pkt);
++    if (!d->thr_on) {
++        return avcodec_send_packet(d->avctx, pkt);
++    }
++    qemu_mutex_lock(&d->thr_lock);
++    /* the drain request is never refused: its callers cannot resend it */
++    if (pkt && g_queue_get_length(d->thr_in) >= DEC_THR_IN) {
++        qemu_mutex_unlock(&d->thr_lock);
++        return AVERROR(EAGAIN);
++    }
++    c = pkt ? av_packet_clone(pkt) : &dec_thr_eos;
++    if (!c) {
++        qemu_mutex_unlock(&d->thr_lock);
++        return AVERROR(ENOMEM);
++    }
++    g_queue_push_tail(d->thr_in, c);
++    qemu_cond_broadcast(&d->thr_cond);
++    qemu_mutex_unlock(&d->thr_lock);
++    return 0;
+ }
+ 
+-/* avcodec_receive_frame. */
++/* avcodec_receive_frame: EAGAIN until the thread has a frame. */
+ static int dec_av_receive(VirtIOMediaDec *d, AVFrame *frame)
+ {
++    DecThrOut *o;
++    int r;
++
+     if (!d->avctx) {
+         return AVERROR(ENODEV);
+     }
+-    return avcodec_receive_frame(d->avctx, frame);
++    if (!d->thr_on) {
++        return avcodec_receive_frame(d->avctx, frame);
++    }
++    qemu_mutex_lock(&d->thr_lock);
++    o = g_queue_peek_head(d->thr_out);
++    if (!o) {
++        qemu_mutex_unlock(&d->thr_lock);
++        return AVERROR(EAGAIN);
++    }
++    if (o->err == AVERROR_EOF) {
++        /* stays: every later call answers EOF too, until a flush */
++        qemu_mutex_unlock(&d->thr_lock);
++        return AVERROR_EOF;
++    }
++    g_queue_pop_head(d->thr_out);
++    qemu_cond_broadcast(&d->thr_cond);   /* room for the next frame */
++    qemu_mutex_unlock(&d->thr_lock);
++    r = o->err;
++    if (o->frame) {
++        av_frame_move_ref(frame, o->frame);
++    }
++    dec_thr_out_free(o);
++    return r;
+ }
+ 
+-/* avcodec_flush_buffers. */
++/* avcodec_flush_buffers. Waits for the packet being decoded. */
+ static void dec_av_flush(VirtIOMediaDec *d)
+ {
+     if (!d->avctx) {
+         return;
+     }
+-    avcodec_flush_buffers(d->avctx);
++    if (!d->thr_on) {
++        avcodec_flush_buffers(d->avctx);
++        return;
++    }
++    qemu_mutex_lock(&d->thr_lock);
++    g_queue_clear_full(d->thr_in, dec_thr_in_free);
++    d->thr_flush = true;
++    qemu_cond_broadcast(&d->thr_cond);
++    while (d->thr_flush) {
++        qemu_cond_wait(&d->thr_cond, &d->thr_lock);
++    }
++    qemu_mutex_unlock(&d->thr_lock);
+ }
+ 
+ /*
+@@ -1786,7 +2054,8 @@ static void dec_av_flush(VirtIOMediaDec *d)
+  * So take the bytes and hold them. A real driver does the same -- the OUTPUT
+  * buffer completes once its data has been copied out, long before any frame
+  * comes back -- and the backlog is drained from dec_pump(), i.e. from the next
+- * QBUF on either queue, once there is room.
++ * QBUF on either queue, or for a codec on the decode thread from dec_thr_bh,
++ * once there is room.
+  *
+  * ORDER IS THE WHOLE POINT. Everything that feeds libavcodec has to go through
+  * the queue once the queue is non-empty; see dec_qbuf.
+@@ -1855,8 +2124,8 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+  *
+  * Called from every path that can change either side of that condition: an
+  * OUTPUT QBUF (new input), a CAPTURE QBUF (new space) and DECODER_CMD(STOP)
+- * (end of input). Nothing else drives decoding, which is why there is no fd
+- * handler and no thread here.
++ * (end of input), and, for a codec decoded on the thread (q11-dec-thread),
++ * dec_thr_bh when frames come out of it.
+  */
+ static void dec_pump(VirtIOMediaSession *s)
+ {
+@@ -1890,7 +2159,8 @@ static void dec_pump(VirtIOMediaSession *s)
+      * SG copies before the main loop turned again -- at 4K that is hundreds of
+      * megabytes of memory traffic, during which DomA's virtio-blk (served by
+      * this same QEMU) is stopped. Bounding it per call costs nothing in
+-     * throughput because the next QBUF pumps again.
++     * throughput because the next QBUF pumps again. (A codec on the decode
++     * thread decodes there; this loop only takes its frames.)
+      */
+     for (n = 0; n < DEC_PUMP_MAX_FRAMES; n++) {
+         int r;
+@@ -2177,8 +2447,9 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+  * again when S_FMT(OUTPUT) picks another one (before any OUTPUT buffer, so
+  * nothing of the old stream is in flight).
+  */
+-static int dec_codec_open(VirtIOMediaDec *d)
++static int dec_codec_open(VirtIOMediaSession *s)
+ {
++    VirtIOMediaDec *d = s->dec;
+     const AVCodec *codec = avcodec_find_decoder_by_name(d->codec->av_name);
+ 
+     if (!codec) {
+@@ -2189,10 +2460,10 @@ static int dec_codec_open(VirtIOMediaDec *d)
+         return ENOMEM;
+     }
+     /*
+-     * One thread. Frame-threaded decoding would reorder completions relative
+-     * to the QBUF that produced them, and this device delivers completions
+-     * synchronously from that QBUF; it would also make libavcodec hold frames
+-     * across calls in a way the buffer accounting here does not model.
++     * One libavcodec thread. Frame-threaded decoding would reorder
++     * completions relative to the QBUF that produced them, and make libavcodec
++     * hold frames across calls in a way the buffer accounting here does not
++     * model. (q11-dec-thread gives H.264 a decode thread of its own instead.)
+      */
+     d->avctx->thread_count = 1;
+ 
+@@ -2223,6 +2494,10 @@ static int dec_codec_open(VirtIOMediaDec *d)
+         avcodec_free_context(&d->avctx);
+         return ENOMEM;
+     }
++    /* q11-dec-thread: a codec without the hwaccel decodes off the main loop */
++    if (!d->codec->hwaccel) {
++        dec_thr_start(s);
++    }
+     return 0;
+ }
+ 
+@@ -2239,6 +2514,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+         s->queues[1].streaming) {
+         return EBUSY;
+     }
++    dec_thr_stop(d);
+     dec_gpu_reset(d);
+     dec_sw_clear(d);
+     dec_backlog_clear(d);
+@@ -2251,12 +2527,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+     d->hw_logged = false;
+     d->gpu_logged = false;
+     d->codec = c;
+-    if (dec_codec_open(d) == 0) {
++    if (dec_codec_open(s) == 0) {
+         return 0;
+     }
+     /* keep a working decoder: the old one */
+     d->codec = old;
+-    return dec_codec_open(d) == 0 ? EINVAL : ENODEV;
++    return dec_codec_open(s) == 0 ? EINVAL : ENODEV;
+ }
+ 
+ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -2281,8 +2557,10 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+     d->pkt = av_packet_alloc();
+     d->frame = av_frame_alloc();
+     d->swframe = av_frame_alloc();
++    s->dec = d;
+     if (!d->codec || !d->pkt || !d->frame || !d->swframe ||
+-        dec_codec_open(d)) {
++        dec_codec_open(s)) {
++        s->dec = NULL;
+         goto fail;
+     }
+ 
+@@ -2311,6 +2589,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+     if (!d) {
+         return;
+     }
++    dec_thr_stop(d);
+     dec_gpu_clear(d);
+     dec_sw_clear(d);
+     sws_freeContext(d->sws_nv12);

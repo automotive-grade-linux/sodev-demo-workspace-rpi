@@ -1,0 +1,50 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 15 Oct 2026 07:50:28 +0900
+Subject: [PATCH] wayland_vulkan: rebuild the swapchain when acquiring says
+ suboptimal
+
+Only a VK_SUBOPTIMAL_KHR from vkQueuePresentKHR made the backend build
+a new swapchain; one from vkAcquireNextImageKHR went to CHECK_VK_RESULT
+and the swapchain stayed. Mesa's Wayland WSI (24.0) reports a change of
+the compositor's dma-buf feedback only there: when the feedback asks
+for other modifiers -- a scanout tranche after the compositor failed to
+put the window on a plane -- the next acquire returns
+VK_SUBOPTIMAL_KHR, and the present does not.
+
+On a QEMU virtio-gpu the cluster's swapchain images are tiled
+(BROADCOM_UIF, from the host's V3D), which the guest's KMS cannot scan
+out, so the compositor composed the window with the GPU every frame.
+It sent a scanout tranche two seconds after start, and the swapchain
+was never rebuilt.
+
+On VK_SUBOPTIMAL_KHR from the acquire, keep the image, which can still
+be presented, and set resize_pending_, so the next frame builds the
+swapchain the way a resize does.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/shell/backend/wayland_vulkan/wayland_vulkan.cc
++++ b/shell/backend/wayland_vulkan/wayland_vulkan.cc
+@@ -725,9 +725,18 @@
+     b->InitializeSwapchain();
+   }
+ 
+-  CHECK_VK_RESULT(d.vkAcquireNextImageKHR(
++  const VkResult acquired = d.vkAcquireNextImageKHR(
+       b->device_, b->swapchain_, 1'000'000'000,  // timeout (ns) 1000ms
+-      nullptr, b->image_ready_fence_, &b->last_image_index_));
++      nullptr, b->image_ready_fence_, &b->last_image_index_);
++  // The image is still presentable, but the surface wants another swapchain:
++  // Mesa's Wayland WSI says so here, and only here, when the compositor's
++  // dma-buf feedback changes (a scanout tranche, for one). Make the next frame
++  // build it, as for a resize.
++  if (acquired == VK_SUBOPTIMAL_KHR) {
++    b->resize_pending_ = true;
++  } else {
++    CHECK_VK_RESULT(acquired);
++  }
+ 
+   // Flutter Engine expects the image to be available for transitioning and
+   // attaching immediately, and so we need to force a host sync here before

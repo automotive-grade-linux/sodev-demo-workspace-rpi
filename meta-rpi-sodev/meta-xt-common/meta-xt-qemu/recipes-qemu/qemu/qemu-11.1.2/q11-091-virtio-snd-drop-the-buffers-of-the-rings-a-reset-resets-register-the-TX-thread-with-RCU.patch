@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 22:28:11 +0900
+Subject: [PATCH] virtio-snd: drop the buffers of the rings a reset resets,
+ register the TX thread with RCU
+
+A reset left the TX and RX buffers still queued on the streams: their
+elements belonged to the rings being reset, and the next callback or
+TX thread pass pushed them to the new rings, or played their data from
+the old ones. Reset now detaches and frees them, with their mappings,
+and stops each stream (k->reset runs before the queues are reset).
+
+The TX thread (tx-poll-us) pushes buffers back with virtqueue_push(),
+which reads the guest's memory map under RCU, without being an RCU
+reader thread. It now registers with RCU.
+
+Both apply whether or not the TX thread is used with the next commit's
+tx-no-bql.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's virtio-snd TX thread (tx-poll-us)]
+---
+ hw/audio/virtio-snd.c | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/hw/audio/virtio-snd.c b/hw/audio/virtio-snd.c
+index b76ecae40..1aebe3602 100644
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -112,6 +112,8 @@ static void *virtio_snd_tx_thread(void *opaque)
+ {
+     VirtIOSound *vsnd = opaque;
+ 
++    /* virtqueue_push() and the memory API it reaches read under RCU */
++    rcu_register_thread();
+     while (!qatomic_read(&vsnd->tx_thread_stop)) {
+         bql_lock();
+         if (vsnd->pcm.streams) {
+@@ -127,6 +129,7 @@ static void *virtio_snd_tx_thread(void *opaque)
+         bql_unlock();
+         g_usleep(vsnd->tx_poll_us);
+     }
++    rcu_unregister_thread();
+     return NULL;
+ }
+ 
+@@ -1435,6 +1438,38 @@ static void virtio_snd_reset(VirtIODevice *vdev)
+      */
+     g_assert(QSIMPLEQ_EMPTY(&vsnd->invalid));
+ 
++    /*
++     * Buffers still on the streams belong to the rings being reset: drop them
++     * with their mappings (k->reset runs before the queues are reset), so none
++     * is pushed to a new ring or played from the old one.
++     */
++    if (vsnd->pcm.streams) {
++        for (uint32_t i = 0; i < vsnd->snd_conf.streams; i++) {
++            VirtIOSoundPCMStream *stream = vsnd->pcm.streams[i];
++            VirtIOSoundPCMBuffer *buffer;
++
++            if (!stream) {
++                continue;
++            }
++            WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++                while ((buffer = QSIMPLEQ_FIRST(&stream->queue))) {
++                    QSIMPLEQ_REMOVE_HEAD(&stream->queue, entry);
++                    virtqueue_detach_element(buffer->vq, buffer->elem, 0);
++                    virtio_snd_pcm_buffer_free(buffer);
++                }
++                stream->active = false;
++                stream->latency_bytes = 0;
++                if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
++                    audio_be_set_active_out(vsnd->audio_be, stream->voice.out,
++                                            false);
++                } else {
++                    audio_be_set_active_in(vsnd->audio_be, stream->voice.in,
++                                           false);
++                }
++            }
++        }
++    }
++
+     WITH_QEMU_LOCK_GUARD(&vsnd->cmdq_mutex) {
+         while (!QTAILQ_EMPTY(&vsnd->cmdq)) {
+             cmd = QTAILQ_FIRST(&vsnd->cmdq);
+-- 
+2.43.0
+

@@ -1,0 +1,41 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 12 Oct 2026 15:09:23 +0900
+Subject: [PATCH] backend-drm: match Broadcom SAND modifiers without the column height
+
+A Broadcom SAND buffer carries its column height in the modifier
+parameter (fourcc_mod_broadcom_param(), bits 8..55), while the KMS
+planes advertise the parameterless DRM_FORMAT_MOD_BROADCOM_SAND128.
+drm_fb_compatible_with_plane() compares modifiers exactly, so an NV12
+SAND128 buffer from the Raspberry Pi 4 video decoder was never put on an
+overlay plane and was composited by GL instead.
+
+When the exact match fails and the modifier belongs to the Broadcom
+vendor, try again with fourcc_mod_broadcom_mod(), i.e. without the
+parameter.
+
+Related upstream work: the draft merge request
+https://gitlab.freedesktop.org/wayland/weston/-/merge_requests/1640
+("backend-drm: Implement DRM_FORMAT_MOD_BROADCOM_SAND128 support"),
+marked for testing only.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/libweston/backend-drm/fb.c
++++ b/libweston/backend-drm/fb.c
+@@ -700,6 +700,14 @@
+ 
+ 		if (weston_drm_format_has_modifier(fmt, fb->modifier))
+ 			return true;
++		/*
++		 * A Broadcom SAND modifier carries the
++		 * column height in bits 8..55 (fourcc_mod_broadcom_param); KMS lists the
++		 * modifier without it, so compare without the parameter.
++		 */
++		if ((fb->modifier >> 56) == DRM_FORMAT_MOD_VENDOR_BROADCOM &&
++		    weston_drm_format_has_modifier(fmt, fourcc_mod_broadcom_mod(fb->modifier)))
++			return true;
+ 	}
+ 
+ 	drm_debug(b, "\t\t\t\t[%s] not assigning view %p on %s, "

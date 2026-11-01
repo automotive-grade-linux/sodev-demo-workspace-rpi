@@ -1,0 +1,110 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 4 Oct 2026 15:45:54 +0900
+Subject: [PATCH] ns16550: leave the bcm2835 mini UART's divisor alone
+
+On the RPi4 the Xen console is the mini UART (brcm,bcm2835-aux-uart,
+/soc/serial@7e215040) since the pl011 went to Bluetooth. The DT path
+uses BAUD_AUTO, which reads the divisor through DLAB; on the mini UART
+that read returned 0 on some boots (why was not determined).
+Xen 4.22 then writes UART_CLOCK_HZ / (115200 * 16) = 1 into it, the mini
+UART runs at core / (8 * (divisor + 1)) ~= 31 Mbaud at 500 MHz, and the
+console is garbage from the first line on. U-Boot printed correctly at
+115200 on the same boot, and `xl dmesg` showed "Automatic baud rate
+determination was requested, but a baud rate was not set up / Setting
+baudrate to 115200".
+
+Skip the divisor latch entirely for this UART and keep what the firmware
+and the boot loader programmed.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/xen/drivers/char/ns16550.c
++++ b/xen/drivers/char/ns16550.c
+@@ -64,6 +64,7 @@
+     bool intr_works;
+     bool force_polling;
+     bool dw_usr_bsy;
++    bool keep_divisor;      /* leave DLL/DLM alone: ns16550_setup_preirq() */
+ #ifdef NS16550_PCI
+     /* PCI card parameters. */
+     bool pb_bdf_enable;     /* if =1, pb-bdf effective, port behind bridge */
+@@ -358,31 +359,50 @@
+ #endif
+ 
+     /* Line control and baud-rate generator. */
+-    ns_write_reg(uart, UART_LCR, lcr | UART_LCR_DLAB);
+-    if ( uart->baud != BAUD_AUTO )
++    if ( uart->keep_divisor )
+     {
+-        /* Baud rate specified: program it into the divisor latch. */
+-        divisor = uart->clock_hz / (uart->baud << 4);
+-        ns_write_reg(uart, UART_DLL, (char)divisor);
+-        ns_write_reg(uart, UART_DLM, (char)(divisor >> 8));
++        /*
++         * The BCM2835/BCM2711 mini UART (brcm,bcm2835-aux-uart): the firmware
++         * and the boot loader program its baud register for the VPU core clock,
++         * and the 16550 divisor rule (clock / (16 * baud)) does not fit it.
++         * On an RPi4 the BAUD_AUTO read below returned 0 on some boots, after
++         * which the fallback wrote UART_CLOCK_HZ / (115200 * 16) = 1 into it:
++         * the mini UART runs at core / (8 * (divisor + 1)), so the console went
++         * to ~31 Mbaud and the host saw only garbage from the first line on.
++         * Leave the divisor as the boot loader set it. The baud value is
++         * nominal and only feeds the polling timeout (ns16550_setup_postirq).
++         */
++        if ( uart->baud == BAUD_AUTO )
++            uart->baud = 115200;
+     }
+     else
+     {
+-        /* Baud rate already set: read it out from the divisor latch. */
+-        divisor  = ns_read_reg(uart, UART_DLL);
+-        divisor |= ns_read_reg(uart, UART_DLM) << 8;
+-        if ( divisor )
+-            uart->baud = uart->clock_hz / (divisor << 4);
+-        else
++        ns_write_reg(uart, UART_LCR, lcr | UART_LCR_DLAB);
++        if ( uart->baud != BAUD_AUTO )
+         {
+-            uart->baud = 115200;
+-            printk(XENLOG_ERR
+-                   "Automatic baud rate determination was requested,"
+-                   " but a baud rate was not set up\n"
+-                   "Setting baudrate to %u\n", uart->baud);
++            /* Baud rate specified: program it into the divisor latch. */
+             divisor = uart->clock_hz / (uart->baud << 4);
+-            ns_write_reg(uart, UART_DLL, (uint8_t)divisor);
+-            ns_write_reg(uart, UART_DLM, (uint8_t)(divisor >> 8));
++            ns_write_reg(uart, UART_DLL, (char)divisor);
++            ns_write_reg(uart, UART_DLM, (char)(divisor >> 8));
++        }
++        else
++        {
++            /* Baud rate already set: read it out from the divisor latch. */
++            divisor  = ns_read_reg(uart, UART_DLL);
++            divisor |= ns_read_reg(uart, UART_DLM) << 8;
++            if ( divisor )
++                uart->baud = uart->clock_hz / (divisor << 4);
++            else
++            {
++                uart->baud = 115200;
++                printk(XENLOG_ERR
++                       "Automatic baud rate determination was requested,"
++                       " but a baud rate was not set up\n"
++                       "Setting baudrate to %u\n", uart->baud);
++                divisor = uart->clock_hz / (uart->baud << 4);
++                ns_write_reg(uart, UART_DLL, (uint8_t)divisor);
++                ns_write_reg(uart, UART_DLM, (uint8_t)(divisor >> 8));
++            }
+         }
+     }
+     ns_write_reg(uart, UART_LCR, lcr);
+@@ -1841,6 +1861,7 @@
+     {
+         uart->reg_width = 4;
+         uart->reg_shift = 2;
++        uart->keep_divisor = true;
+     }
+ 
+     res = platform_get_irq(dev, 0);

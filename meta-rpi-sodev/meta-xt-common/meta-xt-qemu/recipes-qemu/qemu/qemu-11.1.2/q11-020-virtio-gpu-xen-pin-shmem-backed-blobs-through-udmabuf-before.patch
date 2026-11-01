@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-gpu/xen: pin shmem-backed blobs through udmabuf before
+ sharing them into the guest
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0121-virtio-gpu-xen-pin-shmem-blobs-through-udmabuf-before-.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [extends 0116, which is itself Inappropriate]
+---
+ hw/arm/xen-stubs.c            |  6 ++-
+ hw/display/virtio-gpu-virgl.c | 84 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 88 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/xen-stubs.c b/hw/arm/xen-stubs.c
+index e526a6f97..3d2932d52 100644
+--- a/hw/arm/xen-stubs.c
++++ b/hw/arm/xen-stubs.c
+@@ -74,8 +74,10 @@ void arch_handle_ioreq(XenIOState *state, ioreq_t *req)
+  *    process to be privileged enough to read the PFNs -- true for a device
+  *    model;
+  *  - mlock() keeps them resident but does not stop the kernel from migrating
+- *    them (compaction, ballooning). A production version needs a real pin,
+- *    which means kernel help;
++ *    them (compaction, khugepaged), so this route is only safe for memory the
++ *    caller has pinned some other way: a dma-buf by the gntdev import above,
++ *    a shmem blob by a udmabuf (0121, which vetoes the share when it cannot).
++ *    A failed export or XT_XEN_NO_BLOB_EXPORT still sends a shmem blob here;
+  *  - the hypervisor has to permit the direction at all. Without the matching
+  *    change (4.22-0007) the batch below fails -- with -ESRCH on Xen 4.22, whose
+  *    rcu_lock_remote_domain_by_id() cannot resolve DOMID_SELF, and with -EPERM
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 614f2a8f0..e81d9b159 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -18,6 +18,10 @@
+ #include "hw/virtio/virtio.h"
+ #include "hw/virtio/virtio-gpu.h"
+ #include "system/xen.h"
++#include "ui/console.h"
++#include "standard-headers/linux/udmabuf.h"
++#include <fcntl.h>
++#include <sys/ioctl.h>
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
+ 
+@@ -151,6 +155,66 @@ static void virtio_gpu_virgl_types(void)
+ }
+ 
+ type_init(virtio_gpu_virgl_types)
++/*
++ * Under Xen a blob that the renderer backs with plain shared memory (a memfd:
++ * the Venus rings, the reply shmem, the allocation pools) has so far been
++ * shared into the guest's p2m by frame number, read from /proc/self/pagemap,
++ * with only mlock() holding the pages. mlock keeps them resident; it does not
++ * keep them in place. DomD's kernel migrates pages routinely (compaction,
++ * khugepaged -- /proc/vmstat pgmigrate_success climbs by thousands a minute
++ * under Venus load), and once a shared frame moves the guest keeps writing the
++ * old frame while the renderer reads the new one: the render server then
++ * decodes an all-zero command ("vkCreateInstance resulted in CS error", chunk
++ * bytes all 00), declares the context fatal, and the guest's ICD aborts in
++ * vn_relax waiting for a reply that never comes -- SurfaceFlinger dies, zygote
++ * restarts, the boot animation plays again. Measured on RPi4 2026-09-12;
++ * disabling compaction of unevictable pages on DomD made the errors stop, which
++ * is what identifies the mechanism.
++ *
++ * udmabuf gives a real pin: /dev/udmabuf wraps the memfd's pages in a dma-buf
++ * and pins them for the dma-buf's lifetime, and the gntdev import path this
++ * file already uses for GPU dma-bufs then reports their frames. udmabuf insists
++ * on F_SEAL_SHRINK, so add the seal if the renderer did not; a memfd created
++ * without MFD_ALLOW_SEALING refuses; the caller then vetoes the share rather
++ * than falling back to the unpinned pagemap route. Returns the dma-buf fd, or
++ * -1.
++ */
++static int xen_arm_udmabuf_from_shm(int memfd, uint64_t size)
++{
++    struct udmabuf_create create = {
++        .memfd = memfd,
++        .flags = UDMABUF_FLAGS_CLOEXEC,
++        .offset = 0,
++        .size = size,
++    };
++    int ufd, seals, dmabuf;
++
++    ufd = udmabuf_fd();
++    if (ufd < 0) {
++        warn_report("xen-arm: /dev/udmabuf unavailable; cannot pin the shmem "
++                    "blob, refusing the share");
++        return -1;
++    }
++    seals = fcntl(memfd, F_GET_SEALS);
++    if (seals < 0) {
++        warn_report("xen-arm: F_GET_SEALS on blob memfd: %s", strerror(errno));
++        return -1;
++    }
++    if (!(seals & F_SEAL_SHRINK) &&
++        fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) {
++        warn_report("xen-arm: cannot seal blob memfd against shrinking (%s); "
++                    "udmabuf needs that, refusing the share",
++                    strerror(errno));
++        return -1;
++    }
++    dmabuf = ioctl(ufd, UDMABUF_CREATE, &create);
++    if (dmabuf < 0) {
++        warn_report("xen-arm: UDMABUF_CREATE (%" PRIu64 " bytes): %s",
++                    size, strerror(errno));
++        return -1;
++    }
++    return dmabuf;
++}
+ 
+ static int
+ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+@@ -255,6 +319,26 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+                             __func__, rc, blob_fd);
+             } else if (fd_type == VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF) {
+                 xen_dm_set_blob_dmabuf(blob_fd);
++            } else if (fd_type == VIRGL_RENDERER_BLOB_FD_TYPE_SHM) {
++                int dmabuf = xen_arm_udmabuf_from_shm(blob_fd, size);
++
++                if (dmabuf >= 0) {
++                    info_report("xen-arm: blob res %u: shmem pinned through "
++                                "udmabuf (%" PRIu64 " bytes)",
++                                res->base.resource_id, size);
++                    xen_dm_set_blob_dmabuf(dmabuf);
++                } else {
++                    /*
++                     * No pin, so no share. The pagemap route 0116 keeps for
++                     * this case IS the unpinned sharing measured above to
++                     * corrupt the guest's command ring, so falling back to it
++                     * would reintroduce the bug this patch exists to fix.
++                     * Refusing gives the guest VK_ERROR_MEMORY_MAP_FAILED,
++                     * which is diagnosable.
++                     */
++                    xen_dm_refuse_blob_share();
++                }
++                close(blob_fd);
+             } else {
+                 close(blob_fd);
+             }

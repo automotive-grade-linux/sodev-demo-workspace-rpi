@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 08:07:07 +0900
+Subject: [PATCH] virtio-media: decoder mode: scale wide streams down to
+ host-max-width
+
+A 3840x2160 HEVC stream reached the guest as a 3840x2160 RGBA buffer:
+33 MB a frame, written by the GPU conversion and then composed by the
+guest down to its 1920x1080 display. On the Raspberry Pi 5 that kept
+V3D at 99% and 4K60 played at 47 to 48 fps, while the decoder alone
+runs at about 120.
+
+host-max-width (q11-048) now applies in decoder mode too. A stream
+wider than it reaches the guest at that width, the height following
+the aspect ratio: CAPTURE's format, G_FMT after SOURCE_CHANGE and the
+S_FMT reply carry that size, normalised as any CAPTURE size is, and
+the compose rectangle is scaled by the width's ratio. The GPU
+conversion samples the full frame and writes the smaller buffer with
+that one ratio (the shader's u_scale, as the proxy's host-nv12 does),
+for hardware frames and for software ones (q11-073's NV12 is staged
+at the frame's size). It does so only when host-max-width made the
+guest's size: a guest that chose another size itself is scaled on the
+CPU, axis by axis, as before. A scaled buffer is not offered for
+direct scanout (q11-071 shows a buffer 1:1). In decoder mode the
+property must be 0 or at least 128, the smallest CAPTURE width. The
+two size helpers move to virtio-media.h for the decoder to share.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16, AOSP's codec tool,
+host-max-width=1920, with the next patch applied too): HEVC 3840x2160
+60p plays at 56.4 and 60.5 fps with -T (V3D 59 to 74% busy) and
+decodes at 72.0 fps with -S, against 47.3 and 48.1 fps (V3D 99.3%)
+and 56.3 without; all 896 frames come out, with the source's framing.
+HEVC 1080p60 plays at 61.1 fps with V3D 18.7 to 18.9%, H.264 1080p60
+at 60.6 fps. H.264 2560x1440 60p reaches the guest at 1920x1080
+through the GPU and plays at 39.6 fps, the decode thread taking a
+whole core.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 126 ++++++++++++++++++++++++-------
+ hw/virtio/virtio-media.c         |  30 +-------
+ include/hw/virtio/virtio-media.h |  41 ++++++++--
+ 3 files changed, 137 insertions(+), 60 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 3fbac888f..e92f54067 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -178,6 +178,7 @@ typedef struct DecGpuEntry {
+     dev_t dev;
+     ino_t ino;
+     uint32_t w, h;
++    uint32_t src_w, src_h;   /* q11-dec-scale: the frame's size */
+     int matrix;
+     void *handle;
+     /* q11-dec-sand-scanout: the buffer as the display sees it (dec_ds_*) */
+@@ -338,6 +339,12 @@ struct VirtIOMediaDec {
+      */
+     bool stream_fmt_known;
+     uint32_t stream_w, stream_h;
++    /*
++     * q11-dec-scale: host-max-width. A stream wider than this reaches the
++     * guest scaled down to it (dec_guest_dims): coded_w/h is then the
++     * guest's size and stream_w/h stays the decoder's.
++     */
++    uint32_t max_w;
+ 
+     /* Event subscriptions. Unsubscribed events must not be sent. */
+     bool sub_source_change;
+@@ -426,6 +433,7 @@ struct VirtIOMediaDec {
+     DecSwSlot sw[DEC_SW_RING];
+     unsigned sw_next;
+     uint32_t sw_w, sw_h, sw_stride, sw_uv_offset;
++    uint32_t sw_dw, sw_dh;   /* q11-dec-scale: the guest's size */
+     int sw_matrix;
+     bool sw_off;      /* the GPU path failed for this stream: CPU from now on */
+     bool sw_logged;
+@@ -501,6 +509,31 @@ static void dec_norm_dims(uint32_t *w, uint32_t *h)
+     *h = (hh + 1) & ~1u;
+ }
+ 
++/* q11-dec-scale: the guest-facing size of the stream. */
++static void dec_guest_dims(const VirtIOMediaDec *d, uint32_t *w, uint32_t *h)
++{
++    virtio_media_scaled_size(d->max_w, d->stream_w, d->stream_h, w, h);
++    dec_norm_dims(w, h);
++}
++
++/*
++ * q11-dec-scale: may a fw x fh frame go into the guest's w x h buffer, scaled
++ * by the one ratio the shader uses? Only when host-max-width made that size.
++ * A guest that chose another size itself (no SOURCE_CHANGE subscription) is
++ * scaled on the CPU, axis by axis.
++ */
++static bool dec_scaled_ok(const VirtIOMediaDec *d, uint32_t fw, uint32_t fh,
++                          uint32_t w, uint32_t h)
++{
++    uint32_t gw, gh;
++
++    if (!d->max_w || fw != d->stream_w || fh != d->stream_h) {
++        return false;
++    }
++    dec_guest_dims(d, &gw, &gh);
++    return w == gw && h == gh;
++}
++
+ static uint32_t dec_cap_sizeimage(uint32_t w, uint32_t h)
+ {
+     /*
+@@ -1203,12 +1236,18 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     unsigned i;
+     int err = 0, r;
+     bool show, skip;
++    /*
++     * q11-dec-scale: the guest's buffer is the frame's size, or smaller
++     * (host-max-width): the shader scales by one ratio, as the proxy does.
++     */
++    uint32_t fw = (uint32_t)fr->width, fh = (uint32_t)fr->height;
++    bool scaled = fw != w || fh != h;
++    float scale = scaled ? (float)fw / w : 1.0f;
+ 
+     if (!gb->virgl_res || gb->num_planes != 1 || !desc) {
+         return -EINVAL;
+     }
+-    /* Unscaled only: the guest's buffer is the frame's size (see dec_pump). */
+-    if ((uint32_t)fr->width != w || (uint32_t)fr->height != h) {
++    if (scaled && !dec_scaled_ok(d, fw, fh, w, h)) {
+         return -ENOTSUP;
+     }
+     l = &desc->layers[0];
+@@ -1222,7 +1261,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     col = (uint32_t)DEC_MOD_PARAM(mod);
+     uv_offset = (uint32_t)l->planes[1].offset;
+     /* luma_rows (uv_offset / 128) lines of Y, then the CbCr lines, per column */
+-    if (uv_offset % 128 || uv_offset / 128 < h || col < uv_offset / 128 + h / 2) {
++    if (uv_offset % 128 || uv_offset / 128 < fh ||
++        col < uv_offset / 128 + fh / 2) {
+         return -ENOTSUP;
+     }
+     if (fstat(desc->objects[0].fd, &st) < 0) {
+@@ -1245,7 +1285,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         DecGpuEntry *c = &d->gpu[i];
+ 
+         if (c->dev == st.st_dev && c->ino == st.st_ino &&
+-            c->w == w && c->h == h && c->matrix == matrix) {
++            c->w == w && c->h == h && c->src_w == fw && c->src_h == fh &&
++            c->matrix == matrix) {
+             e = c;
+             break;
+         }
+@@ -1254,7 +1295,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         int fd;
+ 
+         /* Another size: the old imports are of no further use. */
+-        if (d->gpu_n && (d->gpu[0].w != w || d->gpu[0].h != h)) {
++        if (d->gpu_n && (d->gpu[0].w != w || d->gpu[0].h != h ||
++                         d->gpu[0].src_w != fw || d->gpu[0].src_h != fh)) {
+             dec_gpu_clear(d);
+         }
+         if (d->gpu_n == DEC_GPU_CACHE) {
+@@ -1267,11 +1309,12 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         }
+         e = &d->gpu[d->gpu_n];
+         e->handle = s->vm->host_sand == 2
+-            ? virtio_media_gpu_import_sand_linear(fd, w, uv_offset / 128, col,
+-                                                  w, h, 1.0f,
++            ? virtio_media_gpu_import_sand_linear(fd, fw, uv_offset / 128, col,
++                                                  w, h, scale,
+                                                   (uint32_t)desc->objects[0].size,
+                                                   matrix, &err)
+-            : virtio_media_gpu_import_nv12(fd, w, h, w, uv_offset, w, h, 1.0f,
++            : virtio_media_gpu_import_nv12(fd, fw, fh, fw, uv_offset, w, h,
++                                           scale,
+                                            (uint32_t)desc->objects[0].size,
+                                            matrix, col, &err);
+         if (!e->handle) {
+@@ -1281,6 +1324,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         e->ino = st.st_ino;
+         e->w = w;
+         e->h = h;
++        e->src_w = fw;
++        e->src_h = fh;
+         e->matrix = matrix;
+         e->show_fd = -1;
+         e->seq = 0;
+@@ -1293,7 +1338,9 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
+     assert(!d->thr_on);   /* avctx below: a hwaccel codec has no decode thread */
+     tex = virtio_media_gpu_res_tex(gb->virgl_res);
+-    show = tex && dec_ds_on() && direct_scanout_sand_usable() && dec_ds_wanted(d);
++    /* q11-dec-scale: the display shows a buffer 1:1, so not a scaled one */
++    show = !scaled && tex && dec_ds_on() && direct_scanout_sand_usable() &&
++           dec_ds_wanted(d);
+     if (show && e->show_fd < 0) {
+         e->show_fd = fcntl(desc->objects[0].fd, F_DUPFD_CLOEXEC, 0);
+     }
+@@ -1388,7 +1435,7 @@ static void dec_sw_clear(VirtIOMediaDec *d)
+         sl->fd = -1;
+     }
+     d->sw_next = 0;
+-    d->sw_w = d->sw_h = 0;
++    d->sw_w = d->sw_h = d->sw_dw = d->sw_dh = 0;
+ }
+ 
+ /* A dma-buf of len bytes from the system heap, mapped. */
+@@ -1449,9 +1496,13 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+ {
+     VirtIOMediaDec *d = s->dec;
+     int matrix = dec_gpu_matrix(fr);
+-    uint32_t stride = ROUND_UP(w, 64);
+-    uint32_t uv_offset = ROUND_UP(stride * h, 4096);
+-    size_t len = ROUND_UP((size_t)uv_offset + stride * ((h + 1) / 2), 4096);
++    /* q11-dec-scale: staged at the frame's size, scaled into the guest's */
++    uint32_t fw = (uint32_t)fr->width, fh = (uint32_t)fr->height;
++    bool scaled = fw != w || fh != h;
++    float scale = scaled ? (float)fw / w : 1.0f;
++    uint32_t stride = ROUND_UP(fw, 64);
++    uint32_t uv_offset = ROUND_UP(stride * fh, 4096);
++    size_t len = ROUND_UP((size_t)uv_offset + stride * ((fh + 1) / 2), 4096);
+     DecSwSlot *sl;
+     uint8_t *dst[4];
+     int dst_ls[4] = { 0 };
+@@ -1459,19 +1510,22 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     uint32_t tex;
+ 
+     if (!gb->virgl_res || gb->num_planes != 1 ||
+-        (uint32_t)fr->width != w || (uint32_t)fr->height != h) {
++        (scaled && !dec_scaled_ok(d, fw, fh, w, h))) {
+         return -ERANGE;
+     }
+-    if (d->sw_w != w || d->sw_h != h || d->sw_matrix != matrix) {
++    if (d->sw_w != fw || d->sw_h != fh || d->sw_dw != w || d->sw_dh != h ||
++        d->sw_matrix != matrix) {
+         dec_sw_clear(d);
+-        d->sw_w = w;
+-        d->sw_h = h;
++        d->sw_w = fw;
++        d->sw_h = fh;
++        d->sw_dw = w;
++        d->sw_dh = h;
+         d->sw_stride = stride;
+         d->sw_uv_offset = uv_offset;
+         d->sw_matrix = matrix;
+         sws_freeContext(d->sws_nv12);
+         /* YUVJ420P is YUV420P with full range, which the matrix carries */
+-        d->sws_nv12 = sws_getContext(w, h, AV_PIX_FMT_YUV420P, w, h,
++        d->sws_nv12 = sws_getContext(fw, fh, AV_PIX_FMT_YUV420P, fw, fh,
+                                      AV_PIX_FMT_NV12, SWS_POINT,
+                                      NULL, NULL, NULL);
+         if (!d->sws_nv12) {
+@@ -1491,9 +1545,10 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         if (fd < 0) {
+             return -errno;
+         }
+-        sl->handle = virtio_media_gpu_import_nv12(fd, w, h, stride, uv_offset,
+-                                                  w, h, 1.0f, (uint32_t)len,
+-                                                  matrix, 0, &err);
++        sl->handle = virtio_media_gpu_import_nv12(fd, fw, fh, stride,
++                                                  uv_offset, w, h, scale,
++                                                  (uint32_t)len, matrix, 0,
++                                                  &err);
+         if (!sl->handle) {
+             return err ? err : -EINVAL;
+         }
+@@ -1533,7 +1588,7 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+         d->sw_logged = true;
+         info_report("virtio-media/dec: sw-gpu: %s frames reach the guest on "
+                     "the GPU (linear NV12 %ux%u, stride %u, matrix %d)",
+-                    d->codec->desc, w, h, stride, matrix);
++                    d->codec->desc, fw, fh, stride, matrix);
+     }
+     return 0;
+ }
+@@ -2314,8 +2369,7 @@ static void dec_pump(VirtIOMediaSession *s)
+                  * no renegotiation coming, so its chosen format must stay put and
+                  * dec_write_frame() scales into it.
+                  */
+-                d->coded_w = d->stream_w;
+-                d->coded_h = d->stream_h;
++                dec_guest_dims(d, &d->coded_w, &d->coded_h);
+                 /*
+                  * Hold this frame across the renegotiation rather than dropping
+                  * it: it is the IDR the guest has to start decoding from.
+@@ -2430,6 +2484,12 @@ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
+                    vm->decoder);
+         return false;
+     }
++    /* q11-dec-scale: no narrower than the smallest CAPTURE size (DEC_MIN_W) */
++    if (vm->host_max_width && vm->host_max_width < DEC_MIN_W) {
++        error_setg(errp, "virtio-media: host-max-width must be 0 or at least "
++                   "%d in decoder mode", DEC_MIN_W);
++        return false;
++    }
+     /*
+      * device_caps is what the guest reads out of config space, and
+      * v4l2_codec2 refuses to start without M2M_MPLANE (V4L2Decoder::start()).
+@@ -2568,6 +2628,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+ 
+     d = g_new0(VirtIOMediaDec, 1);
+     d->codec = dec_codec_nth(s->vm, 0);
++    d->max_w = s->vm->host_max_width;   /* q11-dec-scale */
+     for (unsigned i = 0; i < DEC_SW_RING; i++) {
+         d->sw[i].fd = -1;
+     }
+@@ -2699,8 +2760,7 @@ static int dec_s_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+         uint32_t w = pix->width, h = pix->height;
+ 
+         if (d->stream_fmt_known) {
+-            w = d->stream_w;
+-            h = d->stream_h;
++            dec_guest_dims(d, &w, &h);
+         }
+         /*
+          * ALWAYS, not only in the else branch. Without it the stream-known path
+@@ -2764,6 +2824,20 @@ static int dec_g_selection(VirtIOMediaDec *d, struct v4l2_selection *sel)
+         sel->r.top = 0;
+         sel->r.width = d->visible_w ? d->visible_w : d->coded_w;
+         sel->r.height = d->visible_h ? d->visible_h : d->coded_h;
++        /*
++         * q11-dec-scale: in the guest's pixels, by the one ratio the shader
++         * uses, the width's (as the proxy's host-max-width does)
++         */
++        if (d->max_w && d->stream_fmt_known && d->coded_w != d->stream_w) {
++            sel->r.width = MIN(virtio_media_scale_coord(sel->r.width,
++                                                        d->coded_w,
++                                                        d->stream_w),
++                               d->coded_w);
++            sel->r.height = MIN(virtio_media_scale_coord(sel->r.height,
++                                                         d->coded_w,
++                                                         d->stream_w),
++                                d->coded_h);
++        }
+         return 0;
+     default:
+         return EINVAL;
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index e7acc7bed..40caf7455 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -197,30 +197,6 @@ static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
+     return QEMU_ALIGN_UP(width * 4, 64);
+ }
+ 
+-/*
+- * host-max-width: the guest-facing size of a w x h host frame. Keeps the
+- * aspect ratio, rounds the height up so no source row is dropped, and keeps
+- * both even.
+- */
+-static void virtio_media_scaled_size(uint32_t max_w, uint32_t w, uint32_t h,
+-                                     uint32_t *sw, uint32_t *sh)
+-{
+-    if (!max_w || !w || !h || w <= max_w) {
+-        *sw = w;
+-        *sh = h;
+-        return;
+-    }
+-    *sw = max_w & ~1u;
+-    *sh = (uint32_t)(((uint64_t)h * *sw + w - 1) / w);
+-    *sh = (*sh + 1) & ~1u;
+-}
+-
+-/* One host coordinate in the scaled frame, rounded to nearest. */
+-static uint32_t virtio_media_scale_coord(uint32_t v, uint32_t to, uint32_t from)
+-{
+-    return from ? (uint32_t)(((uint64_t)v * to + from / 2) / from) : v;
+-}
+-
+ /* Does this v4l2_format describe the CAPTURE side of a decoder? */
+ static bool virtio_media_fmt_is_capture(const struct v4l2_format *f)
+ {
+@@ -3159,10 +3135,10 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+                    "least 16");
+         return;
+     }
+-    if (vm->host_max_width &&
+-        (vm->decoder || !vm->host_nv12 || !vm->gpu_xfer)) {
++    if (vm->host_max_width && !vm->decoder &&
++        (!vm->host_nv12 || !vm->gpu_xfer)) {
+         warn_report("virtio-media: host-max-width has no effect without "
+-                    "host-nv12=on and gpu-xfer=on, or in decoder mode");
++                    "host-nv12=on and gpu-xfer=on");
+     }
+     /* host-sand: 0 = NV12, 1 = SAND detiled by Mesa, 2 = SAND detiled in the shader */
+     if (vm->host_sand > 2) {
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 1495874c5..c4a78ce14 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -397,13 +397,14 @@ struct VirtIOMedia {
+      */
+     uint32_t host_sand;
+     /*
+-     * host-max-width (needs host-nv12): give the guest frames no wider than
+-     * this, scaled down by the NV12 shader, and report that size in the
+-     * CAPTURE format and compose rectangle. It applies to every decode wider
+-     * than this, whatever the guest does with the frames -- a ByteBuffer
+-     * reader or a re-encoder gets the smaller size too. 0 (default) keeps
+-     * the codec's size. The CPU fallback does not scale; with scaling on, a
+-     * frame the GPU path could not take is left as it was, with a warning.
++     * host-max-width (needs host-nv12, or decoder mode): give the guest
++     * frames no wider than this, scaled down by the NV12 shader, and report
++     * that size in the CAPTURE format and compose rectangle. It applies to
++     * every decode wider than this, whatever the guest does with the frames
++     * -- a ByteBuffer reader or a re-encoder gets the smaller size too. 0
++     * (default) keeps the codec's size. In the proxy the CPU fallback does
++     * not scale; with scaling on, a frame the GPU path could not take is left
++     * as it was, with a warning. Decoder mode's CPU fallback scales.
+      */
+     uint32_t host_max_width;
+     /*
+@@ -522,4 +523,30 @@ int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
+                            uint8_t *payload, size_t payload_len,
+                            size_t work_len);
+ 
++/*
++ * host-max-width: the guest-facing size of a w x h host frame. Keeps the
++ * aspect ratio, rounds the height up so no source row is dropped, and keeps
++ * both even.
++ */
++static inline void virtio_media_scaled_size(uint32_t max_w, uint32_t w,
++                                            uint32_t h, uint32_t *sw,
++                                            uint32_t *sh)
++{
++    if (!max_w || !w || !h || w <= max_w) {
++        *sw = w;
++        *sh = h;
++        return;
++    }
++    *sw = max_w & ~1u;
++    *sh = (uint32_t)(((uint64_t)h * *sw + w - 1) / w);
++    *sh = (*sh + 1) & ~1u;
++}
++
++/* One host coordinate in the scaled frame, rounded to nearest. */
++static inline uint32_t virtio_media_scale_coord(uint32_t v, uint32_t to,
++                                                uint32_t from)
++{
++    return from ? (uint32_t)(((uint64_t)v * to + from / 2) / from) : v;
++}
++
+ #endif /* QEMU_VIRTIO_MEDIA_H */

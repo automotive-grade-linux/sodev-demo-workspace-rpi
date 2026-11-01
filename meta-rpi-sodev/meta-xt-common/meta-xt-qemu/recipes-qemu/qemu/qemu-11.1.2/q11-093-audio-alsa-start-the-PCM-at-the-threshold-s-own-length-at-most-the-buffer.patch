@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 25 Oct 2026 02:53:53 +0900
+Subject: [PATCH] audio/alsa: start the PCM at the threshold's own length, at
+ most the buffer
+
+alsa_set_threshold() was given audio_buffer_frames(apdo, &as,
+threshold), and audio_buffer_frames() uses the direction's
+buffer-length when one is set, in place of the microseconds it is
+passed. With out.buffer-length=100000 and threshold=60000 the start
+threshold came to 4800 frames at 48 kHz, the whole buffer, not 2880;
+and had the device granted a smaller buffer, the start threshold would
+have been above it and the PCM would never have started.
+
+Count the threshold's frames from its own microseconds and keep them
+to the buffer the device granted.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ audio/alsaaudio.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/audio/alsaaudio.c b/audio/alsaaudio.c
+index a0fdd56d9..cbb0705e5 100644
+--- a/audio/alsaaudio.c
++++ b/audio/alsaaudio.c
+@@ -533,11 +533,17 @@ static int alsa_open(bool in, struct alsa_params_req *req,
+     }
+ 
+     if (!in && aopts->has_threshold && aopts->threshold) {
+-        struct audsettings as = { .freq = freq };
+-        alsa_set_threshold(
+-            handle,
+-            audio_buffer_frames(qapi_AudiodevAlsaPerDirectionOptions_base(apdo),
+-                                &as, aopts->threshold));
++        /*
++         * The threshold's own length, at most the buffer. audio_buffer_frames()
++         * takes a buffer-length given for the direction in place of the
++         * microseconds it is passed, so with one the threshold was the whole
++         * requested buffer; and a start threshold above the buffer the device
++         * granted never starts the PCM.
++         */
++        snd_pcm_uframes_t frames =
++            ((uint64_t)freq * aopts->threshold + 500000) / 1000000;
++
++        alsa_set_threshold(handle, MIN(frames, obt_buffer_size));
+     }
+ 
+     obt->nchannels = nchannels;
+-- 
+2.43.0
+

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-gpu-virgl: poll for retired fences every 1 ms instead
+ of 10 ms
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0235-v10-virtio-gpu-virgl-poll-retired-fences-every-1-ms.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [tuning for Xen/Arm: a 1 ms fence-poll timer instead of 10 ms]
+---
+ hw/display/virtio-gpu-virgl.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 869d9ba9a..c218b7e3a 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1557,7 +1557,16 @@ static void virtio_gpu_fence_poll(void *opaque)
+     virgl_renderer_poll();
+     virtio_gpu_process_cmdq(g);
+     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
+-        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
++        /*
++         * FENCE RETIREMENT IS DISCOVERED ONLY HERE (and at the end of the
++         * ctrl handler), so a guest blocked on a fence waits for this timer.
++         * At 10 ms every such wait is rounded up to the next tick; measured on
++         * RPi4 DomA (2026-09-05) that quantization, not CPU or GPU, capped
++         * 1080p60 HW playback at 14.7 fps (~7 waits/frame) and 720p60 at
++         * 22 fps. 1 ms costs one timer wakeup per ms while fences are
++         * outstanding, which the main loop already pays for ioreqs.
++         */
++        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+     }
+ }
+ 

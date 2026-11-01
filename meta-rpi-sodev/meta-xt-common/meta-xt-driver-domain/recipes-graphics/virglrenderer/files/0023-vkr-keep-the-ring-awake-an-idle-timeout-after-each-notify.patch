@@ -1,0 +1,203 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 5 Oct 2026 19:59:36 +0900
+Subject: [PATCH] vkr: keep the ring awake an idle timeout after each notify
+
+The guest (vn_ring_submit_internal) sends vkNotifyRingMESA only when it
+reads IDLE after publishing its tail, and at most once per idle_timeout
+(1 ms), counted from a clock read after that status load. The ring
+thread went idle once idle_timeout had passed since its own last
+command, and cleared pending_notify, unlocked, on the way in.
+
+If the ring thread sees a command before that command's notify arrives -- it
+was still awake, or vkSubmitVirtqueueSeqnoMESA woke it -- the notify lands
+while it is awake and is wiped at idle entry, possibly less than 1 ms after the
+guest sent it. A submission in the rest of that 1 ms sees IDLE, is rate
+limited and sends nothing, and the guest and the ring thread wait for each
+other: the state 0022 bounds. Under Xen the window widens whenever the guest
+vCPU is preempted between the status load and the clock read.
+
+Record when each notify arrives and do not go idle until idle_timeout
+(+1/4 for clock-rate skew) after it, so a submission that reads IDLE is
+always past the guest's window; clear pending_notify under the mutex.
+
+Also make the 0022 bound VKR_RING_IDLE_WAIT_MS (1..60000, default 10),
+and classify each bounded rescue when the next notify arrives: a seqno
+at or before the rescued tail means the notify was late, a newer one
+means it was never sent. Both counts are in the rescue log line.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/venus/vkr_ring.h
++++ b/src/venus/vkr_ring.h
+@@ -102,6 +102,13 @@
+    atomic_bool pending_notify;
+    atomic_bool monitor;
+    uint64_t virtqueue_seqno;
++
++   /* 0023, all under mutex: when the guest's last vkNotifyRingMESA arrived
++    * (CLOCK_MONOTONIC ns), and the tail a bounded wake found queued without a
++    * notify, kept until the next notify tells whether it was late or lost */
++   uint64_t last_notify_ns;
++   bool rescued;
++   uint32_t rescued_tail;
+ };
+ 
+ struct vkr_ring *
+@@ -120,6 +127,9 @@
+ 
+ void
+ vkr_ring_notify(struct vkr_ring *ring);
++
++void
++vkr_ring_notify_seqno(struct vkr_ring *ring, uint32_t seqno);
+ 
+ bool
+ vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val);
+--- a/src/venus/vkr_transport.c
++++ b/src/venus/vkr_transport.c
+@@ -304,7 +304,7 @@
+       return;
+    }
+ 
+-   vkr_ring_notify(ring);
++   vkr_ring_notify_seqno(ring, args->seqno);
+ }
+ 
+ static void
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -6,6 +6,7 @@
+ #include "vkr_ring.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <sys/resource.h>
+ #include <time.h>
+ #include <pthread.h>
+@@ -37,7 +38,33 @@
+  * finds queued commands and no notify is counted and logged: that count is the
+  * measurement of how often the wake-up is lost on this transport.
+  */
+-#define VKR_RING_IDLE_WAIT_MAX_NS (10ull * 1000 * 1000)
++#define VKR_RING_IDLE_WAIT_DEFAULT_MS 10
++
++/* 0023: the bound in ms from VKR_RING_IDLE_WAIT_MS (1..60000), else the default.
++ * Read once; the render server inherits the device model's environment. */
++static uint64_t
++vkr_ring_idle_wait_ns(void)
++{
++   static atomic_uint_fast64_t cached;
++   uint64_t ns = atomic_load_explicit(&cached, memory_order_relaxed);
++   if (!ns) {
++      uint64_t ms = VKR_RING_IDLE_WAIT_DEFAULT_MS;
++      const char *s = getenv("VKR_RING_IDLE_WAIT_MS");
++      if (s && *s) {
++         char *end;
++         const unsigned long long v = strtoull(s, &end, 10);
++         if (!*end && v >= 1 && v <= 60000)
++            ms = v;
++      }
++      ns = ms * 1000000ull;
++      atomic_store_explicit(&cached, ns, memory_order_relaxed);
++   }
++   return ns;
++}
++
++/* 0023: a bounded rescue, classified when the next notify arrives */
++static atomic_uint_fast64_t vkr_ring_late_notifies;
++static atomic_uint_fast64_t vkr_ring_lost_notifies;
+ 
+ /* The ring condition variable is waited on with a CLOCK_MONOTONIC deadline, so a
+  * wall-clock step (DomD sets its clock from NTP after boot) can neither cut the
+@@ -63,10 +90,12 @@
+    /* the first few always, then sparsely: enough to count without flooding */
+    if (n <= 16 || (n & (n - 1)) == 0)
+       vkr_log("ring %u: no wake-up from the guest, %u byte(s) queued; recovered on the "
+-              "%llu ms bound (lost wake-ups so far: %llu)",
++              "%llu ms bound (rescues so far: %llu; notify late %llu, never sent %llu)",
+               (unsigned)ring->id, queued,
+-              (unsigned long long)(VKR_RING_IDLE_WAIT_MAX_NS / 1000000),
+-              (unsigned long long)n);
++              (unsigned long long)(vkr_ring_idle_wait_ns() / 1000000),
++              (unsigned long long)n,
++              (unsigned long long)atomic_load(&vkr_ring_late_notifies),
++              (unsigned long long)atomic_load(&vkr_ring_lost_notifies));
+ }
+ 
+ static inline void *
+@@ -318,8 +347,24 @@
+    int ret = 0;
+    while (ring->started) {
+       bool wait = false;
++      bool go_idle = false;
+       if (vkr_ring_now() >= last_submit + ring->idle_timeout) {
+-         ring->pending_notify = false;
++         /* The guest rate-limits its notify to one per idle_timeout, counted from
++          * when it sent the last one. Going idle sooner than that after a notify
++          * arrived lets a submission see IDLE inside the guest's window and send
++          * nothing. Stay awake until idle_timeout (+1/4 for clock rate skew)
++          * after the last notify, and clear pending_notify under the mutex so a
++          * notify racing this check cannot be wiped. */
++         mtx_lock(&ring->mutex);
++         const uint64_t notify_quiet =
++            ring->last_notify_ns + ring->idle_timeout + ring->idle_timeout / 4;
++         if (vkr_ring_now() >= notify_quiet) {
++            ring->pending_notify = false;
++            go_idle = true;
++         }
++         mtx_unlock(&ring->mutex);
++      }
++      if (go_idle) {
+          vkr_ring_set_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
+          wait = ring->buffer.cur == vkr_ring_load_tail(ring);
+          if (!wait)
+@@ -334,7 +379,7 @@
+          if (ring->started && !ring->pending_notify) {
+             struct timespec deadline;
+             clock_gettime(CLOCK_MONOTONIC, &deadline);
+-            const uint64_t ns = (uint64_t)deadline.tv_nsec + VKR_RING_IDLE_WAIT_MAX_NS;
++            const uint64_t ns = (uint64_t)deadline.tv_nsec + vkr_ring_idle_wait_ns();
+             deadline.tv_sec += ns / 1000000000ull;
+             deadline.tv_nsec = ns % 1000000000ull;
+             /* This tree's c11 shim returns thrd_busy, not thrd_timeout, on
+@@ -352,6 +397,8 @@
+                mtx_unlock(&ring->mutex);
+                continue;
+             }
++            ring->rescued = true;
++            ring->rescued_tail = ring->buffer.cur + queued;
+             vkr_ring_note_lost_notify(ring, queued);
+          }
+          vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
+@@ -443,6 +490,29 @@
+ }
+ 
+ void
++vkr_ring_notify_seqno(struct vkr_ring *ring, uint32_t seqno)
++{
++   mtx_lock(&ring->mutex);
++   ring->last_notify_ns = vkr_ring_now();
++   if (ring->rescued) {
++      /* the guest notifies with the tail it just published: one at or before
++       * the rescued tail is that submission's notify, merely late; a newer one
++       * means the rescued submission never sent its own */
++      ring->rescued = false;
++      const bool late = vkr_seqno_ge(ring->rescued_tail, seqno);
++      const uint64_t n =
++         atomic_fetch_add(late ? &vkr_ring_late_notifies : &vkr_ring_lost_notifies, 1) + 1;
++      if (!late && (n <= 16 || (n & (n - 1)) == 0))
++         vkr_log("ring %u: a rescued submission (tail %u) never sent its notify; "
++                 "the next one carries seqno %u (never sent so far: %llu)",
++                 (unsigned)ring->id, ring->rescued_tail, seqno, (unsigned long long)n);
++   }
++   ring->pending_notify = true;
++   cnd_signal(&ring->cond);
++   mtx_unlock(&ring->mutex);
++}
++
++void
+ vkr_ring_notify(struct vkr_ring *ring)
+ {
+    mtx_lock(&ring->mutex);

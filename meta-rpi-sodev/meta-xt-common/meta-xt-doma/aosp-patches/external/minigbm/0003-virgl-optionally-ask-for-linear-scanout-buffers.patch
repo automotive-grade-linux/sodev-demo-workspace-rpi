@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 23 Oct 2026 11:21:59 +0900
+Subject: [PATCH] virgl: optionally ask for linear scanout buffers
+
+On QEMU's virtio-gpu over virglrenderer, a scanout buffer is created
+as a host GL texture, and the host's GL driver lays it out the way it
+likes: BROADCOM_UIF on the Raspberry Pi's V3D. The host display cannot
+scan that out, so a composer layer the device model hands to the host
+compositor (qemu's plane handoff) is composed by the host GPU after
+all.
+
+With vendor.minigbm.scanout_linear=true, a buffer allocated with
+BO_USE_SCANOUT also carries VIRGL_BIND_LINEAR, so a virglrenderer that
+gives LINEAR | SCANOUT resources a linear gbm bo makes it scannable.
+That includes a video decoder's output buffer the composer is handed.
+Measured on a Raspberry Pi 5 against the same build with such buffers
+left tiled (H.264 1080p60 decoded in the device model and shown in a
+WebView, ten minutes a run): the host's DRM state showed the frame's own
+buffer on the primary plane in place of the compositor's GPU composite,
+V3D's render time fell from 80-84% to about 50-57%, and full screen
+58.7-59.1 frames a second were shown in three runs of four (51.2 in the
+fourth) against 40.2 and 55.9; among the HMI 59.2 and 59.3 against 56.6.
+HEVC 4K and 1080p were shown at the same rates within 0.3 fps (codec -T
+59.7-60.7; 59.6 a second for 1080p60 in a WebView among the HMI); an
+earlier 41.7-45.7 against 45.8-47.9 for 4K (2026-10-15, an older device
+model) did not reproduce. The cost is in decoding as fast as the GPU
+allows (codec -S, HEVC 1080p: 105-157 fps in six runs, against 178-182
+in four), presumably the host GPU writing each frame into a linear
+buffer. It is off by default and read once, when the driver starts.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -420,11 +420,27 @@
+ 	}
+ }
+ 
++/*
++ * vendor.minigbm.scanout_linear=true: ask the host for a linear layout for the
++ * scanout buffers (VIRGL_BIND_LINEAR next to VIRGL_BIND_SCANOUT). The host's GL
++ * driver lays a plain texture out tiled (BROADCOM_UIF on the Raspberry Pi's
++ * V3D), which the host display cannot scan out, so a composer layer handed to
++ * the host compositor (qemu's plane handoff) is composed with the GPU there; a
++ * virglrenderer that gives such a buffer a linear gbm bo (LINEAR | SCANOUT)
++ * lets it go on a plane instead. A video decoder's output buffer is one of
++ * them when the composer is handed it. Off unless the property says so; read
++ * once, when the driver starts.
++ */
++static bool virgl_scanout_linear;
++
+ static uint32_t compute_virgl_bind_flags(uint64_t use_flags)
+ {
+ 	/* In crosvm, VIRGL_BIND_SHARED means minigbm will allocate, not virglrenderer. */
+ 	uint32_t bind = VIRGL_BIND_SHARED;
+ 
++	if (virgl_scanout_linear && (use_flags & BO_USE_SCANOUT))
++		bind |= VIRGL_BIND_LINEAR;
++
+ 	handle_flag(&use_flags, BO_USE_TEXTURE, &bind, VIRGL_BIND_SAMPLER_VIEW);
+ 	handle_flag(&use_flags, BO_USE_RENDERING, &bind, VIRGL_BIND_RENDER_TARGET);
+ 	handle_flag(&use_flags, BO_USE_SCANOUT, &bind, VIRGL_BIND_SCANOUT);
+@@ -649,6 +665,14 @@
+ 	drv->priv = priv;
+ 	lru_init(&priv->virgl_blob_metadata_cache, MAX_CACHED_FORMATS);
+ 
++	{
++		const char *opt = drv_get_os_option("vendor.minigbm.scanout_linear");
++
++		virgl_scanout_linear = opt && !strcmp(opt, "true");
++		if (virgl_scanout_linear)
++			drv_logi("virgl: scanout buffers are linear on the host\n");
++	}
++
+ 	virgl_init_params_and_caps(drv);
+ 
+ 	/*

@@ -1,0 +1,154 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 1 Oct 2026 12:45:30 +0900
+Subject: [PATCH] vkr: bound the idle ring wait so a lost guest wake-up cannot hang it
+
+An idle venus ring thread sleeps in cnd_wait() until the guest sends
+vkNotifyRingMESA. The guest sends that only when it reads IDLE in the
+ring status after publishing its tail, and it does not re-send while it
+then waits for a reply: vn_ring_wait_seqno() -> vn_relax() polls the
+head and nothing else. If one wake-up is lost between the guest and this
+thread, each side waits for the other until the guest aborts by design
+after ~895 s (vn_relax, abort_order).
+
+That is the state captured four times on Raspberry Pi 4 (Xen, DomA AAOS
+WebView, DomD render server) on 2026-10-01: every vkr-ring-N thread in
+futex, pending_notify clear, qemu idle, and the guest blocked in
+vkGetMemoryResourcePropertiesMESA -- a handler that cannot block, so the
+command had never been dispatched at all. The browser either froze for
+15 minutes and then died in vn_relax, or was killed earlier by an input
+ANR.
+
+Bound the wait at 10 ms. A bounded wake that finds the ring still empty
+goes straight back to sleep with IDLE left set, so an idle ring costs
+one timed wake per period rather than the 1 ms re-poll a real wake-up
+performs. A bounded wake that finds queued commands with no notify is
+counted and logged ("no wake-up from the guest"): that count measures
+how often the wake-up is lost on this transport, which is the part still
+not explained.
+
+The ring condition variable is initialised with CLOCK_MONOTONIC so a
+wall-clock step (DomD sets its clock from NTP after boot) can neither
+shorten the bound nor stretch it into a hang.
+
+Note for anyone touching this: this tree's c11 shim returns thrd_busy on
+ETIMEDOUT, not thrd_timeout. A comparison with thrd_timeout alone is
+constant false and the compiler deletes the recovery branch -- the first
+build of this patch did exactly that, and only a check for the log
+string in the binary caught it.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -8,11 +8,67 @@
+ #include <stdio.h>
+ #include <sys/resource.h>
+ #include <time.h>
++#include <pthread.h>
+ 
+ #include "venus-protocol/vn_protocol_renderer_dispatches.h"
+ 
+ #include "vkr_context.h"
+ 
++/*
++ * BOUNDED IDLE WAIT.
++ *
++ * An idle ring thread used to sleep in cnd_wait() until the guest sent
++ * vkNotifyRingMESA. The guest only sends that when it reads IDLE in the ring status
++ * after publishing its tail, and it does not re-send while it then waits for a
++ * reply (vn_ring_wait_seqno -> vn_relax polls the head and nothing else). So if one
++ * wake-up is lost between the guest and this thread, both sides wait for each other:
++ * the guest's call never starts here, and the guest aborts by design after ~895 s
++ * (vn_relax, abort_order).
++ *
++ * That is exactly the state captured four times on RPi4 DomA/DomD (2026-10-01):
++ * every vkr-ring-N thread in futex, pending_notify clear, qemu idle, and the guest
++ * blocked in vkGetMemoryResourcePropertiesMESA -- a handler that cannot block, so the
++ * command had simply never been dispatched.
++ *
++ * Bounding the wait turns a lost wake-up into a delay of at most
++ * VKR_RING_IDLE_WAIT_MAX_NS. A bounded wake that finds the ring still empty goes
++ * straight back to sleep with IDLE left set, so an idle ring costs one timed wake
++ * per period and not the 1 ms re-poll a real wake-up performs. A bounded wake that
++ * finds queued commands and no notify is counted and logged: that count is the
++ * measurement of how often the wake-up is lost on this transport.
++ */
++#define VKR_RING_IDLE_WAIT_MAX_NS (10ull * 1000 * 1000)
++
++/* The ring condition variable is waited on with a CLOCK_MONOTONIC deadline, so a
++ * wall-clock step (DomD sets its clock from NTP after boot) can neither cut the
++ * bound short nor stretch it into a hang. cnd_t is pthread_cond_t in this tree. */
++static int
++vkr_ring_cnd_init_monotonic(cnd_t *cond)
++{
++   pthread_condattr_t attr;
++   if (pthread_condattr_init(&attr))
++      return thrd_error;
++   int ret = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
++   if (!ret)
++      ret = pthread_cond_init(cond, &attr);
++   pthread_condattr_destroy(&attr);
++   return ret ? thrd_error : thrd_success;
++}
++
++static void
++vkr_ring_note_lost_notify(struct vkr_ring *ring, uint32_t queued)
++{
++   static atomic_uint_fast64_t lost;
++   const uint64_t n = atomic_fetch_add(&lost, 1) + 1;
++   /* the first few always, then sparsely: enough to count without flooding */
++   if (n <= 16 || (n & (n - 1)) == 0)
++      vkr_log("ring %u: no wake-up from the guest, %u byte(s) queued; recovered on the "
++              "%llu ms bound (lost wake-ups so far: %llu)",
++              (unsigned)ring->id, queued,
++              (unsigned long long)(VKR_RING_IDLE_WAIT_MAX_NS / 1000000),
++              (unsigned long long)n);
++}
++
+ static inline void *
+ get_resource_pointer(const struct vkr_resource *res, size_t offset)
+ {
+@@ -142,7 +198,7 @@
+    if (mtx_init(&ring->mutex, mtx_plain) != thrd_success)
+       goto err_mtx_init;
+ 
+-   if (cnd_init(&ring->cond) != thrd_success)
++   if (vkr_ring_cnd_init_monotonic(&ring->cond) != thrd_success)
+       goto err_cond_init;
+ 
+    return ring;
+@@ -274,8 +330,30 @@
+          TRACE_SCOPE("ring idle");
+ 
+          mtx_lock(&ring->mutex);
+-         if (ring->started && !ring->pending_notify)
+-            cnd_wait(&ring->cond, &ring->mutex);
++         bool timed_out = false;
++         if (ring->started && !ring->pending_notify) {
++            struct timespec deadline;
++            clock_gettime(CLOCK_MONOTONIC, &deadline);
++            const uint64_t ns = (uint64_t)deadline.tv_nsec + VKR_RING_IDLE_WAIT_MAX_NS;
++            deadline.tv_sec += ns / 1000000000ull;
++            deadline.tv_nsec = ns % 1000000000ull;
++            /* This tree's c11 shim returns thrd_busy, not thrd_timeout, on
++             * ETIMEDOUT (src/mesa/compat/c11/threads_posix.h). Comparing with
++             * thrd_timeout alone is always false -- the compiler then deletes the
++             * whole recovery branch, which is what the first build of this patch
++             * did. Accept both so a fixed shim cannot silently break it again. */
++            const int wr = cnd_timedwait(&ring->cond, &ring->mutex, &deadline);
++            timed_out = wr == thrd_busy || wr == thrd_timeout;
++         }
++         if (timed_out && ring->started && !ring->pending_notify) {
++            const uint32_t queued = vkr_ring_load_tail(ring) - ring->buffer.cur;
++            if (!queued) {
++               /* still empty: stay idle, IDLE stays set, no 1 ms re-poll */
++               mtx_unlock(&ring->mutex);
++               continue;
++            }
++            vkr_ring_note_lost_notify(ring, queued);
++         }
+          vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
+          mtx_unlock(&ring->mutex);
+ 

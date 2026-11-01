@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 08:57:53 +0900
+Subject: [PATCH] virtio-media: decoder mode: set the nice value of the
+ software frame threads
+
+A software codec (H.264) decodes on two libavcodec frame threads
+(q11-079), and they take the nice value of the thread that creates
+them, which is the device model's. A board that runs the device model
+at a raised priority so the guest's waits on it are answered soon
+therefore runs its heaviest work at that priority too, beside the
+threads the guest waits for: the main loop, the ioreq thread and the
+TX thread of the sound card. Measured on a Raspberry Pi 5
+(2026-10-24), H.264 1080p60 played in a WebView beside the HMI, with
+the device model at nice -19: the two frame threads took 56-67% of a
+CPU each, and DomD's two vCPUs were idle 18-22% of 200%.
+
+The new property dec-sw-nice sets their nice value. libavcodec creates
+the frame threads inside avcodec_open2(), and a new thread inherits
+its creator's nice value, so avcodec_open2() runs on a short-lived
+thread of its own at dec-sw-nice while the main loop waits for it;
+that thread ends and the frame threads stay. The main loop's own nice
+value is never touched, so nothing has to be raised back. Every open
+does this: a new session and S_FMT picking another codec. The default,
+20, is outside the nice range and leaves the threads at the device
+model's value, as before; realize refuses another value outside -20 to
+19. A hardware-accelerated codec (HEVC) is not affected.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
+---
+ hw/virtio/virtio-media-decoder.c | 51 +++++++++++++++++++++++++++++++-
+ hw/virtio/virtio-media.c         |  8 +++++
+ include/hw/virtio/virtio-media.h |  8 +++++
+ 3 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 8204d1d3e..a129190ca 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -78,6 +78,7 @@
+ #include <libswscale/swscale.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/resource.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-heap.h>
+ 
+@@ -3478,6 +3479,54 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+     return fmts[0];
+ }
+ 
++/*
++ * q11-dec-sw-nice: avcodec_open2(), with a software codec's frame threads at
++ * dec-sw-nice. They are created inside it (ff_frame_thread_init(), checked in
++ * rpidistro-ffmpeg 7.1) and a new thread inherits its creator's nice value, so
++ * avcodec_open2() runs on a thread of its own at that value while the main
++ * loop waits for it; that thread ends, the frame threads stay. The two frame
++ * threads of a 1080p60 H.264 stream take about 60% of a CPU each, at the
++ * device model's nice -19 otherwise: the main loop, the ioreq thread and the
++ * TX thread of the sound card, which the guest waits for, would then share the
++ * CPU with them evenly. The main loop's own nice value is never changed, so
++ * nothing has to be raised back (which would need CAP_SYS_NICE). A device
++ * model under a real-time policy is unaffected: nice does not apply to it.
++ */
++typedef struct DecOpen {
++    AVCodecContext *avctx;
++    const AVCodec *codec;
++    int nice;
++    int ret;
++} DecOpen;
++
++static void *dec_open_run(void *opaque)
++{
++    DecOpen *o = opaque;
++
++    /* Linux: PRIO_PROCESS 0 is the calling thread */
++    if (setpriority(PRIO_PROCESS, 0, o->nice) < 0) {
++        warn_report_once("virtio-media/dec: dec-sw-nice %d: %s", o->nice,
++                         strerror(errno));
++    }
++    o->ret = avcodec_open2(o->avctx, o->codec, NULL);
++    return NULL;
++}
++
++static int dec_avcodec_open(VirtIOMediaSession *s, const AVCodec *codec)
++{
++    VirtIOMediaDec *d = s->dec;
++    DecOpen o = { d->avctx, codec, s->vm->dec_sw_nice, 0 };
++    QemuThread t;
++
++    if (d->codec->hwaccel || o.nice == VIRTIO_MEDIA_DEC_SW_NICE_INHERIT) {
++        return avcodec_open2(d->avctx, codec, NULL);
++    }
++    qemu_thread_create(&t, "vmedia-open", dec_open_run, &o,
++                       QEMU_THREAD_JOINABLE);
++    qemu_thread_join(&t);
++    return o.ret;
++}
++
+ /*
+  * Set up libavcodec for d->codec. At open with the device's first codec, and
+  * again when S_FMT(OUTPUT) picks another one (before any OUTPUT buffer, so
+@@ -3541,7 +3590,7 @@ static int dec_codec_open(VirtIOMediaSession *s)
+         d->avctx->hw_device_ctx = av_buffer_ref(d->hwdev);
+         d->avctx->get_format = dec_get_format;
+     }
+-    if (avcodec_open2(d->avctx, codec, NULL) < 0) {
++    if (dec_avcodec_open(s, codec) < 0) {
+         avcodec_free_context(&d->avctx);
+         return ENOMEM;
+     }
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 4726b93c0..460b0a3a8 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -3372,6 +3372,12 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+         error_setg(errp, "virtio-media: host-sand must be 0, 1 or 2");
+         return;
+     }
++    if (vm->dec_sw_nice != VIRTIO_MEDIA_DEC_SW_NICE_INHERIT &&
++        (vm->dec_sw_nice < -20 || vm->dec_sw_nice > 19)) {
++        error_setg(errp, "virtio-media: dec-sw-nice must be a nice value, "
++                   "-20 to 19 (or 20, the default: inherited)");
++        return;
++    }
+     if (vm->host_sand && (!vm->host_nv12 || !vm->gpu_xfer)) {
+         warn_report("virtio-media: host-sand has no effect without "
+                     "host-nv12=on and gpu-xfer=on");
+@@ -3531,6 +3537,8 @@ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_UINT32("host-max-width", VirtIOMedia, host_max_width, 0),
+     DEFINE_PROP_BOOL("output-coherent", VirtIOMedia, output_coherent, false),
+     DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
++    DEFINE_PROP_INT32("dec-sw-nice", VirtIOMedia, dec_sw_nice,
++                      VIRTIO_MEDIA_DEC_SW_NICE_INHERIT),
+ };
+ 
+ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index e7ef9ac3a..f06aa146e 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -434,6 +434,14 @@ struct VirtIOMedia {
+      * DomD's Mesa advertises the extension (checked 2026-09-07).
+      */
+     bool gpu_fence_fd;
++#define VIRTIO_MEDIA_DEC_SW_NICE_INHERIT 20
++    /*
++     * dec-sw-nice: the nice value of libavcodec's frame threads for a
++     * software codec (H.264), which otherwise inherit the device model's.
++     * VIRTIO_MEDIA_DEC_SW_NICE_INHERIT (the default) leaves them at it;
++     * realize refuses anything else outside -20 to 19.
++     */
++    int32_t dec_sw_nice;
+ 
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;
+-- 
+2.43.0
+

@@ -89,13 +89,14 @@
 #     service only runs `cmd wifi set-wifi-enabled` / `connect-network VirtWifi`
 #     (the product installs an empty virtwifi.rc over it), and cuttlefish's
 #     setup_wifi, which is what creates the interface, is gated on
-#     ro.boot.wifi_impl=virt_wifi -- empty here. There is no wlan0 to protect.
+#     ro.boot.wifi_impl=virt_wifi -- empty here. There is no virtwifi wlan0 to
+#     protect (this product's wlan0 is the shadow AP's mac80211_hwsim station).
 #   - doma.cfg gives DomA two vifs on the same bridge, so eth0 and eth1 were both
 #     taking a lease out of 192.168.10.0/24 (.14 and .13) and
 #     ConnectivityService carried two ETHERNET networks, one of which never
 #     validated. Spending one of them on the radio HAL removes that duplication.
-#     eth1 keeps .13, which is the address dnsmasq reserves for DomA and the one
-#     adb connects to.
+#     eth1 then becomes a port of the shadow AP's bridge, so DomA takes its lease
+#     on wlan0, not on eth1's .13 reservation (see init.xenvm-hwsim.rc).
 # Clearing the property instead of starting the service was considered and
 # rejected: aosp_trout_common.mk sets it with an unconditional `+=` into
 # PRODUCT_VENDOR_PROPERTIES, so a later assignment does not remove it.

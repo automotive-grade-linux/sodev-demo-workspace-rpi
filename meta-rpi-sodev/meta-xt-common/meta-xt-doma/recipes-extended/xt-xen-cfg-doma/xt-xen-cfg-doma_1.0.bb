@@ -41,11 +41,12 @@ BOARD_RAM ??= "16g"
 # and the BOARD_RAM map in do_install is not consulted. Empty means "use the map".
 DOMA_MEM_MiB ??= ""
 
-# DomA's vCPU count and its physical-core mask: 2 vCPUs on pcpu 2-3 on every board,
-# off the pcpus DomD and its device model run on. The measurements behind it are in
-# doma.cfg next to the two tokens. Board layers can still override either.
+# DomA's vCPU count and the pcpu of each vCPU, in order (space separated; one entry
+# per vCPU, each a pcpu or a range): 2 vCPUs on pcpu 2 and 3 on every board, off the
+# pcpus DomD and its device model run on. The measurements behind it are in doma.cfg
+# next to the two tokens. Board layers can still override either.
 DOMA_VCPUS ?= "2"
-DOMA_CPUS ?= "2-3"
+DOMA_CPUS ?= "2 3"
 
 # [Venus] virtio-gpu-gl device-model options, from the moulin GPU parameter (see
 # do_install). Defaulted for the same reason BOARD_RAM is defaulted a few lines above:
@@ -77,16 +78,17 @@ XT_VENUS_GPU_OPTS ??= ""
 XT_VENUS_V3DV_BO_CACHE_MIB ??= "8"
 XT_VENUS_VKR_DEVICE_HEAP_MIB ??= "1088"
 # [qemu 10] The qemu version the guests' device model is built from. It comes from
-# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: 10.0.2 in the
-# default GPU=vulkan lane (meta-xt-qemu/qemu_10.0.2.bb, docs/VULKAN-VENUS.md),
+# PREFERRED_VERSION_qemu, which the moulin conf sets per lane: in the default
+# GPU=vulkan lane 11.1.2 on both boards (qemu_11.1.2.bb; docs/VULKAN-VENUS.md), or
+# 10.0.2 where a board selects meta-xt-qemu/qemu_10.0.2.bb instead,
 # 7.0.0 for --gpu=gl -- which is the yaml's base value, left standing.
 #
 # The '7.0.0' fallback below is deliberately the OLDER of the two, because the
 # 7.0.0-only syntax is the conservative choice: every qemu in this tree parses
 # the config it produces, whereas the 10.x form makes a 7.0.0 device model exit
 # on an unknown property. It is not a safe default in general, though: a build
-# that leaves PREFERRED_VERSION_qemu unset gets oe-core's qemu
-# (10.2.0 at the time of writing) while this fallback still emits the 7.0.0-only
+# that leaves PREFERRED_VERSION_qemu unset gets meta-xt-qemu's newest default qemu
+# (10.0.2 at the time of writing) while this fallback still emits the 7.0.0-only
 # syntax, and that device model exits on it. Such a build must set
 # XT_DM_QEMU_VERSION itself. Inside moulin the variable is always set, so the
 # fallback only ever applies to a bare `bitbake` in this tree's own conf.
@@ -95,13 +97,12 @@ XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 # [hardware decode] Whether DomA is given a virtio-media device. Comes from the
 # moulin GPU parameter through the domd and dom0 component confs, for a reason that
 # is a hard dependency and not a policy: the decoder the guest talks to IS a
-# virtio-media device, and only the qemu 10.0.2 device model has one, so GPU=gl is
-# false, and GPU=vulkan gives whatever the board yaml sets for that lane: true,
-# except in a Dom0 flavour whose DomD has no decoder (the Pi 5's linux one). The
-# same parameter sets it on the AOSP side, where it
-# gates the c2 HAL and its seccomp policy (the HAL's sepolicy is built in every
-# lane) -- the two halves must agree or the guest declares a HAL for a device
-# that is not on the bus.
+# virtio-media device, which only the qemu 10.0.2 and 11.1.2 device models have, so
+# GPU=gl is false, and GPU=vulkan gives whatever the board yaml sets for that lane:
+# true, except in a Dom0 flavour whose DomD has no decoder (the Pi 5's linux one).
+# The same parameter sets it on the AOSP side, where it gates the c2 HAL and its
+# seccomp policy (the HAL's sepolicy is built in every lane) -- the two halves must
+# agree or the guest declares a HAL for a device that is not on the bus.
 #
 # Defaulted for the same reason BOARD_RAM is: a standalone bitbake outside moulin
 # must still install a working config, and "no decoder" is the one configuration
@@ -123,6 +124,8 @@ XT_DOMA_HWDEC ??= "false"
 #         and a request fd per frame, neither of which virtio-media can carry.
 #         qemu patches 0217-v10/0218-v10 therefore synthesise a stateful decoder
 #         and drive the stateless side through libavcodec's v4l2request hwaccel.
+#         With qemu 11.1.2 meta-xt-rpi5 makes it decoder=hevc+h264: the same
+#         device decodes H.264 too, in software (q11-072..074).
 #
 # The default is the RPi4 value and only raspberrypi5 overrides it, so the boards
 # that do not set it keep the generated file they had.
@@ -149,6 +152,8 @@ XT_DOMA_HWDEC ??= "false"
 #   gpu-fence-fd     export the blit fence as a sync_file and poll it, instead of two
 #                    eglMakeCurrent calls per CAPTURE QBUF.
 XT_DOMA_HWDEC_DEVARG ?= "v4l2-device=/dev/video10,output-coherent=on,gpu-fence-fd=on"
+# meta-xt-rpi5 appends +h264 (RPI5_DOMA_H264), its host-sand and gpu-fence-fd
+# (RPI5_DOMA_HOST_SAND) and host-max-width (RPI5_DOMA_HWDEC_MAX_W) to this.
 XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
 
 # [display] Extra virtio-gpu-gl-pci properties, substituted only on the qemu 10
@@ -161,6 +166,35 @@ XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
 # 37.5 Hz. The RPi5 verification image ran with the same value (2026-09-21). Both
 # boards' DomA panels are 60 Hz, so it is the default rather than a board override.
 XT_DOMA_GPU_PROPS ??= "refresh_rate=60000,"
+
+# [overlay planes] How many overlay planes DomA's display gets.
+# It is a pair, and both halves come from here: the device model's virtio-gpu
+# overlay-planes=N (qemu 10.0.2 patch 0250-v10-virtio-gpu-gl-sdl2-overlay-planes, q11-051)
+# and DomA's virtio_gpu.overlay_planes=N (aosp-kernel-patches/common/0001-drm-virtio-
+# overlay-planes-on-output-0). With them drm_hwcomposer scans the app out on the
+# primary plane and the system bars on the overlays, so SurfaceFlinger stops
+# compositing on the GPU. Measured on the RPi4 2026-10-02 (a 640x360 video playing
+# in a WebView): all three layers DEVICE, dropped frames 35% -> 25% (Vulkan HWUI) and
+# 21% -> 13.5% (GL HWUI).
+# 0 (the default here) turns both off; a board may set its own value in its
+# xt-xen-cfg-doma bbappend. The qemu 7.0.0 device model (GPU=gl lane) has no such property,
+# so that lane gets neither, whatever this says. Only the SDL GL display draws the
+# overlays; doma.cfg uses -display sdl,gl=es on both boards.
+# Keep the halves together: a guest kernel without the patch would treat the extra
+# scanouts as extra (disconnected) connectors; a kernel with it and
+# a device model without overlay-planes simply finds too few scanouts and falls back.
+XT_DOMA_OVERLAY_PLANES ??= "0"
+
+# [plane scaling] 1 = DomA's virtio_gpu.plane_scaling=1 (aosp-kernel-patches/common/
+# 0002-drm-virtio-primary-plane-rect): the primary plane may be positioned and scaled,
+# its destination going to the device in VIRTIO_GPU_CMD_SET_PRIMARY_RECT. Needs a device
+# model with the handler, which only qemu 11.1.2 has (its patch q11-064), so it
+# is off here and do_install refuses it with any other device model. Measured on
+# the RPi4 2026-10-12/13 with XT_DOMA_OVERLAY_PLANES = "3": the non-fullscreen WebView
+# ("HMI + video", the scaled video underlay on the primary) goes from all four layers
+# CLIENT to all DEVICE, local 720p60 40 -> 52-55 fps; fullscreen 1080p60 and Gallery
+# unchanged. Without overlays it does nothing useful, so it requires XT_DOMA_OVERLAY_PLANES > 0.
+XT_DOMA_PLANE_SCALING ??= "0"
 
 
 do_compile() {
@@ -212,11 +246,28 @@ do_install() {
     if ! grep -q '^vcpus = DOMA_VCPUS_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "DOMA_VCPUS_PLACEHOLDER not found in doma.cfg"
     fi
-    if ! grep -q '^cpus = "DOMA_CPUS_PLACEHOLDER"$' ${D}${sysconfdir}/xen/doma.cfg; then
+    if ! grep -q '^cpus = DOMA_CPUS_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "DOMA_CPUS_PLACEHOLDER not found in doma.cfg"
     fi
+    # xl's list form, one pcpu (or range) per vCPU: cpus = ["2", "3"]
+    doma_cpus=""
+    doma_sep=""
+    for c in ${DOMA_CPUS}; do
+        case "$c" in
+        *[!0-9-]*|-*|*-|*-*-*) bbfatal "DOMA_CPUS: '$c' is not a pcpu or a range of pcpus" ;;
+        *-*) [ "${c%-*}" -le "${c#*-}" ] || bbfatal "DOMA_CPUS: '$c' is a range from high to low" ;;
+        esac
+        doma_cpus="$doma_cpus$doma_sep\"$c\""
+        doma_sep=", "
+    done
+    # Counted with wc rather than $((...)): bitbake's shell parser cannot take
+    # arithmetic expansion and fails the whole recipe at parse time.
+    doma_ncpus=$(echo ${DOMA_CPUS} | wc -w)
+    if [ "$doma_ncpus" != "${DOMA_VCPUS}" ]; then
+        bbfatal "DOMA_CPUS has $doma_ncpus entries for DOMA_VCPUS=${DOMA_VCPUS}: one per vCPU"
+    fi
     sed -i -e "s/^vcpus = DOMA_VCPUS_PLACEHOLDER\$/vcpus = ${DOMA_VCPUS}/" \
-           -e "s/^cpus = \"DOMA_CPUS_PLACEHOLDER\"\$/cpus = \"${DOMA_CPUS}\"/" \
+           -e "s/^cpus = DOMA_CPUS_PLACEHOLDER\$/cpus = [$doma_cpus]/" \
         ${D}${sysconfdir}/xen/doma.cfg
 
     # [Venus] Substitute the virtio-gpu-gl device-model options. XT_VENUS_GPU_OPTS
@@ -251,8 +302,14 @@ do_install() {
     if ! grep -q '^    XT_VENUS_QEMU_ENV_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "XT_VENUS_QEMU_ENV_PLACEHOLDER not found in doma.cfg"
     fi
+    # VKR_RING_IDLE_WAIT_MS=1000: an idle Venus ring thread wakes once a second
+    # instead of every 10 ms to look for a missed notification (virglrenderer 0022
+    # bounds the wait, 0023 makes the bound this variable). Measured on the RPi4:
+    # idle wake-ups 975 -> about 10 a second. VKR_RING_RELAX=0,100: between commands
+    # the ring thread sleeps from 100 us instead of yielding 15 times and sleeping from
+    # 10 us (virglrenderer 0025; measured on the Raspberry Pi 5 only).
     if [ -n "${XT_VENUS_GPU_OPTS}" ]; then
-        venus_env="    'VIRGL_EXTERNAL_GBM=1', 'V3DV_MAX_BO_CACHE_SIZE=${XT_VENUS_V3DV_BO_CACHE_MIB}', 'VKR_DEVICE_HEAP_MIB=${XT_VENUS_VKR_DEVICE_HEAP_MIB}',"
+        venus_env="    'VIRGL_EXTERNAL_GBM=1', 'V3DV_MAX_BO_CACHE_SIZE=${XT_VENUS_V3DV_BO_CACHE_MIB}', 'VKR_DEVICE_HEAP_MIB=${XT_VENUS_VKR_DEVICE_HEAP_MIB}', 'VKR_RING_IDLE_WAIT_MS=1000', 'VKR_RING_RELAX=0,100',"
     else
         venus_env=""
     fi
@@ -288,7 +345,7 @@ do_install() {
     # fails here.
     if [ "$doma_hwdec" = "yes" ]; then
         case "${XT_DM_QEMU_VERSION}" in
-        7.*) bbfatal "XT_DOMA_HWDEC=true with a qemu ${XT_DM_QEMU_VERSION} device model: virtio-media exists only in the 10.0.2 one" ;;
+        7.*) bbfatal "XT_DOMA_HWDEC=true with a qemu ${XT_DM_QEMU_VERSION} device model: virtio-media exists only in the 10.0.2 and 11.1.2 ones" ;;
         esac
     fi
     # Fail loudly rather than ship a placeholder: xl's parser would reject the bare
@@ -321,7 +378,7 @@ do_install() {
     fi
 
     # [audio] Substitute the virtio-snd device-model property that only the patched
-    # qemu 10.0.2 has, and empty the token on 7.0.0.
+    # qemu 10.0.2 and 11.1.2 have, and empty the token on 7.0.0.
     #
     # tx-poll-us comes from qemu patch
     # 0243-v10-virtio-snd-drain-tx-from-a-dedicated-thread.patch: it drains the TX
@@ -362,11 +419,32 @@ do_install() {
         bbfatal "doma.cfg: tx-poll-us left in for qemu ${XT_DM_QEMU_VERSION}, whose device model has no such property"
     fi
 
+    # [bluetooth] The HCI chardev's retry option, keyed on the device model's version
+    # like tx-poll-us above. doma.cfg spells it reconnect=1, which 7.0.0 and 10.0.2
+    # take; qemu removed `reconnect` in 10.2, so 11.1.2 only has reconnect-ms
+    # (chardev/char.c) and its device model refuses the option and exits, taking
+    # DomA's disk with it (one device model serves every DomA virtio device).
+    bt_from="socket,path=/run/bt-hci.sock,server=off,reconnect=1,"
+    grep -q "$bt_from" ${D}${sysconfdir}/xen/doma.cfg || \
+        bbfatal "doma.cfg: the Bluetooth chardev '$bt_from' not found"
+    case "${XT_DM_QEMU_VERSION}" in
+    11.*)
+        sed -i "s|$bt_from|socket,path=/run/bt-hci.sock,server=off,reconnect-ms=1000,|" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "socket,path=/run/bt-hci.sock,server=off,reconnect-ms=1000," ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: reconnect-ms=1000 did not reach the Bluetooth chardev"
+        if grep -v '^[[:space:]]*#' ${D}${sysconfdir}/xen/doma.cfg | grep -q 'reconnect='; then
+            bbfatal "doma.cfg: a chardev reconnect= left in for qemu ${XT_DM_QEMU_VERSION}, which has no such option"
+        fi
+        ;;
+    esac
+
     # [display] Substitute the board's extra virtio-gpu-gl-pci properties on the
     # qemu 10 device model, and empty the token on 7.0.0. Keyed on the device
     # model's version for the same reason as tx-poll-us above: the properties this
-    # carries come from patches only the 10.0.2 device model has (refresh_rate is
-    # 0236), and a 7.0.0 device model exits on an unknown property.
+    # carries come from patches only the 10.0.2 and 11.1.2 device models have
+    # (refresh_rate is 0236 / q11-039), and a 7.0.0 device model exits on an unknown
+    # property.
     if ! grep -q 'virtio-gpu-gl-pci,XT_DOMA_GPU_PROPS_PLACEHOLDER' ${D}${sysconfdir}/xen/doma.cfg; then
         bbfatal "XT_DOMA_GPU_PROPS_PLACEHOLDER not found in doma.cfg"
     fi
@@ -384,6 +462,43 @@ do_install() {
         grep -q "virtio-gpu-gl-pci,$doma_gpu_props" ${D}${sysconfdir}/xen/doma.cfg || \
             bbfatal "doma.cfg: '$doma_gpu_props' did not reach the virtio-gpu -device line"
     fi
+
+    # [overlay planes] both halves of XT_DOMA_OVERLAY_PLANES, or neither.
+    case "${XT_DOMA_OVERLAY_PLANES}" in
+    0|1|2|3) ;;
+    *) bbfatal "XT_DOMA_OVERLAY_PLANES='${XT_DOMA_OVERLAY_PLANES}': expected 0..3" ;;
+    esac
+    case "${XT_DM_QEMU_VERSION}" in
+    7.*) doma_overlays=0 ;;
+    *)   doma_overlays="${XT_DOMA_OVERLAY_PLANES}" ;;
+    esac
+    if [ "$doma_overlays" != 0 ]; then
+        sed -i -e "s/'virtio-gpu-gl-pci,$doma_gpu_props/&overlay-planes=$doma_overlays,/" \
+               -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.overlay_planes=$doma_overlays\"/" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "virtio-gpu-gl-pci,${doma_gpu_props}overlay-planes=$doma_overlays," ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: overlay-planes=$doma_overlays did not reach the virtio-gpu -device line"
+        grep -q "^extra = \".* virtio_gpu.overlay_planes=$doma_overlays\"\$" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: virtio_gpu.overlay_planes=$doma_overlays did not reach DomA's command line"
+    fi
+
+    # [plane scaling] DomA's half only (the device model's half is qemu 11's q11-064).
+    case "${XT_DOMA_PLANE_SCALING}" in
+    0) ;;
+    1)
+        [ "$doma_overlays" != 0 ] || \
+            bbfatal "XT_DOMA_PLANE_SCALING=1 needs XT_DOMA_OVERLAY_PLANES > 0 (and not the qemu 7 lane)"
+        case "${XT_DM_QEMU_VERSION}" in
+        11.*) ;;
+        *) bbfatal "XT_DOMA_PLANE_SCALING=1 needs the qemu 11 device model (XT_DM_QEMU_VERSION='${XT_DM_QEMU_VERSION}')" ;;
+        esac
+        sed -i -e "s/^\(extra = \".*\)\"\$/\1 virtio_gpu.plane_scaling=1\"/" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "^extra = \".* virtio_gpu.plane_scaling=1\"\$" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: virtio_gpu.plane_scaling=1 did not reach DomA's command line"
+        ;;
+    *) bbfatal "XT_DOMA_PLANE_SCALING='${XT_DOMA_PLANE_SCALING}': expected 0 or 1" ;;
+    esac
 
     # [qemu 10] Device-model argument fixups. Two of the options in doma.cfg are
     # 7.0.0-xt-only and qemu 10 EXITS on either one -- both measured on RPi5:
@@ -461,6 +576,7 @@ do_install[vardeps] += "XT_DM_QEMU_VERSION"
 # lane's device, or the other board's backend argument.
 do_install[vardeps] += "XT_DOMA_HWDEC XT_DOMA_HWDEC_DEVARG"
 do_install[vardeps] += "XT_DOMA_GPU_PROPS"
+do_install[vardeps] += "XT_DOMA_OVERLAY_PLANES XT_DOMA_PLANE_SCALING"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \

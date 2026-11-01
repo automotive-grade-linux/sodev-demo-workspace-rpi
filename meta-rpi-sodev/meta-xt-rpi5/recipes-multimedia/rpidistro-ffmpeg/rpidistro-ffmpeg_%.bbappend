@@ -20,11 +20,12 @@
 #   3. libavfilter/vf_unsand.o is not built either -- configure derives
 #      unsand_filter_select from "sand".
 #
-# And the host needs a linear frame, not the guest: qemu's decoder mode brings
-# each hardware frame back to the CPU with av_hwframe_transfer_data(), which
-# lands in the driver's sw_format, rpi4_8 (SAND/COL128), and converts it with
-# libswscale, whose COL128 detiling is the code in 2. The guest never sees a
-# COL128 format; it gets the formats decoder mode offers.
+# And the host needs it, not the guest: qemu's decoder mode gets each frame as a
+# DRM frame (1.), and a frame it brings back to the CPU with
+# av_hwframe_transfer_data() lands in YUV420P, detiled by
+# av_rpi_sand_to_planar_frame() (the code in 2); libswscale then converts that to
+# RGBA. The guest never sees a COL128 format; it gets the formats decoder mode
+# offers.
 #
 # `mmal` and `vout-drm` are deliberately NOT restored with it. mmal is the
 # VideoCore MMAL/OMX path, which needs the closed userland blobs and is
@@ -36,3 +37,17 @@
 # and the v4l-request/drm/udev PACKAGECONFIGs are in the default set, which is
 # where configure's libdrm and libudev dependencies come from.
 PACKAGECONFIG:append:raspberrypi5 = " sand"
+
+# The one-buffer SAND (NV12_COL128) for 8-bit HEVC, not the two-buffer NV12MT_COL128
+# that rpi-hevc-dec lists first: qemu's GL import of a SAND frame (the Raspberry Pi 4
+# proxy's, q11-059) takes one dmabuf with the chroma at an offset, the layout
+# bcm2835-codec gives. See the patch.
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+SRC_URI:append:raspberrypi5 = " file://0001-v4l2request-hevc-take-the-one-buffer-SAND-for-8-bit-output.patch"
+
+# A bounded wait for a free destination buffer: qemu's decoder mode decodes on its
+# decode thread (q11-083), and a frame the display holds is let go only on qemu's
+# main loop, which may itself be waiting for that thread (a stop, a codec switch), so
+# an unbounded wait there could not end. See the patch, whose description is of the
+# decode on the main loop it was written for.
+SRC_URI:append:raspberrypi5 = " file://0002-v4l2request-bound-the-wait-for-a-free-destination-buffer.patch"

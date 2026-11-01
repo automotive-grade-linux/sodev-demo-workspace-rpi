@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 27 Oct 2026 22:42:21 +0900
+Subject: [PATCH] ui/sdl2-wl-scanout: give a plane its producer's buffer
+
+The plane handoff (q11-066) hands weston each guest plane as the export
+of its GL texture. When the texture is a decoder's output -- the video
+of a WebView, a layer of its own under the app's window or among the
+HMI -- the decoder's SAND buffer is published for it (q11-071), but
+only a lone full-screen scanout ever took it, so the decoder converted
+every frame into the texture on the GPU and weston was handed that.
+
+With /run/qemu-plane-sand a plane whose texture has a current entry with
+a fourcc gets the producer's buffer instead, as the full-screen path
+does: the WlScanBuf of that path (asynchronous create, the owner told
+hold(true) once the plane shows it and hold(false) on weston's release),
+with a viewport whose source is the texture's rectangle in the buffer's
+pixels (DirectScanout.src_w/src_h give the texture area a larger buffer
+fills; 0 means 1:1) clamped to the buffer, so the HVS scales a 4K frame
+onto a 1080p plane. A buffer is not taken when it names another
+virtio-gpu resource than the plane's (the GL name went to a new one) or
+has another size than the texture without saying what area it fills (the
+Raspberry Pi 4's proxy). The flush is a hit when a plane got one and
+every plane whose texture has an entry got its; it is reported before
+any texture is exported, so a miss makes the skipped conversions first
+(sdl2-gl.c reports a false return before its blit). A producer may skip
+only while the last flush, a hit, took its buffer
+(direct_scanout_note_shown), so a second decoder whose video DomA
+composes on its GPU, on no plane, does not skip; and a flush is a hit
+only if every producer with conversions to catch up had its buffer
+taken. A miss runs the catch-up of every such producer, a bounded number
+of conversions each, and a producer stays listed until its catch-up is
+done (the registry kept only the last one's before). The decoder's
+catch-up makes at most 12 conversions a miss and says when none is left;
+the Raspberry Pi 4 proxy's (virtio-media.c) makes all of its copies at
+once. The proxy asks to skip as itself too: its buffer is taken in the
+full-screen path; in the plane layout the proxy's entry is taken only at
+the texture's own size, unless the proxy says what area of the texture
+it fills. A buffer the planes attach is no longer the direct path's last
+commit, so that path commits it again when it takes over.
+
+A hit lets the producer skip conversions in this layout too (decided
+2026-10-19, against keeping the conversions): should DomA compose the
+video on its GPU meanwhile -- a screenshot, a client composition -- it
+samples what the texture was last converted to, an older frame of the
+stream or none yet. Seen on the board with screencap while a 1080p video
+played among the HMI: consecutive screenshots went back and forth
+between two frames. Without skipping, the same layout cost V3D 18 -> 48%
+at 1080p and 4K60 in a WebView fell from 42 to 19 frames shown a second.
+
+A fourcc buffer larger than the window is attached whole by the
+full-screen path, and SDL 2.32's own wp_viewport on the window surface
+shows it at the window's size; without wp_viewporter it is refused,
+since SDL then has no viewport either.
+
+Two cases are left as they are. A buffer the full-screen path attached
+stays on the window surface, and its frame held (in DomD's CMA, 12.4 MB
+at 4K, also after its decoder closed), while the planes have the
+display, until that path commits again; plane 0 is opaque and a
+scaled primary has the black backdrop under it, so it is not seen
+(without the dma-buf heap there is no backdrop). A wl_buffer weston
+still has to release when it is attached again -- also when a plane
+that moves is unmapped and mapped again in one present -- would see
+that release clear its state; weston releases a buffer once, when no
+surface has it any more, and this was not seen to go wrong.
+
+Measured on a 16 GB Raspberry Pi 5 running the 8g image, DomD's CMA
+640 MiB, DomA's scanout buffers linear (vendor.minigbm.scanout_linear)
+and q11-082 (2026-10-19):
+  - HEVC 1080p60 in a WebView among the HMI: 58 frames shown a second,
+    V3D render 18.3-18.8%, DomA's output on five planes (the black
+    backdrop, the SAND frame on an overlay scaled to 1614x908, three
+    AB24 layers), hvs_underrun 0. Without plane-sand the video is the
+    texture's UIF export, which no vc4 RGB plane takes (expected, not
+    measured in this layout, with the decoder's output not linear then).
+  - HEVC 4K60 full screen in the WebView: 41.8-43.2 frames shown a
+    second in five runs (25.3 with neither this nor q11-082, and the CMA
+    then 384 MiB), V3D render about 22% where it was recorded, on two
+    planes (the 3840x2160 SAND frame scaled to 1920x1080 on the primary,
+    the app's window as AB24 on an overlay).
+  - the same 4K stream among the HMI: 42.3-43.9 frames shown a second
+    in three runs, the SAND frame on an overlay scaled to 1614x908.
+Not measured on the Raspberry Pi 4 when this was written (the display
+toggles of that build left the switch off); its proxy's skipping with
+the changed registry was not run there either.
+
+Left for later (2026-10-27, Raspberry Pi 4 with plane-sand and
+sand-skip-isp on): the proxy's catch-up runs on the main loop with the
+BQL held and makes all of its skipped copies at once, 35-41 ms for 9
+frames. With DomA's Wi-Fi relay, its uplink interface and the WebView's
+transport fixed outside qemu, steady full-screen playback made no miss;
+a pause still makes one, when DomA's drm_hwcomposer flattens the still
+scene after 1 s and composes it on its GPU. Accepted while no other
+sound plays alongside a paused video (no such use case yet); if one
+comes, stop the guest's flattening or convert only the resource on the
+display (a comment at virtio_media_isp_catch_up says the same).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c |   5 +-
+ hw/virtio/virtio-media.c         |  23 +++-
+ include/ui/direct-scanout.h      |  35 +++++-
+ ui/direct-scanout.c              |  74 +++++++++---
+ ui/sdl2-gl.c                     |  12 +-
+ ui/sdl2-wl-scanout.c             | 195 ++++++++++++++++++++++++++++---
+ 6 files changed, 301 insertions(+), 43 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 93d268d37..c97e9f8b2 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -918,7 +918,7 @@ static void dec_ds_unpend(VirtIOMediaDec *d, uint32_t res)
+  * The blits are on one GL context, so the GPU runs them in order and the last
+  * one's fence covers the others: one wait.
+  */
+-static void dec_ds_catch_up(void *owner)
++static bool dec_ds_catch_up(void *owner)
+ {
+     VirtIOMediaDec *d = owner;
+     void *last = NULL;
+@@ -939,6 +939,7 @@ static void dec_ds_catch_up(void *owner)
+     if (last && virtio_media_gpu_wait(last) < 0) {
+         warn_report_once("virtio-media/dec: host-sand: GPU wait failed");
+     }
++    return !d->ds_pend_n;
+ }
+ 
+ /* Every entry goes (dec_gpu_clear): the display forgets this owner's buffers. */
+@@ -1195,7 +1196,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+            dec_ds_keep(d, (unsigned)(e - d->gpu),
+                        (unsigned)(gb - s->queues[1].guest), fr,
+                        desc->objects[0].size, d->avctx->has_b_frames);
+-    skip = show && dec_ds_skip_on() && direct_scanout_skip_copy();
++    skip = show && dec_ds_skip_on() && direct_scanout_skip_copy(d);
+ 
+     if (!skip) {
+         r = virtio_media_gpu_blit(e->handle, gb->virgl_res);
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index e4f52002b..b7e3b2946 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -829,7 +829,7 @@ static bool virtio_media_sand_skip_on(void)
+ }
+ 
+ static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_t except);
+-static void virtio_media_isp_catch_up(void *owner);
++static bool virtio_media_isp_catch_up(void *owner);
+ 
+ /*
+  * q11-sand-catchup: the GL path's import of decoder buffer idx (as in host_readable_body), so a
+@@ -889,7 +889,7 @@ static bool virtio_media_sand_skip(VirtIOMediaSession *s, VirtIOMediaQueue *q, u
+ 
+     if (!virtio_media_sand_skip_on() || !virtio_media_sand_on() || !q->isp ||
+         idx >= VIRTIO_MEDIA_MAX_BUFFERS || !q->isp_src_fd[idx] || q->isp_src_busy[idx] ||
+-        !direct_scanout_skip_copy()) {
++        !direct_scanout_skip_copy(q)) {
+         return false;
+     }
+     tex = virtio_media_gpu_res_tex(res);
+@@ -943,7 +943,7 @@ static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_
+ 
+ static bool virtio_media_isp_skip(VirtIOMediaQueue *q)
+ {
+-    if (!direct_scanout_skip_copy()) {
++    if (!direct_scanout_skip_copy(q)) {
+         return false;
+     }
+     if (q->isp_pending_n >= VIRTIO_MEDIA_ISP_PENDING_MAX) {
+@@ -953,8 +953,18 @@ static bool virtio_media_isp_skip(VirtIOMediaQueue *q)
+     return true;
+ }
+ 
+-/* the display missed: make every skipped copy, and wait for it, before it samples */
+-static void virtio_media_isp_catch_up(void *owner)
++/*
++ * the display missed: make every skipped copy, and wait for it, before it samples
++ *
++ * Left for later (Raspberry Pi 4, 2026-10-27): this runs on the main loop with the BQL
++ * held and makes all the skipped copies at once, 35-41 ms for 9 frames. With DomA's own
++ * network path fixed (outside qemu), steady playback made no miss, but a pause still
++ * makes one: DomA's drm_hwcomposer flattens the still scene after 1 s and composes it
++ * on its GPU. Accepted while no other sound plays alongside a paused video; if one
++ * does, the hold can starve virtio-snd: stop the guest's flattening, or convert here
++ * only the resource the display shows.
++ */
++static bool virtio_media_isp_catch_up(void *owner)
+ {
+     VirtIOMediaQueue *q = owner;
+     uint32_t j;
+@@ -980,7 +990,7 @@ static void virtio_media_isp_catch_up(void *owner)
+         }
+     }
+     if (!q->isp_pending_n) {
+-        return;
++        return true;
+     }
+     for (j = 0; j < VIRTIO_MEDIA_ISP_RING; j++) {
+         if (q->isp_ring_pending[j]) {
+@@ -1000,6 +1010,7 @@ static void virtio_media_isp_catch_up(void *owner)
+         }
+     }
+     q->isp_pending_n = 0;
++    return true;
+ }
+ 
+ static void virtio_media_isp_mark_ready(VirtIOMediaQueue *q)
+diff --git a/include/ui/direct-scanout.h b/include/ui/direct-scanout.h
+index 58c0e1fa9..502bf68a5 100644
+--- a/include/ui/direct-scanout.h
++++ b/include/ui/direct-scanout.h
+@@ -14,7 +14,15 @@ typedef struct DirectScanout {
+     void *owner;             /* the producer (forgotten with direct_scanout_forget) */
+     uint64_t epoch;          /* the producer's session: a reopened producer gets a new one */
+     int fd;                  /* dmabuf, owned by the producer */
+-    uint32_t width, height;  /* of the buffer (>= the scanout rectangle) */
++    uint32_t width, height;  /* of the buffer: the scanout rectangle's size or larger */
++    /*
++     * q11-plane-sand: the guest texture's area the buffer's picture fills, when the
++     * buffer is a scaled-up copy of it (a 3840x2160 frame for a 1920x1080 texture);
++     * 0: the buffer is the texture's pixels 1:1
++     */
++    uint32_t src_w, src_h;
++    /* q11-plane-sand: the virtio-gpu resource the texture is (0: unknown) */
++    uint32_t res;
+     uint32_t stride;
+     /* q11-sand-scanout: 0 = one ABGR8888 LINEAR plane (the ISP ring); else a DRM fourcc with */
+     uint32_t fourcc;         /* modifier on every plane and a second plane at offset1/pitch1 */
+@@ -46,13 +54,28 @@ void direct_scanout_sand_set_failed(void);
+ 
+ /*
+  * q11-isp-skip-copy: the display reports each flush (hit = presented a dmabuf
+- * directly). A miss first runs the producer's catch-up, which must leave every guest
+- * texture it skipped filling complete before the display samples one.
++ * directly). A miss first runs the producers' catch-ups, which make a bounded number
++ * of the conversions they skipped, oldest first, before the display samples a texture;
++ * the rest are made at the next miss.
+  */
+ void direct_scanout_note_flush(bool hit);
+-/* /run/qemu-isp-skip-copy is present and the recent flushes all hit */
+-bool direct_scanout_skip_copy(void);
+-void direct_scanout_set_catch_up(void *owner, void (*fn)(void *owner));
++/*
++ * q11-plane-sand: the display took owner's buffer in this flush. A hit counts only
++ * when every producer with conversions to catch up was taken: a producer whose
++ * video is not on the display (a second decoder the guest composes on its GPU)
++ * makes the flush a miss, and every producer's catch-up runs.
++ */
++void direct_scanout_note_shown(void *owner);
++/*
++ * /run/qemu-isp-skip-copy is present, the recent flushes all hit, and the last one
++ * took owner's buffer (q11-plane-sand: a producer not on the display does not skip)
++ */
++bool direct_scanout_skip_copy(void *owner);
++/*
++ * owner skipped filling a texture: fn makes its conversions at a miss, a bounded
++ * number each time, and returns true once none is left
++ */
++void direct_scanout_set_catch_up(void *owner, bool (*fn)(void *owner));
+ /* q11-dec-sand-scanout: the last flush took a producer's buffer, within ms of now */
+ bool direct_scanout_hit_within(int64_t ms);
+ 
+diff --git a/ui/direct-scanout.c b/ui/direct-scanout.c
+index 7ce4ef82a..cfd1afc42 100644
+--- a/ui/direct-scanout.c
++++ b/ui/direct-scanout.c
+@@ -54,28 +54,74 @@ static gboolean of_owner(gpointer key, gpointer value, gpointer owner)
+ #define DIRECT_SCANOUT_FRESH_MS 100
+ static uint32_t streak;
+ static int64_t last_hit_ms;
+-static void *catch_up_owner;
+-static void (*catch_up_fn)(void *owner);
++/*
++ * q11-plane-sand: owner -> catch-up, for each producer that skipped and has not
++ * made all its conversions since
++ */
++static GHashTable *catch_ups;
++/* q11-plane-sand: the owners whose buffers the display took in this flush */
++static GHashTable *shown;
++/* q11-plane-sand: ... and in the last flush, if it was a hit (may skip) */
++static GHashTable *taken;
++
++static void sets_init(void)
++{
++    if (!catch_ups) {
++        catch_ups = g_hash_table_new(g_direct_hash, g_direct_equal);
++        shown = g_hash_table_new(g_direct_hash, g_direct_equal);
++        taken = g_hash_table_new(g_direct_hash, g_direct_equal);
++    }
++}
++
++void direct_scanout_set_catch_up(void *owner, bool (*fn)(void *owner))
++{
++    sets_init();
++    g_hash_table_insert(catch_ups, owner, fn);
++}
+ 
+-void direct_scanout_set_catch_up(void *owner, void (*fn)(void *owner))
++void direct_scanout_note_shown(void *owner)
+ {
+-    catch_up_owner = owner;
+-    catch_up_fn = fn;
++    sets_init();
++    g_hash_table_add(shown, owner);
++}
++
++static gboolean not_shown(gpointer owner, gpointer fn, gpointer unused)
++{
++    return !g_hash_table_contains(shown, owner);
++}
++
++/* the catch-up makes a bounded number of conversions: keep its entry until done */
++static gboolean run_catch_up(gpointer owner, gpointer fn, gpointer unused)
++{
++    return ((bool (*)(void *))fn)(owner);
+ }
+ 
+ void direct_scanout_note_flush(bool hit)
+ {
++    GHashTable *t;
++
++    sets_init();
++    /*
++     * a producer that skipped and is not on the display now: its textures may
++     * be sampled
++     */
++    if (hit && g_hash_table_find(catch_ups, not_shown, NULL)) {
++        hit = false;
++    }
++    g_hash_table_remove_all(taken);
+     if (hit) {
++        t = taken;
++        taken = shown;
++        shown = t;
+         if (streak < UINT32_MAX) {
+             streak++;
+         }
+         last_hit_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+         return;
+     }
++    g_hash_table_remove_all(shown);
+     streak = 0;
+-    if (catch_up_fn) {
+-        catch_up_fn(catch_up_owner);
+-    }
++    g_hash_table_foreach_remove(catch_ups, run_catch_up, NULL);
+ }
+ 
+ /* q11-dec-sand-scanout: the display took a producer's buffer in the last ms */
+@@ -84,7 +130,7 @@ bool direct_scanout_hit_within(int64_t ms)
+     return streak && qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - last_hit_ms < ms;
+ }
+ 
+-bool direct_scanout_skip_copy(void)
++bool direct_scanout_skip_copy(void *owner)
+ {
+     static int64_t checked = -1000000;
+     static bool on;
+@@ -95,14 +141,16 @@ bool direct_scanout_skip_copy(void)
+         on = access("/run/qemu-isp-skip-copy", F_OK) == 0;
+     }
+     return on && streak >= DIRECT_SCANOUT_STREAK &&
+-           now - last_hit_ms < DIRECT_SCANOUT_FRESH_MS;
++           now - last_hit_ms < DIRECT_SCANOUT_FRESH_MS &&
++           g_hash_table_contains(taken, owner); /* q11-plane-sand */
+ }
+ 
+ void direct_scanout_forget(void *owner)
+ {
+-    if (catch_up_owner == owner) {
+-        catch_up_owner = NULL;
+-        catch_up_fn = NULL;
++    if (catch_ups) {
++        g_hash_table_remove(catch_ups, owner);
++        g_hash_table_remove(shown, owner);
++        g_hash_table_remove(taken, owner);
+     }
+     if (entries) {
+         g_hash_table_foreach_remove(entries, of_owner, owner);
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 24bcd5874..cec7558eb 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -418,6 +418,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+ 
+         if (!why) {
+             sdl2_wl_planes_off(); /* q11-plane-handoff */
++            direct_scanout_note_shown(d.owner); /* q11-plane-sand */
+             direct_scanout_note_flush(true); /* q11-isp-skip-copy */
+             if (t0) {
+                 qemu_lat_diag_add(LAT_SDL_BLIT,
+@@ -429,15 +430,20 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+     } else {
+         sdl2_wl_scanout_off(); /* no waiting direct frame may follow this one */
+     }
+-    /* q11-isp-skip-copy: the guest textures sampled below must be complete */
+-    direct_scanout_note_flush(false);
+-    /* q11-plane-handoff: weston takes the planes, no blit and no swap here */
++    /*
++     * q11-plane-handoff: weston takes the planes, no blit and no swap here. Once
++     * it goes ahead it reports the flush itself (q11-plane-sand): a hit when the
++     * planes got the producers' buffers, else a miss before it exports a texture;
++     * a false return is reported below.
++     */
+     if (sdl2_wl_planes(scon, ww, wh)) {
+         if (t0) {
+             qemu_lat_diag_add(LAT_SDL_BLIT, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0);
+         }
+         return;
+     }
++    /* q11-isp-skip-copy: the guest textures sampled below must be complete */
++    direct_scanout_note_flush(false);
+     sdl2_wl_planes_off();
+     egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
+     /*
+diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
+index aec8bf276..e459f7e1d 100644
+--- a/ui/sdl2-wl-scanout.c
++++ b/ui/sdl2-wl-scanout.c
+@@ -514,6 +514,16 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
+     if (!wl_init(scon->real_window) || d->width < w || d->height < h) {
+         return false; /* counted by the caller (sdl2_wl_scanout_miss) */
+     }
++    /*
++     * q11-plane-sand: a fourcc buffer larger than the window (a scaled frame's)
++     * is attached whole and shown at the window's size by SDL's own wp_viewport
++     * on the window surface (SDL 2.32 sets its destination to the window size);
++     * without wp_viewporter SDL has none, and the surface would take the
++     * buffer's size. (The ISP ring's buffer is cut to the window: wl_buf_for.)
++     */
++    if (d->fourcc && (d->width > w || d->height > h) && !wl.viewporter) {
++        return false;
++    }
+     sdl2_wl_scanout_dispatch();
+     b = wl_buf_for(d, w, h);
+     if (!b->ready) {
+@@ -568,10 +578,11 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
+  * with a wp_viewport), and weston composites them. RPi4, local 720p60 in the HMI layout:
+  * 52 -> 57 fps, Chromium drops 8 -> 2%, V3D render (qemu + weston) 37.5 -> 16.6%; a streamed
+  * video in the HMI layout 32.7 -> 42.6 (DomA CPU is the limit there).
+- * No hold of the guest: the guest's next write to a buffer and weston's read of it are
+- * both V3D jobs on the same BO and are ordered by the kernel's implicit sync. (Holding the
+- * guest until weston's frame callback or buffer release was tried: 20-24 ms per frame,
+- * 42 fps.) What did bite:
++ * No hold of the guest for a texture's export: the guest's next write to a buffer and
++ * weston's read of it are both V3D jobs on the same BO and are ordered by the kernel's
++ * implicit sync (a producer's buffer on a plane, q11-plane-sand, is held until weston
++ * releases it). (Holding the guest until weston's frame callback or buffer release was
++ * tried: 20-24 ms per frame, 42 fps.) What did bite:
+  *  - GL texture names are recycled: a cache keyed by name and size handed weston another
+  *    resource's old dmabuf (the launcher shown instead of the app, flashing video) -> the
+  *    cache is keyed by the virtio resource too and drops a resource the guest unrefs;
+@@ -611,6 +622,11 @@ static struct {
+     uint64_t geom, name_reuse, gone; /* per stats line */
+     uint64_t blobs; /* q11-blob-handoff: guest dma-bufs handed over */
+     bool blob_off;  /* q11-blob-handoff: weston refused one; blit them from now on */
++    /* q11-plane-sand: a plane showing a producer's buffer (the wl_buffer is b's) */
++    WlPlaneBuf sand[WL_PLANES];
++    WlScanBuf *sand_sb[WL_PLANES];
++    uint32_t sand_tw[WL_PLANES], sand_th[WL_PLANES]; /* the texture's area it fills */
++    uint64_t sand_n, sand_wait; /* per stats line: planes shown one / not ready for one */
+ } pl;
+ 
+ static bool planes_flag(void)
+@@ -626,6 +642,64 @@ static bool planes_flag(void)
+     return on;
+ }
+ 
++/*
++ * q11-plane-sand (on while /run/qemu-plane-sand exists, read once a second): a
++ * plane whose guest texture a producer filled from a buffer of its own -- the
++ * decoder's SAND frame, the video of the WebView layout -- gets that buffer, as
++ * a lone full-screen scanout does (sdl2_wl_scanout), instead of the export of
++ * the texture: the producer may skip the conversion into the texture, and the
++ * compositor scales the frame (a 4K frame on a 1080p plane) on the HVS. The
++ * buffer is a WlScanBuf of the direct path, so the owner hears hold(true) when
++ * it goes on the plane and hold(false) when weston releases it; unlike a
++ * texture's export the guest does not overwrite it in place, the producer
++ * keeps it until then.
++ */
++static bool plane_sand_flag(void)
++{
++    static int64_t last = INT64_MIN;
++    static bool on;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    if (last == INT64_MIN || now - last > NANOSECONDS_PER_SECOND) {
++        last = now;
++        on = access("/run/qemu-plane-sand", F_OK) == 0;
++    }
++    return on;
++}
++
++/*
++ * The producer's buffer for plane i showing texture tex (tw x th) of resource res, or
++ * NULL. Not one that names another resource (the GL name was given to a new one, the
++ * reason plane_buf keys its cache by resource too), nor one of another size that does
++ * not say what area of the texture it fills (the proxy's).
++ */
++static WlPlaneBuf *plane_sand(int i, uint32_t tex, uint32_t tw, uint32_t th, uint32_t res)
++{
++    DirectScanout d;
++    WlScanBuf *sb;
++    WlPlaneBuf *pb = &pl.sand[i];
++
++    if (!tex || !direct_scanout_lookup(tex, &d) || !d.fourcc ||
++        (d.res && res && d.res != res) ||
++        (!d.src_w && (d.width != tw || d.height != th))) {
++        return NULL;
++    }
++    sb = wl_buf_for(&d, d.width, d.height);
++    if (!sb->ready) {
++        pl.sand_wait++; /* being created, or refused: the texture this time */
++        return NULL;
++    }
++    direct_scanout_note_shown(d.owner);
++    pl.sand_sb[i] = sb;
++    pl.sand_tw[i] = d.src_w ? d.src_w : sb->w;
++    pl.sand_th[i] = d.src_h ? d.src_h : sb->h;
++    pb->tex = tex;
++    pb->w = sb->w;
++    pb->h = sb->h;
++    pb->wb = sb->wb;
++    return pb;
++}
++
+ static bool plane_in_use(WlPlaneBuf *b)
+ {
+     for (int i = 0; i < WL_PLANES; i++) {
+@@ -1091,9 +1165,51 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
+     pl.cur[i] = b;
+ }
+ 
++/* plane i shows its producer's buffer now: weston's release gives it back to the owner */
++static void plane_sand_shown(int i)
++{
++    WlScanBuf *sb = pl.sand_sb[i];
++
++    if (pl.cur[i] != &pl.sand[i] || !sb) {
++        return;
++    }
++    if (!sb->held) {
++        sb->held = true;
++        sb->hold(sb->owner, sb->slot, true);
++    }
++    sb->attached = true; /* buf_release clears it and calls buf_unhold */
++    if (wl.last == sb) {
++        /* attached here, not on the window: the direct path must commit it again */
++        wl.last = NULL;
++    }
++    pl.sand_n++;
++}
++
++/* a source rectangle in plane i's texture, in its producer's buffer's pixels */
++static void plane_src(int i, int *sx, int *sy, int *sw, int *sh)
++{
++    const WlPlaneBuf *b = &pl.sand[i];
++    uint32_t tw = pl.sand_tw[i], th = pl.sand_th[i];
++
++    if (b->w != tw && tw) {
++        *sx = (int64_t)*sx * b->w / tw;
++        *sw = (int64_t)*sw * b->w / tw;
++    }
++    if (b->h != th && th) {
++        *sy = (int64_t)*sy * b->h / th;
++        *sh = (int64_t)*sh * b->h / th;
++    }
++    /* a source past the buffer is a wp_viewport protocol error: keep it inside */
++    *sx = MIN(MAX(*sx, 0), (int)b->w);
++    *sy = MIN(MAX(*sy, 0), (int)b->h);
++    *sw = MIN(*sw, (int)b->w - *sx);
++    *sh = MIN(*sh, (int)b->h - *sy);
++}
++
+ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+ {
+     WlPlaneBuf *b[WL_PLANES] = { NULL };
++    bool sand_on, hit = false;
+     bool rect = scon->prim_w && scon->prim_h && scon->prim_cw && scon->prim_ch;
+     uint32_t cw = rect ? scon->prim_cw : (scon->w ? scon->w : (uint32_t)ww);
+     uint32_t ch = rect ? scon->prim_ch : (scon->h ? scon->h : (uint32_t)wh);
+@@ -1110,14 +1226,54 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+         return false;
+     }
+     sdl2_wl_scanout_dispatch();
+-    b[0] = scon->blob ? blob_buf(scon->blob, q11_scanout0_resource_id) /* q11-blob-handoff */
+-                      : plane_buf(scon->guest_fb.texture, scon->guest_fb.width,
+-                                  scon->guest_fb.height, q11_scanout0_resource_id);
++    /*
++     * q11-plane-sand: the producers' buffers first. The flush is a hit when a
++     * plane got one and every plane whose texture has an entry got its; otherwise
++     * the skipped conversions are made now (direct_scanout_note_flush), before any
++     * texture is exported below. A false return after that is followed by another
++     * note_flush(false) in the caller, ahead of its blit. A hit lets the producer
++     * skip conversions in this layout too: should the guest compose the video on
++     * its GPU meanwhile (a client composition, a screenshot), it samples what the
++     * texture was last converted to, an older frame of the stream or none. A
++     * producer whose buffer this flush did not take does not skip next, and one
++     * with conversions to catch up makes the flush a miss
++     * (direct_scanout_note_shown).
++     */
++    memset(pl.sand_sb, 0, sizeof(pl.sand_sb));
++    sand_on = plane_sand_flag() && direct_scanout_sand_usable();
++    if (sand_on && !scon->blob && !scon->y0_top) {
++        b[0] = plane_sand(0, scon->guest_fb.texture, scon->guest_fb.width,
++                          scon->guest_fb.height, q11_scanout0_resource_id);
++    }
++    for (int i = 0; sand_on && i < 3; i++) {
++        if (scon->ovl[i].on && !scon->ovl[i].y0_top) {
++            b[i + 1] = plane_sand(i + 1, scon->ovl[i].fb.texture, scon->ovl[i].fb.width,
++                                  scon->ovl[i].fb.height, q11_overlay_resource_id[i]);
++        }
++    }
++    for (int i = 0; i < WL_PLANES; i++) {
++        hit = hit || b[i];
++    }
++    for (int i = 0; hit && i < WL_PLANES; i++) {
++        bool on = i ? scon->ovl[i - 1].on && scon->ovl[i - 1].fb.texture : true;
++        uint32_t tex = i ? scon->ovl[i - 1].fb.texture : scon->guest_fb.texture;
++
++        if (on && !b[i] && tex && direct_scanout_has(tex)) {
++            hit = false; /* an entry, but its buffer could not be given this time */
++        }
++    }
++    direct_scanout_note_flush(hit);
++    if (!b[0]) {
++        /* q11-blob-handoff */
++        b[0] = scon->blob ? blob_buf(scon->blob, q11_scanout0_resource_id)
++                          : plane_buf(scon->guest_fb.texture, scon->guest_fb.width,
++                                      scon->guest_fb.height, q11_scanout0_resource_id);
++    }
+     if (!b[0]) {
+         return false;
+     }
+     for (int i = 0; i < 3; i++) {
+-        if (scon->ovl[i].on && scon->ovl[i].fb.texture) {
++        if (scon->ovl[i].on && scon->ovl[i].fb.texture && !b[i + 1]) {
+             b[i + 1] = plane_buf(scon->ovl[i].fb.texture, scon->ovl[i].fb.width,
+                                  scon->ovl[i].fb.height, q11_overlay_resource_id[i]);
+             if (!b[i + 1]) {
+@@ -1130,6 +1286,9 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+         int sw = scon->w ? (int)scon->w : scon->guest_fb.width;
+         int sh = scon->h ? (int)scon->h : scon->guest_fb.height;
+ 
++        if (b[0] == &pl.sand[0]) {
++            plane_src(0, &sx, &sy, &sw, &sh);
++        }
+         if (rect) {
+             backdrop_show(ww, wh); /* q11-plane-backdrop */
+             plane_show(0, b[0], scon->y0_top, sx, sy, sw, sh, scon->prim_x * fx,
+@@ -1141,23 +1300,33 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+     }
+     for (int i = 0; i < 3; i++) {
+         if (b[i + 1]) {
+-            plane_show(i + 1, b[i + 1], scon->ovl[i].y0_top, 0, 0, scon->ovl[i].fb.width,
+-                       scon->ovl[i].fb.height, scon->ovl[i].x * fx, scon->ovl[i].y * fy,
++            int sx = 0, sy = 0, sw = scon->ovl[i].fb.width, sh = scon->ovl[i].fb.height;
++
++            if (b[i + 1] == &pl.sand[i + 1]) {
++                plane_src(i + 1, &sx, &sy, &sw, &sh);
++            }
++            plane_show(i + 1, b[i + 1], scon->ovl[i].y0_top, sx, sy, sw, sh,
++                       scon->ovl[i].x * fx, scon->ovl[i].y * fy,
+                        scon->ovl[i].fb.width * fx, scon->ovl[i].fb.height * fy, ww, wh);
+         } else {
+             plane_hide(i + 1);
+         }
+     }
++    for (int i = 0; i < WL_PLANES; i++) {
++        plane_sand_shown(i);
++    }
+     wl_surface_commit(wl.surf); /* the subsurfaces are synchronized: apply them */
+     wl_display_flush(wl.dpy);
+     pl.shown = true;
+     if ((pl.presents++ % 600) == 0) {
+         info_report("sdl2: plane-handoff: %" PRIu64 " presents, %" PRIu64 " exports (%"
+                     PRIu64 " failed, %" PRIu64 " evicted), %" PRIu64 " guest dma-bufs, %u "
+-                    "cached; geom %" PRIu64 ", name_reuse %" PRIu64 ", gone %" PRIu64,
++                    "cached; geom %" PRIu64 ", name_reuse %" PRIu64 ", gone %" PRIu64
++                    "; producer buffers %" PRIu64 " (%" PRIu64 " not ready)",
+                     pl.presents, pl.exports, pl.export_fail, pl.evicted, pl.blobs,
+-                    pl.cache ? pl.cache->len : 0, pl.geom, pl.name_reuse, pl.gone);
+-        pl.geom = pl.name_reuse = pl.gone = 0;
++                    pl.cache ? pl.cache->len : 0, pl.geom, pl.name_reuse, pl.gone,
++                    pl.sand_n, pl.sand_wait);
++        pl.geom = pl.name_reuse = pl.gone = pl.sand_n = pl.sand_wait = 0;
+     }
+     return true;
+ }

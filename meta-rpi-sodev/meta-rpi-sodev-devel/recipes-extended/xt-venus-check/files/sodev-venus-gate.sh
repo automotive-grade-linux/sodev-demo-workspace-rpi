@@ -202,7 +202,7 @@ if want_phase 2; then
         else
             bad "virtio-gpu-gl has no venus property"
             note "venus= arrived in QEMU 9.2.0. This tree pins 7.0.0 unless"
-            note "GPU=vulkan selects the 10.0.2-xt build. If the version is"
+            note "GPU=vulkan selects the 11.1.2 build. If the version is"
             note "already >= 9.2, qemu was built without a venus-capable"
             note "virglrenderer -- check the virglrenderer PACKAGECONFIG."
         fi

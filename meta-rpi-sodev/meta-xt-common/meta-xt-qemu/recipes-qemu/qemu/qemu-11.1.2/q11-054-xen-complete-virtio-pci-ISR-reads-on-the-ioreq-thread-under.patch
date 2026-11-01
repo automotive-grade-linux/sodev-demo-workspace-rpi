@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 28 Oct 2026 11:18:02 +0900
+Subject: [PATCH] xen: complete virtio-pci ISR reads on the ioreq thread under
+ the BQL
+
+Interrupts on Raspberry Pi 4 are INTx (the GIC-400 has no ITS, so there
+is no MSI), and the guest's INTx handler reads the virtio-pci ISR
+register on every interrupt to learn the cause and lower the line. A
+read must be answered, so unlike a notify write it cannot be
+acknowledged early by the ioreq thread; through the FIFO it waits for
+the main loop to reach the handler that drains it. With DomA decoding
+1080p60 video that was about 160 ISR reads a second at 1.05 ms each on
+average, i.e. about 17% of a vCPU stalled.
+
+When the ioreq thread (QEMU_XEN_IOREQ_THREAD=1) sees a plain read of a
+"virtio-pci-isr-" region, it tries to take the BQL with a new
+bql_trylock() helper. If it gets the lock and the FIFO is empty, it
+executes the read itself and responds at once. Only the ioreq thread
+adds to the FIFO and the main loop's handler drains it under the BQL, so
+with the BQL held and the FIFO empty every earlier ioreq has already run
+and none can start, so the ioreqs keep the order the handler would have
+used. A bottom half that an earlier ioreq scheduled on the iohandler
+context may not have run yet; the read then sees at worst an interrupt
+not raised yet, which that bottom half raises afterwards, as a KVM vCPU
+reading the register concurrently would. The ISR read handler only
+exchanges vdev->isr and lowers the INTx line, which is what a KVM vCPU
+thread does for the same register under the same lock; it does not touch
+the GL context the main thread owns. The response goes out without
+xen_ioreq_check_shutdown(), which may run qemu_system_reset() and with
+it device resets that belong on the main thread: with a shutdown or
+reset pending the read takes the FIFO, and one requested while the read
+runs inline is picked up by the next ioreq the main thread completes.
+
+A trylock rather than bql_lock() is used because waiting for the BQL
+would hold the ioreq thread for as long as the main thread runs (58% of
+the time at 1080p60), and the other vCPU's notify writes, otherwise
+acknowledged in about 0.3 ms, would wait as long. If the BQL is busy or
+anything is queued, the read takes the FIFO as before, so this path is
+never worse than without it.
+
+bql_trylock() keeps the bql_locked() bookkeeping through
+qemu_mutex_post_lock(), as bql_lock() does. The 30 s statistics line
+gains the number of ISR reads completed inline. Without the ioreq thread
+(the default) nothing changes.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's Xen device model; switched by an environment variable]
+---
+ hw/xen/xen-hvm-common.c         | 92 ++++++++++++++++++++++++++++++++-
+ include/hw/xen/xen-hvm-common.h |  1 +
+ include/qemu/main-loop.h        |  1 +
+ system/cpus.c                   | 10 ++++
+ 4 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/hw/xen/xen-hvm-common.c b/hw/xen/xen-hvm-common.c
+index e5c8f0856..343f290bb 100644
+--- a/hw/xen/xen-hvm-common.c
++++ b/hw/xen/xen-hvm-common.c
+@@ -690,6 +690,87 @@ static bool xen_ioreq_is_virtio_notify(const ioreq_t *r)
+     return ret;
+ }
+ 
++/*
++ * Is this ioreq a plain read of a virtio-pci ISR register? (no BQL; RCU)
++ *
++ * WHY THESE ARE WORTH A SHORTCUT. Interrupts are INTx on this platform (GIC-400 has
++ * no ITS, so no MSI), and the guest's INTx handler reads ISR on every interrupt to
++ * learn the cause and lower the line. A read must be answered, so it cannot be
++ * acknowledged early like a notify; through the FIFO it waits for the main loop to
++ * reach the handler. RPi4 DomA at 1080p60: ~160 of them a second, 1.05 ms each on
++ * average (2026-10-03), i.e. ~17% of a vCPU stalled.
++ */
++static bool xen_ioreq_is_virtio_isr_read(const ioreq_t *r)
++{
++    MemoryRegionSection sec;
++    bool ret;
++
++    if (r->type != IOREQ_TYPE_COPY || r->dir != IOREQ_READ ||
++        r->data_is_ptr || r->count != 1) {
++        return false;
++    }
++    sec = memory_region_find(get_system_memory(), r->addr, r->size);
++    if (!sec.mr) {
++        return false;
++    }
++    ret = g_str_has_prefix(memory_region_name(sec.mr), "virtio-pci-isr-");
++    memory_region_unref(sec.mr);
++    return ret;
++}
++
++/*
++ * Complete an ISR read on the ioreq thread, under the BQL, if nothing is queued
++ * ahead of it. Returns false (and does nothing) otherwise.
++ *
++ * ORDER. Only the ioreq thread adds to the FIFO, and the handler drains it under the BQL.
++ * Once this thread holds the BQL and sees the FIFO empty, every earlier ioreq has run and
++ * none can start until the BQL is dropped: the ioreqs keep the handler's order. A bottom
++ * half an earlier ioreq scheduled may not have run yet; the read then at worst sees an
++ * interrupt not raised yet, which that bottom half raises. Queued ahead -> normal path.
++ *
++ * SAFETY. The ISR read handler (virtio_pci_isr_read) only exchanges vdev->isr and
++ * lowers the INTx line -- what a KVM vCPU thread does for the same register under
++ * the same lock. It does not touch the GL context the main thread owns.
++ * The response is sent without xen_ioreq_check_shutdown(): that may run
++ * qemu_system_reset(), whose device resets (virtio-gpu-gl among them) belong on
++ * the main thread. A pending shutdown or reset sends the read the normal way; one
++ * requested while the read runs here is picked up by the next ioreq the main
++ * thread completes.
++ *
++ * WHAT IT BUYS. The read no longer waits for the main loop to reach the handler that
++ * drains the FIFO.
++ *
++ * TRYLOCK, NOT bql_lock(). Waiting for the BQL here would hold the ioreq thread for
++ * as long as the main thread runs (58% of the time at 1080p60), and meanwhile the
++ * OTHER vCPU's notify writes -- acknowledged in ~0.3 ms otherwise -- would wait as
++ * long. If the BQL is busy, the read takes the FIFO as before: never worse than
++ * without this path.
++ */
++static bool xen_ioreq_isr_inline(XenIOState *state, ioreq_t *req, int vcpu)
++{
++    ioreq_t copy = *req;
++    bool empty;
++
++    if (!bql_trylock()) {
++        return false;
++    }
++    qemu_mutex_lock(&state->ioreq_lock);
++    empty = QSIMPLEQ_EMPTY(&state->ioreq_fifo);
++    qemu_mutex_unlock(&state->ioreq_lock);
++    if (!empty || qemu_shutdown_requested_get() || qemu_reset_requested_get()) {
++        bql_unlock();
++        return false;
++    }
++    handle_ioreq(state, &copy);
++    req->data = copy.data;
++    xen_wmb(); /* Update ioreq contents /then/ update state. */
++    req->state = STATE_IORESP_READY;
++    qemu_xen_evtchn_notify(state->xce_handle, state->ioreq_local_port[vcpu]);
++    bql_unlock();
++    state->ioreq_isr_inline++;
++    return true;
++}
++
+ /*
+  * One queued ioreq per call, on the main loop's iohandler context: the context
+  * cpu_handle_ioreq() runs on without the thread, and one ioreq a call, as it
+@@ -792,6 +873,11 @@ static void *xen_ioreq_thread(void *opaque)
+             continue;
+         }
+ 
++        if (xen_ioreq_is_virtio_isr_read(req) &&
++            xen_ioreq_isr_inline(state, req, i)) {
++            continue;
++        }
++
+         it = g_new0(XenIoreqItem, 1);
+         it->copy = *req;
+         it->vcpu = i;
+@@ -818,8 +904,10 @@ static void *xen_ioreq_thread(void *opaque)
+         now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+         if (now - last >= 30000) {
+             info_report("xen ioreq thread: %" PRIu64 " notify writes acknowledged "
+-                        "early, %" PRIu64 " ioreqs completed by the main loop",
+-                        state->ioreq_early, state->ioreq_queued);
++                        "early, %" PRIu64 " ISR reads completed inline, %" PRIu64
++                        " ioreqs completed by the main loop",
++                        state->ioreq_early, state->ioreq_isr_inline,
++                        state->ioreq_queued);
+             last = now;
+         }
+     }
+diff --git a/include/hw/xen/xen-hvm-common.h b/include/hw/xen/xen-hvm-common.h
+index 19ec88c73..c713c0356 100644
+--- a/include/hw/xen/xen-hvm-common.h
++++ b/include/hw/xen/xen-hvm-common.h
+@@ -90,6 +90,7 @@ typedef struct XenIOState {
+     bool ioreq_thread_on;
+     uint64_t ioreq_early;
+     uint64_t ioreq_queued;
++    uint64_t ioreq_isr_inline;
+ 
+     Notifier exit;
+ } XenIOState;
+diff --git a/include/qemu/main-loop.h b/include/qemu/main-loop.h
+index 8c1241a2c..a8540179b 100644
+--- a/include/qemu/main-loop.h
++++ b/include/qemu/main-loop.h
+@@ -367,6 +367,7 @@ bool qemu_in_main_thread(void);
+  */
+ #define bql_lock() bql_lock_impl(__FILE__, __LINE__)
+ void bql_lock_impl(const char *file, int line);
++bool bql_trylock(void);
+ 
+ /**
+  * bql_unlock: Unlock the Big QEMU Lock (BQL).
+diff --git a/system/cpus.c b/system/cpus.c
+index 3e0cd4766..fd4fd209c 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -580,6 +580,16 @@ void bql_lock_impl(const char *file, int line)
+     bql_lock_fn(&bql, file, line);
+ }
+ 
++/*
++ * bql_trylock: take the BQL only if it is free; true on success. The bookkeeping
++ * behind bql_locked() is done by qemu_mutex_post_lock(), as for bql_lock().
++ */
++bool bql_trylock(void)
++{
++    g_assert(!bql_locked());
++    return qemu_mutex_trylock(&bql) == 0;
++}
++
+ void bql_unlock(void)
+ {
+     g_assert(bql_locked());

@@ -1,0 +1,524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] hw/virtio-media: let host-nv12 scale the frame down to the
+ display (host-max-width)
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0246-v10-hw-virtio-media-let-host-nv12-scale-the-frame-down-to-the-display.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-virgl-stub.c    |   1 +
+ hw/virtio/virtio-media-virgl.c         |  38 ++++--
+ hw/virtio/virtio-media.c               | 159 +++++++++++++++++++++++--
+ include/hw/virtio/virtio-media-virgl.h |  13 +-
+ include/hw/virtio/virtio-media.h       |  20 ++++
+ 5 files changed, 203 insertions(+), 28 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+index 6494912ad..64c8d81d3 100644
+--- a/hw/virtio/virtio-media-virgl-stub.c
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -26,6 +26,7 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t src_height, uint32_t stride,
+                                    uint32_t uv_offset, uint32_t dst_width,
++                                   uint32_t dst_height, float scale,
+                                    uint32_t len, int matrix, int *err)
+ {
+     close(dmabuf_fd);
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 9bdc3f498..5ec4e01c9 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -74,6 +74,8 @@ typedef struct VirtIOMediaGpuBuf {
+     /* host-nv12: two planes of one NV12 buffer, converted by a shader. */
+     bool nv12;
+     uint32_t src_width;
++    uint32_t src_height;      /* NV12 source rows; height is the RGBA one */
++    float scale_x, scale_y;   /* source pixels per destination pixel */
+     GLuint tex_uv;
+     int matrix;
+ } VirtIOMediaGpuBuf;
+@@ -98,7 +100,7 @@ static struct {
+     GLuint draw_fbo;
+     /* NV12 -> RGBA conversion program (built on first use). */
+     GLuint prog;
+-    GLint u_y, u_uv, u_src_size, u_yoff, u_yscale, u_coef;
++    GLint u_y, u_uv, u_src_size, u_scale, u_yoff, u_yscale, u_coef;
+     bool prog_failed;
+ } gpu;
+ 
+@@ -269,7 +271,7 @@ static void gpu_leave(const GpuSaved *sv)
+  */
+ static GLuint gpu_import_plane(int fd, uint32_t fourcc, uint32_t width,
+                                uint32_t height, uint32_t stride,
+-                               uint32_t offset)
++                               uint32_t offset, bool linear)
+ {
+     EGLImageKHR img;
+     GLuint tex = 0;
+@@ -301,8 +303,10 @@ static GLuint gpu_import_plane(int fd, uint32_t fourcc, uint32_t width,
+     }
+     glGenTextures(1, &tex);
+     glBindTexture(GL_TEXTURE_2D, tex);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
++                    linear ? GL_LINEAR : GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
++                    linear ? GL_LINEAR : GL_NEAREST);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
+@@ -324,9 +328,11 @@ static const char *nv12_vs =
+     "  gl_Position = vec4(p, 0.0, 1.0);\n"
+     "}\n";
+ /*
+- * gl_FragCoord is in destination pixels; the destination may be wider than
+- * the source (gralloc pads the row), so sample by texel and let
+- * CLAMP_TO_EDGE repeat the last column. The RGBA resource is sampled by the
++ * gl_FragCoord is in destination pixels. Unscaled (u_scale 1), the
++ * destination may be wider than the source (gralloc pads the row), so sample
++ * by texel and let CLAMP_TO_EDGE repeat the last column. Scaled down
++ * (host-max-width), u_scale maps destination pixels onto source pixels and
++ * the planes are sampled with GL_LINEAR. The RGBA resource is sampled by the
+  * guest with y=0 at the top of the image, as is the V4L2 buffer, so no flip.
+  */
+ static const char *nv12_fs =
+@@ -335,12 +341,13 @@ static const char *nv12_fs =
+     "uniform sampler2D u_y;\n"
+     "uniform sampler2D u_uv;\n"
+     "uniform vec2 u_src_size;\n"
++    "uniform vec2 u_scale;\n"
+     "uniform float u_yoff;\n"
+     "uniform float u_yscale;\n"
+     "uniform vec4 u_coef;\n"   /* r_cr, g_cb, g_cr, b_cb */
+     "out vec4 o;\n"
+     "void main() {\n"
+-    "  vec2 uv = gl_FragCoord.xy / u_src_size;\n"
++    "  vec2 uv = gl_FragCoord.xy * u_scale / u_src_size;\n"
+     "  float y = (texture(u_y, uv).r - u_yoff) * u_yscale;\n"
+     "  vec2 c = texture(u_uv, uv).rg - vec2(0.5);\n"
+     "  float r = y + u_coef.x * c.y;\n"
+@@ -403,6 +410,7 @@ static bool gpu_build_nv12_program(void)
+     gpu.u_y = glGetUniformLocation(gpu.prog, "u_y");
+     gpu.u_uv = glGetUniformLocation(gpu.prog, "u_uv");
+     gpu.u_src_size = glGetUniformLocation(gpu.prog, "u_src_size");
++    gpu.u_scale = glGetUniformLocation(gpu.prog, "u_scale");
+     gpu.u_yoff = glGetUniformLocation(gpu.prog, "u_yoff");
+     gpu.u_yscale = glGetUniformLocation(gpu.prog, "u_yscale");
+     gpu.u_coef = glGetUniformLocation(gpu.prog, "u_coef");
+@@ -412,10 +420,12 @@ static bool gpu_build_nv12_program(void)
+ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t src_height, uint32_t stride,
+                                    uint32_t uv_offset, uint32_t dst_width,
++                                   uint32_t dst_height, float scale,
+                                    uint32_t len, int matrix, int *err)
+ {
+     GpuSaved sv;
+     VirtIOMediaGpuBuf *b;
++    bool scaled = scale != 1.0f;
+ 
+     if (!gpu_enter(&sv)) {
+         close(dmabuf_fd);
+@@ -437,16 +447,19 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+     b->fd = dmabuf_fd;
+     b->nv12 = true;
+     b->width = dst_width;
+-    b->height = src_height;
++    b->height = dst_height;
+     b->src_width = src_width;
++    b->src_height = src_height;
++    b->scale_x = scale;
++    b->scale_y = scale;
+     b->stride = stride;
+     b->len = len;
+     b->matrix = matrix;
+     b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, src_width,
+-                              src_height, stride, 0);
++                              src_height, stride, 0, scaled);
+     b->tex_uv = b->tex ? gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_GR88,
+                                           src_width / 2, src_height / 2,
+-                                          stride, uv_offset) : 0;
++                                          stride, uv_offset, scaled) : 0;
+     if (!b->tex || !b->tex_uv) {
+         if (b->tex) {
+             glDeleteTextures(1, &b->tex);
+@@ -498,7 +511,8 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+     glBindTexture(GL_TEXTURE_2D, b->tex_uv);
+     glUniform1i(gpu.u_y, 0);
+     glUniform1i(gpu.u_uv, 1);
+-    glUniform2f(gpu.u_src_size, (float)b->src_width, (float)b->height);
++    glUniform2f(gpu.u_src_size, (float)b->src_width, (float)b->src_height);
++    glUniform2f(gpu.u_scale, b->scale_x, b->scale_y);
+     glUniform1f(gpu.u_yoff, yoff);
+     glUniform1f(gpu.u_yscale, yscale);
+     glUniform4fv(gpu.u_coef, 1, c);
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 554664800..b6205a52c 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -185,6 +185,30 @@ static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
+     return QEMU_ALIGN_UP(width * 4, 64);
+ }
+ 
++/*
++ * host-max-width: the guest-facing size of a w x h host frame. Keeps the
++ * aspect ratio, rounds the height up so no source row is dropped, and keeps
++ * both even.
++ */
++static void virtio_media_scaled_size(uint32_t max_w, uint32_t w, uint32_t h,
++                                     uint32_t *sw, uint32_t *sh)
++{
++    if (!max_w || !w || !h || w <= max_w) {
++        *sw = w;
++        *sh = h;
++        return;
++    }
++    *sw = max_w & ~1u;
++    *sh = (uint32_t)(((uint64_t)h * *sw + w - 1) / w);
++    *sh = (*sh + 1) & ~1u;
++}
++
++/* One host coordinate in the scaled frame, rounded to nearest. */
++static uint32_t virtio_media_scale_coord(uint32_t v, uint32_t to, uint32_t from)
++{
++    return from ? (uint32_t)(((uint64_t)v * to + from / 2) / from) : v;
++}
++
+ /* Does this v4l2_format describe the CAPTURE side of a decoder? */
+ static bool virtio_media_fmt_is_capture(const struct v4l2_format *f)
+ {
+@@ -206,15 +230,41 @@ static void virtio_media_fmt_set_pixelformat(struct v4l2_format *f, uint32_t pf)
+     }
+ }
+ 
++static void virtio_media_fmt_get_size(const struct v4l2_format *f,
++                                      uint32_t *w, uint32_t *h)
++{
++    if (V4L2_TYPE_IS_MULTIPLANAR(f->type)) {
++        *w = f->fmt.pix_mp.width;
++        *h = f->fmt.pix_mp.height;
++    } else {
++        *w = f->fmt.pix.width;
++        *h = f->fmt.pix.height;
++    }
++}
++
++static void virtio_media_fmt_set_size(struct v4l2_format *f, uint32_t w,
++                                      uint32_t h)
++{
++    if (V4L2_TYPE_IS_MULTIPLANAR(f->type)) {
++        f->fmt.pix_mp.width = w;
++        f->fmt.pix_mp.height = h;
++    } else {
++        f->fmt.pix.width = w;
++        f->fmt.pix.height = h;
++    }
++}
++
+ /*
+  * Rewrite a host NV12 v4l2_format into the RGBA one the guest asked for,
+- * with the bytesperline/sizeimage the codec would have given for RGBA.
++ * with the bytesperline/sizeimage the codec would have given for RGBA, and
++ * with the size scaled down to max_w when host-max-width asks for it.
+  * Records the host geometry / colour description in q when q != NULL.
+  */
+ static void virtio_media_fmt_nv12_to_rgba(VirtIOMediaQueue *q,
+-                                          struct v4l2_format *f)
++                                          struct v4l2_format *f,
++                                          uint32_t max_w)
+ {
+-    uint32_t w, h, bpl, cs, enc, quant;
++    uint32_t w, h, sw, sh, bpl, cs, enc, quant;
+ 
+     if (V4L2_TYPE_IS_MULTIPLANAR(f->type)) {
+         w = f->fmt.pix_mp.width;
+@@ -225,11 +275,14 @@ static void virtio_media_fmt_nv12_to_rgba(VirtIOMediaQueue *q,
+         if (q) {
+             q->host_sizeimage = f->fmt.pix_mp.plane_fmt[0].sizeimage;
+         }
+-        bpl = virtio_media_rgba_bpl(w);
++        virtio_media_scaled_size(max_w, w, h, &sw, &sh);
++        bpl = virtio_media_rgba_bpl(sw);
++        f->fmt.pix_mp.width = sw;
++        f->fmt.pix_mp.height = sh;
+         f->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_RGBA32;
+         f->fmt.pix_mp.num_planes = 1;
+         f->fmt.pix_mp.plane_fmt[0].bytesperline = bpl;
+-        f->fmt.pix_mp.plane_fmt[0].sizeimage = bpl * h;
++        f->fmt.pix_mp.plane_fmt[0].sizeimage = bpl * sh;
+         /* RGB output from the codec is SRGB/full; say the same. */
+         f->fmt.pix_mp.colorspace = V4L2_COLORSPACE_SRGB;
+         f->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+@@ -243,10 +296,13 @@ static void virtio_media_fmt_nv12_to_rgba(VirtIOMediaQueue *q,
+         if (q) {
+             q->host_sizeimage = f->fmt.pix.sizeimage;
+         }
+-        bpl = virtio_media_rgba_bpl(w);
++        virtio_media_scaled_size(max_w, w, h, &sw, &sh);
++        bpl = virtio_media_rgba_bpl(sw);
++        f->fmt.pix.width = sw;
++        f->fmt.pix.height = sh;
+         f->fmt.pix.pixelformat = V4L2_PIX_FMT_RGBA32;
+         f->fmt.pix.bytesperline = bpl;
+-        f->fmt.pix.sizeimage = bpl * h;
++        f->fmt.pix.sizeimage = bpl * sh;
+         f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+         f->fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+         f->fmt.pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
+@@ -255,7 +311,11 @@ static void virtio_media_fmt_nv12_to_rgba(VirtIOMediaQueue *q,
+         bool is709;
+ 
+         q->rgba_bytesperline = bpl;
+-        q->rgba_sizeimage = bpl * h;
++        q->rgba_sizeimage = bpl * sh;
++        q->host_w = w;
++        q->host_h = h;
++        q->scaled_w = (sw != w || sh != h) ? sw : 0;
++        q->scaled_h = (sw != w || sh != h) ? sh : 0;
+         if (enc == V4L2_YCBCR_ENC_DEFAULT) {
+             enc = V4L2_MAP_YCBCR_ENC_DEFAULT(cs);
+         }
+@@ -640,8 +700,10 @@ static void virtio_media_host_readable(void *opaque)
+                     /* Destination (RGBA) geometry, in either host format. */
+                     uint32_t dst_bpl = q->nv12_host ? q->rgba_bytesperline
+                                                     : q->bytesperline;
++                    uint32_t dst_w = q->scaled_w ? q->scaled_w : q->width;
++                    uint32_t dst_h = q->scaled_h ? q->scaled_h : q->height;
+                     bool geom_ok = q->width && q->height &&
+-                                   dst_bpl >= q->width * 4 &&
++                                   dst_bpl >= dst_w * 4 &&
+                                    (!q->nv12_host || q->bytesperline >= q->width);
+ 
+                     if (vm->gpu_xfer && gb->virgl_res && p == 0 &&
+@@ -663,12 +725,21 @@ static void virtio_media_host_readable(void *opaque)
+                                          "path off for this queue\n", errno);
+                             } else {
+                                 if (q->nv12_host) {
++                                    /*
++                                     * The same ratio the compose rectangle
++                                     * is scaled by (G_SELECTION below).
++                                     */
++                                    float scale = q->scaled_w && q->host_w
++                                        ? (float)q->host_w / q->scaled_w
++                                        : 1.0f;
++
+                                     q->gpu_buf[idx] =
+                                         virtio_media_gpu_import_nv12(
+                                             eb.fd, q->width, q->height,
+                                             q->bytesperline,
+                                             q->bytesperline * q->height,
+-                                            dst_bpl / 4, q->host_len[idx][p],
++                                            dst_bpl / 4, dst_h, scale,
++                                            q->host_len[idx][p],
+                                             q->matrix, &e);
+                                 } else {
+                                     q->gpu_buf[idx] = virtio_media_gpu_import(
+@@ -708,6 +779,17 @@ static void virtio_media_host_readable(void *opaque)
+                     void *src_map = q->host_map[evt.buffer.index][p];
+                     uint32_t src_bpl = q->bytesperline;
+ 
++                    if (q->nv12_host && q->scaled_w) {
++                        /*
++                         * host-max-width: only the GPU path scales. A host-size
++                         * frame does not fit the guest's smaller buffer, so
++                         * leave the buffer as it was rather than overrun it.
++                         */
++                        warn_report_once("virtio-media: host_max_width: GPU "
++                                         "path unavailable, frame not "
++                                         "updated");
++                        continue;
++                    }
+                     if (q->nv12_host) {
+                         size_t need = (size_t)q->rgba_sizeimage;
+ 
+@@ -1149,9 +1231,10 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+              */
+             if (q->nv12_host &&
+                 virtio_media_fmt_pixelformat(&fmt) == V4L2_PIX_FMT_NV12) {
+-                virtio_media_fmt_nv12_to_rgba(q, &fmt);
++                virtio_media_fmt_nv12_to_rgba(q, &fmt, s->vm->host_max_width);
+             } else {
+                 q->nv12_host = false;
++                q->scaled_w = q->scaled_h = 0;
+             }
+         }
+     }
+@@ -1531,6 +1614,7 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+         struct v4l2_format *f = (struct v4l2_format *)payload;
+         bool capture = virtio_media_fmt_is_capture(f);
+         bool want_rgba = false;
++        uint32_t guest_w = 0, guest_h = 0;
+ 
+         q = &s->queues[virtio_media_queue_index(f->type)];
+         if (s->vm->host_nv12 && s->vm->gpu_xfer && capture) {
+@@ -1539,6 +1623,14 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+             } else if (virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_RGBA32) {
+                 want_rgba = true;
+                 virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
++                /*
++                 * host-max-width: the guest only knows the scaled size and
++                 * the codec cannot scale, so ask the codec for its own size.
++                 */
++                if (s->vm->host_max_width && q->host_w && q->host_h) {
++                    virtio_media_fmt_get_size(f, &guest_w, &guest_h);
++                    virtio_media_fmt_set_size(f, q->host_w, q->host_h);
++                }
+             }
+         }
+         if (ioctl(s->fd, code, payload) < 0) {
+@@ -1547,11 +1639,15 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+             if (want_rgba && code != VIDIOC_G_FMT) {
+                 /* Give the guest's format back untouched in the reply. */
+                 virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_RGBA32);
++                if (guest_w) {
++                    virtio_media_fmt_set_size(f, guest_w, guest_h);
++                }
+             }
+             return err;
+         }
+         if (want_rgba && virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12) {
+-            virtio_media_fmt_nv12_to_rgba(code == VIDIOC_TRY_FMT ? NULL : q, f);
++            virtio_media_fmt_nv12_to_rgba(code == VIDIOC_TRY_FMT ? NULL : q, f,
++                                          s->vm->host_max_width);
+             if (code == VIDIOC_S_FMT && !q->nv12_host) {
+                 q->nv12_host = true;
+                 qemu_log("virtio-media-diag: host_nv12: CAPTURE %ux%u runs NV12 "
+@@ -1566,12 +1662,34 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+         } else if (code == VIDIOC_S_FMT && capture) {
+             /* The host ended up in some other format: no translation. */
+             q->nv12_host = false;
++            q->scaled_w = q->scaled_h = 0;
+         }
+         return 0;
+     }
+ 
+     ret = ioctl(s->fd, code, payload) < 0 ? errno : 0;
+ 
++    /*
++     * host-max-width: the visible (compose) rectangle is in host pixels;
++     * give it in the scaled frame's pixels, like the format. Both axes by
++     * scaled_w / host_w, the ratio the shader samples at. S_SELECTION is
++     * passed through unscaled: the guest's decoder only reads the rectangle.
++     */
++    if (!ret && code == VIDIOC_G_SELECTION) {
++        struct v4l2_selection *sel = (struct v4l2_selection *)payload;
++        struct v4l2_rect *r = &sel->r;
++
++        q = &s->queues[virtio_media_queue_index(sel->type)];
++        if (q->nv12_host && q->scaled_w && q->host_w && q->host_h) {
++            r->left = virtio_media_scale_coord(r->left, q->scaled_w, q->host_w);
++            r->top = virtio_media_scale_coord(r->top, q->scaled_w, q->host_w);
++            r->width = virtio_media_scale_coord(r->width, q->scaled_w,
++                                                q->host_w);
++            r->height = virtio_media_scale_coord(r->height, q->scaled_w,
++                                                 q->host_w);
++        }
++    }
++
+     if (!ret && code == VIDIOC_QUERYBUF) {
+         struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
+ 
+@@ -1887,6 +2005,22 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+     struct v4l2_capability cap;
+     int fd;
+ 
++    /*
++     * host-max-width scales in the host-nv12 shader, on the GPU path only.
++     * Below 16 the scaled frame would be empty; without that path the
++     * property would silently do nothing, so say so.
++     */
++    if (vm->host_max_width && vm->host_max_width < 16) {
++        error_setg(errp, "virtio-media: host-max-width must be 0 or at "
++                   "least 16");
++        return;
++    }
++    if (vm->host_max_width &&
++        (vm->decoder || !vm->host_nv12 || !vm->gpu_xfer)) {
++        warn_report("virtio-media: host-max-width has no effect without "
++                    "host-nv12=on and gpu-xfer=on, or in decoder mode");
++    }
++
+     /*
+      * Decoder mode needs no host device, so v4l2-device is not required there;
+      * virtio_media_dec_realize() sets device_caps from what the decoder
+@@ -2015,6 +2149,7 @@ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+     DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
+     DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
++    DEFINE_PROP_UINT32("host-max-width", VirtIOMedia, host_max_width, 0),
+     DEFINE_PROP_BOOL("output-coherent", VirtIOMedia, output_coherent, false),
+     DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
+ };
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 07b2e0069..5ff529be4 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -59,14 +59,19 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+  * `stride` bytes per row from offset 0, interleaved CbCr plane of the same
+  * stride from `uv_offset`, `src_width` x `src_height` pixels). The blit then
+  * converts it on the GPU into the RGBA resource, which is `dst_width` x
+- * `src_height` (dst_width = the guest's bytesperline / 4, >= src_width; the
+- * padding columns repeat the last source column). `matrix` selects the
+- * YCbCr -> RGB coefficients: 0 = BT.601 limited, 1 = BT.709 limited,
+- * 2 = BT.601 full, 3 = BT.709 full.
++ * `dst_height` (dst_width = the guest's bytesperline / 4). `scale` is source
++ * pixels per destination pixel, the same on both axes. At 1 (unscaled),
++ * dst_height == src_height and dst_width >= src_width (the padding columns
++ * repeat the last source column). With host-max-width it is the codec's
++ * width over the width the guest was given -- not over dst_width, which is
++ * padded to 16 pixels -- and the planes are sampled with GL_LINEAR.
++ * `matrix` selects the YCbCr -> RGB coefficients: 0 = BT.601 limited,
++ * 1 = BT.709 limited, 2 = BT.601 full, 3 = BT.709 full.
+  */
+ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+                                    uint32_t src_height, uint32_t stride,
+                                    uint32_t uv_offset, uint32_t dst_width,
++                                   uint32_t dst_height, float scale,
+                                    uint32_t len, int matrix, int *err);
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id);
+ int virtio_media_gpu_wait(void *handle);
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 12052fcac..b5ac40365 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -221,6 +221,16 @@ typedef struct VirtIOMediaQueue {
+     uint32_t rgba_sizeimage;
+     uint32_t host_sizeimage;
+     int matrix;
++    /*
++     * host-max-width: the guest-facing RGBA frame is scaled_w x scaled_h
++     * when the NV12 shader scales it down, 0 x 0 when it is not scaled.
++     * host_w/host_h: the codec's CAPTURE size from its last format reply;
++     * a guest S_FMT/TRY_FMT is turned back into that size.
++     */
++    uint32_t scaled_w;
++    uint32_t scaled_h;
++    uint32_t host_w;
++    uint32_t host_h;
+     /* CPU fallback: RGBA scratch for frames that could not go through the GPU. */
+     uint8_t *conv_scratch;
+     size_t conv_scratch_len;
+@@ -306,6 +316,16 @@ struct VirtIOMedia {
+      * cannot take the GPU path are converted on the CPU (slow, correct).
+      */
+     bool host_nv12;
++    /*
++     * host-max-width (needs host-nv12): give the guest frames no wider than
++     * this, scaled down by the NV12 shader, and report that size in the
++     * CAPTURE format and compose rectangle. It applies to every decode wider
++     * than this, whatever the guest does with the frames -- a ByteBuffer
++     * reader or a re-encoder gets the smaller size too. 0 (default) keeps
++     * the codec's size. The CPU fallback does not scale; with scaling on, a
++     * frame the GPU path could not take is left as it was, with a warning.
++     */
++    uint32_t host_max_width;
+     /*
+      * output-coherent: REQBUFS the host OUTPUT queue coherent instead of
+      * cacheable, trading a Normal-NC bitstream copy (~8 KB) for vb2's cache

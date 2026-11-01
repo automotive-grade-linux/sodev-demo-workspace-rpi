@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 14 Oct 2026 00:44:26 +0900
+Subject: [PATCH] virtio-gpu-virgl: retire a destroyed context's ring fences
+
+A fenced command with VIRTIO_GPU_FLAG_INFO_RING_IDX gets a context fence
+from virgl_renderer_context_create_fence() and is answered only when
+virglrenderer reports that fence (write_context_fence, or the async
+fence bottom half); virgl_write_fence() skips such commands
+(hw/display/virtio-gpu-virgl.c:1178 in qemu 11.1.2). Two cases leave one
+in g->fenceq for good:
+
+1. CTX_DESTROY while ring fences are pending.
+   virgl_cmd_context_destroy() (virtio-gpu-virgl.c:506-515) only calls
+   virgl_renderer_context_destroy(), which just removes the context
+   (virglrenderer 1.3.0 src/virglrenderer.c:283). For a Venus (proxy)
+   context, proxy_context_destroy() frees the pending fences of every
+   timeline without retiring them (src/proxy/proxy_context.c:528-533).
+   The guest does not wait for its fences first: the Linux driver's
+   virtio_gpu_driver_postclose() sends CTX_DESTROY when the DRM file is
+   closed, e.g. when a process exits or is killed, and frees the ctx_id
+   for reuse.
+
+2. virgl_renderer_context_create_fence() fails; it returns -EINVAL for
+   an unknown ctx_id (src/virglrenderer.c:430-432). The error is logged
+   and the command left unanswered (virtio-gpu-virgl.c:1140-1152), and
+   virtio_gpu_process_cmdq() then queues it on fenceq
+   (hw/display/virtio-gpu.c:1181).
+
+Such a command is never answered: the guest's descriptor and dma_fence
+leak, and virtio_gpu_fence_poll() keeps re-arming its timer while fenceq
+is not empty (virtio-gpu-virgl.c:1395-1396). A new context that reuses
+the ctx_id would also retire the stale entries with its own fences.
+
+After virgl_renderer_context_destroy(), answer every command still
+waiting on a ring fence of that ctx_id with OK_NODATA: the context is
+gone, so there is nothing left to wait for. When the context fence
+cannot be created, answer the command at once with
+VIRTIO_GPU_RESP_ERR_UNSPEC: an error rather than OK, because no fence
+was set up and qemu cannot tell that the work is done; and not a ctx0
+fence as a fallback, because that signals when vrend's GL work is done,
+not when the context's ring reaches the fence. The response carries the
+fence id like any fenced response, so the guest's fence still signals
+and nothing waits forever.
+
+The async fence path (VIRGL_RENDERER_ASYNC_FENCE_CB) has the same
+problem, as its bottom half also retires only reported fences; the
+change covers both.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-virgl.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index e610358..8b13bbf 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -671,11 +671,35 @@ static void virgl_cmd_context_destroy(VirtIOGPU *g,
+                                       struct virtio_gpu_ctrl_command *cmd)
+ {
+     struct virtio_gpu_ctx_destroy cd;
++#if VIRGL_VERSION_MAJOR >= 1
++    struct virtio_gpu_ctrl_command *fcmd, *tmp;
++#endif
+ 
+     VIRTIO_GPU_FILL_CMD(cd);
+     trace_virtio_gpu_cmd_ctx_destroy(cd.hdr.ctx_id);
+ 
+     virgl_renderer_context_destroy(cd.hdr.ctx_id);
++#if VIRGL_VERSION_MAJOR >= 1
++    /*
++     * virglrenderer frees the context's pending ring fences without reporting
++     * them, so answer the commands still waiting on one: otherwise they stay
++     * in fenceq forever, and a new context reusing ctx_id would retire them.
++     */
++    QTAILQ_FOREACH_SAFE(fcmd, &g->fenceq, next, tmp) {
++        if (!(fcmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) ||
++            fcmd->cmd_hdr.ctx_id != cd.hdr.ctx_id) {
++            continue;
++        }
++        trace_virtio_gpu_fence_resp(fcmd->cmd_hdr.fence_id);
++        virtio_gpu_ctrl_response_nodata(g, fcmd, VIRTIO_GPU_RESP_OK_NODATA);
++        QTAILQ_REMOVE(&g->fenceq, fcmd, next);
++        g_free(fcmd);
++        g->inflight--;
++        if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
++            trace_virtio_gpu_dec_inflight_fences(g->inflight);
++        }
++    }
++#endif
+ }
+ 
+ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
+@@ -1325,6 +1349,12 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+             qemu_log_mask(LOG_GUEST_ERROR,
+                           "%s: virgl_renderer_context_create_fence error: %s",
+                           __func__, strerror(-ret));
++            /*
++             * No fence will ever retire this command (e.g. the context does
++             * not exist): fail it now instead of leaving it in fenceq. The
++             * response still carries the fence, so the guest's fence signals.
++             */
++            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_ERR_UNSPEC);
+         }
+         return;
+     }

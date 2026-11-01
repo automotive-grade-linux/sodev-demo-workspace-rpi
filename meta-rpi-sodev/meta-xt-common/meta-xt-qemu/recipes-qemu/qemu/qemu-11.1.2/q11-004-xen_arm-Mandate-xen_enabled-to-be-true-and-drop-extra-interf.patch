@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrii <andrii_chepurnyi@epam.com>
+Date: Mon, 18 Aug 2025 18:04:59 +0000
+Subject: [PATCH] xen_arm: Mandate xen_enabled() to be true and drop extra
+ interface opening
+
+In order to use virtio backends we need to make sure that Xen
+accelerator is enabled (xen_enabled() returns true) as the memory/cache
+systems check for xen_enabled() to perform specific actions. Without
+that the xen-mapcache (which is needed for mapping guest memory) is not
+in use.
+
+Also drop extra interface opening as this is already done in xen-all.c
+(so drop xen_init_ioreq() completely) and skip virtio/tpm initialization
+if device emulation is not available.
+
+Alternatively the toolstack could pass required accelerator using "-M"
+arg (for example "-M xenpv,accel=xen").
+
+Original patch: 6a2fd4e314da9c34398445931f8929fab2078a02
+
+(cherry picked from commit 20db6464821d4e364a376a165e089324a74aee74)
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Signed-off-by: Andrii <andrii_chepurnyi@epam.com>
+Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
+Local-Modifications: rebased onto qemu 11.1.2; the changed lines are the original commit's, the context (xen_register_ioreq's mapcache argument) is 11.1.2's
+Origin: https://github.com/xen-troops/qemu commit 20db6464821d4e364a376a165e089324a74aee74
+---
+ hw/arm/xen-pvh.c                |  1 +
+ hw/xen/xen-hvm-common.c         |  9 +++++----
+ hw/xen/xen-pvh-common.c         | 17 +++++++++++++++--
+ include/hw/xen/xen-hvm-common.h |  2 +-
+ 4 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/hw/arm/xen-pvh.c b/hw/arm/xen-pvh.c
+index 10cac28a9..6edef0eb4 100644
+--- a/hw/arm/xen-pvh.c
++++ b/hw/arm/xen-pvh.c
+@@ -75,6 +75,7 @@ static void xen_arm_machine_class_init(ObjectClass *oc, const void *data)
+      * mc->max_cpus, QEMU will bail out with an error message.
+      */
+     mc->max_cpus = GUEST_MAX_VCPUS;
++    mc->default_machine_opts = "accel=xen";
+ 
+     /* Xen/ARM does not use buffered IOREQs.  */
+     xpc->handle_bufioreq = HVM_IOREQSRV_BUFIOREQ_OFF;
+diff --git a/hw/xen/xen-hvm-common.c b/hw/xen/xen-hvm-common.c
+index 62d88804c..3e5f3f434 100644
+--- a/hw/xen/xen-hvm-common.c
++++ b/hw/xen/xen-hvm-common.c
+@@ -906,12 +906,12 @@ err:
+     exit(1);
+ }
+ 
+-void xen_register_ioreq(XenIOState *state, unsigned int max_cpus,
++int xen_register_ioreq(XenIOState *state, unsigned int max_cpus,
+                         uint8_t handle_bufioreq,
+                         const MemoryListener *xen_memory_listener,
+                         bool mapcache)
+ {
+-    int rc;
++    int rc = -1;
+ 
+     setup_xen_backend_ops();
+ 
+@@ -934,12 +934,13 @@ void xen_register_ioreq(XenIOState *state, unsigned int max_cpus,
+     } else {
+         warn_report("xen: failed to create ioreq server");
+     }
+-
++    rc = 0;
+     xen_bus_init();
+ 
+-    return;
++    return rc;
+ 
+ err:
+     error_report("xen hardware virtual machine backend registration failed");
+     exit(1);
++    return rc;
+ }
+diff --git a/hw/xen/xen-pvh-common.c b/hw/xen/xen-pvh-common.c
+index cca37202f..51ff1fe8e 100644
+--- a/hw/xen/xen-pvh-common.c
++++ b/hw/xen/xen-pvh-common.c
+@@ -15,6 +15,7 @@
+ #include "system/tpm.h"
+ #include "system/tpm_backend.h"
+ #include "system/runstate.h"
++#include "system/xen.h"
+ #include "hw/xen/xen-pvh-common.h"
+ #include "trace.h"
+ 
+@@ -274,6 +275,12 @@ static void xen_pvh_init(MachineState *ms)
+     XenPVHMachineState *s = XEN_PVH_MACHINE(ms);
+     XenPVHMachineClass *xpc = XEN_PVH_MACHINE_GET_CLASS(s);
+     MemoryRegion *sysmem = get_system_memory();
++    int rc = -1;
++
++    if (!xen_enabled()) {
++        error_report("xenpv machine requires the Xen accelerator");
++        exit(1);
++    }
+ 
+     if (ms->ram_size == 0) {
+         warn_report("%s: ram size not specified. QEMU machine started"
+@@ -282,12 +289,18 @@ static void xen_pvh_init(MachineState *ms)
+         return;
+     }
+ 
+-    xen_pvh_init_ram(s, sysmem);
+-    xen_register_ioreq(&s->ioreq, ms->smp.max_cpus,
++    rc = xen_register_ioreq(&s->ioreq, ms->smp.max_cpus,
+                        xpc->handle_bufioreq,
+                        &xen_memory_listener,
+                        s->cfg.mapcache);
+ 
++    if (rc) {
++        DPRINTF("Device emulation is not available, only PV backend can be used\n");
++        return;
++    }
++
++    xen_pvh_init_ram(s, sysmem);
++
+     if (s->cfg.virtio_mmio_num) {
+         xen_create_virtio_mmio_devices(s);
+     }
+diff --git a/include/hw/xen/xen-hvm-common.h b/include/hw/xen/xen-hvm-common.h
+index d177ff14e..1fa45b5bf 100644
+--- a/include/hw/xen/xen-hvm-common.h
++++ b/include/hw/xen/xen-hvm-common.h
+@@ -89,7 +89,7 @@ void xen_device_realize(DeviceListener *listener, DeviceState *dev);
+ void xen_device_unrealize(DeviceListener *listener, DeviceState *dev);
+ 
+ void xen_hvm_change_state_handler(void *opaque, bool running, RunState rstate);
+-void xen_register_ioreq(XenIOState *state, unsigned int max_cpus,
++int xen_register_ioreq(XenIOState *state, unsigned int max_cpus,
+                         uint8_t handle_bufioreq,
+                         const MemoryListener *xen_memory_listener,
+                         bool mapcache);

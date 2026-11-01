@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 23 Oct 2026 00:47:54 +0900
+Subject: [PATCH] drm/vc4: let an overlay plane go under the primary plane
+
+The primary plane had an immutable zpos of 0 and the overlays a range of
+1..17, so no plane could be put under the primary. weston uses an
+underlay plane only when the plane's zpos_min is below the primary's, so
+a video under a translucent UI (a WebView) never got a plane and was
+composited on the GPU. Give the primary a zpos of 1 (range 1..17) and
+let the overlays go down to 0. With no zpos set the order is unchanged:
+equal zpos sort by plane id, and the primary is created before the
+overlays.
+
+The primary's maximum is written as 16 + 1 because
+VC4_NUM_OVERLAY_PLANES is defined after this function in vc4_plane.c.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/drivers/gpu/drm/vc4/vc4_plane.c
++++ b/drivers/gpu/drm/vc4/vc4_plane.c
+@@ -2803,8 +2803,15 @@
+ 
+ 	drm_plane_create_chroma_siting_properties(plane, 0, 0);
+ 
++	/*
++	 * The primary sits at zpos 1 (range 1..17) and the overlays may go down to 0,
++	 * so a compositor can put a plane under the primary: weston only uses an
++	 * underlay plane whose zpos_min is below the primary zpos_min. With no zpos
++	 * set the order is unchanged: equal zpos sort by plane id, and the primary is
++	 * created before the overlays.
++	 */
+ 	if (type == DRM_PLANE_TYPE_PRIMARY)
+-		drm_plane_create_zpos_immutable_property(plane, 0);
++		drm_plane_create_zpos_property(plane, 1, 1, 16 + 1);
+ 
+ 	return plane;
+ }
+@@ -2852,7 +2859,7 @@
+ 		/* Create zpos property. Max of all the overlays + 1 primary +
+ 		 * 1 cursor plane on a crtc.
+ 		 */
+-		drm_plane_create_zpos_property(plane, i + 1, 1,
++		drm_plane_create_zpos_property(plane, i + 1, 0,
+ 					       VC4_NUM_OVERLAY_PLANES + 1);
+ 	}
+ 
+@@ -2867,7 +2874,7 @@
+ 		/* Create zpos property. Max of all the overlays + 1 primary +
+ 		 * 1 cursor plane on a crtc.
+ 		 */
+-		drm_plane_create_zpos_property(plane, i + 1, 1,
++		drm_plane_create_zpos_property(plane, i + 1, 0,
+ 					       VC4_NUM_OVERLAY_PLANES + 1);
+ 	}
+ 

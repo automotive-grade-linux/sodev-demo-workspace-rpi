@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-gpu-gl: suppress guest notifications while draining
+ the control queue
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0233-v10-virtio-gpu-gl-suppress-notifications-while-draining.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-gl.c | 36 ++++++++++++++++++++++++++++--------
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 8d6369c81..9404f9929 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -75,16 +75,36 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         return;
+     }
+ 
+-    cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+-    while (cmd) {
+-        cmd->vq = vq;
+-        cmd->error = 0;
+-        cmd->finished = false;
+-        QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
++    /*
++     * SUPPRESS GUEST NOTIFICATIONS WHILE DRAINING THE QUEUE (the virtio-blk
++     * pattern). On Xen/Arm a doorbell write is not fire-and-forget: it is an
++     * MMIO ioreq that blocks the guest vCPU until this main loop answers it,
++     * and it is answered only once the previous batch below has been
++     * processed. The guest compositor submits several small GL command
++     * batches per frame; measured on RPi4 DomA (2026-09-05, 720p60 HW
++     * playback) that was 360 virtio-gpu kicks/s, 63 % of all ioreqs
++     * together with the ISR reads they cause. With notifications off while
++     * we are already here, the guest's virtqueue_kick_prepare() sees no need
++     * to ring, keeps submitting, and the extra commands are picked up by the
++     * re-check below instead of costing a vCPU stall and a main-loop wakeup
++     * each.
++     */
++    do {
++        virtio_queue_set_notification(vq, 0);
++
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+-    }
++        while (cmd) {
++            cmd->vq = vq;
++            cmd->error = 0;
++            cmd->finished = false;
++            QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
++            cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
++        }
++
++        virtio_gpu_process_cmdq(g);
++        virtio_queue_set_notification(vq, 1);
++    } while (!virtio_queue_empty(vq));
+ 
+-    virtio_gpu_process_cmdq(g);
+     virtio_gpu_virgl_fence_poll(g);
+ }
+ 

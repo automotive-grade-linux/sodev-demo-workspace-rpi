@@ -119,6 +119,9 @@ DOMD_WIFI_FW = "${@'linux-firmware-rpidistro-bcm43455' \
 # wireless-regdb-static, not wireless-regdb, carries /lib/firmware/regulatory.db
 # and .p7s, which is where cfg80211 loads regulatory data from. Without it the
 # radio is clamped to the world-roaming channel set.
+#
+# xt_TCPMSS (the TCPMSS target) and xt_tcpudp (the tcp match its -p tcp needs) are for
+# the MSS cap DomD's NAT puts on forwarded TCP; neither is pulled in by anything else.
 DOMD_WIFI_PACKAGES = ""
 DOMD_WIFI_PACKAGES:raspberrypi5 = " \
     kernel-module-cfg80211 \
@@ -130,6 +133,8 @@ DOMD_WIFI_PACKAGES:raspberrypi5 = " \
     kernel-module-brcmfmac-wcc \
     kernel-module-xt-masquerade \
     kernel-module-xt-conntrack \
+    kernel-module-xt-tcpmss \
+    kernel-module-xt-tcpudp \
     ${DOMD_WIFI_FW} \
     wireless-regdb-static \
     wpa-supplicant \
@@ -179,7 +184,7 @@ brcmfmac_generic_fw_names() {
 }
 # Only with the firmware installed; without it there is nothing to link.
 ROOTFS_POSTPROCESS_COMMAND:append:raspberrypi5 = \
-    "${@' brcmfmac_generic_fw_names;' if d.getVar('DOMD_WIFI_FW') else ''}"
+    "${@' brcmfmac_generic_fw_names' if d.getVar('DOMD_WIFI_FW') else ''}"
 
 # ---------------------------------------------------------------------------
 # HEVC hardware decode in DomD (codec@800000, driver rpi-hevc-dec).
@@ -243,3 +248,9 @@ DOMD_HEVC_PACKAGES:raspberrypi5 = " \
     ffmpeg \
     "
 IMAGE_INSTALL:append = " ${DOMD_HEVC_PACKAGES}"
+
+# The DomA device model's display-path switches (/run/qemu-*), created at boot by tmpfiles.d:
+# the plane handoff (q11-066), media-sg-rw and fb-invalidate (q11-063) and the
+# direct-scanout switches (q11-063, q11-071), plane-sand and sand-scaled (q11-081,
+# q11-082); only qemu 11 reads them.
+IMAGE_INSTALL:append:raspberrypi5 = " xt-qemu-display-toggles"

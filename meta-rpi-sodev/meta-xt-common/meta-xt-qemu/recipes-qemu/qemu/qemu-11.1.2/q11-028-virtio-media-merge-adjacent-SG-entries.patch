@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] virtio-media: merge adjacent SG entries
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0225-v10-virtio-media-coalesce-sg-runs.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c         | 25 ++++++++++++++++++++++---
+ include/hw/virtio/virtio-media.h |  2 +-
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 85a3e5018..c7f70c38a 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -821,16 +821,35 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+             virtio_media_free_buffer_sgl(gb);
+             return EINVAL;
+         }
+-        gb->planes[p].nents = ent_idx - first;
+         gb->planes[p].len = plane_len;
+         /*
++         * Merge physically adjacent entries while copying the list. The guest
++         * driver emits one entry per page whether or not the pages are
++         * contiguous, and each entry later costs one dma_memory_map(), so a
++         * contiguous run of N pages copied as one entry is N times cheaper.
++         * Never worse than the raw list: the merged list is at most as long.
++         *
+          * g_malloc + memcpy, not g_memdup2(): that needs glib 2.68 and this
+          * qemu targets 2.56 (there is a g_memdup2_qemu shim, but an explicit
+          * copy is clearer than depending on which shim exists).
+          */
+         gb->planes[p].ents = g_malloc((ent_idx - first) * sizeof(*ents));
+-        memcpy(gb->planes[p].ents, &ents[first],
+-               (ent_idx - first) * sizeof(*ents));
++        gb->planes[p].nents = 0;
++        {
++            struct virtio_media_sg_entry *out = gb->planes[p].ents;
++            size_t k;
++
++            for (k = first; k < ent_idx; k++) {
++                if (gb->planes[p].nents > 0 &&
++                    out[gb->planes[p].nents - 1].start +
++                    out[gb->planes[p].nents - 1].len == ents[k].start &&
++                    ents[k].len > 0) {
++                    out[gb->planes[p].nents - 1].len += ents[k].len;
++                } else {
++                    out[gb->planes[p].nents++] = ents[k];
++                }
++            }
++        }
+     }
+ 
+     /*
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index bba5b9a98..fd7836557 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -161,7 +161,7 @@ struct virtio_media_event_event {
+  * dozens of buffers queued. Pages are mapped at completion, copied, unmapped.
+  */
+ typedef struct VirtIOMediaPlaneSg {
+-    uint32_t nents;
++    uint32_t nents;               /* after merging adjacent entries */
+     uint32_t len;
+     struct virtio_media_sg_entry *ents;
+ } VirtIOMediaPlaneSg;

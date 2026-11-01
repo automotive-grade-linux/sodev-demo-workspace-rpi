@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 26 Oct 2026 18:30:00 +0900
+Subject: [PATCH] main-loop: one time budget for a whole iteration
+
+The budgeted bottom halves (q11-101's control queue, q11-103's
+virtio-blk queues) each bound their own slice, but aio_bh_poll() runs
+every pending one in a single pass, and a device's notify handler can
+run in the same iteration too: on the Raspberry Pi 4 a virtio-blk slice
+of 9 ms and a notify of 11 ms held the BQL for 20 ms in one iteration (a
+720p60 video in a WebView beside the HMI).
+
+QEMU_MAIN_LOOP_ITER_BUDGET_US gives the whole iteration one budget. Each
+of them also stops once the iteration has used it and goes on in the
+next one, but not more than twice in a row, so that every queue moves.
+The long GPU commands (SUBMIT_3D, RESOURCE_FLUSH, SET_SCANOUT,
+RESOURCE_MAP_BLOB) start a slice only. Unset or 0 keeps the old
+behaviour.
+
+Measured on the Raspberry Pi 4 (2026-10-26, 8000 us, with q11-101 at
+8000 and q11-103 at 6000 us, five 580 s runs): no ALSA under-run in any;
+the BQL was held for 16.7 ms or more only by single commands (41.0 ms
+once full screen, 18.0 ms once beside the HMI), no longer by several in
+one iteration. Both sets of runs had DomA's sound card writing without
+the BQL (tx-no-bql, the mixing engine off) and DomA's block read-ahead
+at 512 KiB, both set at run time; the Raspberry Pi 4 product now sets
+that read-ahead itself.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/block/virtio-blk.c          | 28 ++++++++++++++++++-
+ hw/display/virtio-gpu.c        | 50 +++++++++++++++++++++++++++++-----
+ include/hw/virtio/virtio-blk.h |  2 ++
+ include/hw/virtio/virtio-gpu.h |  1 +
+ include/qemu/main-loop.h       | 10 +++++++
+ util/main-loop.c               | 43 +++++++++++++++++++++++++++++
+ 6 files changed, 126 insertions(+), 8 deletions(-)
+
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index e224bb7db..525212327 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -1033,6 +1033,17 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+                        get_clock() : 0;
+     bool budget_hit = false;
+ 
++    /*
++     * q11-104: a notify in an iteration that has used its budget: leave the
++     * requests in the queue for the bottom half, which goes on in the next one.
++     */
++    if (t_budget && !s->vq_budget_in_bh && qemu_main_loop_iter_spent()) {
++        virtio_queue_set_notification(vq, 0);
++        s->vq_budget_pending |= 1ULL << q;
++        qemu_bh_schedule(s->vq_budget_bh);
++        return;
++    }
++
+     defer_call_begin();
+ 
+     do {
+@@ -1046,7 +1057,8 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+                 g_free(req);
+                 break;
+             }
+-            if (t_budget && get_clock() - t_budget >= s->vq_budget_ns) {
++            if (t_budget && (get_clock() - t_budget >= s->vq_budget_ns ||
++                             qemu_main_loop_iter_spent())) {
+                 budget_hit = true;
+                 break;
+             }
+@@ -1079,13 +1091,26 @@ static void virtio_blk_vq_budget_bh(void *opaque)
+     uint64_t pending = s->vq_budget_pending;
+     unsigned q;
+ 
++    /*
++     * q11-104: the iteration has used its budget (another device's slice):
++     * go on in the next one, but not more than twice in a row, so that a
++     * queue always moves however busy the other devices are.
++     */
++    if (pending && qemu_main_loop_iter_spent() && s->vq_budget_deferred < 2) {
++        s->vq_budget_deferred++;
++        qemu_bh_schedule(s->vq_budget_bh);
++        return;
++    }
++    s->vq_budget_deferred = 0;
+     s->vq_budget_pending = 0;
+     for (q = 0; pending; q++, pending >>= 1) {
+         if (pending & 1) {
+             VirtQueue *vq = virtio_get_queue(vdev, q);
+ 
+             virtio_queue_set_notification(vq, 1);
++            s->vq_budget_in_bh = true;
+             virtio_blk_handle_vq(s, vq);
++            s->vq_budget_in_bh = false;
+         }
+     }
+ }
+@@ -1198,6 +1223,7 @@ static void virtio_blk_reset(VirtIODevice *vdev)
+         qemu_bh_cancel(s->vq_budget_bh);
+     }
+     s->vq_budget_pending = 0;
++    s->vq_budget_deferred = 0; /* q11-104 */
+ 
+     /* ...but requests may still be in flight. */
+     blk_drain(s->blk);
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 354feab47..0d8cfbf92 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -14,6 +14,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/units.h"
+ #include "qemu/iov.h"
++#include "qemu/main-loop.h"
+ #include "system/cpus.h"
+ #include "ui/console.h"
+ #include "ui/rect.h"
+@@ -1291,15 +1292,49 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+          * next iteration too: then the hold is about one command at most.
+          * A bottom half always runs at least one command, so the queue moves.
+          */
+-        if (t_budget && g->cmdq_bh_cmds) {
++        if (t_budget) {
+             int64_t used = get_clock() - t_budget;
++            /*
++             * q11-104: the long commands start a slice only, counted from the
++             * bottom half or from the main-loop iteration, whichever is longer.
++             * Measured on the RPi4 (WebView 720p60): SUBMIT_3D up to 16 ms,
++             * RESOURCE_FLUSH 12-16 ms when a plane handoff misses and
++             * virtio-media catches its skipped frames up, SET_SCANOUT and
++             * RESOURCE_MAP_BLOB 8 ms and more now and then.
++             */
++            int64_t u = MAX(used, qemu_main_loop_iter_used());
+             struct virtio_gpu_ctrl_hdr next;
+-
+-            if (used >= g->cmdq_budget_ns ||
+-                (used >= g->cmdq_submit_ns &&
+-                 iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0, &next,
+-                            sizeof(next)) == sizeof(next) &&
+-                 le32_to_cpu(next.type) == VIRTIO_GPU_CMD_SUBMIT_3D)) {
++            bool long_cmd = false;
++            bool stop;
++
++            if (iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0, &next,
++                           sizeof(next)) == sizeof(next)) {
++                switch (le32_to_cpu(next.type)) {
++                case VIRTIO_GPU_CMD_SUBMIT_3D:
++                case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
++                case VIRTIO_GPU_CMD_SET_SCANOUT:
++                case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
++                    long_cmd = true;
++                    break;
++                default:
++                    break;
++                }
++            }
++            if (g->cmdq_bh_cmds) {
++                stop = used >= g->cmdq_budget_ns || qemu_main_loop_iter_spent() ||
++                       (long_cmd && u >= g->cmdq_submit_ns);
++            } else {
++                /*
++                 * The first command of a bottom half gives way to an iteration
++                 * that is already in use, but not more than twice in a row, so
++                 * the queue always moves.
++                 */
++                stop = long_cmd && u >= g->cmdq_submit_ns && g->cmdq_deferred < 2;
++                if (stop) {
++                    g->cmdq_deferred++;
++                }
++            }
++            if (stop) {
+                 g->cmdq_budget_hit = true;
+                 qemu_bh_schedule(g->ctrl_bh);
+                 break;
+@@ -1329,6 +1364,7 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+ 
+         QTAILQ_REMOVE(&g->cmdq, cmd, next);
+         g->cmdq_bh_cmds++;
++        g->cmdq_deferred = 0;
+         if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+             g->stats.requests++;
+         }
+diff --git a/include/hw/virtio/virtio-blk.h b/include/hw/virtio/virtio-blk.h
+index bd46d3527..8d4e6ae31 100644
+--- a/include/hw/virtio/virtio-blk.h
++++ b/include/hw/virtio/virtio-blk.h
+@@ -79,6 +79,8 @@ struct VirtIOBlock {
+     int64_t vq_budget_ns;
+     QEMUBH *vq_budget_bh;
+     uint64_t vq_budget_pending;     /* queues the bottom half goes on with */
++    unsigned vq_budget_deferred;    /* q11-104: iterations it gave up in a row */
++    bool vq_budget_in_bh;           /* q11-104: handle_vq called from the bottom half */
+ };
+ 
+ typedef struct VirtIOBlockReq {
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 0229a6275..41f2cbdac 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -255,6 +255,7 @@ struct VirtIOGPU {
+     int64_t cmdq_submit_ns;
+     int64_t cmdq_budget_t0;
+     unsigned cmdq_bh_cmds;
++    unsigned cmdq_deferred;     /* q11-104: bottom halves in a row that gave way first */
+     bool cmdq_budget_hit;
+     QEMUBH *cursor_bh;
+     QEMUBH *reset_bh;
+diff --git a/include/qemu/main-loop.h b/include/qemu/main-loop.h
+index a8540179b..60132ad91 100644
+--- a/include/qemu/main-loop.h
++++ b/include/qemu/main-loop.h
+@@ -366,6 +366,16 @@ bool qemu_in_main_thread(void);
+  * is a no-op there.
+  */
+ #define bql_lock() bql_lock_impl(__FILE__, __LINE__)
++
++/*
++ * q11-104: the main loop's iteration budget (QEMU_MAIN_LOOP_ITER_BUDGET_US).
++ * qemu_main_loop_iter_used(): the time since the current iteration took the BQL
++ * (0 before the first iteration or with no budget). qemu_main_loop_iter_spent():
++ * that time has reached the whole budget.
++ */
++extern int64_t qemu_main_loop_iter_start;
++int64_t qemu_main_loop_iter_used(void);
++bool qemu_main_loop_iter_spent(void);
+ void bql_lock_impl(const char *file, int line);
+ bool bql_trylock(void);
+ 
+diff --git a/util/main-loop.c b/util/main-loop.c
+index 65e5dbcc9..287dacece 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -295,6 +295,48 @@ static void glib_pollfds_poll(void)
+ 
+ #define MAX_MAIN_LOOP_SPIN (1000)
+ 
++/*
++ * q11-104: one budget for a whole main-loop iteration. The budgeted bottom
++ * halves (virtio-gpu's control queue, virtio-blk's queues) each bound their own
++ * slice, but aio_bh_poll() runs every pending one in a single pass, and a
++ * device's notify handler can run in the same iteration too: on the RPi4 a
++ * virtio-blk slice of 9 ms and a notify of 11 ms held the BQL for 20 ms in one
++ * iteration (WebView 720p60 in the HMI). Each of them also stops once the
++ * iteration has used this budget, and goes on in the next one.
++ */
++int64_t qemu_main_loop_iter_start;
++
++static int64_t qemu_main_loop_iter_budget(void)
++{
++    static int64_t budget = -1;
++
++    if (budget < 0) {
++        const char *e = getenv("QEMU_MAIN_LOOP_ITER_BUDGET_US");
++
++        budget = e ? (int64_t)strtoul(e, NULL, 10) * 1000 : 0;
++        if (budget) {
++            info_report("main loop: iteration budget %" PRId64 " us (q11-104)",
++                        budget / 1000);
++        }
++    }
++    return budget;
++}
++
++int64_t qemu_main_loop_iter_used(void)
++{
++    if (!qemu_main_loop_iter_budget() || !qemu_main_loop_iter_start) {
++        return 0;
++    }
++    return get_clock() - qemu_main_loop_iter_start;
++}
++
++bool qemu_main_loop_iter_spent(void)
++{
++    int64_t budget = qemu_main_loop_iter_budget();
++
++    return budget && qemu_main_loop_iter_used() >= budget;
++}
++
+ static int os_host_main_loop_wait(int64_t timeout)
+ {
+     GMainContext *context = g_main_context_default();
+@@ -311,6 +353,7 @@ static int os_host_main_loop_wait(int64_t timeout)
+ 
+     replay_mutex_lock();
+     bql_lock();
++    qemu_main_loop_iter_start = get_clock(); /* q11-104 */
+ 
+     glib_pollfds_poll();
+ 

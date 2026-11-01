@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 00:46:03 +0900
+Subject: [PATCH] virtio-media: decoder mode: convert software frames on
+ the GPU
+
+A software-decoded frame (YUV420P) reached the guest's RGBA resource
+through swscale, which has no NEON path from yuv420p to rgba, and
+glTexSubImage2D, which Mesa tiles on the CPU: H.264 1080p60 played at
+48 fps.
+
+With gpu-xfer (the default), the frame now goes into one of four
+linear NV12 dma-bufs from /dev/dma_heap/system, swscale copying the
+luma and interleaving the chroma between two DMA_BUF_IOCTL_SYNC calls,
+and the GPU converts it with the blit host-nv12 uses
+(virtio_media_gpu_import_nv12 and virtio_media_gpu_blit). A slot is
+written again four frames later, after waiting for the blit that
+read it. A frame goes by the CPU while the GL context cannot be
+entered, and for a buffer this path does not write (not a single
+plane GL resource, or another size than the frame). When the import
+cannot take the stream, or the wait times out (its fence is then
+used up, so the slot cannot be known free), the rest of the stream
+goes by the CPU. Another size or colour matrix, STREAMOFF on
+OUTPUT, a codec switch and close free the ring. The comment on the
+CPU path said it writes NV12; it writes RGBA.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16, codec -T): H.264
+1080p60 at 60.5 and 60.9 fps with the main loop at 96 to 98% of a
+core and V3D 48% busy, 720p60 at 61.1 fps with 37 to 38% and 38 to
+40%.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 233 ++++++++++++++++++++++++++++++-
+ 1 file changed, 230 insertions(+), 3 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 1b182b8..053cea7 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -71,6 +71,10 @@
+ #include <libavutil/hwcontext_drm.h> /* AVDRMFrameDescriptor */
+ #include <libavutil/pixdesc.h>     /* av_get_pix_fmt_name, for the diag */
+ #include <libswscale/swscale.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-heap.h>
+ 
+ /*
+  * Guest-visible constants.
+@@ -238,6 +242,22 @@ typedef struct DecDsPend {
+     uint64_t seq;
+ } DecDsPend;
+ 
++/*
++ * q11-dec-sw-gpu: software-decoded frames (H.264) reach the guest's RGBA
++ * resource on the GPU too. A frame is written as linear NV12 into one of these
++ * dma-bufs and converted by the blit host-nv12 uses; the slot is written again
++ * DEC_SW_RING frames later, after waiting for the blit that read it. A wait
++ * that times out takes the stream off this path.
++ */
++#define DEC_SW_RING 4
++
++typedef struct DecSwSlot {
++    int fd;          /* -1: not allocated */
++    uint8_t *map;
++    size_t size;
++    void *handle;    /* the GL import (owns a dup of fd) */
++} DecSwSlot;
++
+ /* A blitted hardware frame and the import whose GPU work reads it. */
+ typedef struct DecGpuHeld {
+     AVFrame *frame;
+@@ -376,6 +396,15 @@ struct VirtIOMediaDec {
+     bool ds_logged;
+     uint64_t ds_pub_n, ds_skip_n, ds_catch_n, ds_lost_n, ds_evict_held_n;
+     uint64_t ds_starved_n, ds_evict_release_n;
++
++    /* q11-dec-sw-gpu (dec_sw_gpu_write) */
++    DecSwSlot sw[DEC_SW_RING];
++    unsigned sw_next;
++    uint32_t sw_w, sw_h, sw_stride, sw_uv_offset;
++    int sw_matrix;
++    bool sw_off;      /* the GPU path failed for this stream: CPU from now on */
++    bool sw_logged;
++    struct SwsContext *sws_nv12;
+ };
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -609,6 +638,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+     av_buffer_unref(&d->gpu_fctx);
+     d->ds_refs_cap = 0;
+     d->gpu_off = false;
++    d->sw_off = false;
+     d->gpu_again = 0;
+ }
+ 
+@@ -1297,11 +1327,184 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+     return 0;
+ }
+ 
++/* q11-dec-sw-gpu: free the ring (another size or matrix, a new codec, close). */
++static void dec_sw_clear(VirtIOMediaDec *d)
++{
++    unsigned i;
++
++    for (i = 0; i < DEC_SW_RING; i++) {
++        DecSwSlot *sl = &d->sw[i];
++
++        if (sl->handle) {
++            virtio_media_gpu_wait(sl->handle);
++            virtio_media_gpu_release(sl->handle);
++            sl->handle = NULL;
++        }
++        if (sl->map) {
++            munmap(sl->map, sl->size);
++            sl->map = NULL;
++        }
++        if (sl->fd >= 0) {
++            close(sl->fd);
++        }
++        sl->fd = -1;
++    }
++    d->sw_next = 0;
++    d->sw_w = d->sw_h = 0;
++}
++
++/* A dma-buf of len bytes from the system heap, mapped. */
++static int dec_sw_alloc(DecSwSlot *sl, size_t len)
++{
++    struct dma_heap_allocation_data a = {
++        .len = len, .fd_flags = O_RDWR | O_CLOEXEC,
++    };
++    int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
++    int r;
++
++    if (heap < 0) {
++        return -errno;
++    }
++    r = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a);
++    r = r < 0 ? -errno : 0;
++    close(heap);
++    if (r) {
++        return r;
++    }
++    sl->map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
++    if (sl->map == MAP_FAILED) {
++        r = -errno;
++        sl->map = NULL;
++        close(a.fd);
++        return r;
++    }
++    sl->fd = a.fd;
++    sl->size = len;
++    return 0;
++}
++
++static void dec_sw_sync(int fd, uint64_t flags)
++{
++    struct dma_buf_sync sync = { .flags = flags };
++
++    while (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && errno == EINTR) {
++    }
++}
++
++/*
++ * q11-dec-sw-gpu: a software frame (YUV420P) to the guest's RGBA resource on
++ * the GPU. The CPU path converted it to RGBA with swscale -- no NEON path for
++ * yuv420p -> rgba ("No accelerated colorspace conversion found") -- and
++ * uploaded it with glTexSubImage2D, which Mesa tiles on the CPU too: 48 fps
++ * at H.264 1080p60 on the Raspberry Pi 5. Here the CPU only copies the luma
++ * and interleaves the chroma (libswscale's planar-to-NV12, NEON) into a linear
++ * NV12 dma-buf, and the GPU converts it as it does host-nv12's frames.
++ * Returns 0 when the guest's resource holds the frame; -EAGAIN when the GL
++ * context is not there yet or cannot be made current, and -ERANGE for a buffer
++ * this path does not write (not a single-plane GL resource, or another size
++ * than the frame): both, this frame goes by the CPU. Another negative errno
++ * (-EIO: the slot's previous blit did not finish) when this path cannot take
++ * the stream.
++ */
++static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
++                            const AVFrame *fr, uint32_t w, uint32_t h)
++{
++    VirtIOMediaDec *d = s->dec;
++    int matrix = dec_gpu_matrix(fr);
++    uint32_t stride = ROUND_UP(w, 64);
++    uint32_t uv_offset = ROUND_UP(stride * h, 4096);
++    size_t len = ROUND_UP((size_t)uv_offset + stride * ((h + 1) / 2), 4096);
++    DecSwSlot *sl;
++    uint8_t *dst[4];
++    int dst_ls[4] = { 0 };
++    int err = 0, r;
++    uint32_t tex;
++
++    if (!gb->virgl_res || gb->num_planes != 1 ||
++        (uint32_t)fr->width != w || (uint32_t)fr->height != h) {
++        return -ERANGE;
++    }
++    if (d->sw_w != w || d->sw_h != h || d->sw_matrix != matrix) {
++        dec_sw_clear(d);
++        d->sw_w = w;
++        d->sw_h = h;
++        d->sw_stride = stride;
++        d->sw_uv_offset = uv_offset;
++        d->sw_matrix = matrix;
++        sws_freeContext(d->sws_nv12);
++        /* YUVJ420P is YUV420P with full range, which the matrix carries */
++        d->sws_nv12 = sws_getContext(w, h, AV_PIX_FMT_YUV420P, w, h,
++                                     AV_PIX_FMT_NV12, SWS_POINT,
++                                     NULL, NULL, NULL);
++        if (!d->sws_nv12) {
++            return -ENOMEM;
++        }
++    }
++    sl = &d->sw[d->sw_next];
++    if (sl->fd < 0) {
++        r = dec_sw_alloc(sl, len);
++        if (r) {
++            return r;
++        }
++    }
++    if (!sl->handle) {
++        int fd = fcntl(sl->fd, F_DUPFD_CLOEXEC, 0);
++
++        if (fd < 0) {
++            return -errno;
++        }
++        sl->handle = virtio_media_gpu_import_nv12(fd, w, h, stride, uv_offset,
++                                                  w, h, 1.0f, (uint32_t)len,
++                                                  matrix, 0, &err);
++        if (!sl->handle) {
++            return err ? err : -EINVAL;
++        }
++    } else {
++        /*
++         * The blit DEC_SW_RING frames ago reads this slot. -EAGAIN keeps its
++         * fence for the next try; a timeout (-EIO) has used it up, so the slot
++         * cannot be known free again.
++         */
++        r = virtio_media_gpu_wait(sl->handle);
++        if (r < 0) {
++            return r;
++        }
++    }
++
++    dec_sw_sync(sl->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
++    dst[0] = sl->map;
++    dst[1] = sl->map + uv_offset;
++    dst[2] = dst[3] = NULL;
++    dst_ls[0] = dst_ls[1] = (int)stride;
++    sws_scale(d->sws_nv12, (const uint8_t * const *)fr->data, fr->linesize,
++              0, fr->height, dst, dst_ls);
++    dec_sw_sync(sl->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
++
++    r = virtio_media_gpu_blit(sl->handle, gb->virgl_res);
++    if (r) {
++        return r;
++    }
++    d->sw_next = (d->sw_next + 1) % DEC_SW_RING;
++
++    /* this content came by the conversion: an older SAND offer would be stale */
++    tex = virtio_media_gpu_res_tex(gb->virgl_res);
++    if (d->ds_epoch && tex) {
++        direct_scanout_forget_tex(tex);
++    }
++    if (!d->sw_logged) {
++        d->sw_logged = true;
++        info_report("virtio-media/dec: sw-gpu: %s frames reach the guest on "
++                    "the GPU (linear NV12 %ux%u, stride %u, matrix %d)",
++                    d->codec->desc, w, h, stride, matrix);
++    }
++    return 0;
++}
++
+ /*
+- * Write one decoded frame into the guest's pages as NV12.
++ * Write one decoded frame into the guest's pages as RGBA.
+  *
+- * The frame is converted only when it is not already NV12: libavcodec's
+- * software HEVC decoder produces YUV420P, and the hwaccel path will produce
++ * The frame is converted only when it is not already RGBA: libavcodec's
++ * software decoders produce YUV420P, and the hwaccel path will produce
+  * something else again, so this stays a general conversion rather than an
+  * assumption about the backend.
+  */
+@@ -1381,6 +1584,23 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+         fr = d->swframe;
+     }
+ 
++    /* q11-dec-sw-gpu: a software frame to the GPU, as dec_gpu_write does */
++    if ((fr->format == AV_PIX_FMT_YUV420P || fr->format == AV_PIX_FMT_YUVJ420P) &&
++        s->vm->gpu_xfer && !d->sw_off) {
++        int r = dec_sw_gpu_write(s, gb, fr, w, h);
++
++        if (r == 0) {
++            *bytesused = need;
++            return true;
++        }
++        if (r != -EAGAIN && r != -ERANGE) {
++            d->sw_off = true;
++            dec_sw_clear(d);
++            warn_report("virtio-media/dec: sw-gpu: the GPU cannot take this "
++                        "stream's frames (%d); converting them on the CPU", r);
++        }
++    }
++
+     /* q11-dec-sand-scanout: the CPU wrote this copy, so no offer stands for it */
+     if (d->ds_epoch && gb->virgl_res) {
+         uint32_t tex = virtio_media_gpu_res_tex(gb->virgl_res);
+@@ -2020,6 +2240,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+         return EBUSY;
+     }
+     dec_gpu_reset(d);
++    dec_sw_clear(d);
+     dec_backlog_clear(d);
+     av_frame_free(&d->held);
+     avcodec_free_context(&d->avctx);
+@@ -2044,6 +2265,9 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+ 
+     d = g_new0(VirtIOMediaDec, 1);
+     d->codec = dec_codec_nth(s->vm, 0);
++    for (unsigned i = 0; i < DEC_SW_RING; i++) {
++        d->sw[i].fd = -1;
++    }
+     d->backlog = g_queue_new();
+     d->coded_w = DEC_MIN_W;
+     d->coded_h = DEC_MIN_H;
+@@ -2088,6 +2312,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+         return;
+     }
+     dec_gpu_clear(d);
++    dec_sw_clear(d);
++    sws_freeContext(d->sws_nv12);
+     av_buffer_unref(&d->gpu_fctx);
+     if (d->avctx) {
+         avcodec_free_context(&d->avctx);
+@@ -2574,6 +2800,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+             av_frame_free(&d->held);
+             dec_backlog_clear(d);
+             dec_gpu_reset(d);
++            dec_sw_clear(d);
+             d->draining = false;
+             d->drain_done = false;
+         }

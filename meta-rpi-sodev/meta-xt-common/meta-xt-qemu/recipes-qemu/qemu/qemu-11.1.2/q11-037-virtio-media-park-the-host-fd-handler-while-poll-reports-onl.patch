@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-media: park the host fd handler while poll() reports
+ only POLLERR
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0234-v10-virtio-media-park-fd-handler-on-pollerr.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c         | 37 ++++++++++++++++++++++++++++++++
+ include/hw/virtio/virtio-media.h |  6 ++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 0e1040c2c..4de592d4c 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -510,6 +510,36 @@ static void virtio_media_host_readable(void *opaque)
+     }
+     revents = pfd.revents;
+ 
++    /*
++     * NOTE: POLLERR ALONE MEANS "NOTHING TO DO, AND NOTHING WILL HAPPEN UNTIL THE
++     * GUEST QUEUES A BUFFER". PARK THE HANDLER.
++     *
++     * vb2_core_poll() returns EPOLLERR for a streaming queue whose queued_list
++     * is empty (videobuf2-core.c, "return EPOLLERR" for the CAPTURE queue with
++     * no buffers). During playback the guest holds every CAPTURE buffer for a
++     * moment between DQBUF and the next QBUF, and the OUTPUT queue is empty
++     * between bitstream chunks, so the fd sits at POLLERR level for a good
++     * part of every frame. qemu's read handler is registered for
++     * G_IO_IN|G_IO_HUP|G_IO_ERR, so the main loop wakes for that level on
++     * every iteration and this function returns having done nothing.
++     *
++     * Measured on RPi4 (2026-09-05, strace of the qemu main thread, 720p60 HW
++     * playback, 4 s): 3112 ppoll() returns, of which 2402 were
++     * {fd=/dev/video10, revents=POLLERR} -- 600 empty wakeups per second,
++     * each a full main-loop iteration (28 fds + glib dispatch), in a loop
++     * whose per-frame latency is what limits the decoded frame rate.
++     *
++     * Detach until the guest QBUFs (virtio_media_qbuf re-attaches) or the
++     * queues change state (virtio_media_update_fd_handler). A V4L2 event
++     * (POLLPRI) cannot be missed by this: bcm2835-codec raises SOURCE_CHANGE
++     * only after consuming bitstream, i.e. after an OUTPUT QBUF re-armed us.
++     */
++    if ((revents & POLLERR) && !(revents & (POLLIN | POLLOUT | POLLPRI))) {
++        qemu_set_fd_handler(s->fd, NULL, NULL, NULL);
++        s->fd_parked = true;
++        return;
++    }
++
+     /* V4L2 events first: a SOURCE_CHANGE tells the guest to re-negotiate. */
+     if (revents & POLLPRI) {
+         virtio_media_drain_events(s);
+@@ -801,6 +831,7 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
+             want = true;
+         }
+     }
++    s->fd_parked = false;
+     if (want) {
+         /*
+          * NOTE: BOTH CALLBACKS ARE THE SAME FUNCTION, AND THE WRITE ONE IS NOT
+@@ -1249,6 +1280,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+     }
+ 
+     gb->queued = true;
++
++    /* A queue got a buffer: the fd can become readable again, re-arm it. */
++    if (s->fd_parked) {
++        s->fd_parked = false;
++        virtio_media_update_fd_handler(s);
++    }
+     return 0;
+ }
+ 
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 6b145becc..0731dacd2 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -224,6 +224,12 @@ typedef struct VirtIOMediaSession {
+     struct VirtIOMedia *vm;
+     uint32_t id;
+     int fd;
++    /*
++     * The main-loop fd handler was detached because poll() reported only
++     * POLLERR (a streaming queue with no buffer queued). Re-attached by the
++     * next host QBUF or STREAMON. See virtio_media_host_readable().
++     */
++    bool fd_parked;
+     /*
+      * Two queues per session is all a codec needs, and it is what the guest
+      * driver models too (VIRTIO_MEDIA_LAST_QUEUE). Indexed by

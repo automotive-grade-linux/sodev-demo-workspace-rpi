@@ -1,0 +1,48 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 12 Oct 2026 15:14:27 +0900
+Subject: [PATCH] gl-renderer: log once instead of aborting when YUV uniforms are missing
+
+On the Raspberry Pi 4 (v3d, Mesa 26.2) an NV12 SAND128 buffer imported
+as separate Y and UV planes is drawn with the Y_UV shader variant, and
+the compiled shader comes back without the yuv_coefficients/yuv_offsets
+uniforms. gl_shader_load_config_representation() asserts that only the
+EXTERNAL and RGBA variants may lack them, so weston died with SIGABRT,
+which took down the qemu display connection and with it the AAOS guest
+(DomA).
+
+Replace the assert with a one-time weston_log() that names the variant,
+and return without loading the uniforms, as the allowed variants already
+do.
+
+This is the weston 16.0.0 version. 16.0.0 contains upstream commit
+5c49563ef49a ("gl-shaders: Remove asserts relying on shader compiler
+behavior") and allows the RGBA variant as well, but still asserts for
+Y_UV, so the change is still needed; RGBA stays an accepted variant
+here.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [workaround for v3d dropping the uniforms; replaces an upstream assert]
+---
+--- a/libweston/renderer-gl/gl-shaders.c
++++ b/libweston/renderer-gl/gl-shaders.c
+@@ -825,8 +825,17 @@
+ 
+ 	if (shader->yuv_coefficients_uniform == -1 ||
+ 	    shader->yuv_offsets_uniform == -1) {
+-		assert(shader->key.variant == SHADER_VARIANT_EXTERNAL ||
+-		       shader->key.variant == SHADER_VARIANT_RGBA);
++		/*
++		 * The v3d compiler drops these uniforms for the
++		 * Y_UV variant of an NV12 SAND128 buffer too; the assert aborted weston.
++		 */
++		static bool logged;
++		if (shader->key.variant != SHADER_VARIANT_EXTERNAL &&
++		    shader->key.variant != SHADER_VARIANT_RGBA && !logged) {
++			logged = true;
++			weston_log("gl-renderer: YUV uniforms missing for variant %d\n",
++				   shader->key.variant);
++		}
+ 		return;
+ 	}
+ 

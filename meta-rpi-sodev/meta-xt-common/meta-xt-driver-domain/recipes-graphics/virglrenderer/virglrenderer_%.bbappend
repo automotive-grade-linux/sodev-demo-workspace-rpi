@@ -43,7 +43,13 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # compositing with Vulkan needs the global gbm (it is what makes guest resources
 # exportable as dma-bufs, without which venus aborts), while a GL guest loses half its
 # frame rate to it (60.0 -> 29.0 fps measured on the AGL cluster). The device models are
-# separate processes, so DomA sets VIRGL_EXTERNAL_GBM=1 in its qemu_envs and DomU does not.
+# separate processes, so DomA sets VIRGL_EXTERNAL_GBM=1 in its qemu_envs, and DomU only with
+# overlay planes (xt-xen-cfg-domu's XT_DOMU_OVERLAY_PLANES). It should not cost DomU that:
+# on 1.3.0 a resource gets GBM backing only with gbm-layout negotiated (the gbm_layout_feat
+# early-out below) or, with 0024, as a linear scanout buffer. /etc/qemu-gbm-layout does
+# not change that: DomD's qemu wrapper turns
+# gbm-layout on for DomA's device model only (rpi5-image-xt-domd-vc4). On 1.2.0 (selected
+# with qemu 10.0.2) the penalty would apply: keep XT_DOMU_OVERLAY_PLANES at 0 there.
 #
 # Removing the gbm assignment outright would spare a GL guest that cost, but it
 # breaks the other direction: venus-blob-to-host-compositor (import) needs no gbm,
@@ -116,11 +122,13 @@ SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 #     to come from the guest learning the real modifier (the mesa MR 43000 pairing,
 #     first shipping in mesa 26.3), not from this side.
 #  2. There is no configuration left that wants it. The global gbm is switched on
-#     per device model by VIRGL_EXTERNAL_GBM, and only DomA's qemu_envs sets it
-#     (doma.cfg) -- DomU never initialises gbm, so DomU's GL compositor never pays
-#     the linear penalty. DomA composites with Vulkan in the default configuration,
-#     where 1. applies; and in the --gpu=gl configuration DomA's device model does
-#     not set VIRGL_EXTERNAL_GBM either.
+#     per device model by VIRGL_EXTERNAL_GBM: DomA's qemu_envs sets it (doma.cfg),
+#     DomU's only with overlay planes on 1.3.0, whose gbm_layout_feat early-out
+#     keeps DomU's GL resources textures -- so DomU's GL compositor never pays the
+#     linear penalty. Both boards' AAOS products composite with GL in the default
+#     configuration, so 1. would apply only to a DomA set back to Vulkan
+#     compositing; and in the --gpu=gl configuration DomA's device model does not
+#     set VIRGL_EXTERNAL_GBM either.
 #  3. It does not apply alongside 0017. 0017's vrend_renderer.c hunk sits in the
 #     resource path MR 1561/1654 rewrote, so with the backport applied first 0017
 #     fails do_patch at fuzz=0 -- i.e. the knob could not be turned on without
@@ -186,3 +194,39 @@ SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 # knob here and not two.
 SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
     'file://0021-vkr-force-the-advertised-device-local-heap-size.patch', '', d)}"
+
+# 0022: the idle venus ring thread used to sleep in cnd_wait() with no bound, so one
+# lost guest wake-up left guest and renderer waiting on each other until the guest
+# aborted in vn_relax ~895 s later (RPi4 DomA WebView, four times on 2026-10-01).
+# Bounded at 10 ms on a CLOCK_MONOTONIC cond; a rescued wake-up is logged as
+# "no wake-up from the guest" so the loss rate stays measurable. See the patch.
+SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0022-vkr-bound-the-idle-ring-wait-so-a-lost-guest-wake-up.patch', '', d)}"
+
+# 0023: the guest rate-limits its notify to one per idle_timeout from when it sent it,
+# while the ring thread could go idle sooner than that after a notify arrived and
+# wiped it -- a submission in the gap sent nothing (a lost wake-up). Stay awake an
+# idle_timeout after each notify. Also VKR_RING_IDLE_WAIT_MS for the 0022 bound and
+# a late/never-sent count per rescue. See the patch.
+SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0023-vkr-keep-the-ring-awake-an-idle-timeout-after-each-notify.patch', '', d)}"
+
+# 0025: the ring thread's busy-wait between commands (15 yields, then sleeps from
+# 10 us) from VKR_RING_RELAX ("<order>,<first sleep us>"), unset = upstream's. The
+# guest configs set 0,100: on the Pi 5 the cluster's ring thread made ~24,000 yields a
+# second. The cost: a command in the ~1.3 ms before the ring goes idle waits up to
+# 0.4 ms instead of 40 us. See the patch.
+SRC_URI += "${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0025-vkr-make-the-ring-thread-s-busy-wait-tunable.patch', '', d)}"
+
+# virglrenderer 1.3.0 (the recipe from openembedded-core in this layer): 0009 is upstream there, and
+# 0017's diagnostic hunk is ported to 1.3.0's vrend_resource_gbm_init (which also gained a gbm_layout_feat
+# early-out: without VIRGL_GBM_LAYOUT_ENABLE / _FORCE_ENABLE a non-MINIGBM build gives no resource GBM backing).
+SRC_URI:remove = "${@'file://0009-vrend-Correct-minigbm-definitions.patch file://0017-vkr-vrend-make-an-unexportable-guest-resource-survivab.patch' if d.getVar('PV').startswith('1.3') else ''}"
+SRC_URI += "${@(bb.utils.contains('DISTRO_FEATURES', 'venus', 'file://0017-vkr-vrend-make-an-unexportable-guest-resource-survivab-v130.patch', '', d) if d.getVar('PV').startswith('1.3') else '')}"
+
+# 0024: a guest's linear scanout buffer (VIRGL_BIND_LINEAR | VIRGL_BIND_SCANOUT) gets a
+# linear gbm bo even when gbm-layout was not negotiated, so DomD's compositor can put it
+# on a plane. Needs the device model's gbm device (VIRGL_EXTERNAL_GBM=1). Gated like
+# 0017-v130, whose GBM_INIT_SKIP early-out it edits: venus and 1.3.0 only. See the patch.
+SRC_URI += "${@(bb.utils.contains('DISTRO_FEATURES', 'venus', 'file://0024-vrend-give-a-linear-scanout-buffer-a-linear-gbm-bo.patch', '', d) if d.getVar('PV').startswith('1.3') else '')}"

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] audio/alsa: report the generic buffer as free, as 7.0 did
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0220-v10-audio-alsa-report-the-generic-buffer-as-free.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same change; qemu 11 sets audio ops through a class
+(k->buffer_get_free = ...) instead of a static ops table, and the
+removed alsa_logerr line is one line without a trailing \n.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [platform-specific interaction with virtio-snd]
+---
+ audio/alsaaudio.c | 37 +------------------------------------
+ 1 file changed, 1 insertion(+), 36 deletions(-)
+
+diff --git a/audio/alsaaudio.c b/audio/alsaaudio.c
+index dc99ccb44..a0fdd56d9 100644
+--- a/audio/alsaaudio.c
++++ b/audio/alsaaudio.c
+@@ -557,41 +557,6 @@ static int alsa_open(bool in, struct alsa_params_req *req,
+     return -1;
+ }
+ 
+-static size_t alsa_buffer_get_free(HWVoiceOut *hw)
+-{
+-    ALSAVoiceOut *alsa = (ALSAVoiceOut *)hw;
+-    snd_pcm_sframes_t avail;
+-    size_t alsa_free, generic_free, generic_in_use;
+-
+-    avail = snd_pcm_avail_update(alsa->handle);
+-    if (avail < 0) {
+-        if (avail == -EPIPE) {
+-            if (!alsa_recover(alsa->handle)) {
+-                avail = snd_pcm_avail_update(alsa->handle);
+-            }
+-        }
+-        if (avail < 0) {
+-            alsa_logerr(avail, "Could not obtain number of available frames");
+-            avail = 0;
+-        }
+-    }
+-
+-    alsa_free = avail * hw->info.bytes_per_frame;
+-    generic_free = audio_generic_buffer_get_free(hw);
+-    generic_in_use = hw->samples * hw->info.bytes_per_frame - generic_free;
+-    if (generic_in_use) {
+-        /*
+-         * This code can only be reached in the unlikely case that
+-         * snd_pcm_avail_update() returned a larger number of frames
+-         * than snd_pcm_writei() could write. Make sure that all
+-         * remaining bytes in the generic buffer can be written.
+-         */
+-        alsa_free = alsa_free > generic_in_use ? alsa_free - generic_in_use : 0;
+-    }
+-
+-    return alsa_free;
+-}
+-
+ static size_t alsa_write(HWVoiceOut *hw, void *buf, size_t len)
+ {
+     ALSAVoiceOut *alsa = (ALSAVoiceOut *) hw;
+@@ -903,7 +868,7 @@ static void audio_alsa_class_init(ObjectClass *klass, const void *data)
+     k->init_out = alsa_init_out;
+     k->fini_out = alsa_fini_out;
+     k->write = alsa_write;
+-    k->buffer_get_free = alsa_buffer_get_free;
++    k->buffer_get_free = audio_generic_buffer_get_free;
+     k->run_buffer_out = audio_generic_run_buffer_out;
+     k->enable_out = alsa_enable_out;
+ 

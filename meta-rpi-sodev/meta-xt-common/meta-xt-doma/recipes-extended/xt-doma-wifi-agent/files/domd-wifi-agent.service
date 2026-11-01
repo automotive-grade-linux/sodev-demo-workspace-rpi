@@ -22,7 +22,7 @@ ExecStart=/usr/bin/python3 /usr/bin/domd_wifi_agent.py \
     --socket /run/android_vm_virtconsole5 \
     --ctrl /run/wpa_supplicant/wlan0 \
     --iface wlan0 \
-    --top 8
+    --top 20
 Restart=always
 RestartSec=2
 

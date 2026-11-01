@@ -9,8 +9,9 @@
 # objects -- $CONF_DIR, hostapd.conf, the hostapd binary -- so a second domain would
 # need a duplicate of every rule in doma_shadow_ap.te for no gain, and inventing a
 # domain is where the neverallow risk lives.
-# Attribution stays useful because the two run at different times: doma_shadow_ap is
-# oneshot at bring-up, doma_wifi_relay is the long-lived loop.
+# Both therefore run as doma_shadow_ap and their avc lines name the same domain; tell
+# them apart by pid (doma-shadow-ap is the oneshot at bring-up, doma-wifi-relay the
+# long-lived loop).
 /vendor/bin/doma-wifi-relay      u:object_r:doma_shadow_ap_exec:s0
 
 # /data/vendor/wifi/shadow holds the generated hostapd.conf, the AP list
@@ -24,6 +25,10 @@
 # default already has the rules it needs for that type (22 references in the built
 # vendor_sepolicy.cil), so the apex hostapd works with no policy of its own.
 /data/vendor/wifi/shadow(/.*)?   u:object_r:hostapd_data_file:s0
+# The request drop-box DomaWifiRelay (system_app) writes into and the relay reads: a
+# type of its own, so the app is given this directory and not hostapd's files (the
+# passphrases in aps.conf and hostapd.conf). See system_app.te.
+/data/vendor/wifi/shadow/req(/.*)?   u:object_r:doma_wifi_req_file:s0
 
 # The v4l2 Codec2 HAL. Without this line the binary stays vendor_file and init
 # cannot exec it at all (neverallow init ...:file execute_no_trans), so the

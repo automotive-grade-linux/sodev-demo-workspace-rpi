@@ -9,8 +9,8 @@ surface compositing onto HDMI. \
 This ext4 image is the SHIPPING DomD rootfs: it is written to SD p2 and mounted \
 directly by the dom0less DomD (root=/dev/mmcblk0p2 in the zephyr flavour, or \
 root=/dev/xvda over PV-block in the linux flavour, where Dom0 owns the SD). The \
-older RAM-initramfs boot path is available in the git history if a RAM-root \
-the tree for recovery but is no longer part of the boot flow."
+older RAM-initramfs boot path is no longer part of the boot flow; it is in the \
+git history if a RAM-root DomD is ever wanted for recovery."
 
 # Base: meta-xt-rpi5 minimal DomD image (= driver domain xen-tools subset)
 require recipes-core/images/rpi5-image-minimal-domd.bb
@@ -50,16 +50,16 @@ DOMU_GFX_PACKAGES = " \
 # (GPU=vulkan -> 'venus' in DISTRO_FEATURES). See docs/VULKAN-VENUS.md.
 # Measured against the `--gpu=gl` lane's built image first, which changed what this
 # list is for: two of the three packages are already in the shipping DomD rootfs
-# without any of this. weston 15 is built with -Drenderer-vulkan=true (its
-# PACKAGECONFIG filters 'vulkan' from DISTRO_FEATURES), so
-# /usr/lib/libweston-15/vulkan-renderer.so links libvulkan.so.1; weston therefore
+# without any of this. weston (16 on the vulkan lane, 15 on gl) is
+# built with -Drenderer-vulkan=true (its PACKAGECONFIG filters 'vulkan' from
+# DISTRO_FEATURES), so libweston-<N>/vulkan-renderer.so links libvulkan.so.1; weston therefore
 # RDEPENDS on vulkan-loader, whose RRECOMMENDS on virtual-vulkan-icd resolves to
 # mesa-vulkan-drivers. Confirmed in that lane's manifest: libvulkan1
 # 1.4.341.0 and mesa-vulkan-drivers are installed, and
 # /usr/lib/libvulkan_broadcom.so is in the rootfs. (That measurement was taken at
-# mesa 26.0.5, before this series' ungated `PV = "26.2.2"` in
-# meta-xt-driver-domain's mesa.bbappend; both lanes now resolve PV=26.2.2, and the
-# transitive-install argument above does not depend on the version.)
+# mesa 26.0.5, before the ungated `PV` in meta-xt-driver-domain's mesa.bbappend
+# (26.2.4 now, for both lanes); the transitive-install argument above does not depend
+# on the version.)
 #
 #   - mesa-vulkan-drivers : the V3DV ICD (libvulkan_broadcom.so) plus its ICD
 #     manifest. Arrives transitively today, as above. Listed explicitly because a
@@ -224,7 +224,7 @@ IMAGE_ROOTFS_SIZE = "6291456"
 # discard it, leaving no /var/log/xen in the shipped image at all.
 #
 # /var/volatile stays mounted for the other users that expect it.
-ROOTFS_POSTPROCESS_COMMAND =+ "install_persistent_var_log;"
+ROOTFS_POSTPROCESS_COMMAND =+ "install_persistent_var_log"
 install_persistent_var_log() {
     if [ -L ${IMAGE_ROOTFS}/var/log ]; then
         rm -f ${IMAGE_ROOTFS}/var/log
@@ -268,7 +268,7 @@ EOF
 # thermal-zone (kernel-managed FAN). CONFIG_SENSORS_PWM_FAN=m; force it via
 # systemd-modules-load (pwm-fan EPROBE_DEFERs until the RP1 PWM is up, then
 # binds). bcm2711_thermal / THERMAL_OF are =y (auto-bound).
-ROOTFS_POSTPROCESS_COMMAND += "install_pwm_fan_modload;"
+ROOTFS_POSTPROCESS_COMMAND += "install_pwm_fan_modload"
 install_pwm_fan_modload() {
     install -d ${IMAGE_ROOTFS}/etc/modules-load.d
     echo "pwm_fan" > ${IMAGE_ROOTFS}/etc/modules-load.d/pwm-fan.conf
@@ -288,7 +288,7 @@ install_pwm_fan_modload() {
 # device-model spawn failed; adding the symlink live on the board made the DomA
 # qemu spawn and AAOS boot. The shim is therefore required on ARM, despite the
 # i386 name.
-ROOTFS_POSTPROCESS_COMMAND += "install_qemu_xen_path_shim;"
+ROOTFS_POSTPROCESS_COMMAND += "install_qemu_xen_path_shim"
 install_qemu_xen_path_shim() {
     install -d ${IMAGE_ROOTFS}/usr/lib/xen/bin
     if [ ! -e ${IMAGE_ROOTFS}/usr/lib/xen/bin/qemu-system-i386 ]; then
@@ -301,14 +301,76 @@ install_qemu_xen_path_shim() {
     fi
 }
 
+# The foreign mapcache cap the qemu wrapper exports (QEMU_XEN_MAPCACHE_MAX_MB, q11-053;
+# 64 KiB buckets). Foreign mappings live in DomD's extended regions, which Xen makes from
+# the host RAM not given to DomD. 1024 by default: on the RPi4 (17 x 128 MB of extended
+# regions) an uncapped mapcache died with ENOMEM from privcmd (2026-10-03). With 1024,
+# DomA's RAM (2 GB at 1 GB and the rest at 8 GB) shares buckets: on a Raspberry Pi 5,
+# DomA's device model unmapped and remapped guest pages about 130 times a second each
+# during H.264 1080p60 in a WebView, about a tenth of its main thread. 4608 is the
+# smallest cap at which no two 64 KiB blocks of a 3072 or 4096 MB DomA share a bucket,
+# and it is the Raspberry Pi 5's cap on both of its SKUs. With BOARD_RAM=16g DomD has
+# about 12 GB of extended regions; with 8g about 4.9 GB. Measured on a Raspberry Pi 5
+# with the 8 GB memory map (2026-10-24: a 16 GB board started with total_mem=8192, so
+# not a real 8 GB board; DomA 3072 MB, H.264 1080p60 in a WebView beside the HMI, 10
+# minutes a run): DomA's device model called munmap 3320 times in 30 seconds with 1024
+# and 12 times with 4608, and with 4608 a 1.2 GB adb push into DomA, read back after
+# dropping its caches, ran through with matching data and no ENOMEM from the mapcache.
+# 1536 on the Raspberry Pi 4 (2026-10-24): with q11-098 the cap limits the bytes mapped,
+# and with 2048 DomA's device model died once 1925 MB were mapped under load ("Cannot
+# allocate new IOMEM resource"), while 1536 passed three re-reads of a 1.2 GB adb push.
+XT_QEMU_MAPCACHE_MAX_MB:raspberrypi4-64 = "1536"
+XT_QEMU_MAPCACHE_MAX_MB ?= "1024"
+XT_QEMU_MAPCACHE_MAX_MB:raspberrypi5 = "4608"
+# SCHED_FIFO priority of the device models' ioreq thread (qemu 11, q11-096); empty leaves
+# it at the device model's nice value. 49 on the Raspberry Pi 5: one below the kernel's
+# own FIFO threads in DomD (the threaded IRQs, the DRM commit workers card0-crtcN and
+# watchdogd are at 50, sched_set_fifo()'s default; migration at 99), so that it runs
+# before every SCHED_OTHER thread but never delays an interrupt or a page flip. Nothing
+# else in DomD's user space runs at SCHED_FIFO. Decided 2026-10-27, with qemu, the H.264
+# frame threads and weston at nice -19; a WebView's H.264 1080p60 beside the HMI, 3 runs:
+# no ALSA XRUN and no PCM restart in steady playback. The Raspberry Pi 4 takes the same
+# 49, with weston at nice -19 on CPU 0 and without the device-model placement below
+# (2026-10-28, a WebView's 720p60 H.264, full screen and beside the HMI, four 300 s runs
+# each with and without the two, set at run time): no ALSA XRUN, PCM restart or HAL
+# shortfall in any run, one BQL hold of 16.8 ms in eight, frames dropped 5.3 -> 5.5% full
+# screen and 13.9 -> 17.6% beside the HMI, a 3.7-point difference, less than the one
+# between the two runs without them (10.2 and 17.5%). Nothing got better; it is taken
+# because nothing got worse.
+XT_QEMU_IOREQ_FIFO ?= ""
+XT_QEMU_IOREQ_FIFO:raspberrypi5 = "49"
+XT_QEMU_IOREQ_FIFO:raspberrypi4-64 = "49"
+# Whether the DomD qemu wrapper places the device models on DomD's CPUs (DomA's on CPU 0,
+# DomU's on CPU 1; the wrapper's comment has the reasons and the measurements). On the
+# Raspberry Pi 5 only: the Raspberry Pi 4 leaves its device models on both CPUs (decided
+# 2026-10-28, where the placement is expected to cost DomA's device model CPU time; not
+# measured there).
+XT_QEMU_DM_PLACEMENT ?= "0"
+XT_QEMU_DM_PLACEMENT:raspberrypi5 = "1"
+# qemu 11's time budgets for the main loop, in microseconds, which the DomD qemu wrapper
+# exports to every device model: the control queue of virtio-gpu (q11-101), the queues
+# of virtio-blk (q11-103) and one budget for a whole main-loop iteration (q11-104).
+# Empty leaves a budget off. Measured on the Raspberry Pi 4 with all three (2026-10-26, a
+# WebView's 720p60 H.264, five 580 s runs): no ALSA under-run, and the BQL held for a
+# vsync or more only by single GPU commands (the patches' descriptions have the numbers),
+# with tx-no-bql and DomA's block read-ahead at 512 KiB set at run time; the Raspberry Pi
+# 4 product now sets that read-ahead itself (its device repository, xenvm-cf 0012). The
+# Raspberry Pi 5 takes the same budgets (decided 2026-10-28) and keeps the kernel's
+# read-ahead; not measured there.
+XT_QEMU_GPU_CMDQ_BUDGET_US ?= "8000"
+XT_QEMU_BLK_VQ_BUDGET_US ?= "6000"
+XT_QEMU_MAIN_LOOP_ITER_BUDGET_US ?= "8000"
+
 # Additional V4H DomD compatibility packages
 IMAGE_INSTALL:append = " kernel-module-tun xen-tools-devd xen-tools-xencommons xen-tools-xenstore xt-rpi5-domain cgshim"
+# taskset for the qemu wrapper's CPU placement (busybox here has no taskset applet).
+IMAGE_INSTALL:append = "${@' util-linux-taskset' if d.getVar('XT_QEMU_DM_PLACEMENT') == '1' else ''}"
 
 #
 # Driver-domain runtime postprocess. This is the single owner of the DomD
 # systemd fixups now that the initramfs image is out of the boot path.
 #
-ROOTFS_POSTPROCESS_COMMAND += "install_v4h_sodev_bits_ext4; "
+ROOTFS_POSTPROCESS_COMMAND += "install_v4h_sodev_bits_ext4"
 
 install_v4h_sodev_bits_ext4() {
     # 1. qemu wrapper.
@@ -330,8 +392,10 @@ install_v4h_sodev_bits_ext4() {
 REAL_QEMU="/usr/bin/qemu-system-aarch64.bin"
 name=""
 prev=""
+has_device=""
 for i in "$@"; do
     if [ "$prev" = "-name" ]; then name="$i"; fi
+    [ "$i" = "-device" ] && has_device=1
     prev="$i"
 done
 wmclass="$name"
@@ -348,10 +412,93 @@ export SDL_VIDEO_WAYLAND_WMCLASS="$wmclass"
 # Force clock_gettime through the raw syscall (cgshim.so), bypassing the
 # aarch64 vDSO seqcount spin that hangs this device-model qemu in cpu_enable_ticks.
 export LD_PRELOAD=/usr/lib/cgshim.so
+# qemu 11 only (q11-053; qemu 10 ignores it): cap the foreign mapcache. Uncapped, every
+# guest page ever DMAed through stays mapped; see XT_QEMU_MAPCACHE_MAX_MB in the recipe.
+export QEMU_XEN_MAPCACHE_MAX_MB=${XT_QEMU_MAPCACHE_MAX_MB}
+# Switches, each off unless its file exists:
+#   /etc/qemu-ioreq-thread  qemu 11 (q11-052/054): acknowledge virtio-pci notify writes,
+#                           and answer ISR reads, on a dedicated ioreq thread instead of
+#                           waiting for the main loop. The image creates this file, so
+#                           it is on unless removed.
+#   /etc/qemu-gbm-layout    virglrenderer 1.3.0: back guest resources with GBM dma-bufs, which
+#                           a Vulkan (Venus) DomA needs. It costs the GL path (RPi4: a local
+#                           WebView 1080p fullscreen video stops, HMI 52-56 -> 35-41 fps).
+#                           DomA's device model only: DomU's qemu has a gbm device too when
+#                           it has overlay planes (VIRGL_EXTERNAL_GBM, xt-xen-cfg-domu), and
+#                           gbm-layout would put every shared resource of its GL compositor
+#                           on a linear gbm bo.
+#   /etc/qemu-lat-diag      qemu 11 (q11-057/058): log display-command latencies.
+[ -f /etc/qemu-ioreq-thread ] && export QEMU_XEN_IOREQ_THREAD=1
+# qemu 11 (q11-096): the ioreq thread at SCHED_FIFO; see XT_QEMU_IOREQ_FIFO in the recipe.
+[ -n "${XT_QEMU_IOREQ_FIFO}" ] && export QEMU_XEN_IOREQ_FIFO=${XT_QEMU_IOREQ_FIFO}
+# qemu 11 (q11-101, q11-103, q11-104): the main loop's time budgets; see
+# XT_QEMU_GPU_CMDQ_BUDGET_US in the recipe.
+[ -n "${XT_QEMU_GPU_CMDQ_BUDGET_US}" ] && export QEMU_GPU_CMDQ_BUDGET_US=${XT_QEMU_GPU_CMDQ_BUDGET_US}
+[ -n "${XT_QEMU_BLK_VQ_BUDGET_US}" ] && export QEMU_BLK_VQ_BUDGET_US=${XT_QEMU_BLK_VQ_BUDGET_US}
+[ -n "${XT_QEMU_MAIN_LOOP_ITER_BUDGET_US}" ] && export QEMU_MAIN_LOOP_ITER_BUDGET_US=${XT_QEMU_MAIN_LOOP_ITER_BUDGET_US}
+[ -f /etc/qemu-gbm-layout ] && [ "$wmclass" = DomA ] && export VIRGL_GBM_LAYOUT_ENABLE=1
+[ -f /etc/qemu-lat-diag ] && export QEMU_LAT_DIAG=1
+# A device model's stdout and stderr go through a pipe to a cat of their own,
+# which writes the log that libxl opened for them (/var/log/xen/qdisk-N.log, on
+# the SD card's ext4). The main loop reports statistics there every few seconds,
+# and a write to that file waits whenever jbd2 is committing the block that holds
+# its inode: measured on a Raspberry Pi 4, one such write held the BQL for 112 ms.
+# The pipe takes the write instead and only cat waits. qemu ignores SIGPIPE, so a
+# cat that has gone makes its writes fail rather than kill it. Done before the
+# nice value and the wrapper's other settings below, so that cat keeps none of them.
+[ -n "$has_device" ] && exec > >(LD_PRELOAD= exec cat) 2>&1
+# Every DomA wait on the device model lands on one of qemu's threads: the main
+# loop answers each ioreq (virtio-media QBUF, virtio-gpu commands, virtqueue kicks)
+# while the guest vCPU waits, and the virgl render server it forks answers the
+# Venus rings. Run all of them at nice -19 (set here, before exec, so every thread
+# and the forked render server inherit it) so nothing else in DomD delays a guest
+# wait. Only a guest's device model (it has -device arguments): libxl starts the
+# qdisk PV-disk backend through this same wrapper, with no -device, and that one
+# keeps its nice. `renice PRIORITY` (no -n) is absolute in busybox and util-linux.
+[ -n "$has_device" ] && { renice -19 -p $$ >/dev/null 2>&1 || true; }
+# CPU placement, with XT_QEMU_DM_PLACEMENT=1 (the Raspberry Pi 5). domain-cpu-pin pins
+# DomD's vcpu 0 to pcpu 0, which it shares with Dom0 and DomZ, and vcpu 1 to pcpu 1,
+# which it shares with DomU on the Raspberry Pi 5. DomA's whole device model runs on CPU
+# 0 (= vcpu 0): its main loop holds the BQL while it answers DomA's ioreqs, and the
+# sound card's TX thread gives DomA's buffers back under it, so a main loop whose vcpu
+# Xen takes away keeps DomA's audio waiting. Its other threads and the virgl render
+# server it forks inherit CPU 0 too; only the H.264 decoder's frame threads are let out
+# of it, by virtio-media's dec-sw-cpus (RPI5_DOMA_H264_CPUS). DomU's device model runs
+# on CPU 1. weston is not placed here; its unit starts it on CPU 0 (the board layers'
+# weston-init drop-ins). It holds V3D's kernel locks while it submits, and DomA's device
+# model waits for them: kept to CPU 1 beside DomU's device model at nice -19, it got no
+# CPU for 20 minutes while DomU's Venus ring thread kept CPU 1 busy, and DomA's main
+# loop waited on V3D all that time (Raspberry Pi 5, 2026-10-24). Measured on a Raspberry
+# Pi 5 (2026-10-24, H.264 1080p60 in a WebView beside the HMI, 10 minutes a run, with
+# virtio-snd's tx-no-bql on and weston kept on CPU 1): with DomD's vcpus on pcpu 0-1 and
+# no placement the main loop held the BQL over 50 ms 194 times, using 3-5 ms of CPU in
+# each; with this placement 52 and 37 times in two runs. Letting the frame threads onto
+# CPU 0 as well (dec-sw-cpus=0-1) made it 287 and 204 then; they have been on 0-1 since
+# the main loop's long holds were fixed (2026-10-27, see RPI5_DOMA_H264_CPUS).
+# Interrupts are not placed: DomD's device interrupts (the SDIO Wi-Fi's mmc1 about 330 a
+# second, V3D's about 370) were on CPU 0 and the device models' event channels on CPU 1;
+# swapping the two at run time gave 41 and 15 in two runs, too few to settle it, so it
+# is left out. Set before exec, like the nice value, so that every thread inherits it.
+cpu=""
+if [ -n "$has_device" ] && [ "${XT_QEMU_DM_PLACEMENT}" = 1 ]; then
+    case "$wmclass" in
+        DomA) cpu=0 ;;
+        DomU) cpu=1 ;;
+    esac
+fi
+if [ -n "$cpu" ] && ! taskset -p -c $cpu $$ >/dev/null 2>&1; then
+    logger -t qemu-wrapper "taskset -c $cpu failed for $wmclass's device model" 2>/dev/null || true
+fi
 exec "${REAL_QEMU}" "$@"
 EOF
         chmod 0755 ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64
     fi
+    # The ioreq thread on by default (see the wrapper's switches). A guest vCPU that kicks
+    # a virtqueue or reads the ISR otherwise waits for qemu's main loop: on the Raspberry Pi
+    # 4 with DomA decoding 1080p60 that was about 31% and 17% of a vCPU (q11-052/054).
+    # qemu 10.0.2 ignores the variable.
+    install -d ${IMAGE_ROOTFS}${sysconfdir}
+    touch ${IMAGE_ROOTFS}${sysconfdir}/qemu-ioreq-thread
 
     # 2. xendriverdomain.service drop-ins
     install -d ${IMAGE_ROOTFS}/etc/systemd/system/xendriverdomain.service.d
@@ -365,9 +512,8 @@ ExecStart=
 ExecStart=/usr/sbin/xl devd -F
 EOF
 
-    # 3. /var/log/xen + /var/run/xen/device-model pre-create
+    # 3. /var/log/xen pre-create
     install -d ${IMAGE_ROOTFS}/var/log/xen
-    install -d ${IMAGE_ROOTFS}/var/run/xen/device-model
 
     # 4. Three notification services (block/bridge/weston-up status ready).
     # As on V4H DomD, they write drivers/<name>/status ready in xenstore; the
@@ -484,16 +630,24 @@ EOF
     # units and neither device can ever appear:
     #   - serial-getty@hvc0: /dev/hvc0 never appears. A dom0less DomD gets the
     #     vpl011, not the Xen PV console, so there is no hvc device to serve.
-    #   - serial-getty@ttyAMA10: enabled by poky from SERIAL_CONSOLES, which names
-    #     the RPi5 SoC's own debug UART. DomD does not own that UART -- it is Xen's,
-    #     and DomD sees only the emulated vpl011.
-    # Symptom in the journal: `Expecting device /dev/hvc0...` at t+2 s, then at
-    # t+92 s `Timed out waiting for device` and `Dependency failed for Serial Getty
-    # on hvc0` / `on ttyAMA10`, with multi-user.target held back until then.
-    # Drop both enablement symlinks (the units stay installed, just not wanted).
+    #   - the ones poky enables from SERIAL_CONSOLES, which names the SoC's own
+    #     console UART: ttyAMA10 on the Raspberry Pi 5, ttyS0 (the mini UART) on the
+    #     Raspberry Pi 4. DomD owns neither -- each is Xen's console, and DomD sees
+    #     only the emulated vpl011.
+    # Symptom in the journal (Raspberry Pi 5): `Expecting device /dev/hvc0...` at
+    # t+2 s, then at t+92 s `Timed out waiting for device` and `Dependency failed for
+    # Serial Getty on hvc0` / `on ttyAMA10`, with multi-user.target held back until
+    # then. Drop every serial getty's enablement symlink but ttyAMA0's (the units
+    # stay installed, just not wanted), whatever the board's names are.
     install -d ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants
-    rm -f ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty@hvc0.service
-    rm -f ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA10.service
+    # (serial-getty<baud>@<tty> is how poky names one at a non-default baud.)
+    for l in ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty*@*.service; do
+        [ -e "$l" ] || [ -L "$l" ] || continue
+        case "${l##*/}" in
+            serial-getty@ttyAMA0.service) ;;
+            *) rm -f "$l"; bbnote "not wanted: ${l##*/} (no such port in DomD)" ;;
+        esac
+    done
     ln -sf /lib/systemd/system/serial-getty@.service \
         ${IMAGE_ROOTFS}/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service
 
@@ -532,7 +686,7 @@ EOF
 # in the flavour where it is supposed to. Same default as xt-rpi-u-boot-scr.bbappend.
 DOM0_OS ??= "zephyr"
 
-ROOTFS_POSTPROCESS_COMMAND += "mask_zephyr_toolstack_units; "
+ROOTFS_POSTPROCESS_COMMAND += "mask_zephyr_toolstack_units"
 mask_zephyr_toolstack_units() {
     if [ "${DOM0_OS}" = "zephyr" ]; then
         return
@@ -548,10 +702,6 @@ mask_zephyr_toolstack_units() {
         fi
     done
 }
-
-# The masks above are DOM0_OS-dependent, so a flavour switch must not reuse a rootfs
-# built for the other one. Same reason DOM0_OS is in domd-vc4's do_compile[vardeps].
-do_rootfs[vardeps] += "DOM0_OS"
 
 #
 # Note: the DomD is an xl-created guest, so boot files (start4.elf,

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 17 Oct 2026 21:43:10 +0900
+Subject: [PATCH] init: extra_free_kbytes.sh: read only each zone's min watermark
+
+The script collects every line of /proc/zoneinfo that contains "min" as
+the zones' min watermarks. Newer kernels also print a per-CPU
+"high_min:" line in each zone's pagesets, so min[] gets more entries
+than managed[] has and min[i] no longer belongs to zone i: on a guest
+with DMA32 and Normal zones the Normal zone's term is computed from one
+of DMA32's high_min values. high_min follows the low watermark, which
+the script itself raises, so every run of it raises the result again.
+
+Read only the zones' own "min" lines, as managed[] does for "managed".
+
+Measured on the Raspberry Pi 5 AAOS guest (3 GiB: DMA32, Normal and an
+empty Movable zone, 2026-10-17): 7 lines matched instead of 3;
+watermark_scale_factor was 161 after the runs of a boot, and the same
+arithmetic on successive runs gives 131, 155, 161, 163. With this
+change it is 120, and running the script again leaves it at 120.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ init/extra_free_kbytes.sh | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/init/extra_free_kbytes.sh b/init/extra_free_kbytes.sh
+index a0141be..0edaab2 100755
+--- a/init/extra_free_kbytes.sh
++++ b/init/extra_free_kbytes.sh
+@@ -98,7 +98,9 @@ extra_free_pg=$((extra_free_kbytes/page_size_kb))
+ 
+ managed=($(grep managed /proc/zoneinfo | awk '{print $2}'))
+ length=${#managed[@]}
+-min=($(grep "min" /proc/zoneinfo | awk '{print $2}'))
++# Only each zone's own "min" line: a plain grep "min" also matches the per-CPU
++# "high_min:" lines of newer kernels, and min[i] then stops lining up with managed[i].
++min=($(grep -E "^[[:space:]]+min[[:space:]]" /proc/zoneinfo | awk '{print $2}'))
+ 
+ # calculate vm_total_pages.
+ # WARNING: if the final low watermark differs from the original, the source of

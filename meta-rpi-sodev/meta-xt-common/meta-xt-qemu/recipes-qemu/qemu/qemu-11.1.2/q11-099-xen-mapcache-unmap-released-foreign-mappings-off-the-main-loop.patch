@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 24 Oct 2026 20:00:00 +0900
+Subject: [PATCH] xen-mapcache: unmap released foreign mappings off the main
+ loop
+
+munmap of a foreign mapping on Arm is one XENMEM_remove_from_physmap
+hypercall per page, and the mapcache did it on the main loop under the
+BQL: a chained entry when its lock dropped, and a head that q11-098
+evicts. On the Raspberry Pi 4 a 4 MiB unmap took up to 11 ms that way,
+and with the cap at 1024 MB the mapcache evicted about 12 heads a second
+during a 720p60 video in a WebView beside the HMI. Hand these mappings,
+which nobody can reach any more, to a worker thread after
+ram_block_notify_remove() has run; grants, the full flush and in-place
+replacement stay synchronous, and past 64 MiB waiting the caller unmaps
+synchronously as before.
+
+Measured with a build of the same change that also logged its timings.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's Xen device model]
+---
+ hw/xen/xen-mapcache.c | 95 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 91 insertions(+), 4 deletions(-)
+
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index 4c7cd1755..817110f5e 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -18,6 +18,8 @@
+ #include "hw/xen/xen_native.h"
+ #include "qemu/bitmap.h"
+ #include "qemu/timer.h"
++#include "qemu/thread.h"
++#include "qemu/atomic.h"
+ 
+ #include "system/ramlist.h"
+ #include "system/runstate.h"
+@@ -110,6 +112,86 @@ static unsigned long xen_mc_remaps, xen_mc_replaced, xen_mc_chain_idx,
+                      xen_mc_chain_size, xen_mc_evictions;
+ static int64_t xen_mc_unmap_ns;
+ 
++/*
++ * q11-099: unmap released foreign mappings off the main loop.
++ *
++ * WHY. munmap of a foreign mapping on Arm is one XENMEM_remove_from_physmap
++ * hypercall per page (about 0.01 ms each on the RPi4), and the mapcache does it
++ * on the main loop with the BQL held: a chained entry when its lock drops, and
++ * a head that q11-098 evicts, and a head replaced by a mapping of another
++ * size or index. On the RPi4 a 4 MiB unmap took up to 11 ms, and with the cap
++ * at 1024 MB the mapcache evicted about 12 heads a second during WebView
++ * 720p60 in the HMI.
++ *
++ * Only mappings nobody can reach any more go to the worker: an entry whose
++ * lock has dropped (its reverse entry is gone) or an unlocked head being
++ * evicted, after ram_block_notify_remove() has run here. The address range
++ * stays reserved until the worker has unmapped it, so no new mapping can land
++ * on it. Grants (the guest may revoke them), the full flush and in-place
++ * replacement stay synchronous. At most XEN_MC_DEFER_MAX bytes wait at a time
++ * -- they still occupy the Xen scratch space q11-053 is about -- and past that
++ * the caller unmaps synchronously as before (counted as refused). Scratch use
++ * is thus bounded by the cap plus XEN_MC_DEFER_MAX.
++ *
++ * The worker's munmap holds the process's mmap lock while Xen removes the
++ * pages, so a main-loop mmap/munmap arriving meanwhile still waits for it.
++ */
++#define XEN_MC_DEFER_MAX (64 * MiB)
++
++typedef struct XenMcUnmap {
++    void *vaddr;
++    size_t size;
++} XenMcUnmap;
++
++static GAsyncQueue *xen_mc_unmap_q;
++static QemuThread xen_mc_unmap_thread;
++static uint64_t xen_mc_defer_bytes;     /* atomic */
++static unsigned long xen_mc_deferred, xen_mc_defer_refused;   /* diagnostic */
++
++static void *xen_mc_unmap_worker(void *opaque)
++{
++    for (;;) {
++        XenMcUnmap *u = g_async_queue_pop(xen_mc_unmap_q);
++
++        if (munmap(u->vaddr, u->size) != 0) {
++            perror("mapcache: deferred unmap fails");
++            exit(-1);
++        }
++        qatomic_sub(&xen_mc_defer_bytes, u->size);
++        g_free(u);
++    }
++    return NULL;
++}
++
++/* Hand a released foreign mapping to the worker; false = unmap it yourself. */
++static bool xen_mc_defer_unmap(MapCache *mc, MapCacheEntry *entry)
++{
++    XenMcUnmap *u;
++
++    if (mc != mapcache || (entry->flags & XEN_MAPCACHE_ENTRY_GRANT)) {
++        return false;
++    }
++    if (qatomic_read(&xen_mc_defer_bytes) + entry->size > XEN_MC_DEFER_MAX) {
++        xen_mc_defer_refused++;
++        return false;
++    }
++    if (!xen_mc_unmap_q) {
++        xen_mc_unmap_q = g_async_queue_new();
++        qemu_thread_create(&xen_mc_unmap_thread, "mapcache-unmap",
++                           xen_mc_unmap_worker, NULL, QEMU_THREAD_DETACHED);
++    }
++    u = g_new(XenMcUnmap, 1);
++    u->vaddr = entry->vaddr_base;
++    u->size = entry->size;
++    qatomic_add(&xen_mc_defer_bytes, entry->size);
++    g_async_queue_push(xen_mc_unmap_q, u);
++    xen_mc_deferred++;
++    if (mc->mapped_bytes >= entry->size) {
++        mc->mapped_bytes -= entry->size;
++    }
++    return true;
++}
++
+ static int xen_mc_munmap(MapCache *mc, MapCacheEntry *entry)
+ {
+     int64_t t0 = get_clock();
+@@ -311,11 +393,13 @@ static void xen_remap_bucket(MapCache *mc,
+             info_report("xen mapcache: %lu remaps (%lu replaced a live mapping),"
+                         " new chained entries: other index %lu, other size %lu;"
+                         " %lu evictions, %" PRIu64 " of %" PRIu64 " MB mapped,"
+-                        " munmap total %" PRId64 " ms",
++                        " munmap total %" PRId64 " ms on the main loop,"
++                        " %lu unmaps deferred, %lu refused (q11-099)",
+                         xen_mc_remaps, xen_mc_replaced, xen_mc_chain_idx,
+                         xen_mc_chain_size, xen_mc_evictions,
+                         mc->mapped_bytes >> 20, mc->mapped_cap >> 20,
+-                        xen_mc_unmap_ns / 1000000);
++                        xen_mc_unmap_ns / 1000000, xen_mc_deferred,
++                        xen_mc_defer_refused);
+         }
+     }
+ 
+@@ -344,7 +428,8 @@ static void xen_remap_bucket(MapCache *mc,
+          */
+         assert(!vaddr || (entry->vaddr_base == vaddr && entry->size == size));
+ 
+-        if (!vaddr && xen_mc_munmap(mc, entry) != 0) {
++        if (!vaddr && !xen_mc_defer_unmap(mc, entry) &&
++            xen_mc_munmap(mc, entry) != 0) {
+             perror("unmap fails");
+             exit(-1);
+         }
+@@ -477,7 +562,7 @@ static void xen_map_cache_evict(MapCache *mc, MapCacheEntry *keep)
+         if (!(e->flags & XEN_MAPCACHE_ENTRY_DUMMY)) {
+             ram_block_notify_remove(e->vaddr_base, e->size, e->size);
+         }
+-        if (xen_mc_munmap(mc, e) != 0) {
++        if (!xen_mc_defer_unmap(mc, e) && xen_mc_munmap(mc, e) != 0) {
+             perror("unmap fails");
+             exit(-1);
+         }
+@@ -809,6 +894,8 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+     if (entry->flags & XEN_MAPCACHE_ENTRY_GRANT) {
+         rc = xengnttab_unmap(xen_region_gnttabdev, entry->vaddr_base,
+                              entry->size >> mc->bucket_shift);
++    } else if (xen_mc_defer_unmap(mc, entry)) {
++        rc = 0;
+     } else {
+         rc = xen_mc_munmap(mc, entry);
+     }

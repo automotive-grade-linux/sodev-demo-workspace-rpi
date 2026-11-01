@@ -1,0 +1,833 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:32 +0900
+Subject: [PATCH] virtio-media: run the CAPTURE queue as NV12 on the host,
+ convert on the GPU
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0231-v10-virtio-media-host-nv12-capture-with-gpu-conversion.patch;
+that patch's description has the reasoning and the measurements.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-virgl-stub.c    |  12 +
+ hw/virtio/virtio-media-virgl.c         | 310 +++++++++++++++++++++++--
+ hw/virtio/virtio-media.c               | 291 ++++++++++++++++++++++-
+ include/hw/virtio/virtio-media-virgl.h |  14 ++
+ include/hw/virtio/virtio-media.h       |  26 +++
+ 5 files changed, 623 insertions(+), 30 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
+index 093593a96..b58febb59 100644
+--- a/hw/virtio/virtio-media-virgl-stub.c
++++ b/hw/virtio/virtio-media-virgl-stub.c
+@@ -23,6 +23,18 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+     return NULL;
+ }
+ 
++void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
++                                   uint32_t src_height, uint32_t stride,
++                                   uint32_t uv_offset, uint32_t dst_width,
++                                   uint32_t len, int matrix, int *err)
++{
++    close(dmabuf_fd);
++    if (err) {
++        *err = -ENOTSUP;
++    }
++    return NULL;
++}
++
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+ {
+     return -ENOTSUP;
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index de09cb288..b7a8b49ca 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -50,12 +50,20 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+ 
+ typedef struct VirtIOMediaGpuBuf {
+     int fd;
+-    uint32_t width, height, stride, len;
++    uint32_t width, height, stride, len;   /* width = destination width */
+     GLuint tex;
+     GLuint read_fbo;          /* the blit's read FBO, made on first use */
+     GLsync sync;              /* last copy that read this buffer, or NULL */
++    /* host-nv12: two planes of one NV12 buffer, converted by a shader. */
++    bool nv12;
++    uint32_t src_width;
++    GLuint tex_uv;
++    int matrix;
+ } VirtIOMediaGpuBuf;
+ 
++#define VM_DRM_FORMAT_R8    0x20203852u   /* 'R8  ' */
++#define VM_DRM_FORMAT_GR88  0x38385247u   /* 'GR88': byte0 = R (Cb), byte1 = G (Cr) */
++
+ /*
+  * Context discipline. The display is SDL (gl=es) or egl-headless; either way
+  * virglrenderer's context is current on the main loop while it processes
+@@ -71,6 +79,10 @@ static struct {
+     EGLDisplay dpy;
+     EGLContext ctx;
+     GLuint draw_fbo;
++    /* NV12 -> RGBA conversion program (built on first use). */
++    GLuint prog;
++    GLint u_y, u_uv, u_src_size, u_yoff, u_yscale, u_coef;
++    bool prog_failed;
+ } gpu;
+ 
+ typedef struct GpuSaved {
+@@ -98,6 +110,9 @@ static void gpu_free_buf(VirtIOMediaGpuBuf *b)
+     if (b->read_fbo) {
+         glDeleteFramebuffers(1, &b->read_fbo);
+     }
++    if (b->tex_uv) {
++        glDeleteTextures(1, &b->tex_uv);
++    }
+     glDeleteTextures(1, &b->tex);
+     g_free(b);
+ }
+@@ -218,6 +233,254 @@ static void gpu_leave(const GpuSaved *sv)
+     }
+ }
+ 
++/*
++ * Import one plane of a dmabuf as a 2D texture. Context must be current.
++ * Returns 0 or a GL texture name.
++ */
++static GLuint gpu_import_plane(int fd, uint32_t fourcc, uint32_t width,
++                               uint32_t height, uint32_t stride,
++                               uint32_t offset)
++{
++    EGLImageKHR img;
++    GLuint tex = 0;
++    EGLint attrs[] = {
++        EGL_WIDTH, width,
++        EGL_HEIGHT, height,
++        EGL_LINUX_DRM_FOURCC_EXT, fourcc,
++        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
++        EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset,
++        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
++        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(VM_DRM_FORMAT_MOD_LINEAR & 0xffffffffu),
++        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(VM_DRM_FORMAT_MOD_LINEAR >> 32),
++        EGL_NONE
++    };
++
++    if (!gpu_have_egl_ext(gpu.dpy, "EGL_EXT_image_dma_buf_import_modifiers")) {
++        attrs[12] = EGL_NONE;
++    }
++    img = eglCreateImageKHR(gpu.dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
++                            NULL, attrs);
++    if (img == EGL_NO_IMAGE_KHR) {
++        qemu_log("virtio-media-diag: gpu_xfer: eglCreateImageKHR(fourcc %08x "
++                 "%ux%u stride %u off %u fd %d) failed (0x%x)\n", fourcc, width,
++                 height, stride, offset, fd, eglGetError());
++        return 0;
++    }
++    while (glGetError() != GL_NO_ERROR) {
++        /* clear stale errors */
++    }
++    glGenTextures(1, &tex);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    eglDestroyImageKHR(gpu.dpy, img);
++    if (glGetError() != GL_NO_ERROR) {
++        qemu_log("virtio-media-diag: gpu_xfer: glEGLImageTargetTexture2DOES "
++                 "(fourcc %08x) failed\n", fourcc);
++        glDeleteTextures(1, &tex);
++        return 0;
++    }
++    return tex;
++}
++
++static const char *nv12_vs =
++    "#version 300 es\n"
++    "void main() {\n"
++    "  vec2 p = vec2((gl_VertexID & 1) * 4 - 1, (gl_VertexID & 2) * 2 - 1);\n"
++    "  gl_Position = vec4(p, 0.0, 1.0);\n"
++    "}\n";
++/*
++ * gl_FragCoord is in destination pixels; the destination may be wider than
++ * the source (gralloc pads the row), so sample by texel and let
++ * CLAMP_TO_EDGE repeat the last column. The RGBA resource is sampled by the
++ * guest with y=0 at the top of the image, as is the V4L2 buffer, so no flip.
++ */
++static const char *nv12_fs =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "uniform sampler2D u_y;\n"
++    "uniform sampler2D u_uv;\n"
++    "uniform vec2 u_src_size;\n"
++    "uniform float u_yoff;\n"
++    "uniform float u_yscale;\n"
++    "uniform vec4 u_coef;\n"   /* r_cr, g_cb, g_cr, b_cb */
++    "out vec4 o;\n"
++    "void main() {\n"
++    "  vec2 uv = gl_FragCoord.xy / u_src_size;\n"
++    "  float y = (texture(u_y, uv).r - u_yoff) * u_yscale;\n"
++    "  vec2 c = texture(u_uv, uv).rg - vec2(0.5);\n"
++    "  float r = y + u_coef.x * c.y;\n"
++    "  float g = y + u_coef.y * c.x + u_coef.z * c.y;\n"
++    "  float b = y + u_coef.w * c.x;\n"
++    "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
++    "}\n";
++
++static GLuint gpu_compile(GLenum type, const char *src)
++{
++    GLuint sh = glCreateShader(type);
++    GLint ok = 0;
++
++    glShaderSource(sh, 1, &src, NULL);
++    glCompileShader(sh);
++    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[512] = "";
++        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
++        qemu_log("virtio-media-diag: gpu_xfer: shader compile failed: %s\n", log);
++        glDeleteShader(sh);
++        return 0;
++    }
++    return sh;
++}
++
++static bool gpu_build_nv12_program(void)
++{
++    GLuint vs, fs;
++    GLint ok = 0;
++
++    if (gpu.prog) {
++        return true;
++    }
++    if (gpu.prog_failed) {
++        return false;
++    }
++    vs = gpu_compile(GL_VERTEX_SHADER, nv12_vs);
++    fs = gpu_compile(GL_FRAGMENT_SHADER, nv12_fs);
++    if (!vs || !fs) {
++        gpu.prog_failed = true;
++        return false;
++    }
++    gpu.prog = glCreateProgram();
++    glAttachShader(gpu.prog, vs);
++    glAttachShader(gpu.prog, fs);
++    glLinkProgram(gpu.prog);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    glGetProgramiv(gpu.prog, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        char log[512] = "";
++        glGetProgramInfoLog(gpu.prog, sizeof(log), NULL, log);
++        qemu_log("virtio-media-diag: gpu_xfer: program link failed: %s\n", log);
++        glDeleteProgram(gpu.prog);
++        gpu.prog = 0;
++        gpu.prog_failed = true;
++        return false;
++    }
++    gpu.u_y = glGetUniformLocation(gpu.prog, "u_y");
++    gpu.u_uv = glGetUniformLocation(gpu.prog, "u_uv");
++    gpu.u_src_size = glGetUniformLocation(gpu.prog, "u_src_size");
++    gpu.u_yoff = glGetUniformLocation(gpu.prog, "u_yoff");
++    gpu.u_yscale = glGetUniformLocation(gpu.prog, "u_yscale");
++    gpu.u_coef = glGetUniformLocation(gpu.prog, "u_coef");
++    return true;
++}
++
++void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
++                                   uint32_t src_height, uint32_t stride,
++                                   uint32_t uv_offset, uint32_t dst_width,
++                                   uint32_t len, int matrix, int *err)
++{
++    GpuSaved sv;
++    VirtIOMediaGpuBuf *b;
++
++    if (!gpu_enter(&sv)) {
++        close(dmabuf_fd);
++        if (err) {
++            *err = gpu.tried && gpu.ctx == EGL_NO_CONTEXT ? -ENOTSUP : -EAGAIN;
++        }
++        return NULL;
++    }
++    if (!gpu_build_nv12_program()) {
++        gpu_leave(&sv);
++        close(dmabuf_fd);
++        if (err) {
++            *err = -ENOTSUP;
++        }
++        return NULL;
++    }
++    b = g_new0(VirtIOMediaGpuBuf, 1);
++    b->fd = dmabuf_fd;
++    b->nv12 = true;
++    b->width = dst_width;
++    b->height = src_height;
++    b->src_width = src_width;
++    b->stride = stride;
++    b->len = len;
++    b->matrix = matrix;
++    b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, src_width,
++                              src_height, stride, 0);
++    b->tex_uv = b->tex ? gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_GR88,
++                                          src_width / 2, src_height / 2,
++                                          stride, uv_offset) : 0;
++    if (!b->tex || !b->tex_uv) {
++        if (b->tex) {
++            glDeleteTextures(1, &b->tex);
++        }
++        gpu_leave(&sv);
++        close(dmabuf_fd);
++        g_free(b);
++        if (err) {
++            *err = -EINVAL;
++        }
++        return NULL;
++    }
++    gpu_leave(&sv);
++    return b;
++}
++
++/* Draw the NV12 planes into the destination texture. Context is current. */
++static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
++{
++    /* Coefficients for (r_cr, g_cb, g_cr, b_cb) and the luma range. */
++    static const float coef601[4] = { 1.402f, -0.344136f, -0.714136f, 1.772f };
++    static const float coef709[4] = { 1.5748f, -0.187324f, -0.468124f, 1.8556f };
++    const float *coef = (b->matrix & 1) ? coef709 : coef601;
++    bool full = b->matrix & 2;
++    float yoff = full ? 0.0f : 16.0f / 255.0f;
++    float yscale = full ? 1.0f : 255.0f / 219.0f;
++    float cscale = full ? 1.0f : 255.0f / 224.0f;
++    float c[4] = { coef[0] * cscale, coef[1] * cscale, coef[2] * cscale,
++                   coef[3] * cscale };
++    GLenum status;
++
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
++    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, dst_tex, 0);
++    status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
++    if (status != GL_FRAMEBUFFER_COMPLETE) {
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        return -EIO;
++    }
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_BLEND);
++    glDisable(GL_DEPTH_TEST);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glViewport(0, 0, b->width, b->height);
++    glUseProgram(gpu.prog);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, b->tex);
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(GL_TEXTURE_2D, b->tex_uv);
++    glUniform1i(gpu.u_y, 0);
++    glUniform1i(gpu.u_uv, 1);
++    glUniform2f(gpu.u_src_size, (float)b->src_width, (float)b->height);
++    glUniform1f(gpu.u_yoff, yoff);
++    glUniform1f(gpu.u_yscale, yscale);
++    glUniform4fv(gpu.u_coef, 1, c);
++    glBindVertexArray(0);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glUseProgram(0);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    return 0;
++}
++
+ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+                               uint32_t stride, uint32_t len, int *err)
+ {
+@@ -340,27 +603,34 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+         b->sync = NULL;
+     }
+ 
+-    if (!b->read_fbo) {
+-        glGenFramebuffers(1, &b->read_fbo);
+-        glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read_fbo);
+-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+-                               GL_TEXTURE_2D, b->tex, 0);
++    if (b->nv12) {
++        ret = gpu_draw_nv12(b, info.tex_id);
++        if (ret) {
++            goto out;
++        }
+     } else {
+-        glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read_fbo);
+-    }
+-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
+-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+-                           GL_TEXTURE_2D, info.tex_id, 0);
+-    status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+-    if (status != GL_FRAMEBUFFER_COMPLETE ||
+-        glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+-        ret = -EIO;
+-        goto out;
++        if (!b->read_fbo) {
++            glGenFramebuffers(1, &b->read_fbo);
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read_fbo);
++            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                                   GL_TEXTURE_2D, b->tex, 0);
++        } else {
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read_fbo);
++        }
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_2D, info.tex_id, 0);
++        status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
++        if (status != GL_FRAMEBUFFER_COMPLETE ||
++            glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            ret = -EIO;
++            goto out;
++        }
++        glBlitFramebuffer(0, 0, b->width, b->height, 0, 0, b->width, b->height,
++                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+     }
+-    glBlitFramebuffer(0, 0, b->width, b->height, 0, 0, b->width, b->height,
+-                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+     gl_err = glGetError();
+     if (gl_err != GL_NO_ERROR) {
+         qemu_log("virtio-media-diag: gpu_xfer: copy to res %u tex %u failed, "
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 4b8977736..0e1040c2c 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -170,6 +170,140 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+     q->num_host_planes = 0;
+     q->streaming = false;
+     q->gpu_failed = false;
++    g_free(q->conv_scratch);
++    q->conv_scratch = NULL;
++    q->conv_scratch_len = 0;
++}
++
++/* ------------------------------------------------------------------------- */
++/* host-nv12 helpers                                                         */
++/* ------------------------------------------------------------------------- */
++
++static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
++{
++    /* What bcm2835-codec answers for RGBA32: bytesperline_align 64. */
++    return QEMU_ALIGN_UP(width * 4, 64);
++}
++
++/* Does this v4l2_format describe the CAPTURE side of a decoder? */
++static bool virtio_media_fmt_is_capture(const struct v4l2_format *f)
++{
++    return virtio_media_queue_index(f->type) == 1;
++}
++
++static uint32_t virtio_media_fmt_pixelformat(const struct v4l2_format *f)
++{
++    return V4L2_TYPE_IS_MULTIPLANAR(f->type) ? f->fmt.pix_mp.pixelformat
++                                              : f->fmt.pix.pixelformat;
++}
++
++static void virtio_media_fmt_set_pixelformat(struct v4l2_format *f, uint32_t pf)
++{
++    if (V4L2_TYPE_IS_MULTIPLANAR(f->type)) {
++        f->fmt.pix_mp.pixelformat = pf;
++    } else {
++        f->fmt.pix.pixelformat = pf;
++    }
++}
++
++/*
++ * Rewrite a host NV12 v4l2_format into the RGBA one the guest asked for,
++ * with the bytesperline/sizeimage the codec would have given for RGBA.
++ * Records the host geometry / colour description in q when q != NULL.
++ */
++static void virtio_media_fmt_nv12_to_rgba(VirtIOMediaQueue *q,
++                                          struct v4l2_format *f)
++{
++    uint32_t w, h, bpl, cs, enc, quant;
++
++    if (V4L2_TYPE_IS_MULTIPLANAR(f->type)) {
++        w = f->fmt.pix_mp.width;
++        h = f->fmt.pix_mp.height;
++        cs = f->fmt.pix_mp.colorspace;
++        enc = f->fmt.pix_mp.ycbcr_enc;
++        quant = f->fmt.pix_mp.quantization;
++        if (q) {
++            q->host_sizeimage = f->fmt.pix_mp.plane_fmt[0].sizeimage;
++        }
++        bpl = virtio_media_rgba_bpl(w);
++        f->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_RGBA32;
++        f->fmt.pix_mp.num_planes = 1;
++        f->fmt.pix_mp.plane_fmt[0].bytesperline = bpl;
++        f->fmt.pix_mp.plane_fmt[0].sizeimage = bpl * h;
++        /* RGB output from the codec is SRGB/full; say the same. */
++        f->fmt.pix_mp.colorspace = V4L2_COLORSPACE_SRGB;
++        f->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++        f->fmt.pix_mp.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++    } else {
++        w = f->fmt.pix.width;
++        h = f->fmt.pix.height;
++        cs = f->fmt.pix.colorspace;
++        enc = f->fmt.pix.ycbcr_enc;
++        quant = f->fmt.pix.quantization;
++        if (q) {
++            q->host_sizeimage = f->fmt.pix.sizeimage;
++        }
++        bpl = virtio_media_rgba_bpl(w);
++        f->fmt.pix.pixelformat = V4L2_PIX_FMT_RGBA32;
++        f->fmt.pix.bytesperline = bpl;
++        f->fmt.pix.sizeimage = bpl * h;
++        f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
++        f->fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++        f->fmt.pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++    }
++    if (q) {
++        bool is709;
++
++        q->rgba_bytesperline = bpl;
++        q->rgba_sizeimage = bpl * h;
++        if (enc == V4L2_YCBCR_ENC_DEFAULT) {
++            enc = V4L2_MAP_YCBCR_ENC_DEFAULT(cs);
++        }
++        is709 = (enc == V4L2_YCBCR_ENC_709) || (enc == V4L2_YCBCR_ENC_XV709) ||
++                (enc == V4L2_YCBCR_ENC_DEFAULT && cs == V4L2_COLORSPACE_REC709);
++        q->matrix = (is709 ? 1 : 0) |
++                    (quant == V4L2_QUANTIZATION_FULL_RANGE ? 2 : 0);
++    }
++}
++
++/*
++ * CPU NV12 -> RGBA (fallback only). BT.601/709 limited or full range, no
++ * chroma interpolation. Slow (~10 ms at 720p) but exact enough.
++ */
++static void virtio_media_nv12_to_rgba_cpu(const uint8_t *src, uint32_t bpl,
++                                          uint32_t w, uint32_t h,
++                                          uint32_t uv_offset, int matrix,
++                                          uint8_t *dst, uint32_t dst_bpl)
++{
++    /* Fixed point 1.16 coefficients: r_cr, g_cb, g_cr, b_cb (x 65536). */
++    static const int32_t c601[4] = { 91881, -22554, -46802, 116130 };
++    static const int32_t c709[4] = { 103206, -12276, -30679, 121608 };
++    const int32_t *c = (matrix & 1) ? c709 : c601;
++    bool full = matrix & 2;
++    int32_t yoff = full ? 0 : 16;
++    int32_t yscale = full ? 65536 : 76309;     /* 255/219 */
++    int32_t cscale = full ? 65536 : 74624;     /* 255/224 */
++    uint32_t x, y;
++
++    for (y = 0; y < h; y++) {
++        const uint8_t *yp = src + (size_t)y * bpl;
++        const uint8_t *cp = src + uv_offset + (size_t)(y / 2) * bpl;
++        uint8_t *dp = dst + (size_t)y * dst_bpl;
++
++        for (x = 0; x < w; x++) {
++            int32_t Y = ((int32_t)yp[x] - yoff) * yscale;           /* 16.16 */
++            int32_t cb = (((int32_t)cp[(x & ~1u)] - 128) * cscale) >> 16;
++            int32_t cr = (((int32_t)cp[(x & ~1u) + 1] - 128) * cscale) >> 16;
++            int32_t r = (Y + c[0] * cr) >> 16;
++            int32_t g = (Y + c[1] * cb + c[2] * cr) >> 16;
++            int32_t b = (Y + c[3] * cb) >> 16;
++
++            dp[x * 4 + 0] = r < 0 ? 0 : r > 255 ? 255 : r;
++            dp[x * 4 + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
++            dp[x * 4 + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
++            dp[x * 4 + 3] = 0xff;
++        }
++    }
+ }
+ 
+ static void virtio_media_session_free(VirtIOMediaSession *s)
+@@ -471,9 +605,15 @@ static void virtio_media_host_readable(void *opaque)
+                      * The width handed to GL is the padded one, which is
+                      * also the gralloc resource's width.
+                      */
++                    /* Destination (RGBA) geometry, in either host format. */
++                    uint32_t dst_bpl = q->nv12_host ? q->rgba_bytesperline
++                                                    : q->bytesperline;
++                    bool geom_ok = q->width && q->height &&
++                                   dst_bpl >= q->width * 4 &&
++                                   (!q->nv12_host || q->bytesperline >= q->width);
++
+                     if (vm->gpu_xfer && gb->virgl_res && p == 0 &&
+-                        gb->num_planes == 1 && q->width && q->height &&
+-                        q->bytesperline >= q->width * 4 && !q->gpu_failed) {
++                        gb->num_planes == 1 && geom_ok && !q->gpu_failed) {
+                         uint32_t idx = evt.buffer.index;
+                         int r;
+ 
+@@ -490,10 +630,20 @@ static void virtio_media_host_readable(void *opaque)
+                                          "VIDIOC_EXPBUF failed (%d), GPU "
+                                          "path off for this queue\n", errno);
+                             } else {
+-                                q->gpu_buf[idx] = virtio_media_gpu_import(
+-                                        eb.fd, q->bytesperline / 4, q->height,
+-                                        q->bytesperline, q->host_len[idx][p],
+-                                        &e);
++                                if (q->nv12_host) {
++                                    q->gpu_buf[idx] =
++                                        virtio_media_gpu_import_nv12(
++                                            eb.fd, q->width, q->height,
++                                            q->bytesperline,
++                                            q->bytesperline * q->height,
++                                            dst_bpl / 4, q->host_len[idx][p],
++                                            q->matrix, &e);
++                                } else {
++                                    q->gpu_buf[idx] = virtio_media_gpu_import(
++                                            eb.fd, q->bytesperline / 4,
++                                            q->height, q->bytesperline,
++                                            q->host_len[idx][p], &e);
++                                }
+                                 if (!q->gpu_buf[idx] && e != -EAGAIN) {
+                                     q->gpu_failed = true;
+                                     qemu_log("virtio-media-diag: gpu_xfer: "
+@@ -517,12 +667,41 @@ static void virtio_media_host_readable(void *opaque)
+                             }
+                         }
+                     }
++                    /*
++                     * host-nv12 and the GPU did not take the frame: the host
++                     * bytes are NV12 and nobody downstream can use them as
++                     * they are. Convert on the CPU into the RGBA scratch and
++                     * let the older paths run from that. Slow, correct.
++                     */
++                    void *src_map = q->host_map[evt.buffer.index][p];
++                    uint32_t src_bpl = q->bytesperline;
++
++                    if (q->nv12_host) {
++                        size_t need = (size_t)q->rgba_sizeimage;
++
++                        if (q->conv_scratch_len < need) {
++                            g_free(q->conv_scratch);
++                            q->conv_scratch = g_malloc(need);
++                            q->conv_scratch_len = need;
++                        }
++                        virtio_media_nv12_to_rgba_cpu(
++                                src_map, q->bytesperline, q->width, q->height,
++                                q->bytesperline * q->height, q->matrix,
++                                q->conv_scratch, q->rgba_bytesperline);
++                        src_map = q->conv_scratch;
++                        src_bpl = q->rgba_bytesperline;
++                        used = q->rgba_sizeimage;
++                        if (used > gb->planes[p].len) {
++                            used = gb->planes[p].len;
++                        }
++                        warn_report_once("virtio-media: host_nv12: GPU path "
++                                         "unavailable, converting on the CPU");
++                    }
+                     if (vm->host_xfer && gb->virgl_res && p == 0 &&
+                         gb->num_planes == 1 && q->width && q->height) {
+                         int r = virtio_media_virgl_transfer(
+                                     gb->virgl_res, q->width, q->height,
+-                                    q->bytesperline,
+-                                    q->host_map[evt.buffer.index][p], used);
++                                    src_bpl, src_map, used);
+                         if (r == 0) {
+                             continue;
+                         }
+@@ -533,8 +712,7 @@ static void virtio_media_host_readable(void *opaque)
+                                      gb->virgl_res, r);
+                         }
+                     }
+-                    if (!virtio_media_sg_copy(vm, &gb->planes[p],
+-                                              q->host_map[evt.buffer.index][p],
++                    if (!virtio_media_sg_copy(vm, &gb->planes[p], src_map,
+                                               used, true)) {
+                         virtio_media_send_error_event(s, EFAULT);
+                         return;
+@@ -558,6 +736,24 @@ static void virtio_media_host_readable(void *opaque)
+              * crosses into the guest anyway, which costs nothing and does not
+              * depend on the driver continuing to do that.
+              */
++            /*
++             * host-nv12: the guest's buffer is RGBA-sized; say so. bytesused
++             * is only tested for zero by v4l2_codec2, length is what its
++             * USERPTR bookkeeping compares against.
++             */
++            if (i == 1 && q->nv12_host) {
++                if (q->mplane) {
++                    if (evt.planes[0].bytesused) {
++                        evt.planes[0].bytesused = q->rgba_sizeimage;
++                    }
++                    evt.planes[0].length = q->rgba_sizeimage;
++                } else {
++                    if (evt.buffer.bytesused) {
++                        evt.buffer.bytesused = q->rgba_sizeimage;
++                    }
++                    evt.buffer.length = q->rgba_sizeimage;
++                }
++            }
+             evt.buffer.memory = V4L2_MEMORY_USERPTR;
+             memset(&evt.buffer.m, 0, sizeof(evt.buffer.m));
+             if (q->mplane) {
+@@ -820,6 +1016,16 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+                 q->height = fmt.fmt.pix.height;
+                 q->bytesperline = fmt.fmt.pix.bytesperline;
+             }
++            /*
++             * host-nv12 is armed by S_FMT; confirm the host really is NV12
++             * now (a later S_FMT to something else would have cleared it).
++             */
++            if (q->nv12_host &&
++                virtio_media_fmt_pixelformat(&fmt) == V4L2_PIX_FMT_NV12) {
++                virtio_media_fmt_nv12_to_rgba(q, &fmt);
++            } else {
++                q->nv12_host = false;
++            }
+         }
+     }
+ 
+@@ -1149,7 +1355,71 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+         }
+     }
+ 
++    /*
++     * host-nv12: the guest negotiates AB24 on CAPTURE; the codec is asked for
++     * NV12 and every reply is rewritten to the RGBA the guest expects (see
++     * VirtIOMediaQueue::nv12_host). Only for CAPTURE, only when the guest asks
++     * for RGBA32, only with gpu-xfer on; everything else is untouched.
++     */
++    if (code == VIDIOC_S_FMT || code == VIDIOC_TRY_FMT || code == VIDIOC_G_FMT) {
++        struct v4l2_format *f = (struct v4l2_format *)payload;
++        bool capture = virtio_media_fmt_is_capture(f);
++        bool want_rgba = false;
++
++        q = &s->queues[virtio_media_queue_index(f->type)];
++        if (s->vm->host_nv12 && s->vm->gpu_xfer && capture) {
++            if (code == VIDIOC_G_FMT) {
++                want_rgba = q->nv12_host;
++            } else if (virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_RGBA32) {
++                want_rgba = true;
++                virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
++            }
++        }
++        if (ioctl(s->fd, code, payload) < 0) {
++            int err = errno;
++
++            if (want_rgba && code != VIDIOC_G_FMT) {
++                /* Give the guest's format back untouched in the reply. */
++                virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_RGBA32);
++            }
++            return err;
++        }
++        if (want_rgba && virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12) {
++            virtio_media_fmt_nv12_to_rgba(code == VIDIOC_TRY_FMT ? NULL : q, f);
++            if (code == VIDIOC_S_FMT && !q->nv12_host) {
++                q->nv12_host = true;
++                qemu_log("virtio-media-diag: host_nv12: CAPTURE %ux%u runs NV12 "
++                         "on the host (guest sees RGBA bpl %u size %u, "
++                         "matrix %d)\n",
++                         V4L2_TYPE_IS_MULTIPLANAR(f->type) ? f->fmt.pix_mp.width
++                                                           : f->fmt.pix.width,
++                         V4L2_TYPE_IS_MULTIPLANAR(f->type) ? f->fmt.pix_mp.height
++                                                           : f->fmt.pix.height,
++                         q->rgba_bytesperline, q->rgba_sizeimage, q->matrix);
++            }
++        } else if (code == VIDIOC_S_FMT && capture) {
++            /* The host ended up in some other format: no translation. */
++            q->nv12_host = false;
++        }
++        return 0;
++    }
++
+     ret = ioctl(s->fd, code, payload) < 0 ? errno : 0;
++
++    if (!ret && code == VIDIOC_QUERYBUF) {
++        struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
++
++        q = &s->queues[virtio_media_queue_index(b->type)];
++        if (q->nv12_host) {
++            if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++                if (b->length >= 1) {
++                    b->m.planes[0].length = q->rgba_sizeimage;
++                }
++            } else {
++                b->length = q->rgba_sizeimage;
++            }
++        }
++    }
+     virtio_media_unpoint(code, payload);
+     if (ret) {
+         return ret;
+@@ -1533,6 +1803,7 @@ static const Property virtio_media_properties[] = {
+     DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
+     DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
+     DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
++    DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
+ };
+ 
+ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
+index 6193a4cfd..6917d37de 100644
+--- a/include/hw/virtio/virtio-media-virgl.h
++++ b/include/hw/virtio/virtio-media-virgl.h
+@@ -54,6 +54,20 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+  */
+ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+                               uint32_t stride, uint32_t len, int *err);
++/*
++ * NV12 variant (host-nv12): the dmabuf holds an NV12 frame (Y plane of
++ * `stride` bytes per row from offset 0, interleaved CbCr plane of the same
++ * stride from `uv_offset`, `src_width` x `src_height` pixels). The blit then
++ * converts it on the GPU into the RGBA resource, which is `dst_width` x
++ * `src_height` (dst_width = the guest's bytesperline / 4, >= src_width; the
++ * padding columns repeat the last source column). `matrix` selects the
++ * YCbCr -> RGB coefficients: 0 = BT.601 limited, 1 = BT.709 limited,
++ * 2 = BT.601 full, 3 = BT.709 full.
++ */
++void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
++                                   uint32_t src_height, uint32_t stride,
++                                   uint32_t uv_offset, uint32_t dst_width,
++                                   uint32_t len, int matrix, int *err);
+ int virtio_media_gpu_blit(void *handle, uint32_t res_id);
+ int virtio_media_gpu_wait(void *handle);
+ void virtio_media_gpu_release(void *handle);
+diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
+index 2da0ed63d..6b145becc 100644
+--- a/include/hw/virtio/virtio-media.h
++++ b/include/hw/virtio/virtio-media.h
+@@ -199,6 +199,22 @@ typedef struct VirtIOMediaQueue {
+      */
+     void *gpu_buf[VIRTIO_MEDIA_MAX_BUFFERS];
+     bool gpu_failed;
++    /*
++     * host-nv12: this CAPTURE queue runs NV12 on the host while the guest
++     * negotiated RGBA (AB24). Two geometries: the host one is in
++     * width/height/bytesperline above (NV12: bpl = ALIGN(w,32), CbCr plane at
++     * bpl*height, sizeimage = bpl*height*3/2); the guest-facing RGBA one is
++     * here (bpl = ALIGN(w*4,64), sizeimage = bpl*height) and is what every
++     * reply to the guest must say. matrix: see virtio_media_gpu_import_nv12.
++     */
++    bool nv12_host;
++    uint32_t rgba_bytesperline;
++    uint32_t rgba_sizeimage;
++    uint32_t host_sizeimage;
++    int matrix;
++    /* CPU fallback: RGBA scratch for frames that could not go through the GPU. */
++    uint8_t *conv_scratch;
++    size_t conv_scratch_len;
+     uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
+     /* Guest buffers by index, mirrored onto the host buffer of the same index. */
+     VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
+@@ -242,6 +258,16 @@ struct VirtIOMedia {
+      */
+     bool gpu_xfer;
+     uint64_t gpu_xfer_fail;
++    /*
++     * host-nv12 (needs gpu-xfer): when the guest sets AB24 on CAPTURE, ask the
++     * codec for NV12 instead and convert on the GPU while copying into the
++     * virgl resource. A 720p RGBA capture buffer is 3.7 MB = order 10, which
++     * the host's CMA/buddy cannot supply 25 times (5 of 25 allocated at
++     * 720p60); NV12 is 1.4 MB = order 9 and 2.7x less codec write bandwidth.
++     * The guest keeps seeing RGBA (its Mesa cannot sample YUV). Frames that
++     * cannot take the GPU path are converted on the CPU (slow, correct).
++     */
++    bool host_nv12;
+ 
+     VirtQueue *command_vq;
+     VirtQueue *event_vq;

@@ -74,3 +74,18 @@ rpi5_doma_output_fhd() {
 }
 
 do_install[vardeps] += "RPI5_DOMA_PANEL_MODE RPI5_DOMA_FHD_MODE"
+
+# weston's priority and CPU on the Raspberry Pi 5 (decided 2026-10-27): nice -19 like
+# the device models, on DomD's CPU 0 beside DomA's device model (the DomD qemu wrapper's
+# taskset -c 0), off CPU 1, where DomU's device model and its Venus ring threads run.
+# A systemd drop-in rather than a renice of the running process, so that only the
+# threads weston starts itself get -19 and Mesa's shader disk-cache thread
+# (weston:disk$0) keeps the nice 19 / SCHED_BATCH that Mesa gives it.
+FILESEXTRAPATHS:prepend:raspberrypi5 := "${THISDIR}/files:"
+SRC_URI:append:raspberrypi5 = " file://99-rpi5-priority.conf"
+do_install:append:raspberrypi5() {
+    install -d ${D}${systemd_system_unitdir}/weston.service.d
+    install -m 0644 ${UNPACKDIR}/99-rpi5-priority.conf \
+        ${D}${systemd_system_unitdir}/weston.service.d/99-rpi5-priority.conf
+}
+FILES:${PN}:append:raspberrypi5 = " ${systemd_system_unitdir}/weston.service.d/99-rpi5-priority.conf"

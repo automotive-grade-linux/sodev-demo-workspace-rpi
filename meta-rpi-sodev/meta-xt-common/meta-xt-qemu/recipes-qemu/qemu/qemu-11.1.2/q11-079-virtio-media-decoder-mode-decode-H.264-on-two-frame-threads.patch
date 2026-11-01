@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 16 Oct 2026 14:53:17 +0900
+Subject: [PATCH] virtio-media: decoder mode: decode H.264 on two frame
+ threads
+
+A 1080p60 H.264 stream played in a WebView (High profile, one slice a
+picture) takes about 1.35 times the CPU of the local test clip: DomD's
+ffmpeg decodes it at 70.3 frames a second on one thread against 94.8.
+On the decode thread, with the rest of DomD busy, codec in DomA
+decoded 30 s of it at 60.8 frames a second without display (-S) and
+played it at 50.8-59.2 (-T).
+
+The decode thread takes its frames from libavcodec itself and the
+bottom half completes them, so frame threads there only add one frame
+of latency. Give a codec decoded on that thread (one without the
+hwaccel: H.264) two frame threads. HEVC keeps one thread on the main
+loop. Slice threads would not help: these streams have one slice a
+picture.
+
+Measured on the Raspberry Pi 5 8GB (2026-10-16), codec in DomA, 30 s
+of that stream: -S 60.8 -> 75.2 fps, -T 50.8-59.2 -> 60.2-60.3; the
+local clip -T 60.9; HEVC 1080p60 -S 169.5-177.8 and -T 61.1 (no
+libavcodec threads for HEVC). Played from a local file in a WebView,
+the stream decoded at 58.2-58.4 frames a second with its clock at 0.97
+of real time; the two threads take 63-66% of a core each, against 85%
+for the one thread at 47 frames a second.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ hw/virtio/virtio-media-decoder.c | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
+index 3aee470..e59e4d8 100644
+--- a/hw/virtio/virtio-media-decoder.c
++++ b/hw/virtio/virtio-media-decoder.c
+@@ -2586,12 +2586,23 @@ static int dec_codec_open(VirtIOMediaSession *s)
+         return ENOMEM;
+     }
+     /*
+-     * One libavcodec thread. Frame-threaded decoding would reorder
+-     * completions relative to the QBUF that produced them, and make libavcodec
+-     * hold frames across calls in a way the buffer accounting here does not
+-     * model. (q11-dec-thread gives H.264 a decode thread of its own instead.)
++     * One libavcodec thread for a codec decoded on the main loop (HEVC):
++     * completions there are produced by the QBUF that caused them, and frame
++     * threads would make libavcodec hold frames across those calls.
++     *
++     * q11-dec-frame-threads: a codec on the decode thread (H.264) gets two
++     * frame threads. Its frames already come out of that thread in decode
++     * order and are completed by the bottom half, so the one frame libavcodec
++     * holds back is only latency. A 1080p60 H.264 stream played in a WebView
++     * (High, one slice a picture, so slice threads would not help) needs about
++     * 1.35 times the CPU of the local test clip: with one thread it decoded
++     * below 60 frames a second on the Raspberry Pi 5.
+      */
+     d->avctx->thread_count = 1;
++    if (!d->codec->hwaccel) {
++        d->avctx->thread_count = 2;
++        d->avctx->thread_type = FF_THREAD_FRAME;
++    }
+ 
+     /*
+      * Hardware decode, FAIL-SOFT. A board whose /dev/mediaN is missing, busy or

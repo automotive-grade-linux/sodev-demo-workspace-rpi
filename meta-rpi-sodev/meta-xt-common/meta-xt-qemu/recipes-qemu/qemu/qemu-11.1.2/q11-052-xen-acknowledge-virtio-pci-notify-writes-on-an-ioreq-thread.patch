@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 20 Oct 2026 16:16:22 +0900
+Subject: [PATCH] xen: acknowledge virtio-pci notify writes on an ioreq thread
+ (opt-in)
+
+Without this patch every ioreq waits for the QEMU main loop: a guest
+vCPU that kicks a virtqueue stays paused until the main thread has
+finished whatever it is doing and comes back to the event channel. On
+Raspberry Pi 4, with DomA decoding 1080p60 video in hardware, that wait
+averaged 1.11 ms, 283 times a second, i.e. 31% of a vCPU (1.47 ms when
+the main thread was busy at the time, 0.64 ms when it slept). The main
+thread is not saturated (58% busy); the kicks queue behind the per-event
+work of ioreqs, bottom halves, timers and hypercalls.
+
+With QEMU_XEN_IOREQ_THREAD=1 in the device model's environment, a
+dedicated "xen-ioreq" thread owns the ioreq event channel. Every ioreq
+is still executed on the main thread, under the BQL and in arrival
+order, so device models see the same sequence as before. What changes is
+when the vCPU is released: a plain write to a virtio-pci notify region
+is acknowledged as soon as it is queued, because a virtqueue
+notification is asynchronous by definition (KVM's ioeventfd does the
+same for this register; Xen has no ioeventfd). Every other ioreq is
+acknowledged by the main loop once it has run, as before. A vCPU has at
+most one ioreq outstanding, so an early acknowledgement cannot reorder
+anything that vCPU does through the device model. The shutdown/reset
+check that precedes each response is kept, and is also run for
+early-acknowledged writes.
+
+The thread queues each ioreq in a FIFO and sets an EventNotifier whose
+handler sits on the main loop's iohandler context, where
+cpu_handle_ioreq() serves the event channel without the thread. The
+handler runs one ioreq a call and sets the notifier again while more are
+queued. That context runs its bottom halves before its fd handlers, so
+a bottom half one ioreq schedules there runs before the next ioreq is
+handled, as without the thread: virtio-gpu's control queue (the
+RESOURCE_CREATE of a buffer) before the virtio-media QBUF of that
+buffer. An earlier version drained the whole FIFO from a bottom half of
+the default AioContext, which the main loop dispatches first; then the
+QBUF ran first, and the decoder mode looked up a resource virtio-gpu had
+not created yet. On a Raspberry Pi 5 (2026-10-20, 4K HEVC in decoder
+mode, 30 stream starts each) that version lost the first frame's
+resource once in 30 starts (created 88 ms after the lookup) and
+converted that stream on the CPU at 4.6 frames shown a second; this one
+lost none, at the same 27 frames shown a second.
+
+The early acknowledgement uses a full barrier rather than xen_wmb(): the
+copy of the shared ioreq slot is a load, and on ARMv8 the store to the
+slot's state could otherwise become visible first, letting the vCPU
+reuse the slot under the copy.
+
+The thread logs its counters (early acknowledgements, ioreqs completed
+by the main loop) every 30 s. Without the variable (the default) the
+event channel is served from the main loop exactly as before.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [this layer's Xen device model; switched by an environment variable]
+---
+ hw/xen/xen-hvm-common.c         | 254 +++++++++++++++++++++++++++++---
+ include/hw/xen/xen-hvm-common.h |  15 ++
+ 2 files changed, 250 insertions(+), 19 deletions(-)
+
+diff --git a/hw/xen/xen-hvm-common.c b/hw/xen/xen-hvm-common.c
+index 3e5f3f434..e5c8f0856 100644
+--- a/hw/xen/xen-hvm-common.c
++++ b/hw/xen/xen-hvm-common.c
+@@ -19,6 +19,10 @@
+ #include "system/system.h"
+ #include "system/xen.h"
+ #include "system/xen-mapcache.h"
++#include "qemu/main-loop.h"
++#include "qemu/event_notifier.h"
++#include "qemu/rcu.h"
++#include <poll.h>
+ 
+ MemoryRegion xen_memory, xen_grants;
+ 
+@@ -576,6 +580,40 @@ static void handle_buffered_io(void *opaque)
+     }
+ }
+ 
++/*
++ * The end of every ioreq that was not acknowledged early: give the tools a
++ * chance to see a shutdown or reset before the guest resumes, then respond.
++ */
++static void xen_ioreq_check_shutdown(void)
++{
++    /*
++     * We do this before we send the response so that the tools
++     * have the opportunity to pick up on the reset before the
++     * guest resumes and does a hlt with interrupts disabled which
++     * causes Xen to powerdown the domain.
++     */
++    if (runstate_is_running()) {
++        ShutdownCause request;
++
++        if (qemu_shutdown_requested_get()) {
++            destroy_hvm_domain(false);
++        }
++        request = qemu_reset_requested_get();
++        if (request) {
++            qemu_system_reset(request);
++            destroy_hvm_domain(true);
++        }
++    }
++}
++
++static void xen_ioreq_finish(XenIOState *state, ioreq_t *req, int vcpu)
++{
++    xen_wmb(); /* Update ioreq contents /then/ update state. */
++    xen_ioreq_check_shutdown();
++    req->state = STATE_IORESP_READY;
++    qemu_xen_evtchn_notify(state->xce_handle, state->ioreq_local_port[vcpu]);
++}
++
+ static void cpu_handle_ioreq(void *opaque)
+ {
+     XenIOState *state = opaque;
+@@ -599,31 +637,193 @@ static void cpu_handle_ioreq(void *opaque)
+             return;
+         }
+ 
+-        xen_wmb(); /* Update ioreq contents /then/ update state. */
++        xen_ioreq_finish(state, req, state->send_vcpu);
++    }
++}
+ 
+-        /*
+-         * We do this before we send the response so that the tools
+-         * have the opportunity to pick up on the reset before the
+-         * guest resumes and does a hlt with interrupts disabled which
+-         * causes Xen to powerdown the domain.
+-         */
+-        if (runstate_is_running()) {
+-            ShutdownCause request;
++/*
++ * ioreq thread (opt-in: QEMU_XEN_IOREQ_THREAD=1 in the device model's environment).
++ *
++ * WHY. Without it every ioreq waits for the main loop: a guest vCPU that kicks a
++ * virtqueue stays paused until the main thread has finished whatever it is doing and
++ * comes back to the event channel. On RPi4 DomA (1080p60 hardware decode) that was
++ * 1.11 ms on average, 283 times a second, i.e. 31% of a vCPU (measured 2026-10-03:
++ * 1.47 ms when the main thread was busy at the time, 0.64 ms when it slept). The main
++ * thread is not saturated (58% busy); it is the per-event work of ioreqs, BHs, timers
++ * and hypercalls that the kicks queue behind.
++ *
++ * WHAT. The thread owns the event channel. Every ioreq still EXECUTES on the main
++ * thread, under the BQL, in arrival order -- one FIFO the main loop drains one ioreq
++ * at a time (xen_ioreq_notified()) -- so device
++ * models see exactly the sequence they saw before. What changes is when the vCPU is
++ * RELEASED: a write to a virtio-pci notify region is acknowledged as soon as it is
++ * queued, because a virtqueue notification is asynchronous by definition (it is what
++ * KVM's ioeventfd does for the same register; Xen has no ioeventfd). Every other ioreq
++ * is acknowledged by that handler once it has run, as before. A vCPU has at most one
++ * ioreq outstanding, so an early acknowledgement cannot reorder anything that vCPU
++ * does through the device model.
++ */
++typedef struct XenIoreqItem {
++    ioreq_t copy;
++    ioreq_t *req;   /* the shared slot to complete; NULL if acknowledged early */
++    int vcpu;
++    QSIMPLEQ_ENTRY(XenIoreqItem) next;
++} XenIoreqItem;
++
++/* Is this ioreq a plain write to a virtio-pci notify region? (no BQL; RCU) */
++static bool xen_ioreq_is_virtio_notify(const ioreq_t *r)
++{
++    MemoryRegionSection sec;
++    bool ret;
++
++    if (r->type != IOREQ_TYPE_COPY || r->dir != IOREQ_WRITE ||
++        r->data_is_ptr || r->count != 1) {
++        return false;
++    }
++    sec = memory_region_find(get_system_memory(), r->addr, r->size);
++    if (!sec.mr) {
++        return false;
++    }
++    /* hw/virtio/virtio-pci.c names them "virtio-pci-notify-<dev>" (and -pio-) */
++    ret = g_str_has_prefix(memory_region_name(sec.mr), "virtio-pci-notify-");
++    memory_region_unref(sec.mr);
++    return ret;
++}
+ 
+-            if (qemu_shutdown_requested_get()) {
+-                destroy_hvm_domain(false);
++/*
++ * One queued ioreq per call, on the main loop's iohandler context: the context
++ * cpu_handle_ioreq() runs on without the thread, and one ioreq a call, as it
++ * takes. The context polls its bottom halves before its fd handlers, so a bottom
++ * half one ioreq schedules there (virtio-gpu's control queue: the RESOURCE_CREATE
++ * of a buffer) runs before the next ioreq is handled (the virtio-media QBUF of
++ * that buffer). A bottom half of the default AioContext, which handled the whole
++ * FIFO at once, ran a later device's queue first: the decoder mode then looked up
++ * a guest resource virtio-gpu had not created yet and turned the GPU path off for
++ * the stream.
++ */
++static void xen_ioreq_notified(void *opaque)
++{
++    XenIOState *state = opaque;
++    XenIoreqItem *it;
++    bool more;
++
++    event_notifier_test_and_clear(&state->ioreq_notifier);
++    handle_buffered_iopage(state);
++    qemu_mutex_lock(&state->ioreq_lock);
++    it = QSIMPLEQ_FIRST(&state->ioreq_fifo);
++    if (it) {
++        QSIMPLEQ_REMOVE_HEAD(&state->ioreq_fifo, next);
++    }
++    more = it && !QSIMPLEQ_EMPTY(&state->ioreq_fifo);
++    qemu_mutex_unlock(&state->ioreq_lock);
++    if (!it) {
++        return;
++    }
++    if (more) {
++        event_notifier_set(&state->ioreq_notifier);
++    }
++    handle_ioreq(state, &it->copy);
++    if (it->req) {
++        it->req->data = it->copy.data;
++        if (it->req->state != STATE_IOREQ_INPROCESS) {
++            warn_report("Badness in I/O request ... not in service?!: "
++                    "%x, ptr: %x, port: %"PRIx64", "
++                    "data: %"PRIx64", count: %u, size: %u, type: %u",
++                    it->req->state, it->req->data_is_ptr, it->req->addr,
++                    it->req->data, it->req->count, it->req->size,
++                    it->req->type);
++            g_free(it);
++            destroy_hvm_domain(false);
++            return;
++        }
++        xen_ioreq_finish(state, it->req, it->vcpu);
++    } else {
++        /* acknowledged early: still give a shutdown/reset its hand-off */
++        xen_ioreq_check_shutdown();
++    }
++    g_free(it);
++}
++
++static void *xen_ioreq_thread(void *opaque)
++{
++    XenIOState *state = opaque;
++    MachineState *ms = MACHINE(qdev_get_machine());
++    unsigned int max_cpus = ms->smp.max_cpus;
++    int fd = qemu_xen_evtchn_fd(state->xce_handle);
++    int64_t last = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    rcu_register_thread();
++    for (;;) {
++        struct pollfd pfd = { .fd = fd, .events = POLLIN };
++        evtchn_port_t port;
++        XenIoreqItem *it;
++        ioreq_t *req;
++        unsigned int i;
++        int64_t now;
++
++        if (poll(&pfd, 1, -1) < 0) {
++            if (errno == EINTR) {
++                continue;
+             }
+-            request = qemu_reset_requested_get();
+-            if (request) {
+-                qemu_system_reset(request);
+-                destroy_hvm_domain(true);
++            /* nothing else serves ioreqs now: stop loudly, not silently */
++            hw_error("xen ioreq thread: poll: %s", strerror(errno));
++        }
++        /* as cpu_get_ioreq(), but on this thread */
++        port = qemu_xen_evtchn_pending(state->xce_handle);
++        if (port == state->bufioreq_local_port) {
++            timer_mod(state->buffered_io_timer,
++                      BUFFER_IO_MAX_DELAY + qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
++            continue;
++        }
++        if (port == -1) {
++            continue;
++        }
++        for (i = 0; i < max_cpus; i++) {
++            if (state->ioreq_local_port[i] == port) {
++                break;
+             }
+         }
++        if (i == max_cpus) {
++            hw_error("Fatal error while trying to get io event!\n");
++        }
++        qemu_xen_evtchn_unmask(state->xce_handle, port);
++        req = cpu_get_ioreq_from_shared_memory(state, i);
++        if (!req) {
++            continue;
++        }
+ 
+-        req->state = STATE_IORESP_READY;
+-        qemu_xen_evtchn_notify(state->xce_handle,
+-                               state->ioreq_local_port[state->send_vcpu]);
++        it = g_new0(XenIoreqItem, 1);
++        it->copy = *req;
++        it->vcpu = i;
++        if (xen_ioreq_is_virtio_notify(&it->copy)) {
++            /*
++             * Release the vCPU now; the write itself runs in order in the handler.
++             * A full barrier, not xen_wmb(): the copy above is a LOAD, and ARMv8
++             * may let the store below become visible before it completes -- the
++             * vCPU could then reuse the slot under the copy.
++             */
++            smp_mb();
++            req->state = STATE_IORESP_READY;
++            qemu_xen_evtchn_notify(state->xce_handle, state->ioreq_local_port[i]);
++            state->ioreq_early++;
++        } else {
++            it->req = req;
++            state->ioreq_queued++;
++        }
++        qemu_mutex_lock(&state->ioreq_lock);
++        QSIMPLEQ_INSERT_TAIL(&state->ioreq_fifo, it, next);
++        qemu_mutex_unlock(&state->ioreq_lock);
++        event_notifier_set(&state->ioreq_notifier);
++
++        now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++        if (now - last >= 30000) {
++            info_report("xen ioreq thread: %" PRIu64 " notify writes acknowledged "
++                        "early, %" PRIu64 " ioreqs completed by the main loop",
++                        state->ioreq_early, state->ioreq_queued);
++            last = now;
++        }
+     }
++    return NULL;    /* not reached: hw_error() does not return */
+ }
+ 
+ static void xen_main_loop_prepare(XenIOState *state)
+@@ -645,7 +845,23 @@ static void xen_main_loop_prepare(XenIOState *state)
+                                                  cpu_state);
+             state->cpu_by_vcpu_id[cpu_state->cpu_index] = cpu_state;
+         }
+-        qemu_set_fd_handler(evtchn_fd, cpu_handle_ioreq, NULL, state);
++        if (state->ioreq_thread_on) {
++            return;     /* the ioreq thread is already running (resume) */
++        }
++        if (g_strcmp0(getenv("QEMU_XEN_IOREQ_THREAD"), "1") == 0 &&
++            event_notifier_init(&state->ioreq_notifier, 0) == 0) {
++            qemu_mutex_init(&state->ioreq_lock);
++            QSIMPLEQ_INIT(&state->ioreq_fifo);
++            qemu_set_fd_handler(event_notifier_get_fd(&state->ioreq_notifier),
++                                xen_ioreq_notified, NULL, state);
++            state->ioreq_thread_on = true;
++            qemu_thread_create(&state->ioreq_thread, "xen-ioreq",
++                               xen_ioreq_thread, state, QEMU_THREAD_DETACHED);
++            info_report("xen: ioreq thread on (virtio-pci notify writes are "
++                        "acknowledged on arrival)");
++        } else {
++            qemu_set_fd_handler(evtchn_fd, cpu_handle_ioreq, NULL, state);
++        }
+     }
+ }
+ 
+diff --git a/include/hw/xen/xen-hvm-common.h b/include/hw/xen/xen-hvm-common.h
+index 1fa45b5bf..19ec88c73 100644
+--- a/include/hw/xen/xen-hvm-common.h
++++ b/include/hw/xen/xen-hvm-common.h
+@@ -2,6 +2,8 @@
+ #define HW_XEN_HVM_COMMON_H
+ 
+ #include "qemu/queue.h"
++#include "qemu/thread.h"
++#include "qemu/event_notifier.h"
+ #include "exec/hwaddr.h"
+ #include "hw/xen/xen_native.h"
+ #include "hw/xen/xen_backend_ops.h"
+@@ -76,6 +78,19 @@ typedef struct XenIOState {
+ 
+     bool has_bufioreq;
+ 
++    /*
++     * ioreq thread (QEMU_XEN_IOREQ_THREAD=1), see xen_ioreq_thread() in
++     * xen-hvm-common.c. ioreq_thread_on is set once it has been started; the
++     * thread sets ioreq_notifier for each ioreq it queues.
++     */
++    QemuThread ioreq_thread;
++    QemuMutex ioreq_lock;
++    QSIMPLEQ_HEAD(, XenIoreqItem) ioreq_fifo;
++    EventNotifier ioreq_notifier;
++    bool ioreq_thread_on;
++    uint64_t ioreq_early;
++    uint64_t ioreq_queued;
++
+     Notifier exit;
+ } XenIOState;
+ 

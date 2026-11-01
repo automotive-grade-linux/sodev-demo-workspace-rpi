@@ -7,9 +7,11 @@
 # the tree. That is the same shape as apply-zephyr-patches.sh, which runs after
 # `ninja fetch-dom0` for the same reason.
 #
-# Usage: apply-aosp-patches.sh ROOT [PATCH_SET]
+# Usage: apply-aosp-patches.sh ROOT [PATCH_SET [OUTPUT]]
 #   ROOT      = the repo checkout (the directory holding .repo/)
 #   PATCH_SET = a directory beside this script (default: aosp-patches)
+#   OUTPUT    = a ninja output built from ROOT, removed when a file the set
+#               touches is newer than it (see the end of this script)
 #
 # Two patch sets exist, and they go to two different checkouts:
 #   aosp-patches         -> the DomA AOSP tree        (after `ninja fetch-doma`)
@@ -45,6 +47,9 @@ aosp-patches|aosp-kernel-patches) ;;
 	exit 1 ;;
 esac
 PATCHDIR="$here/$SET"
+# Read now: the loop below reuses the positional parameters for each project's
+# patches.
+OUTPUT="${3:-}"
 
 ROOT="${1:-${AAOS_SRC_DIR:-}}"
 if [ -z "$ROOT" ]; then
@@ -68,6 +73,10 @@ ROOT="$(cd "$ROOT" 2>/dev/null && pwd -P)" || {
 
 applied=0
 skipped=0
+# The files the sets touch, one absolute path a line, for the OUTPUT check below.
+touched=""
+nl='
+'
 
 # Apply one patch idempotently, with an actionable message on drift. Same
 # three-way test as apply-zephyr-patches.sh: reverse-clean means it is already
@@ -197,6 +206,12 @@ for proj in $projects; do
 	fi
 	set -- "$pdir"/*.patch
 	[ -e "$1" ] || continue
+	# Both sides of each diff, as series_state() reads them, so that a deletion
+	# or a rename counts too.
+	touched="$touched$(cat "$@" | sed -n -e 's|^+++ b/||p' -e 's|^--- a/||p' \
+		-e 's|^rename from ||p' -e 's|^rename to ||p' \
+		-e 's|^copy from ||p' -e 's|^copy to ||p' |
+		sed 's/\t.*$//' | LC_ALL=C sort -u | sed "s|^|$ROOT/$proj/|")$nl"
 	state="$(series_state "$ROOT/$proj" "$@")"
 	case "$state" in
 	drift)
@@ -239,3 +254,30 @@ done
 
 echo "apply-aosp-patches[$SET]: $applied applied + $skipped already applied," \
      "across $(printf '%s\n' "$projects" | wc -l) project(s) in $ROOT"
+
+# A ninja output that is older than the sources it is built from. moulin's rules
+# for the DomA guest kernel and for the AOSP build depend on the repo-sync stamp
+# (and the AOSP one on the kernel), so a patch added to a set after the first
+# build is applied here and then never compiled: `ninja doma_kernel` / `ninja doma`
+# see their outputs and do nothing. Removing the output makes ninja run the build
+# again; bazel and Soong are incremental. Checked
+# on every run, not only when something was applied just now, so a run that
+# applied a patch and stopped before the build is caught by the next one.
+# A file a patch deleted or renamed away is judged by the nearest directory that
+# is still there: its mtime changed with the deletion (git apply also removes a
+# directory the deletion left empty, which changes its parent's). Not by ROOT
+# itself, whose mtime changes whenever a project is added to the checkout.
+if [ -n "$OUTPUT" ] && [ -e "$OUTPUT" ]; then
+	printf '%s\n' "$touched" | while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		while [ ! -e "$f" ] && [ "$f" != "$ROOT" ] && [ "$f" != / ]; do
+			f="$(dirname "$f")"
+		done
+		case "$f" in "$ROOT"|/) continue ;; esac
+		if [ "$f" -nt "$OUTPUT" ]; then
+			rm -f "$OUTPUT"
+			echo "STALE $OUTPUT: older than $f, removed so that it is rebuilt"
+			break
+		fi
+	done
+fi

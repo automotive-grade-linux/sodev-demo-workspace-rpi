@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 3 Oct 2026 12:20:31 +0900
+Subject: [PATCH] hw/arm: accept "xenpv" and its libxl-published PCI layout
+
+qemu 11.1.2 port of
+meta-xt-qemu/recipes-qemu/qemu/qemu/0115-hw-arm-accept-xenpv-as-an-alias-for-the-xenpvh-machi.patch;
+that patch's description has the reasoning and the measurements.
+
+Ported: Same change; also includes hw/xen/arch_hvm.h, needed for the
+declarations it uses under qemu 11's header layout.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [restores an interface for a Xen toolstack that predates the property-based configuration; upstream expects libxl to pass the machine name and PCI properties itself]
+---
+ hw/arm/xen-pvh.c | 104 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 104 insertions(+)
+
+diff --git a/hw/arm/xen-pvh.c b/hw/arm/xen-pvh.c
+index 6edef0eb4..a542c2b15 100644
+--- a/hw/arm/xen-pvh.c
++++ b/hw/arm/xen-pvh.c
+@@ -6,11 +6,15 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/error-report.h"
++#include "qemu/cutils.h"
+ #include "qapi/qapi-commands-migration.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "hw/xen/xen-pvh-common.h"
+ #include "hw/arm/machines-qom.h"
++#include "hw/xen/xen_backend_ops.h"
++#include "hw/xen/xen_native.h"
++#include "hw/xen/arch_hvm.h"
+ 
+ #define TYPE_XEN_ARM  MACHINE_TYPE_NAME("xenpvh")
+ 
+@@ -49,6 +53,93 @@ static void xen_pvh_set_pci_intx_irq(void *opaque, int intx_irq, int level)
+     }
+ }
+ 
++/*
++ * Xen's libxl publishes the guest's virtio-pci host bridge layout in xenstore
++ * under device-model/<domid>/virtio_pci_host/ -- ecam, the two MMIO windows and
++ * the INTX SPI base -- and the xen-troops fork's v7.0.0-xt hw/arm/xen_arm.c
++ * read exactly those keys (they are not in any upstream tree). This machine
++ * instead expects the same values as -machine properties, which that libxl does
++ * not pass. Read the keys as a fallback when the properties were not given, so
++ * the toolstack that spawned us can drive us unmodified. The properties, when
++ * present, win: this runs only while pci_ecam.size == 0.
++ */
++static uint64_t xen_arm_xs_read_u64(struct qemu_xs_handle *h, const char *key,
++                                    bool *ok)
++{
++    char path[128];
++    unsigned int len;
++    uint64_t val = 0;
++    void *data;
++
++    /* Relative paths resolve under this backend domain's own xenstore home. */
++    snprintf(path, sizeof(path), "device-model/%u/virtio_pci_host/%s",
++             xen_domid, key);
++    data = qemu_xen_xs_read(h, XBT_NULL, path, &len);
++    if (!data) {
++        *ok = false;
++        return 0;
++    }
++    if (qemu_strtou64(data, NULL, 0, &val)) {
++        *ok = false;
++    }
++    free(data);
++    return val;
++}
++
++static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
++{
++    struct qemu_xs_handle *h;
++    bool ok = true;
++    uint64_t ecam_base, ecam_size, mem_base, mem_size;
++    uint64_t pref_base, pref_size, irq_first;
++
++    if (s->cfg.pci_ecam.size) {
++        return;         /* explicitly configured; nothing to do */
++    }
++
++    /*
++     * The xenstore ops are normally registered inside xen_register_ioreq(),
++     * which the common machine init calls after this point -- so at this
++     * moment qemu_xen_xs_open() would return NULL and the fallback would
++     * silently do nothing (measured on the board without this call).
++     * Registering the ops is idempotent, and the x86 xenpv
++     * machine (hw/xenpv/xen_machine_pv.c) makes this same call first thing
++     * in its machine init for the same reason.
++     */
++    setup_xen_backend_ops();
++
++    h = qemu_xen_xs_open();
++    if (!h) {
++        return;
++    }
++
++    ecam_base = xen_arm_xs_read_u64(h, "ecam_base", &ok);
++    ecam_size = xen_arm_xs_read_u64(h, "ecam_size", &ok);
++    mem_base  = xen_arm_xs_read_u64(h, "mem_base", &ok);
++    mem_size  = xen_arm_xs_read_u64(h, "mem_size", &ok);
++    pref_base = xen_arm_xs_read_u64(h, "prefetch_mem_base", &ok);
++    pref_size = xen_arm_xs_read_u64(h, "prefetch_mem_size", &ok);
++    irq_first = xen_arm_xs_read_u64(h, "irq_first", &ok);
++    qemu_xen_xs_close(h);
++
++    if (!ok || !ecam_size) {
++        return;         /* no layout published; PCI simply stays off */
++    }
++
++    s->cfg.pci_ecam      = (MemMapEntry) { ecam_base, ecam_size };
++    s->cfg.pci_mmio      = (MemMapEntry) { mem_base, mem_size };
++    s->cfg.pci_mmio_high = (MemMapEntry) { pref_base, pref_size };
++    s->cfg.pci_intx_irq_base = irq_first;
++}
++
++static void (*xen_pvh_common_machine_init)(MachineState *ms);
++
++static void xen_arm_machine_init(MachineState *ms)
++{
++    xen_arm_pci_layout_from_xenstore(XEN_PVH_MACHINE(ms));
++    xen_pvh_common_machine_init(ms);
++}
++
+ static void xen_arm_machine_class_init(ObjectClass *oc, const void *data)
+ {
+     XenPVHMachineClass *xpc = XEN_PVH_MACHINE_CLASS(oc);
+@@ -89,6 +180,19 @@ static void xen_arm_machine_class_init(ObjectClass *oc, const void *data)
+     xpc->has_virtio_mmio = true;
+ 
+     xen_pvh_class_setup_common_props(xpc);
++
++    /*
++     * libxl still spawns the qemu backend with `-machine xenpv`, the name this
++     * machine carried in hw/arm/xen_arm.c (upstream f457df2c45, renamed in
++     * 733766cd37) before the PVH consolidation. Accept
++     * it as an alias so a Xen toolstack built against the old name can drive
++     * this QEMU; the machine's own name stays "xenpvh".
++     */
++    mc->alias = "xenpv";
++
++    /* Fill the PCI layout from xenstore before the common init consumes it. */
++    xen_pvh_common_machine_init = mc->init;
++    mc->init = xen_arm_machine_init;
+ }
+ 
+ static const TypeInfo xen_arm_machine_type = {

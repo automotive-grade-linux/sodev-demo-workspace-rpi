@@ -30,7 +30,6 @@
 +        - ["PREFERRED_PROVIDER_virtual/kernel", "linux-raspberrypi"]
 +        - [AAOS_KERNEL_TREE, "${TOPDIR}/../../%{ANDROID_KERNEL_DIR}"]
 +        - [AAOS_SRC_TREE, "${TOPDIR}/../../%{DOMA_DIR}"]
-+        - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
 +        variables:
 +      default: true
 +      overrides:
@@ -45,6 +44,7 @@
 +  DOMA_DIR: "android-rpi5"
 +  MACHINE: "raspberrypi5"   # meta-raspberrypi machine (SOC_FAMILY=rpi, MACHINEOVERRIDES raspberrypi5, DEFAULTTUNE cortexa76-nocrypto)
 +  XT_DOMA_SOURCE_GROUP: "default,rpi5"
++  XT_DOMD_DTB_NAME: "%{SOC_FAMILY}-%{MACHINE}-domd.dtb"
 -                - [LICENSE_FLAGS_ACCEPTED:append:raspberrypi5, " commercial_rpidistro-ffmpeg"]
 -                - [PREFERRED_PROVIDER_ffmpeg:raspberrypi5, "rpidistro-ffmpeg"]
 -                - [PREFERRED_PROVIDER_libav:raspberrypi5, "rpidistro-ffmpeg"]
@@ -66,7 +66,6 @@
 -        - [MACHINE_FEATURES:append, " scmi"]
 -        - [PREFERRED_PROVIDER_ffmpeg:raspberrypi5, "rpidistro-ffmpeg"]
 -        - [PREFERRED_PROVIDER_libav:raspberrypi5, "rpidistro-ffmpeg"]
--        - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
 -        - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
 -        variables:
 -      default: true
