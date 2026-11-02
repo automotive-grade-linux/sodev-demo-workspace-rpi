@@ -48,9 +48,10 @@ SYSTEMD_SERVICE:${PN} = "domd-wpa-supplicant.service domd-wifi-agent.service"
 SYSTEMD_AUTO_ENABLE = "enable"
 
 # python3 for the agent, with python3-io for its socket module; wpa-supplicant
-# is what it drives; the DHCP client it calls after a successful association
-# is busybox's udhcpc, which the image already has.
-RDEPENDS:${PN} = "python3-core python3-io python3-json wpa-supplicant"
+# is what it drives; iw is what it reads the driver's station table with (see
+# DRIVER RESET in the agent); the DHCP client it calls after a successful
+# association is busybox's udhcpc, which the image already has.
+RDEPENDS:${PN} = "python3-core python3-io python3-json wpa-supplicant iw"
 
 do_install() {
     install -d ${D}${bindir}
