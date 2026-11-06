@@ -42,6 +42,7 @@ SRC_URI = " \
     file://domd-sshd-fix.service \
     file://domd-flatbridge-up \
     file://domd-flatbridge.service \
+    file://60uplink-overlap \
 "
 
 S = "${UNPACKDIR}"
@@ -74,6 +75,7 @@ FILES:${PN}-flatbridge = " \
     ${systemd_system_unitdir}/domd-sshd-fix.service \
     ${systemd_system_unitdir}/domd-flatbridge.service \
     ${bindir}/domd-flatbridge-up \
+    ${sysconfdir}/udhcpc.d/60uplink-overlap \
 "
 
 FILES:${PN} = " \
@@ -96,11 +98,13 @@ RDEPENDS:${PN} = " \
 # haveged (entropy for the first-boot ssh-keygen in domd-sshd-fix) and iptables
 # (the source NAT domd-flatbridge-up installs so guests can reach the internet
 # through DomD's Wi-Fi -- without it the script logs a warning and the guests
-# have no route out).
+# have no route out). iproute2-ip: 60uplink-overlap calls ${base_sbindir}/ip with
+# iproute2 syntax (route ... proto 201, route flush ... proto 201).
 RDEPENDS:${PN}-flatbridge = " \
     ${PN} \
     dnsmasq \
     haveged \
+    iproute2-ip \
     iptables \
 "
 
@@ -141,6 +145,14 @@ do_install() {
     install -m 0644 ${S}/domd-flatbridge.service ${D}${systemd_system_unitdir}/domd-flatbridge.service
     install -d ${D}${bindir}
     install -m 0755 ${S}/domd-flatbridge-up ${D}${bindir}/domd-flatbridge-up
+    # udhcpc hook (busybox udhcpc runs /etc/udhcpc.d/* in order, after 50default):
+    # when the Wi-Fi AP hands out a subnet that overlaps xenbr0's, route the AP's
+    # gateway/DNS/DHCP server out of wlan0 instead of xenbr0. See its header.
+    install -d ${D}${sysconfdir}/udhcpc.d
+    install -m 0755 ${S}/60uplink-overlap ${D}${sysconfdir}/udhcpc.d/60uplink-overlap
+    sed -i 's|@SBINDIR@|${base_sbindir}|' ${D}${sysconfdir}/udhcpc.d/60uplink-overlap
+    grep -q '^IP=${base_sbindir}/ip ' ${D}${sysconfdir}/udhcpc.d/60uplink-overlap || \
+        bbfatal "60uplink-overlap: @SBINDIR@ substitution did not take"
 }
 
 # 1: domd-flatbridge-up drops the guests' QUIC (UDP/443) out of the Wi-Fi -- see the rule

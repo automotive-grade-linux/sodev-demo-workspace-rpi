@@ -1,0 +1,117 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# udhcpc hook (run-parts after 50default): keep the Wi-Fi uplink usable when the
+# AP hands out a subnet that overlaps one of DomD's own networks (on xenbr0:
+# 192.168.10.10/24 and 192.168.97.1/30; any other interface is checked too).
+#
+# Why: with two connected routes for the same /24, the xenbr0 one wins, so
+# traffic to the AP's gateway/DNS (e.g. 192.168.10.1) leaves through xenbr0 and
+# is lost.  DomA's DNS goes DomA -> dnsmasq (192.168.10.10) -> AP DNS, so DomA
+# Wi-Fi never validates (NetworkMonitor PROBE_DNS ETIMEDOUT) although DomD itself
+# (systemd-resolved binds per link) reaches the Internet.  Seen 2026-11-05.
+#
+# What: on overlap, drop wlan0's connected route when it is not shorter than the
+# inner prefix (the inner networks keep the whole prefix), and add /32 link
+# routes on wlan0 for the router, the DNS servers and the DHCP server that fall
+# inside the AP subnet.  The default route via the router stays as 50default set
+# it.  Without overlap this script changes nothing.
+#
+# Limitations, while overlapping (Internet access works):
+# - AP-side hosts other than the router/DNS/DHCP server are not reachable (they
+#   share addresses with the inner network).
+# - An inner host that has the same address as one of those (the development PC
+#   is 192.168.10.1, XT_PC_UPLINK_GW_IP, and so is a typical AP gateway) is not
+#   reachable from DomD: its /32 now points out of wlan0.  PC->DomD SSH and the
+#   PC->DomD->Dom0 SSH stop until the overlap ends.  The log names such hosts.
+# Nothing here logs the SSID (udhcpc does not know it).
+#
+# Assumes DomD's inner addresses (domd-flatbridge-up) are set before wlan0 takes a
+# lease; a lease taken earlier is only corrected at the next renew (half the
+# lease time, often hours).
+
+PROTO=201   # marks the routes this hook adds, so deconfig removes only those
+IP=@SBINDIR@/ip   # set by the recipe (iproute2's ip, not busybox's)
+TAG=udhcpc-overlap
+
+log() { logger -t "$TAG" "$*" 2>/dev/null; echo "$TAG: $*"; }
+
+ip2int() {
+	local IFS=.
+	set -- $1
+	echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
+}
+int2ip() {
+	echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+pmask() {	# prefix length -> mask as integer
+	[ "$1" -eq 0 ] && { echo 0; return; }
+	echo $(( (0xffffffff << (32 - $1)) & 0xffffffff ))
+}
+# same_net A B LEN: true when A and B are in the same /LEN
+same_net() {
+	local m=$(pmask "$3")
+	[ $(( $(ip2int "$1") & m )) -eq $(( $(ip2int "$2") & m )) ]
+}
+
+flush_ours() {
+	$IP -4 route flush dev "$interface" proto $PROTO 2>/dev/null
+}
+
+case "$1" in
+deconfig)
+	flush_ours
+	;;
+renew|bound)
+	[ -n "$ip" ] && [ -n "$mask" ] || exit 0
+	flush_ours
+	overlap=""
+	inner=""
+	drop=""
+	# every IPv4 prefix on other interfaces (lo excluded)
+	for a in $($IP -4 -o addr show | awk -v me="$interface" '$2 != me && $2 != "lo" {print $2 "," $4}'); do
+		dev=${a%%,*}; cidr=${a#*,}
+		case $cidr in */*) ;; *) continue ;; esac   # "inet A peer B/32" lines
+		oaddr=${cidr%/*}; olen=${cidr#*/}
+		len=$mask; [ "$olen" -lt "$len" ] && len=$olen
+		if same_net "$ip" "$oaddr" "$len"; then
+			overlap="$overlap $dev:$cidr"
+			inner="$inner $oaddr/$olen"
+			# The uplink prefix is as long as or longer than the inner one: the routes
+			# tie (or the uplink one wins) for inner addresses, so drop the uplink's.
+			# A shorter uplink prefix (e.g. /16 around our /24) loses to the inner
+			# route by longest match anyway, so it is kept for the rest of the AP LAN.
+			[ "$mask" -ge "$olen" ] && drop=1
+		fi
+	done
+	[ -n "$overlap" ] || exit 0
+
+	net=$(int2ip $(( $(ip2int "$ip") & $(pmask "$mask") )))
+	conn=kept
+	if [ -n "$drop" ]; then
+		if $IP -4 route del "$net/$mask" dev "$interface" proto kernel scope link 2>/dev/null; then
+			conn=dropped
+		else
+			conn="not found"   # already gone (a renew), or never added
+		fi
+	fi
+	added=""
+	failed=""
+	shadowed=""
+	for h in $router $dns $serverid; do   # serverid: unicast renews go to it
+		case " $added $failed " in *" $h "*) continue ;; esac
+		same_net "$h" "$ip" "$mask" || continue      # outside the AP subnet: default route covers it
+		if $IP -4 route replace "$h/32" dev "$interface" scope link src "$ip" proto $PROTO; then
+			added="$added $h"
+			for c in $inner; do
+				same_net "$h" "${c%/*}" "${c#*/}" && { shadowed="$shadowed $h"; break; }
+			done
+		else
+			failed="$failed $h"
+		fi
+	done
+	log "uplink $interface $net/$mask overlaps$overlap; connected route $conn, /32 for${added:- none}"
+	[ -n "$shadowed" ] && log "inner hosts at$shadowed are not reachable from DomD while the overlap lasts"
+	[ -n "$failed" ] && log "WARNING: could not add the /32 for$failed; traffic to them still leaves through the inner network"
+	;;
+esac
+exit 0
