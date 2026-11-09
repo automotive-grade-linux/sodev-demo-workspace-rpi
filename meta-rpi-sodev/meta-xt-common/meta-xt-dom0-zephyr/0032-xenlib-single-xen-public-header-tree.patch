@@ -1,11 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
+Date: Tue, 10 Nov 2026 03:13:42 +0900
 Subject: [PATCH] xenlib: make include/xen/public the only Xen header tree
 
 
 Two loose ends from making zephyr-xenlib the single source of the Xen public
-headers (0024 on the Zephyr side, 0027/0029 on the consumers).
+headers (upstream d58fbb8cfc58 on the Zephyr side, 0027/0029 on the
+consumers).
 
 1. vch/include/ carried a second copy of xen/public/io/libxenvchan.h at the same
    relative path as the shared one, and vch.h reached it with a quoted include -
@@ -36,8 +37,6 @@ headers (0024 on the Zephyr side, 0027/0029 on the consumers).
 CONFIG_XEN_INTERFACE_VERSION keeps driving __XEN_INTERFACE_VERSION__; that is
 a deliberate fork behaviour (it lets the board pick) and changing it would
 alter DEFINE_RING_TYPES' flex-array dimension.
-
-Depends on 0024 (zephyr).
 
 Also corrects the one remaining reference to the old path: a comment in
 xstat/include/xstat.h that still pointed at include/zephyr/xen/public/domctl.h,

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
+Date: Tue, 10 Nov 2026 03:13:42 +0900
 Subject: [PATCH] dom0-xt: track the Zephyr 4.x FATFS Kconfig renames
 
 
@@ -63,7 +63,7 @@ index 0147c98..4c0033b 100644
  	  FATFS logical drive name to be used as mount point.
  
 diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
-index 3fd7fd2..28ca4f9 100644
+index 722fc56..384a225 100644
 --- a/boards/rpi_5.conf
 +++ b/boards/rpi_5.conf
 @@ -51,7 +51,7 @@ CONFIG_DOM_STORAGE_FATFS_ENABLE=y
@@ -94,7 +94,7 @@ index 3fd7fd2..28ca4f9 100644
 +# invisible SDHC_BUFFER_ALIGNMENT can no longer leak into configs.c. Fixing the
 +# default instead of overriding it is what makes that Kconfig submittable.
  #
- # CONFIG_DISK_DRIVER_SDMMC is deliberately NOT set here: upstream 4.4.1 has no
+ # CONFIG_DISK_DRIVER_SDMMC is deliberately NOT set here: upstream Zephyr has no
  # bcm2712 SDHCI driver and no sdmmc-disk node, so the symbol is invisible and the
  # subsystem is already off. Assigning to it would only risk a Kconfig warning,
  # which Zephyr 4.x turns into a build error.

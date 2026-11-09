@@ -11,7 +11,7 @@
 #                     .west/ (defaults to $XT_ZEPHYR_SRC, else error).
 #   --manifest-only = apply [1] (the west manifest pins) and stop. This is what the
 #                     DomZ workspace wants: it shares this manifest repository, so it
-#                     needs the 4.4.1 pins, but it builds none of the Dom0 sources
+#                     needs the 4.5.0 pins, but it builds none of the Dom0 sources
 #                     sections [2]-[5] patch.
 #
 # The patch set is self-contained: on a clean checkout of the pinned revs it
@@ -20,7 +20,7 @@
 # is turned on by the moulin builder var in rpi5-sodev.yaml, not here.
 #
 # This script also runs `west update` itself, once, in the middle: 0021 rewrites
-# zephyr-dom0-xt/west.yml (Zephyr 4.4.1 + zephyrproject-rtos xenlib + the
+# zephyr-dom0-xt/west.yml (Zephyr 4.5.0 + zephyrproject-rtos xenlib + the
 # matching fatfs), and those pins only take effect on the next update. See the
 # comment above the 0021 call for why the ordering cannot be changed.
 set -eu
@@ -168,7 +168,7 @@ apply_one() {
 #     it would revert 0021 itself.
 #   * zephyr-dom0-xt is the manifest repository (`self: path:` in west.yml), not
 #     a project, so `west update` leaves it - and 0021 - alone.
-apply_one zephyr-dom0-xt 0021-west-manifest-zephyr-4.4.1-and-upstream-xenlib.patch
+apply_one zephyr-dom0-xt 0021-west-manifest-zephyr-4.5.0-and-upstream-xenlib.patch
 
 # `west update` moves an existing checkout to the new revision, but it does NOT
 # re-point that checkout's git remote when the manifest changes a project's
@@ -270,7 +270,7 @@ echo "west update: re-fetching the pins from the patched manifest ..."
 # --manifest-only stops here. The DomZ workspace is initialised from the SAME
 # manifest repository as Dom0's, so without 0021 it stays on the manifest's
 # Zephyr 3.6 pin -- which wants Zephyr SDK 0.16.5 while this tree's builder image
-# ships 1.0.1 for 4.4.1, and the DomZ build then dies in
+# ships 1.0.1 for 4.5.0, and the DomZ build then dies in
 # FindZephyr-sdk.cmake:57 (find_package) before compiling anything. What it must
 # NOT get is sections [2]-[5]: those patch the Dom0 application, xenlib and xrun,
 # none of which the DomZ guest builds (its drivers are the out-of-tree module in
@@ -282,47 +282,14 @@ fi
 
 # --- [2] zephyr --------------------------------------------------------------
 #
-# 0022-0024 are upstream backports, applied in the order their diffs were generated
-# in, so every hunk lands at offset 0:
-#   0022 31d2bd60ff29  sysctl interface version range
-#   0023 26d1dce50e01  Xen extended regions driver  (adds include/zephyr/xen/regions.h)
-#   0024 d58fbb8cfc58  drop the vendored xen public headers -> use zephyr-xenlib
-#
-# This is NOT upstream's topological order, which is 0023 -> 0022 -> 0024
-# (26d1dce5 is an ancestor of 31d2bd60, which is an ancestor of d58fbb8c). The order
-# does not matter here: 0022 and 0024 touch different lines of different files from
-# 0023, and none of the three shares a hunk with another. An earlier version of this
-# comment claimed 0024 had to follow 0023 because it added
-# <zephyr/xen/regions.h> to drivers/xen/gnttab.c - that include was a stray addition
-# that is not in the upstream commit and has been removed, so no such dependency
-# exists.
-apply_one zephyr         0022-xen-increase-xen-sysctl-interface-version-range.patch
-# 0033 widens the DOMCTL range in the same file 0022 touches, but a different hunk
-# (the domctl block at line 37, the sysctl block at line 48), so it lands at offset
-# 0 right after it. Its position relative to 0008/0019/0026 does not matter for
-# APPLYING it -- those patch zephyr-dom0-xt, this one patches zephyr -- what matters
-# is that it is in the series at all: they set
-# CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18 in the board .conf files, and out of
-# range kconfiglib discards a user value with a warning rather than failing, so
-# without 0033 the build stays green while the symbol silently keeps 0x17 -- and the
-# only symptom is a Dom0 whose `xu list` prints nothing on Xen 4.22.
-apply_one zephyr         0033-zephyr-domctl-interface-version-0x18.patch
-apply_one zephyr         0023-drivers-xen-add-xen-extended-regions-driver.patch
-
-# 0024 upstream also deletes include/zephyr/xen/public/ (14 files). Do the removal
-# here instead of in the patch: the reset loop above restores tracked files, so a
-# deletion expressed as a patch hunk would be undone on every re-run and 0024 would
-# then fail its forward check. Keeping 0024 to the include rewrites plus the doc
-# entry is also what makes it reviewable against the upstream commit.
-if [ -d "$WS/zephyr/include/zephyr/xen/public" ]; then
-	rm -rf "$WS/zephyr/include/zephyr/xen/public"
-	echo "RM    zephyr <- include/zephyr/xen/public (superseded by zephyr-xenlib)"
-fi
-apply_one zephyr         0024-xen-public-remove-and-migrate-to-zephyr-xenlib.patch
-
+# Upstream v4.5.0 is used as is, apart from this one patch: the extended-regions
+# driver, the wider sysctl/domctl interface-version ranges and the removal of the
+# vendored Xen public headers are all upstream in 4.5.0.
 apply_one zephyr         0018-xen-domctl-zero-createdomain-hypercall-arg.patch
 
 # --- [3] zephyr-dom0-xt ------------------------------------------------------
+# 0034 touches only CMakeLists.txt, which nothing else in the series patches.
+apply_one zephyr-dom0-xt 0034-cmake-drop-removed-app-boilerplate.patch
 apply_one zephyr-dom0-xt 0002-Kconfig-add-DOM_CFG_SODEV-and-AAOS.patch
 apply_one zephyr-dom0-xt 0003-xenlib-storage-optional-initrd-loading.patch
 apply_one zephyr-dom0-xt 0004-dom_cfg-rpi_5-add-sodev-domu-doma.patch

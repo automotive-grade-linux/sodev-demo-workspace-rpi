@@ -225,14 +225,22 @@ configuration (`rpi4-sodev.yaml` instead of `rpi5-sodev.yaml`, `meta-xt-rpi4` in
 except that `-z` is refused with `--ram=4g` (see above). What
 is verified on that board is listed in `meta-rpi-sodev/meta-xt-rpi4/README.md`.
 
-> **The builder image needs Zephyr SDK 1.0.1 and a python3.12 virtualenv**, because
-> Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12` and Ubuntu 22.04 ships 3.10. You do
-> not need `--rebuild-images` for that: this series also renames the tag, so
-> `sodev-builder-rpi` does not exist yet on your host and the first build creates it
-> with both. `--rebuild-images` is for the case where `XT_DOCKER` names an image built
-> before that change, which fails in cmake with `Could NOT find Python3: Found
-> unsuitable version "3.10.12", but required is at least "3.12"` -- see *A Zephyr build
-> cannot find Python 3.12* (`docs/TROUBLESHOOTING.md`).
+> **The builder image needs Zephyr SDK 1.0.1, a python3.12 virtualenv and CMake 3.28
+> or newer**, because Zephyr 4.4 and later set `PYTHON_MINIMUM_REQUIRED 3.12`, Zephyr
+> 4.5 requires CMake 3.28, and Ubuntu 22.04 ships python 3.10 and CMake 3.22. The image
+> pip-installs CMake 3.31.6 into the venv (`/opt/zephyr-venv`), and
+> `/usr/local/bin/west` is a wrapper that puts the venv's `bin` first on `PATH`, so only
+> `west` and its children see the newer CMake; Yocto and AOSP keep the distro tools.
+> On a host where `sodev-builder-rpi` does not exist yet, the first build creates it
+> with all of that. **An existing checkout must rebuild the image once** with
+> `--rebuild-images` (or `REBUILD_IMAGES=1`): `build.sh` reuses an existing image by
+> tag, and one built before the Zephyr 4.5.0 move fails the Zephyr configure with
+> `CMake 3.28.0 or higher is required. You are running version 3.22.1` -- see *A Zephyr
+> build stops at "CMake 3.28.0 or higher is required"* (`docs/TROUBLESHOOTING.md`). An older
+> image under another tag (`XT_DOCKER` naming one built before the tag rename) fails
+> earlier, in cmake with `Could NOT find Python3: Found unsuitable version "3.10.12",
+> but required is at least "3.12"` -- see *A Zephyr build cannot find Python 3.12*
+> (`docs/TROUBLESHOOTING.md`).
 
 ### 4. Build the container image
 

@@ -2107,9 +2107,10 @@ in_docker "$XT_DOCKER" "
     # moulin has no patch hook for west sources: fetch-only pass ('fetch-dom0' =
     # west init+update) populates the workspace, apply the Zephyr Dom0 patch
     # series (idempotent), THEN build. Without the ABI patches
-    # (0018 zeroes the createdomain hypercall argument, 0024 drops Zephyr's
-    # vendored Xen public headers, and 0027/0029 point zephyr-dom0-xt and
-    # zephyr-xrun at zephyr-xenlib's copy) guest create fails rc=-3, so this
+    # (0018 zeroes the createdomain hypercall argument, and 0027/0029 point
+    # zephyr-dom0-xt and zephyr-xrun at zephyr-xenlib's copy of the Xen public
+    # headers, which upstream Zephyr uses since it dropped its own) guest create
+    # fails rc=-3, so this
     # must precede the zephyr.bin build.
     ninja fetch-dom0
     '${APPLY_ZEPHYR}' \"\$PWD/zephyr\"
@@ -2119,13 +2120,34 @@ in_docker "$XT_DOCKER" "
   # source patches apply to it -- but
   # its workspace is initialised from the SAME manifest repository, which pins Zephyr
   # 3.6. That pin wants Zephyr SDK 0.16.5, while the builder image ships 1.0.1 for
-  # Dom0's 4.4.1, so an unpatched DomZ workspace dies in
+  # Dom0's 4.5.0, so an unpatched DomZ workspace dies in
   # FindZephyr-sdk.cmake:57 (find_package) before compiling a line. Applying 0021
-  # (--manifest-only) builds DomZ against the same Zephyr 4.4.1 as Dom0: one Zephyr
+  # (--manifest-only) builds DomZ against the same Zephyr 4.5.0 as Dom0: one Zephyr
   # and one SDK in the tree instead of two.
   if [ '${do_west}' = yes ] && [ '${ENABLE_DOMZ}' = yes ]; then
     ninja fetch-domz
     '${APPLY_ZEPHYR}' --manifest-only \"\$PWD/zephyr-domz\"
+  fi
+  # A Zephyr build dir configured by another CMake than the one west runs now is
+  # rebuilt from scratch. moulin's zephyr builder does not build pristine, and the
+  # generated build.ninja re-runs the CMake recorded in CMakeCache.txt: a build dir
+  # left by the distro CMake 3.22 (Zephyr 4.4.1) re-runs 3.22 against Zephyr 4.5.0
+  # and stops at \"CMake 3.28.0 or higher is required\". Dom0 escapes it only
+  # because moulin passes it -D options, which makes west re-run the configure
+  # itself; DomZ, which has none, does not. Removing the dir is what west build
+  # -p always would do, and only happens when the version differs. Only the build
+  # dirs (build-*, the yaml's ZEPHYR_*_BUILD_DIR) are looked at, never a project
+  # checkout next to them.
+  zcmake=\$(/opt/zephyr-venv/bin/cmake --version 2>/dev/null | awk 'NR==1 { split(\$3, v, \".\"); print v[1] \".\" v[2] }')
+  if [ -n \"\$zcmake\" ]; then
+    for cache in zephyr/build-*/CMakeCache.txt zephyr-domz/build-*/CMakeCache.txt; do
+      [ -f \"\$cache\" ] || continue
+      was=\$(awk -F= '/^CMAKE_CACHE_MAJOR_VERSION:/ { M = \$2 } /^CMAKE_CACHE_MINOR_VERSION:/ { m = \$2 } END { print M \".\" m }' \"\$cache\")
+      if [ \"\$was\" != \"\$zcmake\" ]; then
+        echo \">> \${cache%/CMakeCache.txt}: configured by CMake \$was, west runs \$zcmake -- removing it for a pristine build\"
+        rm -rf \"\${cache%/CMakeCache.txt}\"
+      fi
+    done
   fi
   # moulin's generated doma/doma_kernel repo-sync has no built-in retry, so a single
   # transient proxy/network abort can fail the whole ninja run. ninja is incremental

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 10 Nov 2026 01:09:27 +0900
+Subject: [PATCH] CMakeLists.txt: drop the removed app/boilerplate.cmake include
+
+Zephyr 4.5 deletes cmake/app/boilerplate.cmake (upstream 28e363fc69c), so the
+include fails the configure step:
+
+  CMake Error at CMakeLists.txt:8 (include):
+    include could not find requested file:
+      .../zephyr/cmake/app/boilerplate.cmake
+
+The file was a compatibility shim that only forwarded to
+find_package(Zephyr), which this CMakeLists.txt already calls on the line
+before it, so the include is dropped and nothing else changes.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9a9e45f..1e4075e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -5,8 +5,6 @@ cmake_minimum_required(VERSION 3.13.1)
+ 
+ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+ 
+-include($ENV{ZEPHYR_BASE}/cmake/app/boilerplate.cmake NO_POLICY_SCOPE)
+-
+ project(xen-dom0)
+ 
+ include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

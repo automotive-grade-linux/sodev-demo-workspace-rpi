@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
-Subject: [PATCH] boards/rpi_5: adapt the board to Zephyr 4.4
+Date: Tue, 10 Nov 2026 01:09:27 +0900
+Subject: [PATCH] boards/rpi_5: adapt the board to Zephyr 4.4 and 4.5
 
 
 Three things the 4.4 board needs that the 3.6 one did not.
@@ -74,15 +74,25 @@ the
    - - CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME is left to the moulin
      builder var in rpi5-sodev.yaml, which wins over the board .conf anyway.
 
-Depends on 0008 (boards/rpi_5.{conf,overlay}), 0026 (src/storage.c), 0022 and
-0023 (zephyr).
+4. Zephyr 4.5 adds two things on top:
+   - the BCM2712 pin controller (pinctrl@107d504100) and the RP1 one behind
+     the disabled PCIe (rp1_pinctrl), both status "okay". Their registers are
+     DomD's; they are inert while CONFIG_PINCTRL is off, which is the same
+     one-`select`-away hazard as gio_aon, so both are disabled.
+   - UART_INTERRUPT_DRIVEN=y in rpi_5_bcm2712_defconfig, for the UART this
+     overlay disables. Set to n so Kconfig does not warn.
+   The comments name the upstream commits (26d1dce5, 31d2bd60) instead of the
+   backports 0022/0023, which are upstream in 4.5.0.
+
+Depends on 0008 (boards/rpi_5.{conf,overlay}) and 0026 (src/storage.c).
 
 Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
-index 28ca4f9..b9387e4 100644
+index 384a225..06a2752 100644
 --- a/boards/rpi_5.conf
 +++ b/boards/rpi_5.conf
 @@ -52,7 +52,7 @@ CONFIG_FILE_SYSTEM_SHELL=y
@@ -94,13 +104,13 @@ index 28ca4f9..b9387e4 100644
  CONFIG_DOM_STORAGE_FATFS_DIR=""
  CONFIG_XEN_LIBFDT=y
  
-@@ -90,3 +90,46 @@ CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
+@@ -90,3 +90,51 @@ CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
  # unconditionally. It is zeroed by 0018's `xen_domctl_t domctl = { 0 }`, which is
  # XEN_DOMCTL_CONFIG_ARM_SCI_NONE - the same behaviour the old `=n` produced.
  # Assignments to undefined symbols are a hard Kconfig error in Zephyr 4.x.
 +
 +# Dom0 maps guest kernels/dtbs temporarily while building a domain. Keep that on
-+# the Xen extended-region path (drivers/xen/regions.c, restored by 0023) rather
++# the Xen extended-region path (drivers/xen/regions.c, upstream 26d1dce5) rather
 +# than xenlib's fallback: the fallback carves the mapping window out of Dom0's own
 +# heap with k_aligned_alloc() and then removes those pages from Dom0's physmap, so
 +# a 24 MiB guest kernel does not fit in CONFIG_HEAP_MEM_POOL_SIZE (2 MiB) and its
@@ -110,8 +120,8 @@ index 28ca4f9..b9387e4 100644
 +
 +# Xen 4.21's sysctl.h declares XEN_SYSCTL_INTERFACE_VERSION 0x16. Zephyr defaults
 +# to 0x15, which makes every sysctl fail its version check - `xu list` and
-+# `xstat physinfo` then print nothing at all, with no error. 0022 widens the
-+# Kconfig range so this value is accepted.
++# `xstat physinfo` then print nothing at all, with no error. Upstream 31d2bd60
++# widened the Kconfig range so this value is accepted.
 +CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16
 +
 +# The board defconfig (boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig) turns PCIe
@@ -125,6 +135,11 @@ index 28ca4f9..b9387e4 100644
 +# off, and assigning to it would be the same silent no-op that hid the dead
 +# CONFIG_HW_STACK_PROTECTION for so long.
 +CONFIG_PCIE=n
++
++# Zephyr 4.5's rpi_5_bcm2712_defconfig sets UART_INTERRUPT_DRIVEN=y for the board's
++# UART, which this overlay disables (Dom0 uses the Xen PV console). The dependency
++# then cannot be met and Kconfig warns. Say n outright.
++CONFIG_UART_INTERRUPT_DRIVEN=n
 +
 +# CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME is NOT set here, and does not need to
 +# be set anywhere: zephyr-dom0-xt/Kconfig has
@@ -142,11 +157,11 @@ index 28ca4f9..b9387e4 100644
 +# limit. Use the Kconfig maximum; 0031 sized the worker stack (8 KiB) for it.
 +CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16
 diff --git a/boards/rpi_5.overlay b/boards/rpi_5.overlay
-index 0356db2..5dfb735 100644
+index d565c0e..ae74746 100644
 --- a/boards/rpi_5.overlay
 +++ b/boards/rpi_5.overlay
-@@ -20,17 +20,106 @@
-  * Upstream Zephyr 4.4.1 has no such node and no bcm2712 SDHCI driver at all, so
+@@ -20,17 +20,120 @@
+  * Upstream Zephyr has no such node and no bcm2712 SDHCI driver at all, so
   * there is nothing to disable - keeping that override would leave an unresolved
   * DTC label. storage_init() in main() still fails cleanly with -ENODEV, which is
 - * all this topology needs (the FATFS/xu-create path is unused; guests are
@@ -155,7 +170,7 @@ index 0356db2..5dfb735 100644
   */
  
 +/*
-+ * Same reasoning, for the devices upstream 4.4.1's rpi_5 board turns on that the
++ * Same reasoning, for the devices upstream's 4.x rpi_5 board turns on that the
 + * 3.6 fork's board did not have: PCIe (pcie1/pcie2), the RP1 peripheral
 + * controller's GPIO bank behind it (gpio0_0), the iProc RNG200 (rng), and the
 + * always-on GPIO block (gio_aon) that the board's ACT-LED node hangs off.
@@ -201,6 +216,20 @@ index 0356db2..5dfb735 100644
 +};
 +
 +&gio_aon {
++	status = "disabled";
++};
++
++/*
++ * Zephyr 4.5 adds the BCM2712 pin controller and the RP1 one (both status =
++ * "okay" in bcm2712.dtsi; the RP1 one sits behind the disabled PCIe). Their
++ * registers belong to DomD. They are inert while CONFIG_PINCTRL is off, which is
++ * the same one-`select`-away hazard as gio_aon above, so they go too.
++ */
++&pinctrl {
++	status = "disabled";
++};
++
++&rp1_pinctrl {
 +	status = "disabled";
 +};
 +

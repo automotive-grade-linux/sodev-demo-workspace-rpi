@@ -26,7 +26,8 @@ followed by a second `west update`) because it is what moves the pins, and the
 `Depends on` lines in the individual patch headers are load-bearing.
 
 **0001, 0010 and 0013 are vacant numbers.** They were dropped in the move to
-Zephyr 4.4.1, for the reasons in their rows below. The numbers are deliberately
+Zephyr 4.4.1, for the reasons in their rows below. 0022-0024 and 0033 are vacant
+too: Zephyr 4.5.0 carries those changes upstream. The numbers are deliberately
 not reused: commit messages, evidence records and the sections further down this
 file refer to patches by number.
 
@@ -39,7 +40,7 @@ file refer to patches by number.
 
 | # | Target repo (west) | Pinned rev | File(s) | What |
 |---|---|---|---|---|
-| ~~0001~~ | — | — | — | **Gone.** It added the `altp2m` field to Zephyr's vendored `xen_domctl_createdomain`. 0024 removes that vendored copy altogether, and zephyr-xenlib's headers (a byte-for-byte copy of Xen 4.21.0's) already carry the field. Applying 0001 alone was also never enough on 4.4.1: it brought `sizeof(struct xen_domctl_createdomain)` to 72 where Xen 4.21 expects 76, because `arch.arm_sci_type` was still missing. |
+| ~~0001~~ | — | — | — | **Gone.** It added the `altp2m` field to Zephyr's vendored `xen_domctl_createdomain`. Upstream `d58fbb8cfc58` (in Zephyr 4.5.0) removes that vendored copy altogether, and zephyr-xenlib's headers (a byte-for-byte copy of Xen 4.21.0's) already carry the field. Applying 0001 alone was also never enough on 4.4.1: it brought `sizeof(struct xen_domctl_createdomain)` to 72 where Xen 4.21 expects 76, because `arch.arm_sci_type` was still missing. |
 | 0002 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `Kconfig`, `boards/rpi_5.conf` | Add the `DOM_CFG_SODEV` symbol (gates the SoDeV guests) and the `DOM_CFG_AAOS_DOMAIN` symbol (the upstream single-AAOS example). Neither exists at the pinned rev. Also flips `CONFIG_DOM_STORAGE_FATFS_DIR` to `""` in `rpi_5.conf` (p1 FAT-root guest image lookup; see §Guest image staging). |
 | 0003 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `src/dom0.{c,h}`, `src/storage.c` | Add the xenlib **optional-initrd** storage callbacks (`storage_image_initrd_read`/`_get_size`), the `image_initrd_path` field on `dom0_domain_cfg`, and the `dom0.c` wiring that points `initrd_info` at the config when a path is set. `rpi_5_sodev_doma` depends on these. |
 | 0004 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `src/dom_cfg/rpi_5.c` | Add `rpi_5_sodev_domu` (1 GiB AGL cluster) and `rpi_5_sodev_doma` (4 GiB AAOS) dom_cfg + `domain_cfgs[]` registration, gated on `CONFIG_DOM_CFG_SODEV`. Also carries the `domu_cfg_4` AAOS example (gated `CONFIG_DOM_CFG_AAOS_DOMAIN`, off by default). |
@@ -48,31 +49,28 @@ file refer to patches by number.
 | 0007 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xenstore-srv/src/xenstore_srv.c`, `xen-dom-mgmt/{include/xen_dom_mgmt.h,src/xen-dom-mgmt.c}` | DomD-as-toolstack xenstore: `XS_INTRODUCE`/`XS_RELEASE` handlers + `@introduceDomain`/`@releaseDomain` watches, so an external privileged domain (dom0less DomD) can create/destroy guests via `xl` against the thin Zephyr Dom0 xenstore server. Regenerated against xenlib `main`. |
 | 0008 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `boards/rpi_5.{conf,overlay}`, `src/dom0.h` | RPi5 board: HW-verified Dom0 bring-up + DomD-owns-SD. Rebased for 4.4.1: the `&sdio1` disable, `CONFIG_DISK_DRIVER_SDMMC=n` and the `CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_*` assignments are dropped — none of those exist upstream, and on Zephyr 4.x an assignment to an undefined symbol is a build error (an unresolved DTC label likewise). |
 | 0009 | `xen-troops/zephyr-xrun` | `5b6ecf2` | `src/storage.c` | Compile without `CONFIG_SDHC` (the SD is passed through to DomD, so xrun's SDHC path is dead on this board). |
-| ~~0010~~ | — | — | — | **Gone.** Replaced by 0022, the upstream backport of the same `XEN_SYSCTL_INTERFACE_VERSION` range widening. The value itself is now set in `boards/rpi_5.conf` (0028) instead of by changing the Kconfig default, which keeps this tree closer to upstream. |
+| ~~0010~~ | — | — | — | **Gone.** Replaced by upstream `31d2bd60ff29` (in Zephyr 4.5.0), the same `XEN_SYSCTL_INTERFACE_VERSION` range widening. The value itself is now set in `boards/rpi_5.conf` (0028) instead of by changing the Kconfig default, which keeps this tree closer to upstream. |
 | 0011 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `Kconfig`, `src/domain_bins.S` | DomA built-in ramdisk slot (AAOS vendor_boot ramdisk). |
 | 0012 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-dom-mgmt/src/xen-dom-mgmt.c` | `xs-introduce` no-clobber: `XS_INTRODUCE` must not overwrite an externally-created domain's existing xenstore node/state. |
-| ~~0013~~ | — | — | — | **Gone.** It null-initialized `ptr` in `drivers/xen/regions.c`. The upstream version of that driver, backported here as 0023, already has `void *ptr = NULL`. |
+| ~~0013~~ | — | — | — | **Gone.** It null-initialized `ptr` in `drivers/xen/regions.c`. The upstream version of that driver (`26d1dce50e01`, in Zephyr 4.5.0) already has `void *ptr = NULL`. |
 | 0014 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xenstore-srv/src/xenstore_srv.c` | xenstore-server reply-path hardening against ring-wedge conditions (+ "ring corrupt" diagnostics). Rewritten against xenlib `main`; see the 0014 note below. |
 | 0015 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-dom-mgmt/src/...`, `xen-shell-cmd/src/xen_cmds.c` | Toolstack-domain teardown + `xu xsring` diagnostics (HW debug; see note below). |
 | 0016 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-dom-mgmt/include+src` | Guard the domain-destroy paths by toolstack ownership (`f_toolstack`). |
 | 0017 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-console-srv/src` | Guard `xu console` against toolstack-introduced domains whose console ring Dom0 never mapped (was crashing Dom0). |
-| 0018 | `xen-troops/zephyr` (fork) | `1f6485eca2` | `drivers/xen/dom0/domctl.c` | Zero the `createdomain` hypercall argument. It is the only `xen_domctl_t` in that file without an initialiser, and the one that matters: Xen reads its own idea of the struct, so any trailing field Zephyr does not write would come from uninitialised stack. Since 0024 the layouts match, and this makes `arch.arm_sci_type` a defined 0 (`XEN_DOMCTL_CONFIG_ARM_SCI_NONE`). Also fixes the comma operators in the assignments below it. |
-| 0019 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `boards/rpi_4b.{conf,overlay}` | **Raspberry Pi 4 Model B (BCM2711) Zephyr Dom0 board.** From upstream; rebased here for 4.4.1. Three of its Kconfig assignments were hard errors on 4.x: `FS_MULTI_PARTITION` is spelled `FS_FATFS_MULTI_PARTITION` upstream, and `XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE}` existed only in the xen-troops fork. `HW_STACK_PROTECTION=y` is replaced by `STACK_SENTINEL=y` for the same reason as rpi_5 (only `CPU_AARCH64_CORTEX_R` selects `ARCH_HAS_STACK_PROTECTION`). The overlay gains the inert `ramdisk0` (4.4.1 derives `FF_VOLUMES` from status-okay disk nodes and rpi_4b had none, which breaks `ff.c` and the `BUILD_ASSERT(FF_VOLUMES == 1)` in the shared `src/storage.c`), deletes the dangling `chosen zephyr,entropy` and the `leds`/`led0` pair, and disables `gpio1`. Adds `XEN_SYSCTL_INTERFACE_VERSION=0x16`, `XEN_REGIONS=y`, `XENSTORE_TREE_TRAVERSE_DEPTH=16` to match rpi_5. `sram0` stays at upstream's measured `0x20000000` (`dom0_mem=128M`). |
+| 0018 | `zephyrproject-rtos/zephyr` | `v4.5.0` (`41d10b59730`) | `drivers/xen/dom0/domctl.c` | Zero the `createdomain` hypercall argument. It is the only `xen_domctl_t` in that file without an initialiser, and the one that matters: Xen reads its own idea of the struct, so any field Zephyr does not write would come from uninitialised stack. The struct comes from zephyr-xenlib's copy of the Xen 4.21 headers while the hypervisor is Xen 4.22; both are 16 bytes on arm64, but 4.22's new `v8r_el1_msa` field sits where 4.21 has padding, so zeroing is what makes it `XEN_DOMCTL_CONFIG_ARM_V8R_EL1_MSA_NONE`. The comma typo in the assignments below it is fixed upstream (`fc146cab757`); the initialiser is still missing in v4.5.0. |
+| 0019 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `boards/rpi_4b.{conf,overlay}` | **Raspberry Pi 4 Model B (BCM2711) Zephyr Dom0 board.** From upstream; rebased here for 4.4.1 and carried to 4.5.0. Three of its Kconfig assignments were hard errors on 4.x: `FS_MULTI_PARTITION` is spelled `FS_FATFS_MULTI_PARTITION` upstream, and `XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE}` existed only in the xen-troops fork. `HW_STACK_PROTECTION=y` is replaced by `STACK_SENTINEL=y` for the same reason as rpi_5 (only `CPU_AARCH64_CORTEX_R` selects `ARCH_HAS_STACK_PROTECTION`). The overlay gains the inert `ramdisk0` (4.4.1 derives `FF_VOLUMES` from status-okay disk nodes and rpi_4b had none, which breaks `ff.c` and the `BUILD_ASSERT(FF_VOLUMES == 1)` in the shared `src/storage.c`), deletes the dangling `chosen zephyr,entropy` and the `leds`/`led0` pair, and disables `gpio1`. Adds `XEN_SYSCTL_INTERFACE_VERSION=0x16`, `XEN_REGIONS=y`, `XENSTORE_TREE_TRAVERSE_DEPTH=16` to match rpi_5. `sram0` stays at upstream's measured `0x20000000` (`dom0_mem=128M`). Zephyr 4.5.0's `rpi_4b` board is much bigger (4-core SMP, the VideoCore firmware interface, Ethernet, USB, I2C), none of which is Dom0's, so the overlay also deletes `dram0` (chosen `zephyr,sram` points back at `sram0`), `zephyr,display`, the firmware node (mailbox client, `exp_gpio`, `vc_thermal`), the framebuffer, the power domains, the VideoCore shared memory at `0x3f800000`, the `led1`/`i2c-1`/`die-temp0` aliases, `cpu@1`-`cpu@3` (spin-table) and `phy1`, and disables `mbox0`, `i2c1`, `eth0`, `mdio0`, `usb0` and the pin controller `pinctrl` (dropping `eth0`'s `phy-handle` and `usb0`'s `power-domains`); the conf sets `SMP=n`, `PM_CPU_OPS=n`, `PM_DEVICE=n`, `PM_DEVICE_POWER_DOMAIN=n`, `POWER_DOMAIN=n`, `KERNEL_VM_SIZE=0x800000`, `CACHE_MANAGEMENT=n` and `UART_INTERRUPT_DRIVEN=n`. |
 | 0020 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `src/dom_cfg/rpi_4b.c` | **RPi4 guest domain configs** (`rpi_4b_sodev_domu` / `rpi_4b_sodev_doma`, GIC_V2 — BCM2711 is a GIC-400 like BCM2712). From upstream, unchanged: its `<zephyr/xen/public/domctl.h>` include is rewritten by 0027 rather than here, so this patch stays as close to upstream as possible. That is why `apply-zephyr-patches.sh` no longer keeps 0019/0020 at the end of the series — they must precede 0027. |
-| 0021 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `west.yml` | **Zephyr 4.4.1 + the zephyrproject-rtos xenlib.** Moves `zephyr` to `1f6485ec` (`zephyr-v4.4.1-xt`), repoints `zephyr-xenlib` at `zephyrproject-rtos` `7f08845` (`main`), and moves `fatfs` to `f4ead3bf`. Applied first, followed by a second `west update` — moulin's west source can only pin the manifest repo's url/rev, so this file is the only way to change the project pins. |
-| — | `zephyrproject-rtos/fatfs` | `f4ead3bf` | — | Not patched, but pinned by 0021 and part of the workspace: Zephyr 4.4.1's `modules/fatfs/zephyr_fatfs_config.h` asserts `FFCONF_DEF == 80386`, and the previous pin `427159bf` is 80286. |
-| 0022 | `xen-troops/zephyr` (fork) | `1f6485eca2` | `arch/arm64/core/xen/Kconfig` | Backport of upstream `31d2bd60ff29`: widen the `XEN_SYSCTL_INTERFACE_VERSION` range so `0x16` (what Xen 4.21's `sysctl.h` declares) is accepted. Replaces 0010. |
-| 0023 | `xen-troops/zephyr` (fork) | `1f6485eca2` | `drivers/xen/{regions.c,Kconfig,CMakeLists.txt}`, `include/zephyr/xen/regions.h` | Backport of upstream `26d1dce50e01`: the Xen extended-regions driver. Dom0 maps guest kernels/dtbs through it while building a domain. Without it xenlib falls back to carving the window out of Dom0's own 2 MiB heap, which a 24 MiB guest kernel does not fit. |
-| 0024 | `xen-troops/zephyr` (fork) | `1f6485eca2` | `include/zephyr/xen/public/` (removed), 20 files' includes, `arch/arm64/core/xen/Kconfig` | Backport of upstream `d58fbb8cfc58`: drop Zephyr's vendored Xen public headers and take them from zephyr-xenlib instead, plus `select GNU_C_EXTENSIONS`. Both trees used the *same* include guards for *different* struct layouts, so whichever one a translation unit reached first won: `sizeof(struct xen_arch_domainconfig)` was 12 in Zephyr's copy and 16 in xenlib's, an ODR violation the linker cannot see. The 14 header deletions are done by `apply-zephyr-patches.sh` (a `git apply` deletion does not survive the script's reset). |
+| 0021 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `west.yml` | **Zephyr 4.5.0 + the zephyrproject-rtos xenlib.** Moves `zephyr` to upstream `zephyrproject-rtos` `41d10b59730` (tag `v4.5.0`; xen-troops has no 4.5 branch, and its `zephyr-v4.4.1-xt` branch was upstream v4.4.1 at the same SHA), repoints `zephyr-xenlib` at `zephyrproject-rtos` `7f08845` (`main`), and moves `fatfs` to `4f60a12c`. xenlib stays at `7f08845` although v4.5.0's own west.yml names `8b13d0b7`: its xenstore-srv rework makes 7 of the 11 xenlib patches here not apply, so that move is left to a change of its own. `zephyr-xrun` is unchanged. Applied first, followed by a second `west update` — moulin's west source can only pin the manifest repo's url/rev, so this file is the only way to change the project pins. |
+| — | `zephyrproject-rtos/fatfs` | `4f60a12c` | — | Not patched, but pinned by 0021 and part of the workspace: Zephyr 4.5.0's `modules/fatfs/zephyr_fatfs_config.h` asserts `FFCONF_DEF == 80386`, and the original pin `427159bf` is 80286. `4f60a12c` is v4.5.0's own west.yml pin: FatFs R0.16 with upstream patches 1-2 and the fixes for CVE-2026-6682, -6683, -6685, -6686 and -6687. |
 | 0025 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `prj.conf` | `CONFIG_MP_NUM_CPUS` → `CONFIG_MP_MAX_NUM_CPUS`. Removed in Zephyr 4.0; already a no-op alias in 3.6, so the value does not change. |
 | 0026 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `Kconfig`, `boards/rpi_5.conf`, `src/storage.c` | Track the Zephyr 4.x FATFS renames: `FS_MULTI_PARTITION` (a fork-only symbol) → `FS_FATFS_MULTI_PARTITION`, and `SDMMC_VOLUME_NAME` (removed in 4.0, now a devicetree `disk-name`) → the literal `"SD"` its default produced. |
-| 0027 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `src/domu_cfg.c`, `src/dom_cfg/rpi_5{,_domd}.c`, `src/dom_cfg/rpi_4b.c` | `<zephyr/xen/public/domctl.h>` → `<xen/public/domctl.h>`, i.e. take the Xen ABI from zephyr-xenlib. Required once 0024 removes the vendored copy. |
-| 0028 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `boards/rpi_5.{conf,overlay}`, `src/storage.c` | Keep 4.4.1's newly-enabled devices out of Dom0. The overlay disables **eight** nodes - `pcie1`, `pcie2`, the three RP1 GPIO banks `gpio0_0`/`gpio0_1`/`gpio0_2`, `gio_aon` (and the `leds` node plus the `led0` alias that reference it), `rng` and `uart10` - because none of that hardware is Dom0's here and only the GIC is statically mapped, so each driver's `SYS_INIT` would fault on its first register access; the same failure 0008 documents for the 3.6 SDHCI node. Disabling is not always enough, so the overlay also **deletes** the `chosen zephyr,pcie-controller` and `zephyr,entropy` properties and the `.conf` sets **`CONFIG_PCIE=n`**: `gen_defines` resolves a chosen phandle regardless of `status`, so `drivers/pcie/host/pcie.c` still expanded `DEVICE_DT_GET(DT_CHOSEN(zephyr_pcie_controller))` to a `__device_dts_ord_N` that was never emitted. It adds the inert `ramdisk0` FatFs volume (4.4.1 derives `FF_VOLUMES` from status-okay devicetree disk nodes, and with none the generated `ff.c` does not compile) and fixes `src/storage.c`'s `VolToPart[0]` from `{3, 2}` to `{0, 2}` - `pd` indexes `zfs_diskio.c`'s `pdrv_str[]`, which now has one entry, so 3 was an out-of-bounds read. Sets `CONFIG_XEN_REGIONS=y`, `CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16` and `CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16` (see 0031). |
-| 0029 | `xen-troops/zephyr-xrun` | `5b6ecf2` | `src/xrun.c` | Same change as 0027, for the one `#include <zephyr/xen/public/domctl.h>` in xrun. Required once 0024 removes Zephyr's vendored copy, otherwise the build stops with "fatal error: zephyr/xen/public/domctl.h: No such file or directory". |
+| 0027 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `src/domu_cfg.c`, `src/dom_cfg/rpi_5{,_domd}.c`, `src/dom_cfg/rpi_4b.c` | `<zephyr/xen/public/domctl.h>` → `<xen/public/domctl.h>`, i.e. take the Xen ABI from zephyr-xenlib. Required because upstream `d58fbb8cfc58` (in Zephyr 4.5.0) removed the vendored copy. |
+| 0028 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `boards/rpi_5.{conf,overlay}`, `src/storage.c` | Keep 4.4.1's newly-enabled devices out of Dom0. The overlay disables **eight** nodes - `pcie1`, `pcie2`, the three RP1 GPIO banks `gpio0_0`/`gpio0_1`/`gpio0_2`, `gio_aon` (and the `leds` node plus the `led0` alias that reference it), `rng` and `uart10` - because none of that hardware is Dom0's here and only the GIC is statically mapped, so each driver's `SYS_INIT` would fault on its first register access; the same failure 0008 documents for the 3.6 SDHCI node. Disabling is not always enough, so the overlay also **deletes** the `chosen zephyr,pcie-controller` and `zephyr,entropy` properties and the `.conf` sets **`CONFIG_PCIE=n`**: `gen_defines` resolves a chosen phandle regardless of `status`, so `drivers/pcie/host/pcie.c` still expanded `DEVICE_DT_GET(DT_CHOSEN(zephyr_pcie_controller))` to a `__device_dts_ord_N` that was never emitted. It adds the inert `ramdisk0` FatFs volume (4.4.1 derives `FF_VOLUMES` from status-okay devicetree disk nodes, and with none the generated `ff.c` does not compile) and fixes `src/storage.c`'s `VolToPart[0]` from `{3, 2}` to `{0, 2}` - `pd` indexes `zfs_diskio.c`'s `pdrv_str[]`, which now has one entry, so 3 was an out-of-bounds read. Sets `CONFIG_XEN_REGIONS=y`, `CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16` and `CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16` (see 0031). For Zephyr 4.5.0 it also disables `&pinctrl` and `&rp1_pinctrl`, the BCM2712 and RP1 pin controllers that 4.5 adds with status okay (their registers are DomD's, and they are one `select PINCTRL` away from probing), and sets `UART_INTERRUPT_DRIVEN=n` (the 4.5 board defconfig turns it on for the UART this overlay disables). |
+| 0029 | `xen-troops/zephyr-xrun` | `5b6ecf2` | `src/xrun.c` | Same change as 0027, for the one `#include <zephyr/xen/public/domctl.h>` in xrun. Required because upstream `d58fbb8cfc58` (in Zephyr 4.5.0) removed Zephyr's vendored copy, otherwise the build stops with "fatal error: zephyr/xen/public/domctl.h: No such file or directory". |
 | 0030 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-dom-mgmt/src/xen-dom-mgmt.c` | The three `arch_dcache_flush_and_invd_range()` call sites in the kernel/dtb/initrd load paths passed `nr_pages` where `include/zephyr/arch/cache.h` wants a **byte count**, so they flushed 1/4096 of the mapping and left the rest of the guest image in Dom0's dirty D-cache. Found while regenerating 0005 against xenlib `main` (see 0005's `Local-Modifications:`); worth submitting upstream on its own. |
 | 0031 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xenstore-srv/src/xenstore_srv.c`, `Kconfig` | Input validation and resource bounds, from adversarial review of this series. NUL-terminate the request payload at the boundary (every path handler treated it as a C string, so `header.len == 0` or a payload without a NUL read off the end of the allocation - and construct_path() copied what it found into a key the guest can read back); refuse to free the static root node (`xs rm /` wrote through a NULL dlist pointer and k_free()d a .bss address); arm the xss_do_write() rollback before the perms allocation (a failure on the first new node left a node with an empty perms list, which check_perms() dereferences); scope key_to_watcher() by domain and compare tokens exactly; require watch prefixes to end on a path boundary; coalesce and cap pending watch events per domain (the list was unbounded and grew K*K per write); bound the work done per pass under the global tree lock; stop emitting a req_id-0 XS_ERROR for an oversized watch event; bound tree depth at creation (`CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH`, set to the Kconfig maximum 16 by 0028) so the recursive free cannot overflow the xenstore worker stack, which this patch also raises from 4 to 8 KiB to match. All of these predate this series. A second review round then found defects in this patch itself - a missing `path\0token` separator check in watch/unwatch, an unterminated stored token that `fire_watcher()` leaked past, and a pending-event cap that combined with the `running_transaction` drain gate to *drop* events - and they are fixed here too; see its `Second-round review follow-ups:`. |
 | 0032 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `CMakeLists.txt`, `include/xen/public/xen-compat.h`, `vch/include/vch.h`, `vch/include/xen/public/io/libxenvchan.h` (removed), `xstat/include/xstat.h` | Finish the single-header-tree move. vch/ held a second copy of `xen/public/io/libxenvchan.h` at the same relative path, and vch.h reached it with a quoted include - so the authoritative copy was never compiled. And `__XEN_TOOLS__` was defined in xen-compat.h, which domctl.h/sysctl.h test with `#error` *before* including xen.h, so a TU whose first include was `<xen/public/domctl.h>` failed; it is now a build definition, as in upstream Xen's tools - and unconditional under `CONFIG_XEN` rather than gated on `CONFIG_XEN_DOM0`, because `XSTAT`/`XEN_DOMAIN_MANAGEMENT`/`XEN_SHELL` have no `depends on XEN_DOM0` and so a `XEN=y`/`XEN_DOM0=n` build compiles `xstat.c`, which includes `domctl.h`. Also retargets the one stale comment in `xstat/include/xstat.h` that still named `include/zephyr/xen/public/domctl.h`. |
-| 0033 | `xen-troops/zephyr` (fork) | `1f6485eca2` | `arch/arm64/core/xen/Kconfig` | **[Xen 4.22]** Widen `CONFIG_XEN_DOMCTL_INTERFACE_VERSION` to `range 0x15 0x18` and move the default there. Xen bumped `XEN_DOMCTL_INTERFACE_VERSION` to 0x18 for 4.22; out of range, kconfiglib *discards* a user value with only a warning and falls back to the default, so the `=0x18` set by 0008 (`rpi_5.conf`) and 0019 (`rpi_4b.conf`) would silently stay 0x17 - green build, every domctl rejected by 4.22, and the only symptom a Dom0 whose `xu list` prints nothing. Domctl-side counterpart of 0022 (sysctl): same file, non-overlapping hunk, so it applies at offset 0 right after it. The sysctl version is unchanged on 4.22 (still 0x16), so 0022 needs no follow-up. |
+| 0034 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `CMakeLists.txt` | Drop the `include($ENV{ZEPHYR_BASE}/cmake/app/boilerplate.cmake NO_POLICY_SCOPE)`. Zephyr 4.5 deletes that file (upstream `28e363fc69c`), so the configure step stopped with `include could not find requested file`. It was a compatibility shim that only forwarded to `find_package(Zephyr)`, which the line before already calls, so nothing else changes. |
 
 **Gating is self-enabling.** `rpi5-sodev.yaml`'s zephyr `dom0` builder passes
 `CONFIG_DOM_CFG_SODEV=y` (alongside `CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18`),
@@ -118,7 +116,7 @@ That is what 0001 patched. It is no longer the right fix, for two reasons:
   The remaining 4 bytes are `arch.arm_sci_type`, which the vendored copy also
   lacked.
 - **The vendored copy is gone.** Upstream deleted it in favour of zephyr-xenlib's
-  headers (backported here as 0024), and xenlib's `include/xen/public/` tracks Xen
+  headers (`d58fbb8cfc58`, in Zephyr 4.5.0), and xenlib's `include/xen/public/` tracks Xen
   4.21.0 — `altp2m`, `arm_sci_type` and all. "Byte-for-byte" holds for the headers
   that carry the ABI this series depends on (see the 9 diffed below), not for the
   whole 75-header tree. `xen-compat.h` is the one header of the nine that is not a
@@ -135,7 +133,7 @@ That is what 0001 patched. It is no longer the right fix, for two reasons:
 - **A third interface version exists and is *not* set by this series.**
   `CONFIG_XEN_INTERFACE_VERSION` stays at Zephyr's upstream default `0x00040e00`
   (Xen 4.14) from `arch/arm64/core/xen/Kconfig`; only `XEN_DOMCTL_INTERFACE_VERSION`
-  (0x18 for Xen 4.22, patch 0008; range widened by 0033) and `XEN_SYSCTL_INTERFACE_VERSION` (0x16, patches 0022+0028)
+  (0x18 for Xen 4.22, patch 0008; range widened upstream by `c5f988e70d7`) and `XEN_SYSCTL_INTERFACE_VERSION` (0x16, patch 0028; range widened upstream by `31d2bd60ff29`)
   were moved to 4.21. It gates 20-odd `#if __XEN_INTERFACE_VERSION__` blocks in
   `xen.h`/`grant_table.h`/`memory.h`/`errno.h` and the `XENPV_FLEX_ARRAY_DIM` choice
   in `io/ring.h`. Checked: `0x00040e00` satisfies every lower bound those guards use
@@ -143,9 +141,12 @@ That is what 0001 patched. It is no longer the right fix, for two reasons:
   it does not depend on the flex-array dimension. Left alone rather than raised: 4.19
   is the ceiling `xen-compat.h` enforces, and that ceiling is Xen 4.21.0's own.
 
-So on this tree the ABI is correct because 0024 + 0027 make everything read one
-set of headers, and 0018 zeroes the hypercall argument so any field Xen reads and
-Zephyr never writes is 0. The expected layout, which 0024 is what delivers:
+So on this tree the ABI is correct because upstream `d58fbb8cfc58` + 0027 make
+everything read one set of headers, and 0018 zeroes the hypercall argument so any
+field Xen reads and Zephyr never writes is 0. Against Xen 4.22 the arch struct is
+still 16 bytes on arm64, but 4.22's new `v8r_el1_msa` field sits in what the 4.21
+headers leave as padding, which is why the zeroing matters. The expected layout,
+which `d58fbb8cfc58` is what delivers:
 
 | expression | Xen 4.21 | Zephyr's old vendored copy | + 0001 |
 |---|---|---|---|
@@ -157,7 +158,7 @@ Zephyr never writes is 0. The expected layout, which 0024 is what delivers:
 the container size proves nothing. Check `createdomain` and `arch`.
 
 
-## Zephyr 4.4.1 upgrade: behaviour deltas that are NOT from these patches
+## Zephyr 4.4.1 upgrade (3.6.0 -> 4.4.1): behaviour deltas that are NOT from these patches
 
 Measured by diffing the built `.config` against the 3.6.0 build
 (a 230-line diff; 44 `CONFIG_` lines only in 3.6.0, 103 only in 4.4.1, the rest changed values). Everything else in that diff is either one of
@@ -177,6 +178,46 @@ Also worth noting, though not a behaviour change: `NUM_IRQS` went 512 -> 280
 `SCHED_SIMPLE`/`WAITQ_SIMPLE`, newlib gave way to picolibc as the default libc, and
 `CONFIG_KERNEL_DIRECT_MAP=y` is now pulled in because upstream's `XEN_REGIONS`
 selects it.
+
+## Zephyr 4.5.0 upgrade (4.4.1 -> 4.5.0)
+
+0021 now pins upstream `zephyrproject-rtos` `v4.5.0` (`41d10b59730`, released
+2026-10-28) instead of the xen-troops `zephyr-v4.4.1-xt` branch, which was upstream
+v4.4.1 at the same SHA. What the move changed in this series:
+
+- The extended-regions driver (`26d1dce50e01`), the wider sysctl interface-version
+  range (`31d2bd60ff29`), the removal of Zephyr's vendored Xen public headers
+  (`d58fbb8cfc58`) and the domctl range widened to 0x18 (`c5f988e70d7`) are upstream
+  in 4.5.0, so the series no longer carries them, and `apply-zephyr-patches.sh` no
+  longer removes `include/zephyr/xen/public/` itself. The domctl default is still
+  0x17, so the `CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18` set by 0008/0019 and the
+  board yaml is still what selects Xen 4.22's ABI; it is simply accepted now.
+- 0018 is rebased: upstream `fc146cab757` fixed the comma typo, so the patch only
+  adds the initialiser.
+- 0034 is new: 4.5 deletes `cmake/app/boilerplate.cmake` (`28e363fc69c`).
+- 0019 and 0028 keep the devices that 4.5's `rpi_4b` and `rpi_5` boards newly enable
+  out of Dom0 (see their rows).
+- DomZ's `src/main.c` includes `<zephyr/version.h>` instead of `<version.h>`: 4.5
+  removed `LEGACY_GENERATED_INCLUDE_PATH`.
+- `fatfs` moves to `4f60a12c`, v4.5.0's own pin. `zephyr-xenlib` stays at `7f08845`
+  (see the 0021 row). The Zephyr SDK stays 1.0.1, which is v4.5.0's `SDK_VERSION`.
+- The builder image needs CMake 3.28 or newer (Ubuntu 22.04 ships 3.22): CMake
+  3.31.6 is pip-installed into `/opt/zephyr-venv`, and `/usr/local/bin/west` is a
+  wrapper that puts the venv's `bin` first on `PATH`, so only `west` and its
+  children see it. An existing `sodev-builder-rpi` image has to be rebuilt once
+  (`--rebuild-images`), see `docs/BUILD.md`.
+
+The enabled devicetree nodes and the built `.config` were compared against the
+4.4.1 build that ran on hardware. `rpi_5` differs only in upstream symbol
+housekeeping (for example `ASSERT_VERBOSE` -> `ASSERT_LEVEL`,
+`LEGACY_GENERATED_INCLUDE_PATH`, `RING_BUFFER` and `CPU_LOAD_LOG_*` gone,
+`EXCEPTION_DUMP=y`, `ICACHE_LINE_SIZE`/`DCACHE_LINE_SIZE=64`, `SHELL_LOCAL`) plus an
+inert RP1 uartclk fixed clock under the disabled PCIe (both pin controllers are
+disabled by 0028). `rpi_4b` has the same, an
+inert `clk-vpu` fixed clock, and `SYS_CLOCK_HW_CYCLES_PER_SEC` going from 54000000
+to 1500000000, which is harmless: `TIMER_READS_ITS_FREQUENCY_AT_RUNTIME=y`, so the
+arch timer reads `CNTFRQ` at runtime. DomZ (`xenvm`) has the same housekeeping plus a
+new `xen,watchdog` node, which builds no driver because `CONFIG_WATCHDOG` is off.
 
 ## Apply
 
@@ -238,16 +279,16 @@ produced inside the Zephyr Dom0 graph (the Zephyr west build has no
 + `aaos-android-kernel` / `aaos-vendor-boot-ramdisk` + `linux-domu`; p4 the AAOS
 nested GPT). This was verified end-to-end from a clean checkout for **both**
 `--dom0=zephyr` and `--dom0=linux` on the 3.6.0 pins, and both have been re-run on
-the current 4.4.1 pins at the DomD-only scope (no `-u`/`-a`); see
+the 4.4.1 pins at the DomD-only scope (no `-u`/`-a`); see
 "Verification status". `linux-domu` comes
 from the separate `build-domu`.
 
 ## Verification status
 
-> **Read the scope first.** Everything under "On Zephyr 3.6.0 + xenlib v3.2.0"
-> below was measured on the *previous* pins. On the current pins
-> (Zephyr 4.4.1 + zephyrproject-rtos xenlib) **only the build has been verified —
-> there is no hardware run yet.**
+> **Read the scope first.** Everything under "On Zephyr 4.4.1" and "On Zephyr
+> 3.6.0 + xenlib v3.2.0" below was measured on the *previous* pins. On the current
+> pins (Zephyr 4.5.0 + zephyrproject-rtos xenlib) **only the build has been checked,
+> on a PC — there is no hardware run yet.**
 >
 > **Rebased onto upstream `main` (2026-08-17).** The series now sits on top of
 > upstream's RPi4 work, and two things changed underneath it that invalidate part of
@@ -257,7 +298,19 @@ from the separate `build-domu`.
 > two rpi_4b ones. Every measured value in this section was re-taken after the
 > rebase; anything that could not be re-taken is marked as such.
 
-### On Zephyr 4.4.1 + zephyrproject-rtos xenlib (current pins)
+### On Zephyr 4.5.0 + zephyrproject-rtos xenlib (current pins)
+
+- `west build -b rpi_5` and `west build -b rpi_4b` (Dom0) and `-b xenvm` (DomZ)
+  build with no compiler warnings. The only warnings left are dtc warnings that the
+  4.4.1 build printed too: `interrupt_provider` on the GIC node for Dom0, and
+  `ranges_format` for DomZ.
+- The enabled devicetree nodes and `.config` were compared with the board-verified
+  4.4.1 build; every difference is accounted for (see "Zephyr 4.5.0 upgrade" above).
+- DomZ's `zephyr.bin` carries the banner `DomZ up: Zephyr 4.5.0 as Xen DomU (AGL
+  SoDeV)` (read from the PC build; not yet seen on a board).
+- ⚠ **Not done on 4.5.0:** any hardware run on either board.
+
+### On Zephyr 4.4.1 + zephyrproject-rtos xenlib (previous pins)
 
 - `apply-zephyr-patches.sh` runs end to end from a fresh `west init`/`west update`,
   including the mid-series `west update` that moves the pins. Re-running it is
@@ -292,7 +345,8 @@ from the separate `build-domu`.
   `sizeof(xen_arch_domainconfig)==16`, `sizeof(xen_domctl_createdomain)==76`,
   `offsetof(...,arch)==60`, `sizeof(xen_domctl_t)==144`, and the interface versions
   0x17/0x16 — matching Xen 4.21.0, the version that measurement was taken on; the
-  shipping pair is 0x18/0x16 for Xen 4.22 (0008/0019 set it, 0033 widens the range). The asserts were removed afterwards. VERIFIED.
+  shipping pair is 0x18/0x16 for Xen 4.22 (0008/0019 set it; the domctl range that
+  accepts 0x18 is upstream `c5f988e70d7`). The asserts were removed afterwards. VERIFIED.
 - 9 of the 75 headers in xenlib's `include/xen/public/` - the ones this series'
   ABI claims rest on - diffed byte-for-byte against the Xen tree the workspace
   built AT THE TIME (Xen 4.21: `meta-xt-rpi5`'s `xen_4.21.bbappend` pinned PV
@@ -406,7 +460,7 @@ from the separate `build-domu`.
   the `<zephyr/xen/regions.h>` include that is not in `d58fbb8cfc58` (nor omits its
   migration-guide entry). VERIFIED.
 - **Hardware: run on 2026-08-18** on a tree whose 30 patches are payload-identical
-  to these: four patterns (RPi4/RPi5 x Zephyr-Dom0/thin-Linux-Dom0) all passed. The
+  to the 4.4.1 series: four patterns (RPi4/RPi5 x Zephyr-Dom0/thin-Linux-Dom0) all passed. The
   procedure followed there, and the notes in this file, are the reference.
 
 ### On Zephyr 3.6.0 + xenlib v3.2.0 (previous pins — provenance of the fixes)
@@ -424,7 +478,8 @@ from the separate `build-domu`.
   the then-current 0002-0007), and every symbol the SoDeV `dom_cfg`
   references resolves. VERIFIED.
 - The createdomain ABI fix: rc=-3 → `domain:1 created` on real Xen 4.21 (QEMU). VERIFIED.
-  (Carried by 0001 at the time; on 4.4.1 the same ABI comes from 0024+0027+0018 —
+  (Carried by 0001 at the time; now the same ABI comes from upstream
+  `d58fbb8cfc58` + 0027 + 0018 —
   see "The createdomain ABI" above.)
 - 0004: clean compile on the `rpi_5` board; 1 GiB DomU
   `xu create` reaches `domain:1 created` (an earlier configuration halted in the
@@ -443,8 +498,8 @@ from the separate `build-domu`.
 - **0010 (zephyr)** — widened the `CONFIG_XEN_SYSCTL_INTERFACE_VERSION` Kconfig
   range to 0x15-0x16. Xen 4.21 requires 0x16; at 0x15 every sysctl fails the
   version check, so `xu list` / `xstat physinfo` silently print nothing.
-  **Superseded on 4.4.1** by 0022 (upstream backport of the same range change)
-  plus 0028 (which sets the value in `boards/rpi_5.conf`).
+  **Superseded** by upstream `31d2bd60ff29` (the same range change, in Zephyr
+  4.5.0) plus 0028 (which sets the value in `boards/rpi_5.conf`).
 - **0011 (zephyr-dom0-xt)** — DomA (AAOS) builtin-ramdisk incbin slot
   (`CONFIG_DOM_CFG_DOMA_RAMDISK_BIN_FILE`). The stock builtin mechanism embeds
   only kernel+DTB; AAOS boots kernel + a layered ramdisk. Inert when unset.
@@ -458,23 +513,23 @@ from the separate `build-domu`.
 
 The stock board files target the xen-troops **4.19 fork ABI**; on our Xen 4.22 four
 Kconfig values must differ. **These are now carried by the patches — no manual
-`west build -D...` overrides are required** (they were, before 0008/0019/0028 and
-0022/0033 baked them in). Both boards need them:
+`west build -D...` overrides are required** (they were, before 0008/0019/0028
+baked them in). Both boards need them:
 
 | Kconfig | value on Xen 4.22 | applied by |
 |---|---|---|
-| `CONFIG_XEN_DOMCTL_INTERFACE_VERSION` | `0x18` | 0008 (`boards/rpi_5.conf`) + 0019 (`boards/rpi_4b.conf`); **0033 widens the Kconfig range so the value is accepted** |
-| `CONFIG_XEN_SYSCTL_INTERFACE_VERSION` | `0x16` | 0028 (`boards/rpi_5.conf`), 0019 (`boards/rpi_4b.conf`); 0022 widens the Kconfig range so the value is accepted. Unchanged on 4.22 |
-| `CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE` | — | **n/a on 4.4.1.** Fork-only symbol; the field it gated now comes from zephyr-xenlib unconditionally and is zeroed by 0018 |
-| `CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID` | — | **n/a on 4.4.1.** Same |
+| `CONFIG_XEN_DOMCTL_INTERFACE_VERSION` | `0x18` | 0008 (`boards/rpi_5.conf`) + 0019 (`boards/rpi_4b.conf`); **upstream `c5f988e70d7` (in Zephyr 4.5.0) widened the Kconfig range so the value is accepted** - the default is still 0x17 |
+| `CONFIG_XEN_SYSCTL_INTERFACE_VERSION` | `0x16` | 0028 (`boards/rpi_5.conf`), 0019 (`boards/rpi_4b.conf`); upstream `31d2bd60ff29` widened the Kconfig range so the value is accepted. Unchanged on 4.22 |
+| `CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_SCI_TYPE` | — | **n/a on 4.5.0.** Fork-only symbol; the field it gated now comes from zephyr-xenlib unconditionally and is zeroed by 0018 |
+| `CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_VGSX_OSID` | — | **n/a on 4.5.0.** Same |
 
 > **Historical (3.6.0 fork).** The two XENTROOPS options inserted fork-specific
 > fields into the middle of `struct xen_arch_domainconfig` - a u16 `arm_sci_type`
 > between `tee_type` and `nr_spis`, and a u8 `vgsx_osid` between `nr_spis` and
 > `clock_frequency` - taking the vendored struct from 12 to 20 bytes and
 > `xen_domctl_getdomaininfo` from 120 to 128, which is why the stock `=y` had to be
-> overridden. **None of this applies on 4.4.1:** the symbols do not exist, the
-> vendored headers are gone (0024), and the ABI comes from zephyr-xenlib, whose
+> overridden. **None of this applies on 4.5.0:** the symbols do not exist, the
+> vendored headers are gone (upstream `d58fbb8cfc58`), and the ABI comes from zephyr-xenlib, whose
 > `arm_sci_type` is a trailing u8 that matches Xen 4.21 exactly. 0008 removes the
 > assignments rather than setting them to n - assigning to an undefined symbol is a
 > Kconfig error in Zephyr 4.x. See "The createdomain ABI" above for the measured
@@ -506,12 +561,11 @@ builds.
 
 Note that "clean checkouts + patches" is not the whole story, and the script is not
 a plain `git apply` loop: it also (a) runs `west update` in the middle, because 0021
-is what moves the pins - so 0018/0022-0024 only apply to the *second* checkout of
-`zephyr`, not to the one `rpi5-v0.4.0` originally pinned - (b) removes
-`include/zephyr/xen/public/` itself, and (c) rewrites the git remote of any project
+is what moves the pins - so 0018 only applies to the *second* checkout of
+`zephyr`, not to the one `rpi5-v0.4.0` originally pinned - and (b) rewrites the git remote of any project
 whose manifest URL moved - that is how zephyr-xenlib ends up on zephyrproject-rtos.
 `west update` moves an existing checkout to a new revision but never re-points its
-remote, so without (c) the tree would build from the right commit while
+remote, so without (b) the tree would build from the right commit while
 `git remote -v` still said xen-troops. The remote is rewritten in place, not
 deleted and re-cloned: an earlier version did `rm -rf` + reclone, which meant any
 cosmetic change to west.yml's `url-base` could delete the ~1 GiB `zephyr` checkout.
@@ -530,7 +584,7 @@ worker under a global mutex, wedges the whole connection. These patches fix that
 class end-to-end.
 
 - **0013 (zephyr)** — `regions.c xen_region_get_pages`: initialize `ptr = NULL`.
-  **Superseded on 4.4.1**: the upstream driver backported as 0023 already has it.
+  **Superseded**: the upstream driver (`26d1dce50e01`, in Zephyr 4.5.0) already has it.
   When every extended region is -ENOMEM the loop never assigned `ptr` and returned
   uninitialized stack garbage, which `xenmem_map_region` would then map a foreign
   guest page over (arbitrary-VA corruption).
@@ -615,23 +669,29 @@ unaffected. Also drop the `get_domain()` borrow (`put_domain`) on the
 `xen_domctl_createdomain()` in `zephyr/drivers/xen/dom0/domctl.c` was the only
 one of the twenty `xen_domctl_t` locals in that file declared without an
 initialiser, and it is the one where that matters: the struct ends in
-`xen_arch_domainconfig`, which this tree vendors 4 bytes shorter than Xen 4.21's
-(see the ABI section above), so Xen read the trailing `arm_sci_type` byte from
-uninitialised stack. Harmless as this series is configured -- Xen's
-`sci_domain_sanitise_config()` returns 0 while no SCI mediator is registered, and
-none is unless `CONFIG_SCMI_SMC` is selected -- but a sporadic
-`createdomain` failure as soon as one is. 0018 zeroes the argument and, while
-there, replaces the three commas that terminated the following assignments with
-semicolons.
+`xen_arch_domainconfig`, and the copy into the hypercall argument writes only what
+this tree's definition of that struct names. On the 3.6.0 pins that definition was
+4 bytes shorter than Xen 4.21's (see the ABI section above), so Xen read the
+trailing `arm_sci_type` byte from uninitialised stack. Now the definition comes from
+zephyr-xenlib's copy of the Xen 4.21 headers while the hypervisor is Xen 4.22: both
+are 16 bytes on arm64, but 4.22 puts its new `v8r_el1_msa` field where 4.21 has
+padding, so without an initialiser Xen reads that field from uninitialised stack.
+Zeroing makes it `XEN_DOMCTL_CONFIG_ARM_V8R_EL1_MSA_NONE`, which
+`v8r_el1_msa_domain_sanitise_config()` accepts on a non-MPU build, and the same
+holds for any field a later Xen adds in padding this tree does not name. Upstream
+fixed the comma typo in the three assignments below it (`fc146cab757`); the
+initialiser is still missing in v4.5.0.
 
 ## Expected build warnings
 
-**None as of Zephyr 4.4.1.** The build is warning-clean.
+**No compiler warnings as of Zephyr 4.5.0** (`rpi_5` and `rpi_4b`). The one
+warning left is dtc's `interrupt_provider` warning on the GIC node, which comes from
+upstream's bcm2711/bcm2712 dtsi and is printed on 4.4.1 and 4.5.0 alike.
 
 > **Historical (3.6.0).** A benign `No SOURCES given to Zephyr library:
 > drivers__disk` CMake warning used to be expected: `FAT_FILESYSTEM_ELM` selects
 > `DISK_ACCESS` which selects `DISK_DRIVERS`, so `drivers/disk` was configured in
-> while `CONFIG_DISK_DRIVER_SDMMC=n` left it without sources. On 4.4.1 that
+> while `CONFIG_DISK_DRIVER_SDMMC=n` left it without sources. Since 4.4.1 that
 > assignment is gone (0008) and 0028 adds the inert `ramdisk0` node, so
 > `CONFIG_DISK_DRIVER_RAM=y` gives the library a source file and the warning does
 > not occur.

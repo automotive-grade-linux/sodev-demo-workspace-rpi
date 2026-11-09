@@ -58,7 +58,7 @@ reach its PV console — needs a hypervisor, not a Raspberry Pi.
 `tools/domz-qemu/qemu-xen-domz.sh` (repository root) boots Xen with a minimal
 Linux Dom0 under QEMU aarch64 and lets you create DomZ there.
 **This has been run, and it works** (recorded with Zephyr 3.6.0 / Xen 4.21.1-pre /
-GICv2, before the 4.4.1 move):
+GICv2, before the 4.4.1 and 4.5.0 moves):
 
 ```
 root@qemuarm64:~# mkdir -p /mnt/host && mount /dev/vda /mnt/host
@@ -110,9 +110,12 @@ on hardware too:
 ## Hardware bring-up
 
 DomZ has been verified on hardware in all four verification patterns (RPi4 and RPi5,
-Zephyr-Dom0 and thin-Linux-Dom0). The RPi4 runs used the 4 GiB board, with images built
-before `build.sh` began refusing `-z` on `--ram=4g`; the 8 GiB map that `-z` now needs
-on the RPi4 has not been booted:
+Zephyr-Dom0 and thin-Linux-Dom0), on Zephyr 4.4.1. The RPi4 runs used the 4 GiB board,
+with images built before `build.sh` began refusing `-z` on `--ram=4g`; the 8 GiB map that
+`-z` now needs on the RPi4 has not been booted. The Zephyr 4.5.0 image has been built
+and checked on a PC only -- its `zephyr.bin` carries `DomZ up: Zephyr 4.5.0 as Xen DomU
+(AGL SoDeV)` -- and has not been run on a board yet. The log below is from the 4.4.1
+runs:
 
 ```
 xl list                      # DomZ present, 16 MiB, 1 vCPU

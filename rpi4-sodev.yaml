@@ -355,7 +355,7 @@ parameters:
               target: "%{ZEPHYR_DOM0_TARGET}"
               work_dir: "%{ZEPHYR_DOM0_BUILD_DIR}"
               vars:
-                # Volume 0, not 1: on Zephyr 4.4 FF_VOLUMES comes from the number of
+                # Volume 0, not 1: on Zephyr 4.x FF_VOLUMES comes from the number of
                 # status-okay devicetree disk nodes, and this Dom0 has exactly one
                 # (the inert ramdisk0 that 0019 adds so FatFs compiles at all —
                 # the SD belongs to DomD). "1:" would be out of range. 0028 also
@@ -374,11 +374,10 @@ parameters:
                 # meta-xt-dom0-zephyr/0019 for boards/rpi_4b.conf — NOT as a
                 # builder var here, because moulin mangles an empty-string -D
                 # value in its `west build -- ...` cmd.
-                # [R1] match our Xen 4.22 ABI (0x18). NOTE: this only takes
-                # effect together with meta-xt-dom0-zephyr patch 0033, which
-                # widens the symbol's Kconfig range to 0x18 -- outside the range
-                # kconfiglib discards the value with only a warning and falls
-                # back to the default, so the build stays green at 0x17.
+                # [R1] match our Xen 4.22 ABI (0x18). Zephyr's default is still
+                # 0x17; upstream c5f988e7 (in v4.5.0) widened the symbol's Kconfig
+                # range to 0x18, without which kconfiglib would discard this value
+                # with only a warning and the build would stay green at 0x17.
                 # Keep in sync with the board .conf set by patch 0008 (rpi_5)
                 # and patch 0019 (rpi_4b).
                 - "CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x00000018"

@@ -1,6 +1,6 @@
 From 92473f243d386beb6b32f4ac6a6aabc1f18179a4 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 08 Jul 2026 00:00:00 +0900
+Date: Tue, 10 Nov 2026 01:09:27 +0900
 Subject: [PATCH] boards/rpi_5: HW-verified Dom0 bring-up + DomD-owns-SD fixes
 
 
@@ -68,8 +68,9 @@ board reports BANK[0] 0xa0000000-0xc0000000 and loads the Dom0 Image there.
     because that field lands in tail padding; patch 0018 zeroes the createdomain
     hypercall argument so Xen reads it as ARM_SCI_NONE rather than as
     uninitialised stack. (Previously required as manual `west build` -D flags;
-    now carried by this patch. The sysctl version is handled by the 0022 backport
-    plus the value in 0028 - 0010, which used to carry it, is a vacant number.)
+    now carried by this patch. The sysctl version is handled by the value in
+    0028, which upstream 31d2bd60 accepts - 0010, which used to carry it, is a
+    vacant number.)
 * src/dom0.h: CONFIG_SDMMC_VOLUME_NAME fallback so the FATFS code keeps
   compiling with CONFIG_SDHC disabled (runtime storage_init fails cleanly
   with ENODEV; the storage path is unused in the DomD-as-toolstack topology).
@@ -92,12 +93,17 @@ Rebased onto Zephyr 4.4.1 (upstream v4.4.1, no xen-troops fork deltas):
    invisible ones, which is why it went unnoticed. The comment claiming
    residual overflows would fault cleanly was therefore never true.
 
+Carried to Zephyr 4.5.0 with comment changes only: the backports this
+series used to carry for 4.4.1 (0022-0024) are upstream in 4.5.0, so the
+comments name the upstream commits instead of the patch numbers.
+
 Assisted-by: Claude Code:claude-opus-4-8
+Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/boards/rpi_5.conf b/boards/rpi_5.conf
-index 4e74787..3fd7fd2 100644
+index 4e74787..722fc56 100644
 --- a/boards/rpi_5.conf
 +++ b/boards/rpi_5.conf
 @@ -6,10 +6,39 @@ CONFIG_XEN_DOM0=y
@@ -125,7 +131,7 @@ index 4e74787..3fd7fd2 100644
 +# error on assignments to *invisible* symbols (only undefined ones), which is why
 +# it went unnoticed.
 +#
-+# CONFIG_STACK_SENTINEL is the substitute, and it DOES exist in 4.4.1
++# CONFIG_STACK_SENTINEL is the substitute, and it DOES exist upstream
 +# (subsys/debug/Kconfig). An earlier version of this comment claimed it did not,
 +# which left this Dom0 with no overflow detection at all on a false premise. Its
 +# dependencies are all met here (MULTITHREADING=y, !USERSPACE, and MPU_STACK_GUARD
@@ -163,7 +169,7 @@ index 4e74787..3fd7fd2 100644
 +# SDHC_BUFFER_ALIGNMENT -> broken configs.c asm. (Patch 0026 fixes that default and
 +# drops this pin again.)
 +#
-+# CONFIG_DISK_DRIVER_SDMMC is deliberately NOT set here: upstream 4.4.1 has no
++# CONFIG_DISK_DRIVER_SDMMC is deliberately NOT set here: upstream Zephyr has no
 +# bcm2712 SDHCI driver and no sdmmc-disk node, so the symbol is invisible and the
 +# subsystem is already off. Assigning to it would only risk a Kconfig warning,
 +# which Zephyr 4.x turns into a build error.
@@ -171,14 +177,14 @@ index 4e74787..3fd7fd2 100644
 +CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
 +# CONFIG_XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n here.
 +# Those symbols only ever existed in the xen-troops Zephyr fork, to gate the extra
-+# arch_domainconfig fields in its vendored Xen headers. Upstream 4.4.1 does not
-+# define them, and the vendored headers are gone anyway (see 0024): the ABI now
++# arch_domainconfig fields in its vendored Xen headers. Upstream Zephyr does not
++# define them, and its vendored headers are gone anyway (d58fbb8c): the ABI now
 +# comes from zephyr-xenlib, whose arch-arm.h carries `arm_sci_type`
 +# unconditionally. It is zeroed by 0018's `xen_domctl_t domctl = { 0 }`, which is
 +# XEN_DOMCTL_CONFIG_ARM_SCI_NONE - the same behaviour the old `=n` produced.
 +# Assignments to undefined symbols are a hard Kconfig error in Zephyr 4.x.
 diff --git a/boards/rpi_5.overlay b/boards/rpi_5.overlay
-index 14df219..0356db2 100644
+index 14df219..d565c0e 100644
 --- a/boards/rpi_5.overlay
 +++ b/boards/rpi_5.overlay
 @@ -8,6 +8,22 @@
@@ -194,7 +200,7 @@ index 14df219..0356db2 100644
 + * init_domain0/dom0less_init (the dom0less DomD was then never introduced to
 + * xenstore -> xenbus_probe stuck in state D on HW).
 + *
-+ * Upstream Zephyr 4.4.1 has no such node and no bcm2712 SDHCI driver at all, so
++ * Upstream Zephyr has no such node and no bcm2712 SDHCI driver at all, so
 + * there is nothing to disable - keeping that override would leave an unresolved
 + * DTC label. storage_init() in main() still fails cleanly with -ENODEV, which is
 + * all this topology needs (the FATFS/xu-create path is unused; guests are
