@@ -1,0 +1,2270 @@
+From 4577d73133b8dc2aa94dda49af9665c9374d3fb8 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 9 Nov 2026 13:41:11 +0900
+Subject: [PATCH] wifi: DomD's join and typed passphrases in the relay and
+ DomaWifiRelay
+
+DomA's station joins the shadow BSS within seconds whatever happens to
+the real AP, so the Wi-Fi screen showed a network as joined while DomD
+was still looking for it, dropped it without a reason when DomD failed,
+and took any typed passphrase as connected until DomD's answer.
+
+doma-wifi-relay now:
+- writes DomD's join to relay.state: "pending" after each connect it
+  forwards, "offline:<reason>" (not-found, wrong-key, rejected,
+  timeout, error) for DomD's FAILED, "offline:retry" while a later
+  connect for the SSID is pending, "offline:lost" for LOST, and the
+  app's token (psk#<hex>) as a fourth field on every line that answers
+  a request with one;
+- marks the connect for a typed passphrase ,"kind":"u", so that DomD's
+  agent answers its WRONG_KEY at once when the SSID has never been
+  COMPLETED with it, and puts the passphrase into the shadow row only
+  once DomD has joined with it (its COMPLETED, or a BACK after a
+  timed-out join; "online" once hostapd beacons it);
+- times its intervals by /proc/uptime instead of mksh's $SECONDS (the
+  wall clock, which NTP steps once DomA's network is validated), counts
+  every hostapd restart for BOUNCE_MIN_S except one while hostapd
+  beacons only the hidden idle BSS, and holds restarts for the list
+  while the app is about to join the BSS of an "online" (30 s at most).
+  doma_shadow_ap may read proc_uptime.
+
+DomaWifiRelay now:
+- shows one notification for DomD's join (connecting, connected, cannot
+  connect with the reason, disconnected); a failure opens the Wi-Fi
+  settings on a tap;
+- connects a typed passphrase's network on the "online" with its token,
+  once a scan sees the restarted shadow BSS, keeping its auto-join off
+  meanwhile; on a wrong-key answer it connects once so that the screen
+  asks for the password;
+- keeps the (SSID, passphrase) pairs DomD refused as HMAC-SHA-256 in
+  device-protected storage and does not send them again after a boot;
+- takes down the framework's "Failed to connect" (42) that the local
+  handshake against the placeholder, and its own connect after a
+  refusal, make it post.
+
+xenvm_trout_rpi4_arm64/doma-wifi-relay.sh, sepolicy/doma_shadow_ap.te
+and DomaWifiRelay/ become the same files as the Raspberry Pi 5's relay
+and sepolicy and the doma-common DomaWifiRelay of AGL's meta-rpi-sodev.
+
+On a Raspberry Pi 4 (2026-11-09, a WPA2 AP) a wrong passphrase was
+told 13 s after the tap and not sent again after a reboot, and the
+right one reached CONNECTED 25.6 s after the tap with one hostapd
+restart.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ DomaWifiRelay/res/drawable/ic_wifi.xml        |   13 +
+ DomaWifiRelay/res/values/strings.xml          |   19 +
+ .../xt/domawifirelay/RelayService.java        | 1075 +++++++++++++++--
+ sepolicy/doma_shadow_ap.te                    |    4 +
+ xenvm_trout_rpi4_arm64/doma-wifi-relay.sh     |  491 ++++++--
+ 5 files changed, 1438 insertions(+), 164 deletions(-)
+ create mode 100644 DomaWifiRelay/res/drawable/ic_wifi.xml
+ create mode 100644 DomaWifiRelay/res/values/strings.xml
+
+diff --git a/DomaWifiRelay/res/drawable/ic_wifi.xml b/DomaWifiRelay/res/drawable/ic_wifi.xml
+new file mode 100644
+index 0000000..02fd32f
+--- /dev/null
++++ b/DomaWifiRelay/res/drawable/ic_wifi.xml
+@@ -0,0 +1,13 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<!-- Status-bar icon for RelayService's notification: the Material "wifi" glyph
++     (Apache-2.0). White on transparent, as a small icon must be. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="#FFFFFFFF"
++        android:pathData="M1,9l2,2c4.97,-4.97 13.03,-4.97 18,0l2,-2C16.93,2.93 7.08,2.93 1,9zM9,17l3,3 3,-3c-1.65,-1.66 -4.34,-1.66 -6,0zM5,13l2,2c2.76,-2.76 7.24,-2.76 10,0l2,-2C15.14,9.14 8.87,9.14 5,13z" />
++</vector>
+diff --git a/DomaWifiRelay/res/values/strings.xml b/DomaWifiRelay/res/values/strings.xml
+new file mode 100644
+index 0000000..b9d91f9
+--- /dev/null
++++ b/DomaWifiRelay/res/values/strings.xml
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<!-- What RelayService.notifyState tells the user about DomD's real join. The SSID is
++     %1$s; it is shown on the user's own screen only, never logged by these. -->
++<resources>
++    <string name="channel_status">Wi-Fi connection status</string>
++    <string name="channel_failure">Wi-Fi connection problems</string>
++    <string name="connecting">Connecting to %1$s…</string>
++    <string name="connecting_text">Waiting for the access point to answer. The Wi-Fi screen may change before this does.</string>
++    <string name="connected">Connected to %1$s</string>
++    <string name="failed">Cannot connect to %1$s</string>
++    <string name="reason_not_found">The access point was not found. Check that it is on and nearby (for a phone hotspot, keep its hotspot screen open).</string>
++    <string name="reason_wrong_key">The password is not correct.</string>
++    <string name="reason_rejected">The access point refused the connection.</string>
++    <string name="reason_timeout">The access point did not answer in time.</string>
++    <string name="reason_error">The connection could not be started.</string>
++    <string name="lost">Disconnected from %1$s</string>
++    <string name="lost_text">The connection to the access point was lost.</string>
++</resources>
+diff --git a/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java b/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
+index ec2c252..5ba6df3 100644
+--- a/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
++++ b/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
+@@ -3,11 +3,17 @@
+  */
+ package com.android.xt.domawifirelay;
+ 
++import android.app.Notification;
++import android.app.NotificationChannel;
++import android.app.NotificationManager;
++import android.app.PendingIntent;
+ import android.app.Service;
+ import android.content.BroadcastReceiver;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.IntentFilter;
++import android.net.NetworkInfo;
++import android.net.wifi.ScanResult;
+ import android.net.wifi.SupplicantState;
+ import android.net.wifi.WifiConfiguration;
+ import android.net.wifi.WifiInfo;
+@@ -17,7 +23,10 @@ import android.os.Handler;
+ import android.os.HandlerThread;
+ import android.os.IBinder;
+ import android.os.Process;
++import android.os.RemoteException;
++import android.os.SystemClock;
+ import android.os.SystemProperties;
++import android.os.UserHandle;
+ import android.provider.Settings;
+ import android.system.ErrnoException;
+ import android.system.Os;
+@@ -29,9 +38,18 @@ import java.io.IOException;
+ import java.io.OutputStreamWriter;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
++import java.security.GeneralSecurityException;
++import java.security.SecureRandom;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
++import java.util.function.Predicate;
++
++import javax.crypto.Mac;
++import javax.crypto.spec.SecretKeySpec;
+ 
+ /**
+  * Makes an arbitrary real AP connectable from the AAOS Wi-Fi screen.
+@@ -65,10 +83,17 @@ import java.util.Set;
+  *   <li>reads the plaintext passphrase with
+  *       {@link WifiManager#getPrivilegedConfiguredNetworks()} (the only sanctioned
+  *       route; it returns {@code preSharedKey} unmasked),</li>
+- *   <li>hands it to {@code /vendor/bin/doma-wifi-relay}, which puts it into
+- *       {@code aps.conf}, regenerates {@code hostapd.conf}, restarts hostapd and
+- *       forwards a {@code connect} message to DomD over virtio-serial,</li>
+- *   <li>calls {@link WifiManager#connect(int, WifiManager.ActionListener)}, which
++ *   <li>hands it to {@code /vendor/bin/doma-wifi-relay}, which forwards a
++ *       {@code connect} message to DomD over virtio-serial and, once DomD has joined
++ *       the real AP with it, puts it into {@code aps.conf}, regenerates
++ *       {@code hostapd.conf}, restarts hostapd and writes {@code online} to
++ *       {@link #STATE},</li>
++ *   <li>holds the network back meanwhile ({@link #holdBack}): the disable is cleared
++ *       without a connect, so the Wi-Fi screen does not tell the user to check a
++ *       password that may be right, and auto-join is off for it, so the framework
++ *       does not try it against the placeholder again,</li>
++ *   <li>on that {@code online}, calls
++ *       {@link WifiManager#connect(int, WifiManager.ActionListener)}, which
+  *       clears the permanent disable unconditionally:
+  *       {@code ConnectHelper.connectToNetwork()} then
+  *       {@code WifiConfigManager.updateBeforeConnect()} then {@code enableNetwork()}
+@@ -79,6 +104,11 @@ import java.util.Set;
+  * </ol>
+  *
+  * <p>The retry therefore succeeds: hostapd now holds the passphrase the user typed.
++ * Until DomD has joined with it, DomA's station joins nothing, so the screen does not
++ * show the network as connected for a passphrase the real AP refuses (before
++ * 2026-11-08 it did, until DomD's answer). When DomD refuses it, the network is
++ * connected once, against the row's PSK, which the passphrase does not match, so that
++ * it is disabled for a wrong password again and the screen asks for the password.
+  *
+  * <p>Besides that repair, it does what the daemons ask for through the drop-box and may
+  * not do themselves from a vendor domain: the Wi-Fi cycle doma-shadow-ap needs once
+@@ -86,11 +116,15 @@ import java.util.Set;
+  *
+  * <h2>Loop safety</h2>
+  * Every (netId, passphrase) pair is attempted at most once. If the passphrase really is
+- * wrong for the real AP, DomD's association fails while the local one succeeds, and the
+- * user sees "connected, no internet" rather than an endless reconnect storm. Typing a
++ * wrong for the real AP, DomD's association fails, and the network goes back to
++ * disabled for a wrong password rather than into an endless reconnect storm. When DomD
++ * fails it for another reason (the AP not found, no answer), the attempt is returned,
++ * and auto-join stays off for the network until it next associates: the user's tap
++ * tries it again, and auto-join does not, round after round. Typing a
+  * different password produces a different pair and gets one fresh attempt, and so does
+  * a network that has since joined the shadow AP successfully (see
+- * {@link #forgetAttemptsOfAssociated}).
++ * {@link #forgetAttemptsOfAssociated}). A passphrase DomD has refused stays spent
++ * across reboots ({@link #REFUSED}).
+  *
+  * <h2>"No internet" from before DomD had the network</h2>
+  * DomA's station joins the shadow BSS at once, while DomD may still be joining the real
+@@ -139,12 +173,49 @@ public final class RelayService extends Service {
+     private static final File REQ_DIR = new File("/data/vendor/wifi/shadow/req");
+     private static final File REQ = new File(REQ_DIR, "relay.req");
+     private static final File REQ_TMP = new File(REQ_DIR, "relay.req.tmp");
++    /**
++     * Where the daemon moves {@link #REQ} while it handles it, and removes it from
++     * after: a request is handled only once both are gone.
++     */
++    private static final File REQ_BUSY = new File(REQ_DIR, "relay.req.busy");
++    /**
++     * The networks {@link #holdBack} has turned auto-join off for, one netId per line:
++     * turned on again when the network associates, and at the start of this service,
++     * so that a process killed during a wait does not leave one off for good. In this
++     * app's device-protected storage.
++     */
++    private static final String AUTOJOIN_OFF = "autojoin-off";
++    /**
++     * The (SSID, passphrase) pairs DomD has refused ({@code offline:wrong-key}), one
++     * {@code "<SSID mac>TAB<pair mac>"} per line ({@link #refusedEntry}): no plaintext,
++     * and keyed by the SSID, not the netId, which the framework hands out again at each
++     * boot in the order of its store. In this app's device-protected storage, so that a reboot does not
++     * send DomD a passphrase it has refused again: the network stays disabled for a
++     * wrong password across reboots (WifiConfigStore), {@link #mAttempted} does not,
++     * and the sweep of each boot repaired it, which told the user without a tap that
++     * the password is not correct (RPi4 2026-11-08). An entry goes when a network of its
++     * SSID associates ({@link #forgetAttemptsOfAssociated}) or is forgotten (the
++     * framework's CHANGE_REASON_REMOVED, and at {@link #sweep} when none of the SSID is
++     * saved any more: forget and add again tries the passphrase again); a new
++     * passphrase is another pair. Typing the same passphrase again on the same saved
++     * network does not: the framework's broadcast does not tell that from its own
++     * status changes.
++     */
++    private static final String REFUSED = "refused";
++    /** The device's random key of the macs in {@link #REFUSED}, so that the file cannot
++     *  be checked against a list of passphrases elsewhere. */
++    private static final String REFUSED_KEY = "refused.key";
+     /**
+      * Written by the daemon, one line {@code "<kind>\t<seq>\t<SSID>"}: {@code up} when it
+      * starts (no SSID; a sweep then runs, since the daemon may start after this
+-     * service's first sweep), {@code online} each time DomD has joined an SSID, and
+-     * {@code offline} when DomD has lost it or could not join it. {@code <seq>} is new
+-     * on every write.
++     * service's first sweep), {@code pending} when it has forwarded a connect for the
++     * SSID to DomD, {@code online} each time DomD has joined an SSID, and
++     * {@code offline:<reason>} when DomD has lost it ({@code lost}) or could not join it
++     * ({@code not-found}, {@code wrong-key}, {@code rejected}, {@code timeout},
++     * {@code error}; {@code retry} while a later connect for it is still pending). A
++     * daemon from before the reasons writes a bare {@code offline} and no
++     * {@code pending}. {@code <seq>} is new on every write. A line that answers a request
++     * of this app's has a fourth field, the request's token (see {@link #onWaitState}).
+      */
+     private static final File STATE = new File(REQ_DIR, "relay.state");
+     /**
+@@ -164,31 +235,28 @@ public final class RelayService extends Service {
+     private static final long WATCH_RETRY_MS = 5000;
+ 
+     /**
+-     * One polling window. The daemon's own loop reads the channel with {@code read -t 2},
+-     * so 4 s is two of its ticks. Waiting too little is the failure that matters:
+-     * connect() would race hostapd, fail the handshake again and re-arm
+-     * DISABLED_BY_WRONG_PASSWORD.
++     * How often {@link #connectWhenConsumed} looks whether the daemon has handled the
++     * request. Short, since the user is waiting; the daemon itself picks the request up
++     * within its {@code read -t 2}.
+      */
+-    private static final long DAEMON_GRACE_MS = 4000;
++    private static final long POLL_MS = 250;
+ 
+     /**
+-     * How many {@link #DAEMON_GRACE_MS} windows to wait for the daemon to take the
+-     * request. {@link #connectWhenConsumed} looks at the drop-box each window
+-     * and only connects once the request is gone.
++     * How many {@link #POLL_MS} looks to wait for the daemon to handle the request, i.e.
++     * for {@link #REQ} and {@link #REQ_BUSY} to be gone.
+      *
+      * <p>The bound comes from the daemon's own worst case rather than from its poll
+      * interval. In one iteration of doma-wifi-relay.sh, {@code restart_hostapd} can
+      * spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
+-     * {@code confirm_hostapd_running} (6 x 0.5 s) -- about 13 s; its own
+-     * comment says the wait STALLS THE MAIN LOOP FOR UP TO 10 s -- and BOTH
++     * {@code confirm_hostapd_running} (6 x 0.25 s) -- about 11.5 s -- and BOTH
+      * {@code handle_aps} and {@code flush_pending_restart} can fire it in the
+      * same iteration, with
+-     * {@code read -t 2} on top: roughly 28 s. (The one figure actually measured on a PC
++     * {@code read -t 2} on top: roughly 25 s. (The one figure actually measured on a PC
+      * is 10.371 s for a single restart_hostapd, which does not include the confirm
+-     * window.) 10 x 4 s = 40 s therefore covers a healthy-but-busy daemon, and the cost
+-     * is zero on the normal path, where the request is gone at the first check.
++     * window.) 160 x 250 ms = 40 s therefore covers a healthy-but-busy daemon, and the
++     * cost is zero on the normal path, where the request is handled within 2 s.
+      */
+-    private static final int REQ_POLLS = 10;
++    private static final int REQ_POLLS = 160;
+ 
+     /**
+      * The daemon's init service state: the on/off switch of this service, not a liveness
+@@ -207,6 +275,14 @@ public final class RelayService extends Service {
+     private static final String PROP_RELAY_SVC_STATE = "init.svc.doma_wifi_relay";
+ 
+     private WifiManager mWifi;
++    /**
++     * Tells the user what DomD's real join is doing (see {@link #notifyState}). DomA's
++     * station joins the SHADOW BSS within seconds whatever happens to the real AP, so the
++     * Wi-Fi screen alone shows a network as joined while DomD is still looking for it,
++     * and drops it without a reason when DomD fails (2026-11-06: an SSID DomD could not
++     * find looked joined for 30 s). Null if the service is not there.
++     */
++    private NotificationManager mNm;
+     private HandlerThread mThread;
+     private Handler mHandler;
+     /** Watches {@link #REQ_DIR}; null until the directory can be reached. */
+@@ -236,6 +312,37 @@ public final class RelayService extends Service {
+      */
+     private final Set<String> mAttempted = new HashSet<>();
+ 
++    /** A repair waiting for the daemon and for DomD (see {@link #repair}). */
++    private static final class Wait {
++        final int netId;
++        final String ssid;
++        final String key;
++        /** Sent with the request; the daemon gives it back in each {@link #STATE} line
++         *  that answers it, so no other connect's line is taken for its answer. */
++        final String token;
++        /** {@link #STATE}'s {@code <seq>} just before the request was written: a line
++         *  with it is from before the request (see {@link #onWaitState}). */
++        final String startSeq;
++        /** Its {@link #REFUSED} entry, should DomD refuse the passphrase. */
++        final String refused;
++
++        Wait(int netId, String ssid, String key, String token, String startSeq,
++                String refused) {
++            this.netId = netId;
++            this.ssid = ssid;
++            this.key = key;
++            this.token = token;
++            this.startSeq = startSeq;
++            this.refused = refused;
++        }
++    }
++
++    private final SecureRandom mRandom = new SecureRandom();
++
++    /** The one repair under way, or null; one at a time, as the drop-box holds one. */
++    private Wait mWait;
++    private final Runnable mWaitTimeout = () -> finishWait(mWait, "timeout");
++
+     /** init has the daemon running, i.e. the switch is on (see {@link #PROP_RELAY_SVC_STATE}). */
+     static boolean isEnabled() {
+         return "running".equals(SystemProperties.get(PROP_RELAY_SVC_STATE, ""));
+@@ -244,12 +351,45 @@ public final class RelayService extends Service {
+     private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
+         @Override
+         public void onReceive(Context context, Intent intent) {
+-            if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
+-                mHandler.post(RelayService.this::forgetAttemptsOfAssociated);
++            if (Intent.ACTION_LOCALE_CHANGED.equals(intent.getAction())) {
++                mHandler.post(RelayService.this::createChannels);
++            } else if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
++                final NetworkInfo ni = intent.getParcelableExtra(
++                        WifiManager.EXTRA_NETWORK_INFO, NetworkInfo.class);
++                final boolean connected = ni != null && ni.isConnected();
++                mHandler.post(() -> {
++                    forgetAttemptsOfAssociated();
++                    onStationConnected(connected);
++                });
++            } else if (WifiManager.SCAN_RESULTS_AVAILABLE_ACTION.equals(intent.getAction())) {
++                mHandler.post(RelayService.this::onScanResults);
++            } else if (WifiManager.CONFIGURED_NETWORKS_CHANGED_ACTION.equals(intent.getAction())
++                    && intent.getIntExtra(WifiManager.EXTRA_CHANGE_REASON, -1)
++                            == WifiManager.CHANGE_REASON_REMOVED) {
++                // The copy for the system user carries the network (WifiConfigManager
++                //   sendConfiguredNetworkChangedBroadcast): a forgotten network's refused
++                //   pairs go with it (REFUSED), whatever the next sweep reads.
++                final WifiConfiguration gone = intent.getParcelableExtra(
++                        WifiManager.EXTRA_WIFI_CONFIGURATION, WifiConfiguration.class);
++                final String ssid = gone == null ? "" : unquote(gone.SSID);
++                mHandler.post(() -> {
++                    if (!ssid.isEmpty()) {
++                        refusedForget(ssid);
++                    }
++                    sweep();
++                });
+             } else if (WifiManager.WIFI_STATE_CHANGED_ACTION.equals(intent.getAction())
+                     && intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, -1)
+                             == WifiManager.WIFI_STATE_DISABLED) {
+                 mHandler.post(RelayService.this::finishWifiCycle);
++            } else if (WifiManager.CONFIGURED_NETWORKS_CHANGED_ACTION.equals(intent.getAction())) {
++                // The system user's copy names the network (see the REMOVED branch).
++                final WifiConfiguration changed = intent.getParcelableExtra(
++                        WifiManager.EXTRA_WIFI_CONFIGURATION, WifiConfiguration.class);
++                mHandler.post(() -> {
++                    onRefusedConnectFailed(changed);
++                    sweep();
++                });
+             } else {
+                 mHandler.post(RelayService.this::sweep);
+             }
+@@ -277,6 +417,13 @@ public final class RelayService extends Service {
+             stopSelf();
+             return;
+         }
++        mNm = getSystemService(NotificationManager.class);
++        if (mNm != null) {
++            createChannels();
++            // One left by an earlier process of this app (killed, then restarted) names
++            // a join nobody will answer to this one.
++            mNm.cancelAsUser(null, NOTE_ID, UserHandle.ALL);
++        }
+         mThread = new HandlerThread(TAG);
+         mThread.start();
+         mHandler = new Handler(mThread.getLooper());
+@@ -291,8 +438,14 @@ public final class RelayService extends Service {
+         filter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
+         // And the station's state, to re-arm a network once it has associated.
+         filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
++        // And scan results, to connect once the restarted shadow BSS is seen
++        //   (connectAfterScan).
++        filter.addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
++        // And the language, to rename the notification channels (see createChannels).
++        filter.addAction(Intent.ACTION_LOCALE_CHANGED);
+         registerReceiver(mReceiver, filter);
+         Log.i(TAG, "started (" + PROP_RELAY_SVC_STATE + "=" + relaySvcState() + ")");
++        mHandler.post(this::restoreAllAutojoin);
+         mHandler.post(this::sweep);
+         mHandler.post(this::watchReqDir);
+     }
+@@ -321,17 +474,47 @@ public final class RelayService extends Service {
+                     // dead, so watch the one init or the daemon makes next.
+                     mHandler.post(RelayService.this::rewatchReqDir);
+                 } else if (STATE.getName().equals(path)) {
+-                    mHandler.post(RelayService.this::handleState);
++                    mHandler.post(() -> handleState(true));
+                 } else if (WIFI_CYCLE.getName().equals(path)) {
+                     mHandler.post(RelayService.this::handleWifiCycle);
+                 }
+             }
+         };
+         mObserver.startWatching();
+-        handleState();
++        // Not notified on the first watch of this process: the line can be from long
++        // before it (a restart of the app), and a "connecting" it names may never be
++        // answered. A later watch (the directory was made again while this process
++        // ran) is: the line was written while it ran, and one already acted on is
++        // skipped by its seq.
++        handleState(mWatchedOnce);
++        mWatchedOnce = true;
+         handleWifiCycle();
+     }
+ 
++    /** {@link #watchReqDir} has run once in this process (see there). */
++    private boolean mWatchedOnce;
++
++    /**
++     * Create the notification channels, or rename them after a change of language: the
++     * process is persistent, so names taken at onCreate only would stay in the language
++     * of the boot. Creating a channel that exists updates its name and nothing else.
++     */
++    private void createChannels() {
++        if (mNm == null) {
++            return;
++        }
++        // LOW: progress and success, in the shade without a sound or a heads-up.
++        // HIGH: a failure, as a heads-up, since the user is waiting on the Wi-Fi
++        // screen for a network that will not come. No sound on either.
++        final NotificationChannel status = new NotificationChannel(CH_STATUS,
++                getString(R.string.channel_status), NotificationManager.IMPORTANCE_LOW);
++        final NotificationChannel failure = new NotificationChannel(CH_FAILURE,
++                getString(R.string.channel_failure), NotificationManager.IMPORTANCE_HIGH);
++        failure.setSound(null, null);
++        mNm.createNotificationChannel(status);
++        mNm.createNotificationChannel(failure);
++    }
++
+     private void rewatchReqDir() {
+         if (mObserver != null) {
+             mObserver.stopWatching();
+@@ -403,22 +586,41 @@ public final class RelayService extends Service {
+         Log.i(TAG, "wifi-cycle: Wi-Fi on again");
+     }
+ 
+-    /** A new {@link #STATE} line: act on it once. */
+-    private void handleState() {
+-        final String line;
+-        try {
+-            line = new String(Files.readAllBytes(STATE.toPath()), StandardCharsets.UTF_8);
+-        } catch (IOException e) {
+-            return;  // not written yet
+-        }
+-        final String[] f = line.endsWith("\n")
+-                ? line.substring(0, line.length() - 1).split("\t", 3) : new String[0];
++    /**
++     * A new {@link #STATE} line: act on it once.
++     *
++     * @param notify tell the user about it ({@link #notifyState}); false for the line
++     *     found when the watch starts
++     */
++    private void handleState(boolean notify) {
++        final String[] f = readState();
+         if (f.length < 2 || f[1].equals(mStateSeq)) {
+             return;
+         }
+         mStateSeq = f[1];
+         mReEnabled.clear();
+-        mOnlineSsid = "online".equals(f[0]) && f.length == 3 && !f[2].isEmpty() ? f[2] : null;
++        mOnlineSsid = "online".equals(f[0]) && f.length >= 3 && !f[2].isEmpty() ? f[2] : null;
++        mConnectIssued = -1;
++        if (mWait != null) {
++            onWaitState(mWait, f[0], f[1], f.length == 4 ? f[3] : "");
++        }
++        if (mWait == null && mOnlineSsid != null) {
++            connectHeldBack(mOnlineSsid);
++        }
++        if (notify) {
++            // Each line replaces the notification, and the "Connected" one held back for
++            //   an earlier line with it.
++            dropConnectedNote();
++            if (mOnlineSsid != null && mConnectIssued != -1) {
++                // This app has just started DomA's station on the network: "Connected"
++                //   once the station is (onStationConnected), not now, while the screen
++                //   still shows it connecting (2026-11-08: 8 s before it). The
++                //   "Connecting" notification stays until then.
++                holdConnectedNote(mOnlineSsid, mConnectIssued);
++            } else {
++                notifyState(f[0], f.length >= 3 ? f[2] : "");
++            }
++        }
+         if ("up".equals(f[0])) {
+             sweep();
+         } else {
+@@ -426,6 +628,695 @@ public final class RelayService extends Service {
+         }
+     }
+ 
++    /** {@link #STATE}'s fields, or none when it is not there or not a whole line. */
++    private static String[] readState() {
++        final String line;
++        try {
++            line = new String(Files.readAllBytes(STATE.toPath()), StandardCharsets.UTF_8);
++        } catch (IOException e) {
++            return new String[0];  // not written yet
++        }
++        return line.endsWith("\n")
++                ? line.substring(0, line.length() - 1).split("\t", 4) : new String[0];
++    }
++
++    /**
++     * A {@link #STATE} line while a repair waits: one with its token answers it --
++     * connect the network on DomD's {@code online}, give up on a failure. Any other is
++     * about another connect (the mirror's, an earlier one) and changes nothing, but
++     * {@code up}: the daemon restarted, and no answer will come -- unless the line is
++     * from before the request (the first read of {@link #STATE} in this process can
++     * come after the request was written, and finds the daemon's start), or the request
++     * is still in the drop-box, where the new daemon picks it up (2026-11-08: the wait
++     * was given up on an old {@code up}, the daemon then sent the request to DomD, and
++     * its answer told the user of a failure no one waited for).
++     */
++    private void onWaitState(Wait w, String kind, String seq, String token) {
++        if ("up".equals(kind)) {
++            // REQ.busy too: the new daemon removes it before its "up", so one after
++            //   that is the request, taken by the new daemon.
++            if (seq.equals(w.startSeq) || requestPending() || REQ_BUSY.exists()) {
++                Log.i(TAG, "the daemon is up; netId=" + w.netId + " still waits for DomD");
++                return;
++            }
++            finishWait(w, "up");
++        } else if (w.token.equals(token)
++                && ("online".equals(kind) || kind.startsWith("offline"))) {
++            finishWait(w, kind);        // offline:retry too: its connect failed
++        }
++    }
++
++    /**
++     * End the repair w: on {@code online} connect the network; on a refused passphrase
++     * connect it too, against the row's PSK (the placeholder, or a seed or learned one
++     * that this passphrase does not match), so that it is disabled for a wrong
++     * password again and the screen asks for one (the attempt stays spent, so it is not
++     * repaired again); on anything else return the attempt and leave auto-join off
++     * (see Loop safety), unless the daemon never took the request.
++     */
++    private void finishWait(Wait w, String outcome) {
++        if (w == null || w != mWait) {
++            return;
++        }
++        mWait = null;
++        mHandler.removeCallbacks(mWaitTimeout);
++        if ("online".equals(outcome)) {
++            restoreAutojoin(w.netId);
++            Log.i(TAG, "DomD joined " + w.ssid + "; connecting netId=" + w.netId
++                    + " once its shadow BSS is seen");
++            connectAfterScan(w.netId, w.ssid);
++        } else if ("offline:wrong-key".equals(outcome)) {
++            restoreAutojoin(w.netId);
++            if (w.refused != null) {
++                refusedSet(w.refused, true);
++            }
++            Log.i(TAG, "DomD refused the passphrase for " + w.ssid + "; connecting netId="
++                    + w.netId);
++            mRefusedConnectNetId = w.netId;
++            mRefusedConnectUntil = SystemClock.elapsedRealtime() + REFUSED_CONNECT_WINDOW_MS;
++            connect(w.netId);
++        } else {
++            mAttempted.remove(w.key);
++            if ("unconsumed".equals(outcome)) {
++                restoreAutojoin(w.netId);
++            }
++            Log.i(TAG, "DomD did not join " + w.ssid + " (" + outcome + "); netId=" + w.netId
++                    + " is left to the user's tap, attempt NOT spent");
++        }
++        mHandler.post(this::sweep);
++    }
++
++    private void connect(final int netId) {
++        mWifi.connect(netId, new WifiManager.ActionListener() {
++            @Override
++            public void onSuccess() {
++                Log.i(TAG, "connect(" + netId + ") accepted");
++            }
++
++            @Override
++            public void onFailure(int reason) {
++                Log.w(TAG, "connect(" + netId + ") rejected, reason=" + reason);
++            }
++        });
++    }
++
++    /** How long {@link #connectAfterScan} waits for a scan that sees the network. */
++    private static final long SCAN_WAIT_MS = 5000;
++    /** How long a held-back "Connected" waits for the station (see {@link #handleState}). */
++    private static final long CONNECTED_NOTE_WAIT_MS = 30_000;
++    /** The network {@link #connectAfterScan} waits to see, or -1; its SSID, and since when
++     *  (elapsed realtime, us: {@link ScanResult#timestamp}'s clock). */
++    private int mScanNetId = -1;
++    private String mScanSsid;
++    private long mScanSinceUs;
++    private final Runnable mScanTimeout = () -> connectScanned("no scan saw it in "
++            + SCAN_WAIT_MS + " ms");
++    /** The network a connect was started for, for the line handleState is acting on;
++     *  -1 if none. */
++    private int mConnectIssued = -1;
++    /** The SSID whose "Connected" waits for DomA's station, or null; and the network. */
++    private String mConnectedNote;
++    private int mConnectedNoteNetId = -1;
++    private final Runnable mConnectedNoteTimeout = this::dropConnectedNote;
++
++    /**
++     * Connect the network once a scan from now on sees its SSID. DomD's "online" for a
++     * typed passphrase comes once hostapd has restarted with it, and the restart
++     * replaces the shadow BSS: a connect right away failed at once against the BSS
++     * cached from before, and the station joined only after the framework's next scan
++     * (2026-11-08, about 4 s). After {@link #SCAN_WAIT_MS} it connects anyway.
++     */
++    private void connectAfterScan(int netId, String ssid) {
++        mConnectIssued = netId;
++        if (mScanNetId != -1 && mScanNetId != netId) {
++            connectScanned("another network is next");
++        }
++        mScanNetId = netId;
++        mScanSsid = ssid;
++        mScanSinceUs = SystemClock.elapsedRealtime() * 1000;
++        mHandler.removeCallbacks(mScanTimeout);
++        mHandler.postDelayed(mScanTimeout, SCAN_WAIT_MS);
++        if (!mWifi.startScan()) {
++            connectScanned("the scan was refused");
++        }
++    }
++
++    private void onScanResults() {
++        if (mScanNetId == -1) {
++            return;
++        }
++        final List<ScanResult> results = mWifi.getScanResults();
++        if (results == null) {
++            return;
++        }
++        for (ScanResult r : results) {
++            if (r != null && r.timestamp >= mScanSinceUs && mScanSsid.equals(unquote(r.SSID))) {
++                connectScanned("a scan sees it");
++                return;
++            }
++        }
++    }
++
++    private void connectScanned(String why) {
++        final int netId = mScanNetId;
++        if (netId == -1) {
++            return;
++        }
++        mScanNetId = -1;
++        mHandler.removeCallbacks(mScanTimeout);
++        Log.i(TAG, "connecting netId=" + netId + " (" + why + ")");
++        connect(netId);
++    }
++
++    private void holdConnectedNote(String ssid, int netId) {
++        if (stationConnectedTo(ssid, netId)) {
++            // Connected already (the framework joined it first): the connect does
++            //   nothing, and no NETWORK_STATE_CHANGED is to come.
++            notifyState("online", ssid);
++            return;
++        }
++        mConnectedNote = ssid;
++        mConnectedNoteNetId = netId;
++        mHandler.removeCallbacks(mConnectedNoteTimeout);
++        mHandler.postDelayed(mConnectedNoteTimeout, CONNECTED_NOTE_WAIT_MS);
++    }
++
++    /** Forget a held-back "Connected"; past its wait, take the "Connecting" down too. */
++    private void dropConnectedNote() {
++        if (mConnectedNote == null) {
++            return;
++        }
++        final boolean timedOut = !mHandler.hasCallbacks(mConnectedNoteTimeout);
++        mConnectedNote = null;
++        mHandler.removeCallbacks(mConnectedNoteTimeout);
++        if (timedOut && mNm != null) {
++            mNm.cancelAsUser(null, NOTE_ID, UserHandle.ALL);
++        }
++    }
++
++    /** DomA's station is connected (with an IP address) to the SSID: the last, sticky
++     *  NETWORK_STATE_CHANGED says connected, and the connection is that network's: not
++     *  another config of the SSID on the BSS from before hostapd's restart. */
++    private boolean stationConnectedTo(String ssid, int netId) {
++        final Intent last = registerReceiver(null,
++                new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
++        final NetworkInfo ni = last == null ? null
++                : last.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO, NetworkInfo.class);
++        if (ni == null || !ni.isConnected()) {
++            return false;
++        }
++        final WifiInfo wi = mWifi.getConnectionInfo();
++        return wi != null && wi.getNetworkId() == netId && ssid.equals(unquote(wi.getSSID()));
++    }
++
++    /** DomA's station is connected (with an IP address), or not: a held-back "Connected"
++     *  for its SSID is shown now. */
++    private void onStationConnected(boolean connected) {
++        if (mConnectedNote == null || !connected) {
++            return;
++        }
++        final WifiInfo wi = mWifi.getConnectionInfo();
++        if (wi != null && wi.getNetworkId() == mConnectedNoteNetId
++                && mConnectedNote.equals(unquote(wi.getSSID()))) {
++            final String ssid = mConnectedNote;
++            mConnectedNote = null;
++            mHandler.removeCallbacks(mConnectedNoteTimeout);
++            notifyState("online", ssid);
++        }
++    }
++
++    /**
++     * The framework's own "Failed to connect" for the network (WrongPasswordNotifier,
++     * NOTE_WIFI_WRONG_PASSWORD = 42 with the tag {@code com.android.wifi}, posted by
++     * package {@code android} for the current user), which the station's first
++     * handshake against the placeholder posts while DomD is still trying the
++     * passphrase: taken down, since the passphrase may be right. Through
++     * INotificationManager with {@code android} as both the package and the op package:
++     * NotificationManager names this app's package, also from
++     * createPackageContextAsUser("android"), which for "android" copies this app's
++     * own context (ContextImpl), and so finds nothing. NotificationManagerService
++     * takes it from uid system (resolveNotificationUid compares the app id, and with
++     * the two packages the same there is no op package check); the current user is
++     * the driver's, to whom the framework posts it (WifiNotificationManager). Also the
++     * one the connect after DomD has refused the passphrase posts
++     * ({@link #onRefusedConnectFailed}): this app's own notice already says the
++     * password is not correct, with a tap to the Wi-Fi settings, which is all the
++     * framework's tap opens on this product (its {@code wifi_start_connect_ssid} extra
++     * has no reader in Car Settings).
++     */
++    private void cancelFrameworkWrongPassword() {
++        try {
++            NotificationManager.getService().cancelNotificationWithTag("android", "android",
++                    WIFI_NOTE_TAG, WIFI_NOTE_WRONG_PASSWORD, UserHandle.USER_CURRENT);
++        } catch (RemoteException | RuntimeException e) {
++            Log.w(TAG, "cannot take down the framework's wrong-password notification", e);
++        }
++    }
++
++    /**
++     * The connect finishWait issues after DomD has refused a passphrase fails against
++     * the row's PSK by design, and the framework then posts its "Failed to connect"
++     * (ClientModeImpl: onWrongPasswordError, then the network is disabled, which sends
++     * CONFIGURED_NETWORKS_CHANGED with the network): seen 8 s after the connect on the
++     * board (2026-11-08), next to this app's own notice. Taken down until this time
++     * (elapsedRealtime) on that broadcast for that network
++     * ({@link #mRefusedConnectNetId}) disabled for a wrong password -- not for one the
++     * user tapped meanwhile, whose notice is the only one there is -- now and once more
++     * 1 s later in case the post lands after it. The window stays open after a hit: the
++     * auto-join this branch turns on again sends a broadcast of its own, which can still
++     * carry the network disabled from the placeholder's failure, before the connect.
++     */
++    private long mRefusedConnectUntil;
++    private int mRefusedConnectNetId = -1;
++    private static final long REFUSED_CONNECT_WINDOW_MS = 20_000;
++
++    private void onRefusedConnectFailed(WifiConfiguration changed) {
++        if (mRefusedConnectNetId == -1) {
++            return;
++        }
++        if (SystemClock.elapsedRealtime() >= mRefusedConnectUntil) {
++            mRefusedConnectNetId = -1;
++            return;
++        }
++        if (changed == null || changed.networkId != mRefusedConnectNetId
++                || changed.getNetworkSelectionStatus() == null
++                || changed.getNetworkSelectionStatus().getNetworkSelectionDisableReason()
++                        != WifiConfiguration.NetworkSelectionStatus.DISABLED_BY_WRONG_PASSWORD) {
++            return;
++        }
++        cancelFrameworkWrongPassword();
++        mHandler.postDelayed(this::cancelFrameworkWrongPassword, 1000);
++    }
++
++    private static final String WIFI_NOTE_TAG = "com.android.wifi";
++    private static final int WIFI_NOTE_WRONG_PASSWORD = 42;
++
++    /** {@link #REFUSED}'s entry for the pair, {@code "<mac of SSID>TAB<mac of SSID, NUL,
++     *  passphrase>"} (HMAC-SHA-256 with {@link #refusedKey}, hex); null if there is no
++     *  key (nothing is then kept). */
++    private String refusedEntry(String ssid, String psk) {
++        final String sm = refusedMac(ssid.getBytes(StandardCharsets.UTF_8), null);
++        final String pm = refusedMac(ssid.getBytes(StandardCharsets.UTF_8),
++                psk.getBytes(StandardCharsets.UTF_8));
++        return sm == null || pm == null ? null : sm + "\t" + pm;
++    }
++
++    /** The SSID part of {@link #refusedEntry}, with its TAB; null if there is no key. */
++    private String refusedPrefix(String ssid) {
++        final String sm = refusedMac(ssid.getBytes(StandardCharsets.UTF_8), null);
++        return sm == null ? null : sm + "\t";
++    }
++
++    private String refusedMac(byte[] a, byte[] b) {
++        final byte[] key = refusedKey();
++        if (key == null) {
++            return null;
++        }
++        try {
++            final Mac mac = Mac.getInstance("HmacSHA256");
++            mac.init(new SecretKeySpec(key, "HmacSHA256"));
++            mac.update(a);
++            if (b != null) {
++                mac.update((byte) 0);
++                mac.update(b);
++            }
++            final StringBuilder h = new StringBuilder();
++            for (byte x : mac.doFinal()) {
++                h.append(String.format("%02x", x & 0xff));
++            }
++            return h.toString();
++        } catch (GeneralSecurityException e) {
++            Log.e(TAG, "no HmacSHA256", e);
++            return null;
++        }
++    }
++
++    /** {@link #REFUSED_KEY}, made on the first use; null if it can be neither read nor
++     *  made. */
++    private byte[] refusedKey() {
++        if (mRefusedKey != null) {
++            return mRefusedKey;
++        }
++        final File f = new File(createDeviceProtectedStorageContext().getFilesDir(),
++                REFUSED_KEY);
++        try {
++            final byte[] k = Files.readAllBytes(f.toPath());
++            if (k.length == 32) {
++                return mRefusedKey = k;
++            }
++            // torn (cut off by a power loss): made again below
++        } catch (NoSuchFileException e) {
++            // not made yet
++        } catch (IOException e) {
++            // There but not readable now: no key this time, rather than a new one,
++            //   which would drop every entry.
++            Log.e(TAG, "cannot read " + f, e);
++            return null;
++        }
++        final byte[] k = new byte[32];
++        mRandom.nextBytes(k);
++        final File tmp = new File(f.getPath() + ".tmp");
++        try {
++            Files.write(tmp.toPath(), k);
++            if (!tmp.renameTo(f)) {
++                Log.e(TAG, "cannot rename " + tmp + " to " + f);
++                return null;
++            }
++        } catch (IOException e) {
++            Log.e(TAG, "cannot write " + tmp, e);
++            return null;
++        }
++        // A new key: entries made with another one would never match.
++        refusedWrite(new HashSet<>());
++        return mRefusedKey = k;
++    }
++
++    private byte[] mRefusedKey;
++
++    /** {@link #REFUSED}, read once per process (see {@link #autojoinOffMap}). */
++    private Set<String> refusedSet() {
++        if (mRefused == null) {
++            mRefused = new HashSet<>();
++            try {
++                for (String l : Files.readAllLines(refusedFile().toPath(),
++                        StandardCharsets.UTF_8)) {
++                    if (l.indexOf('\t') > 0) {
++                        mRefused.add(l);
++                    }
++                }
++            } catch (IOException e) {
++                // none yet
++            }
++        }
++        return mRefused;
++    }
++
++    private Set<String> mRefused;
++
++    private File refusedFile() {
++        return new File(createDeviceProtectedStorageContext().getFilesDir(), REFUSED);
++    }
++
++    /** Add (on) or remove an entry of {@link #REFUSED}. */
++    private void refusedSet(String entry, boolean on) {
++        final Set<String> set = new HashSet<>(refusedSet());
++        if (on ? !set.add(entry) : !set.remove(entry)) {
++            return;
++        }
++        refusedWrite(set);
++    }
++
++    /** The SSID's entries go. */
++    private void refusedForget(String ssid) {
++        final String pre = refusedPrefix(ssid);
++        if (pre != null) {
++            refusedRetain(e -> !e.startsWith(pre));
++        }
++    }
++
++    /** Keep the entries {@code keep} accepts, the others go. */
++    private void refusedRetain(Predicate<String> keep) {
++        final Set<String> set = new HashSet<>(refusedSet());
++        if (set.removeIf(keep.negate())) {
++            refusedWrite(set);
++        }
++    }
++
++    private void refusedWrite(Set<String> set) {
++        mRefused = set;
++        final File f = refusedFile();
++        final File tmp = new File(f.getPath() + ".tmp");
++        final StringBuilder b = new StringBuilder();
++        for (String e : set) {
++            b.append(e).append('\n');
++        }
++        try {
++            Files.write(tmp.toPath(), b.toString().getBytes(StandardCharsets.UTF_8));
++            if (!tmp.renameTo(f)) {
++                Log.e(TAG, "cannot rename " + tmp + " to " + f);
++            }
++        } catch (IOException e) {
++            Log.e(TAG, "cannot write " + tmp, e);
++        }
++    }
++
++    /**
++     * Clear the network's disable without connecting it, and turn its auto-join off
++     * while DomD tries the passphrase: enableNetwork(netId, false) resets the status, the
++     * reason and the counter (WifiBlocklistMonitor.setNetworkSelectionEnabled) without
++     * an attempt (WifiServiceImpl.enableNetwork), so the screen no longer says to check
++     * the password; with auto-join on, the framework would try it against the
++     * placeholder again and disable it again. Auto-join first: both run on the wifi
++     * thread in this order. The cost: allowAutojoin() also drops the user's connect
++     * choices (WifiConfigManager), which turning it on again does not bring back.
++     */
++    private void holdBack(WifiConfiguration c) {
++        if (c.allowAutojoin) {
++            autojoinOff(c.networkId, unquote(c.SSID));
++            mWifi.allowAutojoin(c.networkId, false);
++        }
++        mWifi.enableNetwork(c.networkId, false);
++    }
++
++    private File autojoinFile() {
++        return new File(createDeviceProtectedStorageContext().getFilesDir(), AUTOJOIN_OFF);
++    }
++
++    /**
++     * {@link #AUTOJOIN_OFF}: netId to the SSID it had when auto-join was turned off. Read
++     * once per process and kept in {@link #mAutojoinOff}, so that a write that fails
++     * does not make a network come back on every DomD report.
++     */
++    private Map<Integer, String> autojoinOffMap() {
++        if (mAutojoinOff == null) {
++            mAutojoinOff = readAutojoinOff();
++        }
++        return new HashMap<>(mAutojoinOff);
++    }
++
++    private Map<Integer, String> mAutojoinOff;
++
++    private Map<Integer, String> readAutojoinOff() {
++        final Map<Integer, String> ids = new HashMap<>();
++        try {
++            for (String l : Files.readAllLines(autojoinFile().toPath(),
++                    StandardCharsets.UTF_8)) {
++                final int tab = l.indexOf('\t');
++                if (tab <= 0) {
++                    continue;   // a torn line
++                }
++                try {
++                    ids.put(Integer.parseInt(l.substring(0, tab)), l.substring(tab + 1));
++                } catch (NumberFormatException ignored) {
++                    // a torn line
++                }
++            }
++        } catch (IOException e) {
++            // none yet
++        }
++        return ids;
++    }
++
++    /** Record (ssid non-null) or forget that this app turned a network's auto-join off. */
++    private void autojoinOff(int netId, String ssid) {
++        final Map<Integer, String> ids = autojoinOffMap();
++        if (ssid != null ? ssid.equals(ids.put(netId, ssid)) : ids.remove(netId) == null) {
++            return;
++        }
++        mAutojoinOff = ids;
++        final File f = autojoinFile();
++        final File tmp = new File(f.getPath() + ".tmp");
++        final StringBuilder b = new StringBuilder();
++        for (Map.Entry<Integer, String> e : ids.entrySet()) {
++            b.append(e.getKey()).append('\t').append(e.getValue()).append('\n');
++        }
++        try {
++            Files.write(tmp.toPath(), b.toString().getBytes(StandardCharsets.UTF_8));
++            if (!tmp.renameTo(f)) {
++                Log.e(TAG, "cannot rename " + tmp + " to " + f);
++            }
++        } catch (IOException e) {
++            Log.e(TAG, "cannot write " + tmp, e);
++        }
++    }
++
++    /**
++     * Turn the network's auto-join on again if this app turned it off -- only while the
++     * netId still names a network of that SSID: a netId is handed out again once its
++     * network is forgotten, and the new one's auto-join is the user's.
++     */
++    private boolean restoreAutojoin(int netId) {
++        final String ssid = autojoinOffMap().get(netId);
++        if (ssid == null) {
++            return false;
++        }
++        final List<WifiConfiguration> configs = mWifi.getConfiguredNetworks();
++        if (configs == null || configs.isEmpty()) {
++            return false;   // not loaded yet (early in a boot): the record stays
++        }
++        // The record goes once the netId is looked at: back on, or no longer that
++        //   SSID's (forgotten, its netId handed out again).
++        autojoinOff(netId, null);
++        for (WifiConfiguration c : configs) {
++            if (c != null && c.networkId == netId && ssid.equals(unquote(c.SSID))) {
++                mWifi.allowAutojoin(netId, true);
++                Log.i(TAG, "netId=" + netId + ": auto-join on again");
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * At the start of this service (see {@link #AUTOJOIN_OFF}); again at each sweep until
++     * the saved networks have been read, which they may not be yet so early in a boot.
++     */
++    private void restoreAllAutojoin() {
++        if (!mRestoreAtStart) {
++            return;
++        }
++        final List<WifiConfiguration> configs = mWifi.getConfiguredNetworks();
++        if (configs == null || configs.isEmpty()) {
++            return;
++        }
++        mRestoreAtStart = false;
++        for (int id : autojoinOffMap().keySet()) {
++            restoreAutojoin(id);
++        }
++    }
++
++    /** {@link #restoreAllAutojoin} has yet to run with the saved networks read. */
++    private boolean mRestoreAtStart = true;
++
++    /**
++     * DomD has the SSID while no repair is waiting: a network of it this app left held
++     * back (a join that took longer than DomD's answer, which DomD then completed, or a
++     * restart of hostapd that came late) is connected now, with auto-join on again.
++     */
++    private void connectHeldBack(String ssid) {
++        int first = -1;
++        for (Map.Entry<Integer, String> e : autojoinOffMap().entrySet()) {
++            if (ssid.equals(e.getValue()) && restoreAutojoin(e.getKey()) && first == -1) {
++                first = e.getKey();
++            }
++        }
++        // Auto-join on again for each, a connect for one: a second would replace it.
++        if (first != -1) {
++            Log.i(TAG, "DomD has " + ssid + "; connecting netId=" + first
++                    + ", held back since its repair");
++            connectAfterScan(first, ssid);
++        }
++    }
++
++    private static final String CH_STATUS = "doma_wifi_status";
++    private static final String CH_FAILURE = "doma_wifi_failure";
++    /** One notification, replaced by each report: only the latest join matters. */
++    private static final int NOTE_ID = 1;
++    /** A "connecting" goes after this long: DomD's agent answers a connect in 75 s at
++     *  most (a 30 s join, then up to 6 DHCP tries), and a lost answer must not leave it. */
++    private static final long CONNECTING_TIMEOUT_MS = 90_000;
++    private static final long CONNECTED_TIMEOUT_MS = 10_000;
++    private static final long FAILED_TIMEOUT_MS = 300_000;
++
++    /**
++     * Show what DomD's real join is doing, as one notification for every user. This
++     * service runs as the system user only (see onCreate), which is headless on AAOS, so
++     * the notification is posted to {@link UserHandle#ALL} -- posted to the system user
++     * it would never reach the driver. A failure opens the Wi-Fi settings on a tap, for
++     * the current user (a plain PendingIntent made here would start them as the
++     * system user). The app is uid system, which holds
++     * POST_NOTIFICATIONS without asking (PermissionManager.checkPermission grants
++     * SYSTEM_UID unconditionally).
++     *
++     * @param kind {@link #STATE}'s first field
++     * @param ssid its third field, empty if there is none
++     */
++    private void notifyState(String kind, String ssid) {
++        if (mNm == null) {
++            return;
++        }
++        if ("up".equals(kind)) {
++            // The daemon (re)started: a connect it had forwarded will not be answered
++            // to it. Not while a repair still waits (onWaitState): its answer comes.
++            if (mWait == null) {
++                mNm.cancelAsUser(null, NOTE_ID, UserHandle.ALL);
++            }
++            return;
++        }
++        if (ssid.isEmpty()) {
++            return;  // nothing to name
++        }
++        // offline:retry: DomD failed an earlier connect for the SSID and the later one
++        // is still under way, so it is still "connecting" -- posted again, which also
++        // starts its timeout again (two connects in a row are answered one after the
++        // other, which can take longer than one timeout).
++        final boolean connecting = "pending".equals(kind) || "offline:retry".equals(kind);
++        final String title;
++        String text = null;
++        final boolean failure;
++        final long timeout;
++        if (connecting) {
++            title = getString(R.string.connecting, ssid);
++            text = getString(R.string.connecting_text);
++            failure = false;
++            timeout = CONNECTING_TIMEOUT_MS;
++        } else if ("online".equals(kind)) {
++            title = getString(R.string.connected, ssid);
++            failure = false;
++            timeout = CONNECTED_TIMEOUT_MS;
++        } else if ("offline:lost".equals(kind)) {
++            title = getString(R.string.lost, ssid);
++            text = getString(R.string.lost_text);
++            failure = true;
++            timeout = FAILED_TIMEOUT_MS;
++        } else if (kind.startsWith("offline:")) {
++            title = getString(R.string.failed, ssid);
++            text = getString(failureText(kind.substring("offline:".length())));
++            failure = true;
++            timeout = FAILED_TIMEOUT_MS;
++        } else {
++            return;  // a bare "offline" (an older daemon) says too little to show
++        }
++        final Notification.Builder b = new Notification.Builder(this,
++                failure ? CH_FAILURE : CH_STATUS)
++                .setSmallIcon(failure ? android.R.drawable.stat_sys_warning : R.drawable.ic_wifi)
++                .setContentTitle(title)
++                .setOnlyAlertOnce(!failure)
++                .setOngoing(connecting)
++                .setTimeoutAfter(timeout)
++                .setCategory(failure ? Notification.CATEGORY_ERROR : Notification.CATEGORY_STATUS);
++        if (failure) {
++            // A tap opens the Wi-Fi settings, for the current (driver) user: this app runs
++            //   as the system user, which has no screen on this headless product.
++            b.setContentIntent(PendingIntent.getActivityAsUser(this, 0,
++                    new Intent(Settings.ACTION_WIFI_SETTINGS)
++                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
++                                    | Intent.FLAG_ACTIVITY_CLEAR_TOP),
++                    PendingIntent.FLAG_IMMUTABLE, null, UserHandle.CURRENT))
++                    .setAutoCancel(true);
++        }
++        if (text != null) {
++            b.setContentText(text);
++            b.setStyle(new Notification.BigTextStyle().bigText(text));
++        }
++        mNm.notifyAsUser(null, NOTE_ID, b.build(), UserHandle.ALL);
++    }
++
++    private static int failureText(String reason) {
++        switch (reason) {
++            case "not-found":
++                return R.string.reason_not_found;
++            case "wrong-key":
++                return R.string.reason_wrong_key;
++            case "rejected":
++                return R.string.reason_rejected;
++            case "timeout":
++                return R.string.reason_timeout;
++            default:
++                return R.string.reason_error;
++        }
++    }
++
+     /**
+      * DomD has {@link #mOnlineSsid}: enable again a saved network of it that AAOS disabled
+      * as NO_INTERNET_PERMANENT, so auto-join can pick it. Run for each DomD report and at
+@@ -497,6 +1388,7 @@ public final class RelayService extends Service {
+         }
+         // A "no internet" verdict that came after DomD's report (see recheckInternet).
+         recheckInternet();
++        restoreAllAutojoin();
+         final List<WifiConfiguration> configs;
+         try {
+             configs = mWifi.getPrivilegedConfiguredNetworks();
+@@ -517,6 +1409,17 @@ public final class RelayService extends Service {
+             Log.w(TAG, "getPrivilegedConfiguredNetworks returned null");
+             return;
+         }
++        if (!configs.isEmpty()) {
++            // A refused pair of an SSID no longer saved goes (see REFUSED).
++            final Set<String> saved = new HashSet<>();
++            for (WifiConfiguration c : configs) {
++                final String pre = c == null ? null : refusedPrefix(unquote(c.SSID));
++                if (pre != null) {
++                    saved.add(pre);
++                }
++            }
++            refusedRetain(e -> saved.contains(e.substring(0, e.indexOf('\t') + 1)));
++        }
+         for (WifiConfiguration c : configs) {
+             if (c == null || c.getNetworkSelectionStatus() == null) {
+                 continue;
+@@ -535,11 +1438,28 @@ public final class RelayService extends Service {
+                 continue;
+             }
+             final String key = c.networkId + " " + psk;
++            if (mWait != null && mWait.key.equals(key)) {
++                // Tapped while DomD is still trying it: the local handshake failed on the
++                // placeholder. Held back again, without a second request.
++                Log.i(TAG, "netId=" + c.networkId + " is waiting for DomD; held back again");
++                mWifi.enableNetwork(c.networkId, false);
++                cancelFrameworkWrongPassword();
++                continue;
++            }
++            if (!mAttempted.contains(key)
++                    && refusedSet().contains(refusedEntry(ssid, psk))) {
++                // DomD refused this very passphrase before this process (a reboot):
++                //   a new password is a new pair, and forget+re-add drops the entry.
++                Log.i(TAG, "netId=" + c.networkId + ": DomD refused this passphrase before;"
++                        + " left to the user");
++                mAttempted.add(key);
++                continue;
++            }
+             if (mAttempted.contains(key)) {
+                 Log.i(TAG, "already attempted netId=" + c.networkId + "; leaving disabled");
+                 continue;
+             }
+-            if (!repair(c.networkId, ssid, psk, key)) {
++            if (!repair(c, ssid, psk, key)) {
+                 // Nothing was written, so nothing is spent: try the next candidate.
+                 // continue rather than return -- the drop-box is untouched so there is
+                 // no race to lose, and no connect() was issued so this cannot loop.
+@@ -590,6 +1510,8 @@ public final class RelayService extends Service {
+         if (mAttempted.removeIf(k -> k.startsWith(prefix))) {
+             Log.i(TAG, "netId=" + wi.getNetworkId() + " associated; its repair is re-armed");
+         }
++        refusedForget(unquote(wi.getSSID()));
++        restoreAutojoin(wi.getNetworkId());
+     }
+ 
+     /**
+@@ -618,7 +1540,9 @@ public final class RelayService extends Service {
+      * @return true if a request was written -- i.e. if the caller should spend the
+      *         attempt. False means nothing was written and nothing is spent.
+      */
+-    private boolean repair(final int netId, String ssid, String psk, final String key) {
++    private boolean repair(final WifiConfiguration c, String ssid, String psk,
++            final String key) {
++        final int netId = c.networkId;
+         if (requestPending()) {
+             Log.w(TAG, "a request is still unconsumed in " + REQ + "; the daemon is not"
+                     + " reading it (" + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
+@@ -627,59 +1551,74 @@ public final class RelayService extends Service {
+                     + " logcat -s doma-wifi-relay");
+             return false;
+         }
++        if (mWait != null) {
++            Log.i(TAG, "netId=" + mWait.netId + " is still waiting for DomD; netId=" + netId
++                    + " after it -- attempt NOT spent");
++            return false;
++        }
+         Log.i(TAG, "repairing netId=" + netId + " ssid=" + ssid);
+-        if (!writeRequest(ssid, psk)) {
++        final String token = String.format("%016x", mRandom.nextLong());
++        final String[] st = readState();
++        final String startSeq = st.length >= 2 ? st[1] : "";
++        if (!writeRequest(ssid, psk, token)) {
+             return false;
+         }
+-        connectWhenConsumed(netId, key, REQ_POLLS);
++        final Wait w = new Wait(netId, ssid, key, token, startSeq,
++                refusedEntry(ssid, psk));
++        mWait = w;
++        holdBack(c);
++        // The framework's "Failed to connect" from the placeholder's handshake, now and
++        //   once more in case it is posted just after.
++        cancelFrameworkWrongPassword();
++        mHandler.postDelayed(() -> {
++            if (mWait == w) {
++                cancelFrameworkWrongPassword();
++            }
++        }, 1000);
++        connectWhenConsumed(w, REQ_POLLS);
+         return true;
+     }
+ 
+     /**
+-     * Wait for the daemon to take the request, then re-trigger the connect. If it never
+-     * takes it, return the attempt to the pool instead of burning it.
++     * Wait for the daemon to handle the request, then for DomD's answer (up to
++     * {@link #CONNECTING_TIMEOUT_MS}, see {@link #onWaitState}). If it never takes the
++     * request, return the attempt to the pool instead of burning it.
+      */
+-    private void connectWhenConsumed(final int netId, final String key, final int polls) {
++    private void connectWhenConsumed(final Wait w, final int polls) {
+         mHandler.postDelayed(new Runnable() {
+             @Override
+             public void run() {
+-                if (requestPending()) {
++                if (w != mWait) {
++                    return;     // answered already (a request the daemon dropped)
++                }
++                if (requestPending() || REQ_BUSY.exists()) {
+                     if (polls > 1) {
+-                        connectWhenConsumed(netId, key, polls - 1);
++                        connectWhenConsumed(w, polls - 1);
+                         return;
+                     }
+-                    mAttempted.remove(key);
+                     Log.w(TAG, "daemon did not consume the request within "
+-                            + (REQ_POLLS * DAEMON_GRACE_MS) + " ms ("
++                            + (REQ_POLLS * POLL_MS) + " ms ("
+                             + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
+-                            + "); not connecting netId=" + netId
+-                            + ", attempt NOT spent. Check: logcat -s doma-wifi-relay");
++                            + "); not connecting netId=" + w.netId
++                            + ". Check: logcat -s doma-wifi-relay");
++                    finishWait(w, "unconsumed");
+                     return;
+                 }
+-                Log.i(TAG, "re-triggering connect netId=" + netId);
+-                mWifi.connect(netId, new WifiManager.ActionListener() {
+-                    @Override
+-                    public void onSuccess() {
+-                        Log.i(TAG, "connect(" + netId + ") accepted");
+-                    }
+-
+-                    @Override
+-                    public void onFailure(int reason) {
+-                        Log.w(TAG, "connect(" + netId + ") rejected, reason=" + reason);
+-                    }
+-                });
++                Log.i(TAG, "the daemon has the request for netId=" + w.netId
++                        + "; waiting for DomD");
++                mHandler.postDelayed(mWaitTimeout, CONNECTING_TIMEOUT_MS);
+             }
+-        }, DAEMON_GRACE_MS);
++        }, POLL_MS);
+     }
+ 
+     /**
+-     * Write one tab-separated {@code psk} request line for the daemon.
++     * Write one tab-separated {@code psk#<token>} request line for the daemon.
+      *
+      * <p>Written to a temporary name and renamed, so the daemon can never read a partial
+      * line: it polls for the final name only, and its own first action is to move the
+      * file aside.
+      */
+-    private boolean writeRequest(String ssid, String psk) {
++    private boolean writeRequest(String ssid, String psk, String token) {
+         if (!REQ_DIR.isDirectory()) {
+             // isDirectory() is also false when the directory exists but a parent denies
+             // search, which is the failure this path actually hit (see the field's
+@@ -692,7 +1631,7 @@ public final class RelayService extends Service {
+         }
+         try (FileOutputStream fos = new FileOutputStream(REQ_TMP);
+                 OutputStreamWriter w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
+-            w.write("psk\t" + ssid + "\t" + psk + "\n");
++            w.write("psk#" + token + "\t" + ssid + "\t" + psk + "\n");
+             w.flush();
+             fos.getFD().sync();
+             // Group-readable for the daemon (uid wifi, group system); see REQ_DIR.
+diff --git a/sepolicy/doma_shadow_ap.te b/sepolicy/doma_shadow_ap.te
+index 180c889..eedf2c5 100644
+--- a/sepolicy/doma_shadow_ap.te
++++ b/sepolicy/doma_shadow_ap.te
+@@ -68,6 +68,10 @@ allow doma_shadow_ap sysfs_net:dir r_dir_perms;
+ allow doma_shadow_ap sysfs_net:file r_file_perms;
+ allow doma_shadow_ap sysfs_net:lnk_file r_file_perms;
+ 
++# The relay times its waits by /proc/uptime (now_s in doma-wifi-relay.sh): mksh's
++# $SECONDS is the wall clock, which NTP steps (genfs proc_uptime).
++allow doma_shadow_ap proc_uptime:file r_file_perms;
++
+ # `setprop ctl.restart|stop|start vendor.doma_shadow_hostapd`: init checks the legacy
+ # name ctl.vendor.doma_shadow_hostapd, which falls to the `ctl.` prefix,
+ # ctl_default_prop, a system_public_prop a vendor domain may set
+diff --git a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
+index dcb80d0..c0942f2 100755
+--- a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
++++ b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
+@@ -41,9 +41,22 @@
+ #                                 (COMPLETED and FAILED answer a connect, with its id;
+ #                                  LOST and BACK come unasked -- see handle_state)
+ #                            out: {"t":"connect","id":"N","ssid":"X","psk":"Y"}   (ours,
+-#                                  compact; the id, see PENDING)
++#                                  compact; the id, see PENDING), with ,"kind":"u" at
++#                                  the end for a passphrase typed on screen (handle_psk):
++#                                  DomD answers FAILED at the first WRONG_KEY (or SAE
++#                                  refusal) for one it has never been COMPLETED with,
++#                                  and every other failure only after its 30 s
++#
++# A TYPED PASSPHRASE REACHES THE SHADOW AP ONLY ONCE DomD HAS JOINED WITH IT. Until
++# then its row keeps what it had (the placeholder, a seed or a learned PSK), so
++# DomA's station does not join the shadow BSS with a passphrase the real AP may
++# refuse and show it as connected; DomaWifiRelay holds the network back meanwhile
++# and connects it on the "online" handle_state writes after hostapd has the
++# passphrase (see handle_psk, handle_state and $STATE_FILE).
+ #   $REQ   .../relay.req     one line per request from DomaWifiRelay (the priv-app):
+-#                                 psk<TAB><SSID><TAB><PSK>
++#                                 psk[#<token>]<TAB><SSID><TAB><PSK>
++#                            (the token, up to 16 hex digits, comes back in each
++#                            relay.state line that answers the request)
+ #                            The app has NETWORK_SETTINGS + READ_WIFI_CREDENTIAL and
+ #                            reads the PSK with WifiManager.getPrivilegedConfiguredNetworks().
+ #
+@@ -69,6 +82,30 @@ TAG=doma-wifi-relay
+ #   FATAL).
+ log() { echo "$TAG: $*"; /vendor/bin/log -t "$TAG" "$*" 2>/dev/null; :; }
+ 
++# now_s -- set _now to the seconds since boot, from $UPTIME_FILE (/proc/uptime, the
++#   kernel's CLOCK_BOOTTIME), with the builtin read: no fork. EVERY INTERVAL HERE IS
++#   MEASURED WITH IT, NOT WITH mksh's $SECONDS, which is gettimeofday(), the wall clock
++#   (external/mksh/src/var.c, sh.h mksh_TIME). DomA sets that clock by NTP once its
++#   first network is validated -- on the board, 2026-11-08, a step of +2984 s right
++#   after the user's first join -- and every wait then ended at once: a hostapd
++#   restart deferred for BOUNCE_MIN_S ran on the next tick and dropped the shadow BSS
++#   the app was about to connect to. Unreadable (it is proc_uptime, which the domain
++#   may read: doma_shadow_ap.te), $SECONDS, logged once.
++UPTIME_FILE=${UPTIME_FILE:-/proc/uptime}
++now_s() {
++    _now=""
++    { read -r _now _ < "$UPTIME_FILE"; } 2>/dev/null
++    _now=${_now%%.*}
++    case "$_now" in
++        ''|*[!0-9]*)
++            _now=$SECONDS
++            if [ "${UPTIME_LOGGED:-0}" != 1 ]; then
++                UPTIME_LOGGED=1
++                log "WARNING: cannot read $UPTIME_FILE -- timing by the wall clock, which NTP can step"
++            fi;;
++    esac
++}
++
+ # THE PATHS CAN BE OVERRIDDEN FROM THE ENVIRONMENT, so the script also runs on a
+ #   PC against a scratch directory. Nothing sets them on the device.
+ CONF_DIR=${CONF_DIR:-/data/vendor/wifi/shadow}
+@@ -91,7 +128,10 @@ REQ_DIR=${REQ_DIR:-$CONF_DIR/req}
+ REQ=${REQ:-$REQ_DIR/relay.req}
+ # For DomaWifiRelay: one line "<kind><TAB><seq><TAB><SSID>", rewritten when this
+ #   script starts and each time DomD reports it joined, lost or could not join an
+-#   SSID (see state_publish).
++#   SSID (see state_publish). For a typed passphrase's connect, "online" comes only
++#   once the row has it and hostapd beacons it (handle_state), and a request
++#   handle_psk drops is answered too ("offline:wrong-key" or "offline:error"): the
++#   app connects the network it holds back on the first and gives up on the others.
+ STATE_FILE=${STATE_FILE:-$REQ_DIR/relay.state}
+ # $CHAN is the hvc node, not /dev/vport2p4. The Wi-Fi channel in doma.cfg is
+ #   declared as `-device virtconsole,chardev=virts_chardev5`, i.e. AS A CONSOLE
+@@ -239,8 +279,9 @@ SEED=${SEED:-/vendor/etc/doma-shadow-aps.conf}
+ # (A PSK repair -- the restart after the user types a passphrase on screen -- always
+ #  happens, independently of this flag.)
+ BOUNCE_ON_APS=${BOUNCE_ON_APS:-}
+-# With BOUNCE_ON_APS false, the least number of seconds between two hostapd restarts
+-#   for AP-list changes; 0 or unset keeps false as described above. With it set, an
++# With BOUNCE_ON_APS false, the least number of seconds from a hostapd restart (any,
++#   see LAST_BOUNCE) to one for an AP-list change; 0 or unset keeps false as described
++#   above. With it set, an
+ #   aps message restarts hostapd as auto does (only while no station is associated),
+ #   but at most once per this many seconds: a change that comes sooner is deferred
+ #   (RESTART_PENDING) and flush_pending_restart applies it once the time has passed
+@@ -248,25 +289,28 @@ BOUNCE_ON_APS=${BOUNCE_ON_APS:-}
+ #   the restarts that took 17% of DomA's CPU on the RPi4 (2026-10-11) are cut to one
+ #   per interval. getprop'd per message, like the flag:
+ #   persist.vendor.doma.wifi_relay_bounce_min_s; the environment variable
+-#   BOUNCE_MIN_S takes precedence if set. Measured with mksh's $SECONDS.
++#   BOUNCE_MIN_S takes precedence if set. Measured with now_s (time since boot).
+ BOUNCE_MIN_S=${BOUNCE_MIN_S:-}
+-# $SECONDS at the last hostapd restart for an AP-list change, empty before the
+-#   first (a restart for a passphrase or for DomD's state does not count, so it
+-#   does not hold the list back); and the interval a deferred restart is waiting
+-#   for (0: none).
++# now_s at the last hostapd restart, empty before the first; and the interval a
++#   deferred restart is waiting for (0: none). EVERY RESTART COUNTS, for a passphrase
++#   DomD joined or for DomD's state as for the list: each drops DomA's station, and
++#   the list change right after a passphrase's restart (on the board, 2026-11-08, 1.4 s
++#   after it, with the app about to join the BSS that restart brought up) is what the
++#   interval is for. Such a restart beacons $APS as it is then (write_hostapd_conf),
++#   so the list it carries is current.
+ LAST_BOUNCE=""
+ BOUNCE_WAIT=0
+-RESTART_FOR_LIST=0  # 1 while the deferred restart is one for a list change
+ # The connects sent that DomD has not answered yet, "<id>TAB<SSID>TAB<since>TAB<kind>
+ #   TAB<PSK>" per line, newline-framed, oldest first. Each connect carries an id that
+ #   DomD's answer (COMPLETED or FAILED) carries back, so an answer is matched to its
+ #   own connect: counting answers instead goes wrong whenever one is lost (a write
+ #   that failed, the agent restarting mid-join, this daemon restarting). The id is
+ #   "<pid>-<n>", so an answer to a connect from before a restart of this daemon
+-#   matches nothing. kind is "u" for a passphrase typed on screen (handle_psk) and
+-#   "m" for the row's own PSK (mirror_station). A typed one is put in $APS at once
+-#   (the local handshake needs it), but into $LEARNED only on DomD's COMPLETED for it
+-#   (see handle_state). DomD handles the connects one at a time, in order, so an
++#   matches nothing. kind is "u" for a passphrase typed on screen (handle_psk; "u#<token>"
++#   with the app's token for the request) and
++#   "m" for the row's own PSK (mirror_station). A typed one goes into $APS and
++#   $LEARNED only on DomD's COMPLETED for it (see handle_state). DomD handles the
++#   connects one at a time, in order, so an
+ #   answer also means every connect sent before it has been answered: those entries
+ #   go. An entry no answer has come for in PENDING_TTL_S (300 s) goes as well.
+ PENDING=""          # newline-framed; set once NL is defined below
+@@ -275,15 +319,15 @@ PENDING_SEQ=0
+ #   lease drop and a scan of up to 15 s), so 300 s covers four queued ones.
+ PENDING_TTL_S=${PENDING_TTL_S:-300}
+ case "$PENDING_TTL_S" in ''|*[!0-9]*) PENDING_TTL_S=300;; esac
+-# The last passphrase DomD rejected with WRONG_KEY, and when: the app asks again with
+-#   the same one once the framework has joined the shadow BSS with it, and taking it
+-#   again would restart hostapd and make DomD try for 30 s, round after round.
++# The last passphrase DomD rejected with WRONG_KEY, and when: asked for again (the
++#   app restarted, or a connect from the screen with it), it is not sent to DomD
++#   again but answered "offline:wrong-key" at once (handle_psk).
+ #   Dropped for FAIL_HOLD_S seconds, or until DomD joins the SSID.
+ REJECT_SSID=""
+ REJECT_PSK=""
+ REJECT_T=0
+ # SSIDs DomD failed to join for a reason other than the key, or lost, while DomA's
+-#   station was on them, "<SSID>TAB<$SECONDS>" per line: handle_state removed their
++#   station was on them, "<SSID>TAB<now_s>" per line: handle_state removed their
+ #   rows, and handle_aps does not add one back for FAIL_HOLD_S seconds, or until it
+ #   leaves DomD's scans and returns to them (FAIL_HOLDS_GONE), or for a lost one until
+ #   DomD reports it BACK. Without this the next publication brings it
+@@ -600,7 +644,27 @@ sta_carrier_up() {
+     [ "$_cr" = 1 ]
+ }
+ 
++# join_waiting -- 0 while the app is about to join JOIN_WAIT_SSID (see there).
++join_waiting() {
++    [ -n "$JOIN_WAIT_SSID" ] || return 1
++    now_s
++    if [ $((_now-JOIN_WAIT_T)) -ge "$JOIN_WAIT_S" ]; then
++        log "aps: DomA has not joined $JOIN_WAIT_SSID within $JOIN_WAIT_S s -- no longer holding hostapd for it"
++        JOIN_WAIT_SSID=""
++        return 1
++    fi
++    return 0
++}
++
+ stations_present() {
++    # 0. The app about to join a BSS (JOIN_WAIT_SSID): as good as a station.
++    if join_waiting; then
++        if [ "$JOIN_WAIT_LOGGED" != 1 ]; then
++            JOIN_WAIT_LOGGED=1
++            log "aps: DomA is about to join $JOIN_WAIT_SSID -- counted as a station, so hostapd is not restarted under the connect"
++        fi
++        return 0
++    fi
+     _known=0
+     # 1. DomA's own station -- unless mirror_station saw it on the hidden idle BSS,
+     #    which carries no AP anyone uses: a restart there loses nothing, and counting
+@@ -673,9 +737,14 @@ sta_is_up() {
+ #   INVALID, including a wrong owner or mode (the measured "12 times, 5.0 s
+ #   apart" in write_hostapd_conf).
+ #
+-# init's `restart_period` defaults to 5 s, so sampling a 3 s window every 0.5 s
+-# (6 samples) is guaranteed to catch a non-running state at least once during a
+-# crash loop. The values can be overridden from the environment.
++# A hostapd that cannot use its conf exits while parsing it, within a fraction of a
++# second of the start, and init then shows a non-running state for its
++# `restart_period` (5 s by default). Sampling a 1.5 s window every 0.25 s (6
++# samples) therefore catches that crash loop. A hostapd that died later than 1.5 s
++# after its start would not be caught here; the window was 3 s (6 x 0.5 s) until
++# 2026-11-08, and the user's "online" waits on it (typed_joined: 4 s from DomD's
++# COMPLETED to the restart on the board), so it is the shorter one. The values can be
++# overridden from the environment.
+ # The hostapd init service, vendor.doma_shadow_hostapd in init.xenvm-hwsim.rc.
+ #   `setprop ctl.restart` exits non-zero when init has no service of that name:
+ #   init's control-message handler replies PROP_ERROR_HANDLE_CONTROL_MESSAGE,
+@@ -702,7 +771,7 @@ svc_is_running() {
+ }
+ 
+ CONFIRM_SAMPLES=${CONFIRM_SAMPLES:-6}
+-CONFIRM_SLEEP=${CONFIRM_SLEEP:-0.5}
++CONFIRM_SLEEP=${CONFIRM_SLEEP:-0.25}
+ confirm_hostapd_running() {
+     _n=0
+     while [ "$_n" -lt "$CONFIRM_SAMPLES" ]; do
+@@ -745,12 +814,15 @@ restart_hostapd() {
+         if svc_is_running; then
+             # Do not call this a success yet (see the confirm_hostapd_running comment).
+             if confirm_hostapd_running; then
+-                RESTART_PENDING=0; BOUNCE_WAIT=0; RESTART_FOR_LIST=0
++                RESTART_PENDING=0; BOUNCE_WAIT=0
++                now_s; LAST_BOUNCE=$_now
+                 # what is beaconed now (see LIVE)
+                 cp "$CONF" "$LIVE.new" 2>/dev/null && chmod 0600 "$LIVE.new" 2>/dev/null \
+                     && mv -f "$LIVE.new" "$LIVE" 2>/dev/null \
+                     || log "WARNING: cannot update $LIVE"
+                 log "hostapd restarted via init ($(grep -c '^ssid=' "$CONF") SSID(s))"
++                # what ONLINE_DUE waits for is on the air now (flush_due writes it)
++                [ -n "$ONLINE_DUE" ] && ONLINE_READY=1
+                 return 0
+             fi
+             RESTART_PENDING=1
+@@ -1182,7 +1254,7 @@ handle_aps() {
+         rm -f "$_tmp"
+         return 0
+     fi
+-    # By rename, as handle_psk does: this daemon runs on every boot, so init's
++    # By rename, as set_row_psk does: this daemon runs on every boot, so init's
+     # SIGKILL at shutdown can land mid-write, and a truncated $APS loses every
+     # PSK in it. The temporary file is in the same directory, so it has the same label.
+     chmod 0660 "$_tmp" 2>/dev/null
+@@ -1199,7 +1271,10 @@ handle_aps() {
+         # The idle-only exception (see BOUNCE_ON_APS): nothing to disrupt.
+         if conf_is_idle "$LIVE"; then
+             log "aps: hostapd beacons only the hidden idle BSS -- applying the list despite ...wifi_relay_bounce_on_aps=false"
+-            write_hostapd_conf && restart_hostapd
++            # Not counted for BOUNCE_MIN_S: it took down no AP anyone uses, and the
++            #   first list after boot is short (the scans are still coming in), so the
++            #   fuller one 20 s later must not wait out the interval.
++            write_hostapd_conf && restart_hostapd && LAST_BOUNCE=""
+             return 0
+         fi
+         # The rate-limited form (see BOUNCE_MIN_S).
+@@ -1208,32 +1283,36 @@ handle_aps() {
+         if [ "$_min" -gt 0 ]; then
+             write_hostapd_conf || return 0
+             if cmp -s "$CONF" "$LIVE" 2>/dev/null; then
+-                RESTART_PENDING=0; BOUNCE_WAIT=0; RESTART_FOR_LIST=0
++                RESTART_PENDING=0; BOUNCE_WAIT=0
+                 return 0
+             fi
++            now_s
+             if stations_present; then
+-                RESTART_PENDING=1; BOUNCE_WAIT=$_min; RESTART_FOR_LIST=1
++                RESTART_PENDING=1; BOUNCE_WAIT=$_min
+                 log "aps: a station is associated -- deferring the hostapd restart (rate-limited to one per $_min s)"
+-            elif [ -n "$LAST_BOUNCE" ] && [ $((SECONDS-LAST_BOUNCE)) -lt "$_min" ]; then
+-                RESTART_PENDING=1; BOUNCE_WAIT=$_min; RESTART_FOR_LIST=1
+-                log "aps: hostapd restarted $((SECONDS-LAST_BOUNCE)) s ago -- deferring this list until $_min s have passed"
++            elif [ -n "$LAST_BOUNCE" ] && [ $((_now-LAST_BOUNCE)) -lt "$_min" ]; then
++                RESTART_PENDING=1; BOUNCE_WAIT=$_min
++                log "aps: hostapd restarted $((_now-LAST_BOUNCE)) s ago -- deferring this list until $_min s have passed"
+             else
+-                # A failed restart is retried by flush_pending_restart as a list one.
+-                RESTART_FOR_LIST=1
+-                restart_hostapd && LAST_BOUNCE=$SECONDS
++                # A failed restart is retried by flush_pending_restart.
++                restart_hostapd
+             fi
+             return 0
+         fi
+         # hostapd is not restarted, so a hostapd.conf written now would not be read before
+-        #   the next boot (doma-shadow-ap regenerates it from $APS then) or a PSK repair
+-        #   (handle_psk writes it itself). Skipping it saves ~0.4 s of CPU per publication
+-        #   that changes the list (2026-10-11, measured on RPi4 DomA). A restart an
+-        #   earlier publication deferred would apply a conf older than $APS: drop it.
+-        if [ "$RESTART_PENDING" = 1 ]; then
+-            RESTART_PENDING=0; RESTART_FOR_LIST=0
++        #   the next boot (doma-shadow-ap regenerates it from $APS then) or a passphrase
++        #   DomD has joined (typed_joined writes it itself). Skipping it saves ~0.4 s of
++        #   CPU per publication that changes the list (2026-10-11, measured on RPi4
++        #   DomA). A restart an earlier publication deferred would apply a conf older
++        #   than $APS: drop it -- unless it carries a passphrase whose "online" waits for
++        #   it (ONLINE_DUE), which then takes a conf of $APS as it is now.
++        if [ "$RESTART_PENDING" = 1 ] && [ -n "$ONLINE_DUE" ]; then
++            write_hostapd_conf || log "WARNING: aps: could not update hostapd.conf for the deferred restart"
++        elif [ "$RESTART_PENDING" = 1 ]; then
++            RESTART_PENDING=0
+             log "aps: dropping the deferred hostapd restart (...wifi_relay_bounce_on_aps=false; its conf is out of date)"
+         fi
+-        log "aps: $APS updated only (...wifi_relay_bounce_on_aps=false); hostapd.conf follows at the next boot or on a PSK repair"
++        log "aps: $APS updated only (...wifi_relay_bounce_on_aps=false); hostapd.conf follows at the next boot or with a passphrase DomD joins"
+         return 0
+     fi
+     write_hostapd_conf || return 0
+@@ -1241,11 +1320,11 @@ handle_aps() {
+     #   rewrite that only added the last newline): no restart, and none pending.
+     if cmp -s "$CONF" "$LIVE" 2>/dev/null; then
+         [ "$RESTART_PENDING" = 1 ] && log "aps: hostapd.conf is back to what hostapd beacons -- the deferred restart is not needed"
+-        RESTART_PENDING=0; RESTART_FOR_LIST=0
++        RESTART_PENDING=0
+         return 0
+     fi
+     if [ "$_bounce" != true ] && stations_present; then
+-        RESTART_PENDING=1; RESTART_FOR_LIST=1
++        RESTART_PENDING=1
+         log "aps: a station is associated -- deferring the hostapd restart (the conf is already updated; it will be applied once the station leaves)"
+     else
+         restart_hostapd
+@@ -1266,8 +1345,9 @@ flush_pending_restart() {
+     # then costs no exec per tick.
+     stations_present && return 0
+     # A restart deferred by BOUNCE_MIN_S waits for its interval as well.
++    now_s
+     [ "$BOUNCE_WAIT" -gt 0 ] && [ -n "$LAST_BOUNCE" ] \
+-        && [ $((SECONDS-LAST_BOUNCE)) -lt "$BOUNCE_WAIT" ] && return 0
++        && [ $((_now-LAST_BOUNCE)) -lt "$BOUNCE_WAIT" ] && return 0
+     # NOT WHILE doma_shadow_ap IS ITSELF BRINGING hostapd UP. Both run at
+     # sys.boot_completed, and on the board a deferred restart that landed
+     # between the oneshot's `ctl.start` and its confirmation left the log saying
+@@ -1276,10 +1356,7 @@ flush_pending_restart() {
+     # until then.
+     [ "$(getprop init.svc.vendor.doma_shadow_ap 2>/dev/null)" = running ] && return 0
+     log "applying deferred hostapd conf (no station associated)"
+-    # Counted as a list restart only when a list change deferred it (not a retry of
+-    #   a restart for a passphrase or for DomD's state that failed).
+-    _fl=$RESTART_FOR_LIST
+-    restart_hostapd && [ "$_fl" = 1 ] && LAST_BOUNCE=$SECONDS
++    restart_hostapd
+ }
+ 
+ # set_row_psk <ssid> <psk> -- give the SSID's row in $APS this PSK (appending the row
+@@ -1335,17 +1412,19 @@ state_restart() {
+ pending_add() {
+     PENDING_SEQ=$((PENDING_SEQ+1))
+     _pid=$$-$PENDING_SEQ
+-    _pnew=$_pid$TAB$1$TAB$SECONDS$TAB$3$TAB$2$NL
++    now_s
++    _pnew=$_pid$TAB$1$TAB$_now$TAB$3$TAB$2$NL
+ }
+ pending_commit() {
+     PENDING=$PENDING$_pnew
+ }
+ pending_expire() {
++    now_s
+     _pk2=$NL; _pr=${PENDING#"$NL"}
+     while [ -n "$_pr" ]; do
+         _pl=${_pr%%"$NL"*}; _pr=${_pr#*"$NL"}
+         _pt=${_pl#*"$TAB"}; _pt=${_pt#*"$TAB"}; _pt=${_pt%%"$TAB"*}
+-        [ $((SECONDS-_pt)) -lt "$PENDING_TTL_S" ] && _pk2=$_pk2$_pl$NL
++        [ $((_now-_pt)) -lt "$PENDING_TTL_S" ] && _pk2=$_pk2$_pl$NL
+     done
+     PENDING=$_pk2
+ }
+@@ -1381,7 +1460,8 @@ hold_add() {
+     hold_active "$1"
+     case "$FAIL_HOLDS" in *"$NL$1$TAB"*) _hr=${FAIL_HOLDS#*"$NL$1$TAB"}
+         FAIL_HOLDS=${FAIL_HOLDS%%"$NL$1$TAB"*}$NL${_hr#*"$NL"};; esac
+-    FAIL_HOLDS=$FAIL_HOLDS$1$TAB$SECONDS$NL
++    now_s
++    FAIL_HOLDS=$FAIL_HOLDS$1$TAB$_now$NL
+ }
+ hold_del() {
+     case "$FAIL_HOLDS" in *"$NL$1$TAB"*) ;; *) return 1;; esac
+@@ -1408,34 +1488,103 @@ holds_seen() {
+     done
+     FAIL_HOLDS_GONE=$_gone
+ }
+-# state_publish online|offline <ssid> | up -- one line in $STATE_FILE for
++# state_publish online|offline|pending <ssid> [<token>] | up -- one line in $STATE_FILE
++#   ("<kind>TAB<seq>TAB<ssid>", then TAB<token> when it answers a request of the app's
++#   that carried one: DomaWifiRelay tells its own answers from the others by it) for
+ #   DomaWifiRelay, which watches the file. <seq> is new on every write, so the app acts
+ #   once per line.
+-#   online: DomD has joined <ssid> (COMPLETED or BACK). If DomA's station checked the
++#   online: DomD has joined <ssid> (COMPLETED or BACK); for a passphrase typed on
++#     screen, only once the row has it and hostapd beacons it, as the app connects
++#     the network it holds back on this (typed_joined). If DomA's station checked the
+ #     network for internet access before DomD had a link, AAOS disabled it as
+ #     NO_INTERNET_PERMANENT (a network that has never had internet: not joined again
+ #     on its own); while DomD has it, the app enables it again.
+ #   offline: DomD lost <ssid> or could not join it (LOST, FAILED); DomD's
+-#     wpa_supplicant holds one network, so it then has none.
++#     wpa_supplicant holds one network, so it then has none. Written as
++#     offline:<reason> (see fail_reason) so the app can tell the user why; LOST is
++#     offline:lost, a FAILED while a later connect for the SSID is still pending
++#     is offline:retry (DomD's answer to that one is still to come), and a FAILED
++#     that answers no connect of this daemon's stays a bare offline.
++#   pending: a connect for <ssid> has just been forwarded to DomD (handle_psk,
++#     mirror_station), so the app can show that the real join is under way (2026-11-06:
++#     an SSID DomD could not find looked joined for 30 s, then dropped without a word);
++#     also for a COMPLETED while a later connect for the SSID is still pending.
++#   offline:wrong-key and offline:error also answer a request handle_psk drops (the
++#     passphrase DomD has just refused, or one that is not valid), so that the app
++#     does not wait for an answer that will not come.
+ #   up: this script has started, so the app sweeps (it reads only the init.svc state of
+ #     this service, and may have swept before the start).
++#   The reason goes into the kind, not into the fourth field, which holds only the
++#     token of the request a line answers (DomaWifiRelay splits at most four fields).
+ state_publish() {
+     STATE_SEQ=$((STATE_SEQ+1))
+-    if printf '%s\t%s\t%s\n' "$1" "$$-$STATE_SEQ" "${2-}" > "$STATE_FILE.new" 2>/dev/null \
++    if printf '%s\t%s\t%s%s\n' "$1" "$$-$STATE_SEQ" "${2-}" "${3:+$TAB$3}" > "$STATE_FILE.new" 2>/dev/null \
+         && chmod 0640 "$STATE_FILE.new" 2>/dev/null \
+         && chgrp system "$STATE_FILE.new" 2>/dev/null \
+         && mv -f "$STATE_FILE.new" "$STATE_FILE" 2>/dev/null; then
+-        :
++        # Only for a BSS hostapd beacons ($LIVE; one with no row yet comes up with
++        #   the next list, which must not be held back for it), and not while the
++        #   station is on it already.
++        if [ "$1" = online ] && [ -n "${3:-}" ] && [ "$2" != "$STA_LAST_SSID" ] \
++            && live_psk_of "$2" >/dev/null; then
++            now_s
++            JOIN_WAIT_SSID=$2; JOIN_WAIT_T=$_now; JOIN_WAIT_LOGGED=0
++        fi
+     else
+         log "WARNING: cannot write $STATE_FILE ($1 ${2-})"
+     fi
+ }
+ STATE_SEQ=0
++# The SSID whose "online" waits for hostapd to beacon the passphrase typed_joined put
++#   in its row (or whose offline:* waits for the row a FAILED undid): written by
++#   flush_due once restart_hostapd has restarted hostapd on it; dropped by a FAILED or
++#   a LOST for the SSID.
++ONLINE_DUE=""
++ONLINE_TOK=""       # the token of the request it answers
++ONLINE_KIND=online  # the line to write: online, or a FAILED's offline:* (handle_state)
++ONLINE_READY=0      # 1 once hostapd has restarted on it
++# The SSID of the last "online" written as the answer to a request of the app's (with
++#   its token) for a BSS hostapd beacons, and now_s then: the app connects to that
++#   shadow BSS on it, within seconds (a scan, then the connect). Until DomA's station associates
++#   (mirror_station), DomD reports FAILED or LOST for the SSID, or JOIN_WAIT_S has
++#   passed, stations_present counts it as a station, so no restart for the list
++#   (handle_aps, flush_pending_restart) takes that BSS down under the connect -- on
++#   the board, 2026-11-08, one did, 2 s after the "online", and the join took 4 s
++#   longer. A restart for DomD's state (state_restart) is not held by it.
++JOIN_WAIT_SSID=""
++JOIN_WAIT_T=0
++JOIN_WAIT_LOGGED=0
++JOIN_WAIT_S=${JOIN_WAIT_S:-30}
++case "$JOIN_WAIT_S" in ''|*[!0-9]*) JOIN_WAIT_S=30;; esac
++# A typed passphrase DomD answered FAILED for the time (not refused), "<SSID>" and
++#   "<PSK>": wpa_supplicant goes on trying it, and when DomD reports the SSID BACK it
++#   is the one joined, so it goes into the row then (typed_joined). Dropped by the
++#   next connect sent, which replaces DomD's network.
++TIMEDOUT_SSID=""
++TIMEDOUT_PSK=""
++# fail_reason <error> -- set _fr to a short token for the "error" of DomD's FAILED
++#   (domd_wifi_agent.py): the app maps it to a sentence. Never the raw text, which can
++#   change with the agent. No fork (a case, not a subshell).
++#   wrong-key  CTRL-EVENT-SSID-TEMP-DISABLED reason=WRONG_KEY
++#   not-found  CTRL-EVENT-NETWORK-NOT-FOUND: the AP was not in DomD's scans
++#   rejected   CTRL-EVENT-ASSOC-REJECT / AUTH-REJECT
++#   timeout    any other "not associated within N s"
++#   error      the join could not even start (e.g. no usable key management)
++fail_reason() {
++    case "$1" in
++        *WRONG_KEY*) _fr=wrong-key;;
++        *NETWORK-NOT-FOUND*) _fr=not-found;;
++        *ASSOC-REJECT*|*AUTH-REJECT*) _fr=rejected;;
++        "not associated within"*) _fr=timeout;;
++        *) _fr=error;;
++    esac
++}
+ hold_active() {
+     case "$FAIL_HOLDS" in *"$NL$1$TAB"*) ;; *) return 1;; esac
+     _hr=${FAIL_HOLDS#*"$NL$1$TAB"}
+     _ht=${_hr%%"$NL"*}
+-    [ $((SECONDS-_ht)) -lt "$FAIL_HOLD_S" ] && return 0
++    now_s
++    [ $((_now-_ht)) -lt "$FAIL_HOLD_S" ] && return 0
+     FAIL_HOLDS=${FAIL_HOLDS%%"$NL$1$TAB"*}$NL${_hr#*"$NL"}
+     return 1
+ }
+@@ -1453,12 +1602,83 @@ state_sta() {
+     fi
+ }
+ 
++# flush_due -- write ONLINE_DUE's line once hostapd has restarted on it.
++flush_due() {
++    [ "$ONLINE_READY" = 1 ] || return 0
++    ONLINE_READY=0
++    [ -n "$ONLINE_DUE" ] || return 0
++    state_publish "$ONLINE_KIND" "$ONLINE_DUE" "$ONLINE_TOK"
++    ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online
++}
++
++# publish_line <kind> <ssid> [<token>] -- state_publish for handle_state, with a due
++#   line (flush_due) of the same pass written around it so that a line with a token,
++#   the answer DomaWifiRelay waits for, is the last: $STATE_FILE holds one line, and
++#   the app may read only the last of two written together.
++publish_line() {
++    if [ -n "${3:-}" ]; then
++        flush_due
++        state_publish "$1" "$2" "$3"
++    else
++        state_publish "$1" "$2"
++        flush_due
++    fi
++}
++
++# online_now <ssid> [<token>] -- "online" for it, unless a later connect for it is still to be
++#   answered: the app connects on "online", with the passphrase of that later one, so
++#   it gets "pending" then; nor while hostapd does not beacon the passphrase of its row
++#   yet (ONLINE_DUE).
++online_now() {
++    if [ "$1" = "$ONLINE_DUE" ] && [ "$ONLINE_KIND" = online ]; then
++        # hostapd does not beacon the row's passphrase yet: its "online" comes then
++        [ -n "${2:-}" ] && ONLINE_TOK=$2
++    elif pending_has "$1"; then
++        publish_line pending "$1" "${2:-}"
++    else
++        publish_line online "$1" "${2:-}"
++    fi
++}
++
++# typed_joined <ssid> <psk> [<token>] -- DomD has joined the SSID with a passphrase typed on
++#   screen: into $LEARNED, and into the row if the SSID still has one (one that has
++#   left the list gets it from $LEARNED when it comes back, handle_aps), then
++#   "online" once hostapd beacons it (ONLINE_DUE). A restart that fails says
++#   "offline:error" now: the app would connect with a passphrase hostapd does not
++#   beacon, and the network be disabled for it. The "online" still comes with the
++#   next restart that succeeds. With no row left, "online" at once: DomD has the
++#   SSID, and once it is listed again it has this passphrase from $LEARNED.
++typed_joined() {
++    learned_put "$1" "$2"
++    log "psk: DomD joined $1; its passphrase is kept"
++    if pending_has "$1"; then
++        _rp=""      # a later connect decides the row (online_now says pending)
++    elif _rp=$(psk_of "$1" 2>/dev/null) \
++        && { [ "$_rp" != "$2" ] || [ "$(live_psk_of "$1")" != "$2" ]; }; then
++        # Also a row that has it already while hostapd does not beacon it yet (a
++        #   restart for it failed, or is deferred).
++        if [ "$_rp" != "$2" ]; then
++            set_row_psk "$1" "$2"
++            log "psk: $1's row takes the passphrase DomD joined with"
++        fi
++        ONLINE_DUE=$1; ONLINE_TOK=${3:-}; ONLINE_KIND=online
++        if ! state_restart; then
++            log "WARNING: state: hostapd did not take $1's passphrase"
++            publish_line offline:error "$1" "${3:-}"
++        fi
++        return 0
++    fi
++    online_now "$1" "${3:-}"
++}
++
+ # handle_state <json-line> -- DomD's report on the network it joined for DomA:
+ #   COMPLETED or FAILED answers a connect (its "id", see PENDING), LOST comes unasked
+ #   once the joined network has stopped being COMPLETED (domd_wifi_agent.py,
+ #   link_lost). Without acting on them, DomA's station stays on a shadow BSS DomD has
+ #   no link behind, and the screen shows "Connected" for it.
+-#   COMPLETED for a typed passphrase's connect in PENDING: it works -- into $LEARNED.
++#   COMPLETED for a typed passphrase's connect in PENDING: it works -- into $LEARNED
++#     and its row, and "online" once hostapd beacons it (typed_joined). Any other
++#     COMPLETED: "online" (online_now).
+ #   FAILED for a connect in PENDING: with WRONG_KEY, its passphrase is remembered as
+ #     rejected (REJECT_*), and forgotten from $LEARNED if that is the one kept there
+ #     (the AP's key changed). An answer that matches no connect (from before a restart
+@@ -1475,7 +1695,8 @@ state_sta() {
+ #   LOST while DomA's station is on the SSID: the row goes (drop_row) and is held as
+ #     above, until BACK.
+ #   BACK (DomD rejoined the SSID on its own): its hold goes, so the next publication
+-#     lists it again.
++#     lists it again; a typed passphrase DomD answered FAILED for the time goes into
++#     the row then, as on a COMPLETED (TIMEDOUT_SSID).
+ #   Each of COMPLETED, BACK, LOST and FAILED is also written to $STATE_FILE
+ #   (state_publish).
+ #   Anything else is only logged. Each restart waits for doma_shadow_ap
+@@ -1491,27 +1712,62 @@ handle_state() {
+     case "$_hst" in COMPLETED|FAILED)
+         json_str id "$1" && pending_take "$_js" && [ "$_pp_s" = "$_hs" ] && _tk=1;;
+     esac
++    # a typed passphrase's connect ("u", with the app's token after a #: handle_psk)
++    _tu=0; _tok=""
++    if [ "$_tk" = 1 ]; then
++        case "$_pp_k" in u) _tu=1;; u#*) _tu=1; _tok=${_pp_k#u#};; esac
++    fi
+     case "$_hst" in
+         COMPLETED)
+-            # A typed passphrase only: the row's own PSK (a mirror connect) is already
+-            #   what the row gets, and an open row has none.
+-            if [ "$_tk" = 1 ] && [ "$_pp_k" = u ]; then
+-                learned_put "$_hs" "$_pp"
+-                log "psk: DomD joined $_hs; its passphrase is kept"
+-            fi
+             [ "$_hs" = "$REJECT_SSID" ] && { REJECT_SSID=""; REJECT_PSK=""; }
+-            state_publish online "$_hs";;
++            # A typed passphrase only: the row's own PSK (a mirror connect) is already
++            #   what the row gets, and an open row has none (see typed_joined).
++            [ "$_hs" = "$TIMEDOUT_SSID" ] && { TIMEDOUT_SSID=""; TIMEDOUT_PSK=""; }
++            if [ "$_tu" = 1 ]; then
++                typed_joined "$_hs" "$_pp" "$_tok"
++            else
++                online_now "$_hs"
++            fi;;
+         FAILED)
+-            state_publish offline "$_hs"
+             case "$_her" in *WRONG_KEY*) _wk=1;; *) _wk=0;; esac
++            [ "$_hs" = "$ONLINE_DUE" ] && { ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online; }
++            [ "$_hs" = "$JOIN_WAIT_SSID" ] && JOIN_WAIT_SSID=""
++            # A typed passphrase not refused, which DomD's wpa_supplicant goes on
++            #   trying: in the row if DomD reports the SSID BACK (see TIMEDOUT_SSID). Not
++            #   while a later connect is pending (DomD has that one's network), nor for
++            #   one that never got to SELECT_NETWORK.
++            case "$_her" in
++                "not associated within"*|*"did not answer"*"after SELECT_NETWORK"*) _tw=1;;
++                *) _tw=0;;
++            esac
++            if [ "$_tk" = 1 ] && [ "$_tu" = 1 ] && [ "$_wk" = 0 ] && [ "$_tw" = 1 ] \
++                && ! pending_has "$_hs"; then
++                TIMEDOUT_SSID=$_hs; TIMEDOUT_PSK=$_pp
++            elif [ "$_hs" = "$TIMEDOUT_SSID" ]; then
++                TIMEDOUT_SSID=""; TIMEDOUT_PSK=""
++            fi
+             if [ "$_wk" = 1 ] && [ "$_tk" = 1 ]; then
+-                REJECT_SSID=$_hs; REJECT_PSK=$_pp; REJECT_T=$SECONDS
++                now_s
++                REJECT_SSID=$_hs; REJECT_PSK=$_pp; REJECT_T=$_now
+                 _lp=$(learned_psk_of "$_hs") && [ "$_lp" = "$_pp" ] && learned_del "$_hs"
+             fi
+             if pending_has "$_hs"; then
++                publish_line offline:retry "$_hs" "$_tok"
+                 log "state: DomD did not join $_hs with an earlier passphrase -- waiting for its answer to the later one"
+                 return 0
+             fi
++            # A reason only for an answer to a connect of this daemon's: one that
++            #   matches none (from before a restart, or after its entry expired) is
++            #   not what the user is waiting on, so it goes out as a bare offline,
++            #   which the app does not show. Written after the row is undone and
++            #   hostapd restarted: the app connects on offline:wrong-key, and must
++            #   meet the PSK the row goes back to.
++            if [ "$_tk" = 1 ]; then
++                fail_reason "$_her"
++                _fk=offline:$_fr
++            else
++                _fk=offline
++            fi
+             # Only a row that is there: an SSID out of the list stays out. An open
+             #   row (empty PSK) has no passphrase to undo.
+             if [ "$_wk" = 1 ] && _rp=$(psk_of "$_hs" 2>/dev/null) && [ -n "$_rp" ]; then
+@@ -1522,7 +1778,16 @@ handle_state() {
+                 if [ "$_rp" != "$_sp" ]; then
+                     set_row_psk "$_hs" "$_sp"
+                     log "state: DomD did not accept the passphrase for $_hs -- its row is back to the $_src PSK"
+-                    state_restart
++                    # Written once hostapd beacons the row's PSK again (flush_due), so
++                    #   that the app's connect meets it; if the restart fails, now.
++                    if [ -z "$ONLINE_DUE" ]; then
++                        ONLINE_DUE=$_hs; ONLINE_TOK=$_tok; ONLINE_KIND=$_fk
++                        state_restart || { publish_line "$_fk" "$_hs" "$_tok"; ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online; }
++                    else
++                        state_restart
++                        publish_line "$_fk" "$_hs" "$_tok"
++                    fi
++                    flush_due
+                     return 0
+                 fi
+             fi
+@@ -1530,9 +1795,12 @@ handle_state() {
+             if [ -n "$_sta" ] && [ "$_hs" = "$_sta" ]; then
+                 hold_add "$_hs"
+                 drop_row "$_hs" "DomD could not join it; not listed again for $FAIL_HOLD_S s"
+-            fi;;
++            fi
++            publish_line "$_fk" "$_hs" "$_tok";;
+         LOST)
+-            state_publish offline "$_hs"
++            [ "$_hs" = "$ONLINE_DUE" ] && { ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online; }
++            [ "$_hs" = "$JOIN_WAIT_SSID" ] && JOIN_WAIT_SSID=""
++            publish_line offline:lost "$_hs"
+             state_sta
+             if [ -n "$_sta" ] && [ "$_hs" = "$_sta" ]; then
+                 hold_add "$_hs"
+@@ -1540,17 +1808,27 @@ handle_state() {
+             fi;;
+         BACK)
+             hold_del "$_hs" && log "state: DomD has $_hs back; it is listed again from the next publication"
+-            state_publish online "$_hs";;
++            # DomD completed the typed passphrase it answered FAILED for the time:
++            #   that one is in it now (see TIMEDOUT_SSID).
++            if [ "$_hs" = "$TIMEDOUT_SSID" ]; then
++                _tp=$TIMEDOUT_PSK; TIMEDOUT_SSID=""; TIMEDOUT_PSK=""
++                typed_joined "$_hs" "$_tp"
++            else
++                online_now "$_hs"
++            fi;;
+     esac
+ }
+ 
+ # handle_psk <ssid> <psk> -- the user typed a passphrase; make it work.
+ #
+-# Order matters: hostapd must know the PSK BEFORE the app re-triggers the
+-# connect, or the retry fails the same way. DomD is told in parallel so the real
+-# association is under way while the local one completes.
++# DomD first: the passphrase is only forwarded here, and its row keeps its PSK until
++# DomD reports COMPLETED for this connect (handle_state puts it in then, restarts
++# hostapd, and writes "online", on which the app connects). Put in at once, as
++# before 2026-11-08, it let DomA's station join the shadow BSS with any passphrase
++# and show the network as connected until DomD's answer, and a wrong one stayed in
++# $APS when DomD's answer named no WRONG_KEY (an SAE AP).
+ handle_psk() {
+-    _s=$1; _p=$2
++    _s=$1; _p=$2; _t=${3:-}
+     # A PSK psk_valid refuses goes nowhere, neither into $APS nor to DomD, and
+     #   the log names neither the value nor its length. NOR DOES AN EMPTY ONE: it
+     #   would make the row open, a secured SSID's open shadow BSS is the dead end
+@@ -1558,39 +1836,34 @@ handle_psk() {
+     #   row comes only from DomD's "sec".
+     if [ -z "${_p:-}" ] || ! psk_valid "$_p"; then
+         log "WARNING: psk: PSK for $_s is empty, or not 8..63 bytes or 64 hex; dropped"
++        state_publish offline:error "$_s" "$_t"
+         return 0
+     fi
+     # The passphrase DomD has just rejected, asked for again (see REJECT_SSID).
+     if [ "$_s" = "$REJECT_SSID" ] && [ "$_p" = "$REJECT_PSK" ] \
+-        && [ $((SECONDS-REJECT_T)) -lt "$FAIL_HOLD_S" ]; then
++        && now_s && [ $((_now-REJECT_T)) -lt "$FAIL_HOLD_S" ]; then
+         log "psk: the passphrase DomD rejected for $_s came again -- dropped for $FAIL_HOLD_S s"
++        state_publish offline:wrong-key "$_s" "$_t"
+         return 0
+     fi
+     cur=$(psk_of "$_s" 2>/dev/null) || cur=""
+     if [ "$cur" = "$_p" ]; then
+         log "psk: $_s already current; only forwarding to DomD"
+     else
+-        set_row_psk "$_s" "$_p"
+-        # If generating the conf failed, do not touch hostapd. `ctl.restart` is a
+-        #   SIGKILL, so dropping it while the old conf is still in place gains nothing
+-        #   and merely loses DomA's only way in.
+-        #   The connect forward below (handing the real PSK to DomD, the only route to
+-        #   the real AP) MUST still run even if this fails. Do not return here.
+-        if write_hostapd_conf; then
+-            restart_hostapd
+-        else
+-            log "WARNING: could not update hostapd.conf, so hostapd is not restarted (the connect is still forwarded)"
+-        fi
++        log "psk: forwarding $_s to DomD; its row takes the passphrase once DomD has joined with it"
+     fi
+     # Do not write `A && log ... || log ...` (see log() at the top).
+-    # Into $LEARNED only once DomD reports COMPLETED for it (see handle_state).
+-    pending_add "$_s" "$_p" u
+-    if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s"}\n' "$_pid" "$(json_esc "$_s")" "$(json_esc "$_p")" >&3; then
++    # Into $APS and $LEARNED only once DomD reports COMPLETED for it (handle_state).
++    pending_add "$_s" "$_p" "u${_t:+#$_t}"
++    if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s","kind":"u"}\n' "$_pid" "$(json_esc "$_s")" "$(json_esc "$_p")" >&3; then
+         pending_commit
++        TIMEDOUT_SSID=""; TIMEDOUT_PSK=""
+         log "psk: forwarded connect($_s) to DomD"
+         mirror_mark_write "$_s" "$_p"      # the mirror must not send this connect again
++        state_publish pending "$_s" "$_t"
+     else
+         log "WARNING: could not write connect($_s) to $CHAN"
++        state_publish offline:error "$_s" "$_t"
+     fi
+ }
+ 
+@@ -1657,6 +1930,9 @@ mirror_station() {
+     fi
+     STA_LAST_SSID=$_ss
+     STA_LAST_UPC=$_uc
++    # The app's join has happened (the station is protected for itself now,
++    #   stations_present step 1).
++    [ "$_ss" = "$JOIN_WAIT_SSID" ] && JOIN_WAIT_SSID=""
+     # The PSK of the BSS the station joined: from $LIVE, what hostapd beacons. $APS can
+     # be ahead of it while a restart is deferred -- an open BSS still on the air while
+     # its row already holds the placeholder, say -- and the station joined the beacon.
+@@ -1700,8 +1976,10 @@ mirror_station() {
+     pending_add "$_ss" "$_pk" m
+     if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s"}\n' "$_pid" "$(json_esc "$_ss")" "$(json_esc "$_pk")" >&3; then
+         pending_commit
++        TIMEDOUT_SSID=""; TIMEDOUT_PSK=""   # DomD's network is this one now
+         log "mirror: station associated with $_ss -> forwarded connect($_ss) to DomD (psk $_how)"
+         mirror_mark_write "$_ss" "$_pk" "$_as"
++        state_publish pending "$_ss"
+     else
+         log "WARNING: mirror: could not write connect($_ss) to $CHAN"
+     fi
+@@ -1775,6 +2053,10 @@ fi
+ # fragment; this keeps the channel clean for an agent that does not.)
+ printf '\n' >&3 2>/dev/null || log "WARNING: chan: could not write the flushing newline to $CHAN"
+ 
++# A request a killed instance was handling: DomaWifiRelay takes a request as handled
++#   only once $REQ.busy is gone too, so a left one would make it wait out its whole
++#   window. Its connect, if sent, is answered to no one ("up").
++rm -f "$REQ.busy"
+ log "started (chan=$CHAN aps=$APS req=$REQ)"
+ state_publish up
+ 
+@@ -1853,15 +2135,22 @@ while :; do
+ 
+     # A request stays in place while the toggle is off, and one left from the previous
+     # boot waits for doma_shadow_ap to finish, as the publications above do: until then
+-    # wlan0 may not exist, so sta_is_up cannot tell, and handle_psk's restart would race
+-    # the oneshot's.
++    # wlan0 may not exist, so sta_is_up cannot tell, and the restart for DomD's answer
++    # would race the oneshot's (state_restart waits for it as well).
+     if [ "$_up" = 1 ] && [ -s "$REQ" ] && [ "$(getprop init.svc.vendor.doma_shadow_ap 2>/dev/null)" != running ]; then
+         # Move before reading so a request cannot be handled twice if hostapd's
+-        # restart takes longer than the poll interval.
++        # restart takes longer than the poll interval. Removed only once it has been
++        # handled: DomaWifiRelay waits for that (see the rm above).
+         mv "$REQ" "$REQ.busy" 2>/dev/null || continue
+         while IFS="$TAB" read -r verb a b; do
++            # psk#<token>: DomaWifiRelay's token for this request, given back with
++            #   every relay.state line that answers it (state_publish). Hex only.
+             case "$verb" in
+-                psk) [ -n "${a:-}" ] && handle_psk "$a" "${b:-}";;
++                psk|psk#*)
++                    _rt=${verb#psk}; _rt=${_rt#\#}
++                    case "$_rt" in *[!0-9a-f]*) _rt="";; esac
++                    [ ${#_rt} -le 16 ] || _rt=""
++                    [ -n "${a:-}" ] && handle_psk "$a" "${b:-}" "$_rt";;
+                 '')  ;;
+                 *)   log "unknown request verb: $verb";;
+             esac
+@@ -1871,5 +2160,15 @@ while :; do
+ 
+     mirror_station
+     flush_pending_restart
+-    [ "$STATE_RESTART" = 1 ] && state_restart
++    if [ "$STATE_RESTART" = 1 ] && ! state_restart && [ "$STATE_RESTART" = 0 ] \
++        && [ -n "$ONLINE_DUE" ]; then
++        if [ "$ONLINE_KIND" = online ]; then
++            log "WARNING: state: hostapd did not take $ONLINE_DUE's passphrase"
++            state_publish offline:error "$ONLINE_DUE" "$ONLINE_TOK"   # online with the next restart
++        else
++            state_publish "$ONLINE_KIND" "$ONLINE_DUE" "$ONLINE_TOK"
++            ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online
++        fi
++    fi
++    flush_due       # a restart of this pass (handle_aps, flush_pending_restart, above)
+ done
+-- 
+2.43.0
+

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- What RelayService.notifyState tells the user about DomD's real join. The SSID is
+     %1$s; it is shown on the user's own screen only, never logged by these. -->
+<resources>
+    <string name="channel_status">Wi-Fi connection status</string>
+    <string name="channel_failure">Wi-Fi connection problems</string>
+    <string name="connecting">Connecting to %1$s…</string>
+    <string name="connecting_text">Waiting for the access point to answer. The Wi-Fi screen may change before this does.</string>
+    <string name="connected">Connected to %1$s</string>
+    <string name="failed">Cannot connect to %1$s</string>
+    <string name="reason_not_found">The access point was not found. Check that it is on and nearby (for a phone hotspot, keep its hotspot screen open).</string>
+    <string name="reason_wrong_key">The password is not correct.</string>
+    <string name="reason_rejected">The access point refused the connection.</string>
+    <string name="reason_timeout">The access point did not answer in time.</string>
+    <string name="reason_error">The connection could not be started.</string>
+    <string name="lost">Disconnected from %1$s</string>
+    <string name="lost_text">The connection to the access point was lost.</string>
+</resources>

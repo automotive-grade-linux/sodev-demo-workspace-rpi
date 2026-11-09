@@ -68,6 +68,10 @@ allow doma_shadow_ap sysfs_net:dir r_dir_perms;
 allow doma_shadow_ap sysfs_net:file r_file_perms;
 allow doma_shadow_ap sysfs_net:lnk_file r_file_perms;
 
+# The relay times its waits by /proc/uptime (now_s in doma-wifi-relay.sh): mksh's
+# $SECONDS is the wall clock, which NTP steps (genfs proc_uptime).
+allow doma_shadow_ap proc_uptime:file r_file_perms;
+
 # `setprop ctl.restart|stop|start vendor.doma_shadow_hostapd`: init checks the legacy
 # name ctl.vendor.doma_shadow_hostapd, which falls to the `ctl.` prefix,
 # ctl_default_prop, a system_public_prop a vendor domain may set
