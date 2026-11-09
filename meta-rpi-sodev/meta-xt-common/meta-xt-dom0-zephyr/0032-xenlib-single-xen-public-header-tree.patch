@@ -1,8 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From ce02e6aa2224b4357d6c8bc41a1cba2e86b20ee0 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 03:13:42 +0900
+Date: Wed, 11 Nov 2026 08:35:26 +0900
 Subject: [PATCH] xenlib: make include/xen/public the only Xen header tree
-
 
 Two loose ends from making zephyr-xenlib the single source of the Xen public
 headers (upstream d58fbb8cfc58 on the Zephyr side, 0027/0029 on the
@@ -42,15 +41,23 @@ Also corrects the one remaining reference to the old path: a comment in
 xstat/include/xstat.h that still pointed at include/zephyr/xen/public/domctl.h,
 which no longer exists anywhere.
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ CMakeLists.txt                          | 15 +++++
+ include/xen/public/xen-compat.h         |  4 --
+ vch/include/vch.h                       | 18 ++++-
+ vch/include/xen/public/io/libxenvchan.h | 88 -------------------------
+ xstat/include/xstat.h                   |  2 +-
+ 5 files changed, 33 insertions(+), 94 deletions(-)
+ delete mode 100644 vch/include/xen/public/io/libxenvchan.h
+
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 69456cd..59c0c98 100644
+index 69456cd..b87fb90 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -9,6 +9,22 @@ if(CONFIG_XEN)
+@@ -9,6 +9,21 @@ if(CONFIG_XEN)
  
    zephyr_include_directories(${ZEPHYR_XENLIB_DIR}/include)
  
@@ -61,8 +68,7 @@ index 69456cd..59c0c98 100644
 +  # <xen/public/domctl.h> failed with
 +  #   "domctl operations are intended for use by node control tools only".
 +  # Pass it from the build, the way upstream Xen's tools do, so include order stops
-+  # mattering. Kept under CONFIG_XEN_DOM0 - the same condition xen-compat.h used.
-+  # Unconditional under CONFIG_XEN, not gated on CONFIG_XEN_DOM0. XSTAT,
++  # mattering. Unconditional under CONFIG_XEN, not gated on CONFIG_XEN_DOM0. XSTAT,
 +  # XEN_DOMAIN_MANAGEMENT and XEN_SHELL have no `depends on XEN_DOM0`, so a
 +  # XEN=y/XEN_DOM0=n build compiles xstat.c and friends, which include
 +  # <xen/public/domctl.h> and would hit its "node control tools only" #error.

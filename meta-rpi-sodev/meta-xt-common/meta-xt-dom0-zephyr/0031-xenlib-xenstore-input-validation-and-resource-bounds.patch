@@ -1,8 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 282645d745d34d18cfdfd1e906c3678901f2d5de Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
+Date: Wed, 11 Nov 2026 08:35:26 +0900
 Subject: [PATCH] xenlib: xenstore-srv: input validation and resource bounds
-
 
 Defects found by adversarial review of the 4.4.1 series. All of them predate
 this work - none is a regression from the Zephyr upgrade - but all are
@@ -140,10 +139,14 @@ Third-round review follow-ups (defects found in this patch's own area):
    the teardown hang this series exists to remove. XS_RM with an empty path is now
    EINVAL instead of wiping the caller's whole subtree.
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ Kconfig                         |  19 +-
+ xenstore-srv/src/xenstore_srv.c | 622 +++++++++++++++++++++++++++-----
+ 2 files changed, 547 insertions(+), 94 deletions(-)
+
 diff --git a/Kconfig b/Kconfig
 index 35efccb..d60c2af 100644
 --- a/Kconfig
@@ -177,7 +180,7 @@ index 35efccb..d60c2af 100644
  	help
  	  Sets the maximum xs traverse depth to avoid stack overflow
 diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
-index 2413d65..af9695e 100644
+index c4d8e49..3613ce1 100644
 --- a/xenstore-srv/src/xenstore_srv.c
 +++ b/xenstore-srv/src/xenstore_srv.c
 @@ -36,7 +36,18 @@ LOG_MODULE_REGISTER(xenstore);
@@ -1002,7 +1005,7 @@ index 2413d65..af9695e 100644
  	xenstore->running_transaction++;
  	snprintf(buf, sizeof(buf), "%d", ++xenstore->transaction);
  	send_reply(xenstore, id, XS_TRANSACTION_START, buf);
-@@ -2132,7 +2528,23 @@ static void handle_input(struct xenstore *xenstore)
+@@ -2133,7 +2529,23 @@ static void handle_input(struct xenstore *xenstore)
  
  		xenstore->in->total_size += header.len;
  		k_free(xenstore->in->buffer);
@@ -1027,7 +1030,7 @@ index 2413d65..af9695e 100644
  		if (!xenstore->in->buffer) {
  			goto alloc_err;
  		}
-@@ -2151,6 +2563,7 @@ static void handle_input(struct xenstore *xenstore)
+@@ -2152,6 +2564,7 @@ static void handle_input(struct xenstore *xenstore)
  		return;
  	}
  
@@ -1035,10 +1038,10 @@ index 2413d65..af9695e 100644
  	process_message(xenstore);
  	return;
  
-@@ -2184,9 +2597,26 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
- 			xenstore->pending_stop_transaction = false;
- 		}
+@@ -2175,9 +2588,26 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
+ 	xenstore->running_transaction = 0;
  
+ 	while (!atomic_get(&xenstore->thrd_stop)) {
 -		if (!xenstore->running_transaction) {
 -			process_pending_watch_events(domain);
 -		}
@@ -1065,7 +1068,7 @@ index 2413d65..af9695e 100644
  
  		/* Backpressure: processing a request while the
  		 * out queue is near XENSTORE_MAX_OUT_BUF_NUM lets a reply/watch
-@@ -2362,6 +2792,12 @@ static void remove_ref_entries_recursive(uint32_t domid, sys_dlist_t *chlds)
+@@ -2353,6 +2783,12 @@ static void remove_ref_entries_recursive(uint32_t domid, sys_dlist_t *chlds)
  
  	SYS_DLIST_FOR_EACH_CONTAINER_SAFE(chlds, entry, next, node) {
  		perms = SYS_SLIST_PEEK_HEAD_CONTAINER(&entry->perms, perms, node);

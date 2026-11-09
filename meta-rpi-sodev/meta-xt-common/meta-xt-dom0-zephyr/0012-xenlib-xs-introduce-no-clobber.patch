@@ -1,21 +1,53 @@
-From 6ee2a03fa9846b95b28527d64181e5c1f630bd76 Mon Sep 17 00:00:00 2001
+From 92b1fe9449ebbdad94c1a2293d4ac97ffe743292 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 08 Jul 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:35:01 +0900
 Subject: [PATCH] xenlib: xs-introduce: no-clobber existing domain node
-
 
 XS_INTRODUCE must not clobber a domain's existing xenstore node/state when the
 domain was created by an external toolstack.
+
+The three comments that described the introduce path as seeding the guest's
+xenstore tree (xen_dom_mgmt.h, xen-dom-mgmt.c, xenstore_srv.c's
+handle_introduce) now say what it does: map the ring, bind the event channel
+and track the domain.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ xen-dom-mgmt/include/xen_dom_mgmt.h |  2 +-
+ xen-dom-mgmt/src/xen-dom-mgmt.c     | 21 +++++++++++++--------
+ xenstore-srv/src/xenstore_srv.c     |  3 ++-
+ 3 files changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/xen-dom-mgmt/include/xen_dom_mgmt.h b/xen-dom-mgmt/include/xen_dom_mgmt.h
+index 94777c7..3ae2d2e 100644
+--- a/xen-dom-mgmt/include/xen_dom_mgmt.h
++++ b/xen-dom-mgmt/include/xen_dom_mgmt.h
+@@ -33,7 +33,7 @@ int domain_create(struct xen_domain_cfg *domcfg, uint32_t domid);
+  * Introduce a domain created by an external privileged toolstack
+  * (DomD via `xl create`) into Zephyr Dom0's xenstore server. Allocates the
+  * shadow xen_domain, maps the store ring at @store_pfn, binds @remote_evtchn,
+- * seeds the guest xenstore tree and tracks it in domain_list. Idempotent.
++ * tracks it in domain_list; the guest xenstore tree is libxl's. Idempotent.
+  * Called from xenstore_srv's XS_INTRODUCE (op 8) handler.
+  *
+  * @param domid         The domid to introduce (must already exist at Xen).
 diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
-index fa34c94..f5c324f 100644
+index faef1de..e97b550 100644
 --- a/xen-dom-mgmt/src/xen-dom-mgmt.c
 +++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
-@@ -1275,11 +1275,17 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+@@ -1243,7 +1243,8 @@ err_free:
+  * introduce flow but drive it from the XS_INTRODUCE (op 8) wire request that
+  * xenstore_srv's handle_introduce() dispatches: allocate a shadow xen_domain,
+  * map the store ring at the caller-supplied gfn, bind the caller-supplied
+- * event channel, seed the guest's xenstore tree and track it in domain_list.
++ * event channel and track it in domain_list; the guest's xenstore tree is
++ * libxl's and is left alone.
+  * store_pfn/remote_evtchn come straight from the XS_INTRODUCE payload (the
+  * toolstack already allocated them), so no HVM_PARAM read is needed here.
+  * Idempotent: a duplicate introduce for an already-tracked domid succeeds.
+@@ -1321,11 +1322,17 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
  		goto err_free;
  	}
  
@@ -38,7 +70,7 @@ index fa34c94..f5c324f 100644
  
  	notify_evtchn(domain->xenstore.remote_evtchn);
  
-@@ -1293,8 +1299,6 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+@@ -1339,8 +1346,6 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
  	LOG_INF("xs_introduce:domid:%u introduced by toolstack", domid);
  	return 0;
  
@@ -47,3 +79,17 @@ index fa34c94..f5c324f 100644
  err_free:
  	k_free(domain);
  	return rc;
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 180349c..63a1646 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -1732,7 +1732,8 @@ static void cleanup_domain_watches(struct xen_domain *domain)
+  * introduce domains; here DomD is the control/toolstack domain (capabilities
+  * 0x1) and must be able to introduce DomU/DomA. Payload is the canonical
+  * NUL-separated triple "domid\0mfn\0evtchn\0"; we hand it to xs_introduce_domain
+- * which maps the ring, binds the evtchn and seeds the guest xenstore tree.
++ * which maps the ring, binds the evtchn and tracks the domain; the xenstore
++ * tree is libxl's.
+  */
+ static void handle_introduce(struct xenstore *xenstore, uint32_t id,
+ 			     char *payload, uint32_t sz)

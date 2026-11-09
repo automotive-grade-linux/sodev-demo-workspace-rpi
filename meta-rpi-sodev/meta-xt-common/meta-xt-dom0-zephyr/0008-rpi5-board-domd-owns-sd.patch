@@ -1,6 +1,6 @@
 From 92473f243d386beb6b32f4ac6a6aabc1f18179a4 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 01:09:27 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] boards/rpi_5: HW-verified Dom0 bring-up + DomD-owns-SD fixes
 
 
@@ -86,7 +86,7 @@ Rebased onto Zephyr 4.4.1 (upstream v4.4.1, no xen-troops fork deltas):
    symbols exist only in the fork. Assigning to an undefined symbol is a hard
    Kconfig error in Zephyr 4.x.
 
- - - CONFIG_HW_STACK_PROTECTION=y is dropped. Only CPU_AARCH64_CORTEX_R
+ - CONFIG_HW_STACK_PROTECTION=y is dropped. Only CPU_AARCH64_CORTEX_R
    selects ARCH_HAS_STACK_PROTECTION on arm64, so on this Cortex-A76 the
    symbol is invisible and the assignment never reached .config - not on 4.4.1
    and not on 3.6 either. Kconfig only hard-errors on *undefined* symbols, not

@@ -1,15 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 03:13:42 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] dom0-xt: track the Zephyr 4.x FATFS Kconfig renames
 
 
 Two symbols this app referenced do not exist in upstream Zephyr 4.4.1:
 
- - - CONFIG_FS_MULTI_PARTITION was never an upstream symbol at all; it was
+ - CONFIG_FS_MULTI_PARTITION was never an upstream symbol at all; it was
    added by the xen-troops Zephyr fork (subsys/fs/Kconfig.fatfs). Upstream
    introduced the same feature in 4.0 as CONFIG_FS_FATFS_MULTI_PARTITION.
- - - CONFIG_SDMMC_VOLUME_NAME was removed in Zephyr 4.0; the SDMMC disk name
+ - CONFIG_SDMMC_VOLUME_NAME was removed in Zephyr 4.0; the SDMMC disk name
    now comes from the devicetree `disk-name` property (see
    doc/releases/migration-guide-4.0.rst). Its default was "SD" for
    FAT_FILESYSTEM_ELM, so the Kconfig default is spelled out as "SD" here. The
@@ -22,7 +22,7 @@ name results.
 
 Depends on 0002, 0008 (both carry the old spelling in boards/rpi_5.conf).
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---

@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From b370fe52800c90ef46d0e6c4174e79efc03c90db Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 01:09:27 +0900
+Date: Wed, 11 Nov 2026 08:33:32 +0900
 Subject: [PATCH] boards/rpi_4b: add Zephyr Dom0 board conf + overlay (BCM2711)
 
 Add the Raspberry Pi 4 (BCM2711) counterpart of boards/rpi_5.{conf,overlay}.
@@ -36,8 +36,9 @@ Three things are genuinely different on BCM2711 and are commented in place:
 
 * SRAM RELINK to 0x20000000, derived rather than measured. Xen's rpi4 platform
   sets .dma_bitsize = 30, so allocate_memory_11() confines Dom0's bank[0] to
-  below 1 GiB -- RPi5 has no platform entry, gets the 32-bit default and landed
-  at 0xc0000000. boot.cmd.xen.zephyr-dom0.in passes dom0_mem=128M
+  below 1 GiB -- RPi5 has no platform entry, gets the 32-bit default and
+  measured bank[0] at 0xa0000000 (0008). boot.cmd.xen.zephyr-dom0.in passes
+  dom0_mem=128M
   (get_allocation_size(128 MiB) is exactly order 15), and the first free
   naturally-aligned 128 MiB block below 1 GiB in that memory map is
   0x20000000-0x28000000. (dom0_mem used to be 256M; the overlay body records why
@@ -110,12 +111,18 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
+ boards/rpi_4b.conf    | 156 +++++++++++++++++++++
+ boards/rpi_4b.overlay | 307 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 463 insertions(+)
+ create mode 100644 boards/rpi_4b.conf
+ create mode 100644 boards/rpi_4b.overlay
+
 diff --git a/boards/rpi_4b.conf b/boards/rpi_4b.conf
 new file mode 100644
-index 0000000..85914da
+index 0000000..d1aee42
 --- /dev/null
 +++ b/boards/rpi_4b.conf
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,156 @@
 +# Copyright (c) 2026 Yuichi Kusakabe
 +# SPDX-License-Identifier: Apache-2.0
 +#
@@ -245,7 +252,8 @@ index 0000000..85914da
 +# `default 4`, so the empty, invisible SDHC_BUFFER_ALIGNMENT can no longer leak
 +# into the generated misc/generated/configs.c assembly.
 +
-+# Xen 4.21 ABI. XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n
++# Xen ABI versions: zephyr-xenlib's headers are Xen 4.21.0's, the hypervisor is
++# 4.22. XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n
 +# here to keep arm_sci_type/vgsx_osid out of xen_arch_domainconfig; those symbols
 +# exist only in the xen-troops Zephyr fork and are absent upstream, where the
 +# vendored public headers are gone (d58fbb8c) and the ABI comes from
@@ -273,7 +281,7 @@ index 0000000..85914da
 +CONFIG_DOM_CFG_SODEV=y
 diff --git a/boards/rpi_4b.overlay b/boards/rpi_4b.overlay
 new file mode 100644
-index 0000000..e468f90
+index 0000000..07abd91
 --- /dev/null
 +++ b/boards/rpi_4b.overlay
 @@ -0,0 +1,307 @@
@@ -307,8 +315,9 @@ index 0000000..e468f90
 + *  3. NO SDHC. The RPi4 SD controller (/emmc2bus/mmc@7e340000) is handed to DomD
 + *     by boot.cmd.xen.zephyr-dom0.in, and the pinned rpi_4b board does not define
 + *     an SDHC node at all — so unlike rpi_5.overlay there is nothing to disable
-+ *     here. boards/rpi_4b.conf still sets CONFIG_DISK_DRIVER_SDMMC=n so the disk
-+ *     driver is not built.
++ *     here. boards/rpi_4b.conf sets neither CONFIG_DISK_DRIVER_SDMMC nor the
++ *     FATFS alignment pin: without an SDHC node the symbol is invisible and the
++ *     disk driver is not built.
 + */
 +
 +/delete-node/ &sram0;
@@ -360,8 +369,7 @@ index 0000000..e468f90
 +	 *   (XEN) Grant table range: 0x............-0x............
 +	 *   (XEN) d0: extended region 1: 0x..........->0x..........
 +	 *
-+	 * Derivation of the values below (see also
-+	 * rpi4-port/meta-rpi5-sodev/meta-xt-common/meta-xt-dom0-zephyr/RPI4-PORT.md):
++	 * Derivation of the values below:
 +	 *
 +	 *   grant table: find_gnttab_region() in xen/arch/arm/domain_build.c sets
 +	 *     gnttab_start = __pa(_stext), i.e. where boot.cmd loaded the Xen binary
@@ -398,12 +406,12 @@ index 0000000..e468f90
 +	 * garbage and faults before console init — on RPi5 the symptom was total UART
 +	 * silence and no xu-create.
 +	 *
-+	 * 0x20000000 is derived, not copied from RPi5 (which uses 0xc0000000):
++	 * 0x20000000 is derived, not copied from RPi5 (measured at 0xa0000000):
 +	 *   - Xen's rpi4 platform sets .dma_bitsize = 30
 +	 *     (xen/arch/arm/platforms/brcm-raspberry-pi.c), so allocate_memory_11()
 +	 *     computes lowmem_bitsize = min(32, 30) = 30 and confines bank[0] to
 +	 *     below 1 GiB. RPi5 has no platform entry, gets the 32-bit default, and
-+	 *     therefore landed at 0xc0000000.
++	 *     measured bank[0] at 0xa0000000 (patch 0008).
 +	 *   - boot.cmd.xen.zephyr-dom0.in passes dom0_mem=128M, and
 +	 *     get_allocation_size(128 MiB) is exactly order 15 = 128 MiB.
 +	 *   - In that boot script's memory map the first free naturally-aligned

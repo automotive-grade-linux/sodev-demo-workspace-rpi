@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From b58f203d8867ce6e67f449223289c7b5557de10e Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 26 Jul 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:33:32 +0900
 Subject: [PATCH] dom_cfg/rpi_4b: add the RPi4 guest domain configs
 
 CMakeLists.txt selects src/dom_cfg/${BOARD}.c, so BOARD="rpi_4b" needs its own
@@ -9,10 +9,13 @@ file. This is a new file; src/dom_cfg/rpi_5.c is untouched.
 Content = rpi_5.c at the pinned rev plus the SoDeV additions patch 0004 makes to
 it, with three BCM2711 changes:
 
-* MEMORY BUDGET. RPi5 ran DomU 1 GiB + DomA 4 GiB on a 16 GiB board. An 8 GiB
-  RPi4 has Dom0 256 MiB + DomD 1920 MiB committed by
-  bcm2711-raspberrypi4-64-xen.dtso, so DomA is halved to 2 GiB, leaving about
-  2.9 GiB for the Xen heap, the boot modules and headroom.
+* MEMORY BUDGET. RPi5 ran DomU 1 GiB + DomA 4 GiB on a 16 GiB board. On RPi4,
+  Dom0 is 128 MiB (dom0_mem=128M in boot.cmd.xen.zephyr-dom0.in) and DomD is
+  what bcm2711-raspberrypi4-64-xen.dtso commits as static-mem: 1920 MiB on the
+  8 GiB SKU, 1056 MiB (GL) or 1440 MiB (Vulkan) on the 4 GiB one. DomA's size
+  is chosen per SKU by meta-xt-rpi4's xt-xen-cfg-doma bbappend (2560 MiB, or
+  2048 MiB on the 4 GiB SKU with the Vulkan lane); this file carries the
+  2048 MiB value.
 
 * DomA dt_passthrough is "/soc/firmware", not "/firmware": on BCM2711 the
   VideoCore firmware interface node lives under /soc. It is a descriptive copy
@@ -31,14 +34,18 @@ with rc=-19.
 
 Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
+ src/dom_cfg/rpi_4b.c | 364 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 364 insertions(+)
+ create mode 100644 src/dom_cfg/rpi_4b.c
+
 diff --git a/src/dom_cfg/rpi_4b.c b/src/dom_cfg/rpi_4b.c
 new file mode 100644
-index 0000000..197b38d
+index 0000000..90edc4e
 --- /dev/null
 +++ b/src/dom_cfg/rpi_4b.c
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,364 @@
 +/*
 + * Copyright (c) 2024 EPAM Systems
 + * Copyright (c) 2026 Yuichi Kusakabe
@@ -169,28 +176,30 @@ index 0000000..197b38d
 + * serial) is a qemu virtio-pci device served by `xl devd` + qemu inside the
 + * dom0less DomD. Neither guest needs iomems or irqs, and back_cfg is left empty
 + * (the Zephyr PV vif/vbd path is unused). Field values mirror the deployed
-+ * /etc/xen/{domu,doma}.cfg — including DomA at 2 GiB: that file used to say 4096,
-+ * carried over from the 16 GiB rpi5 board, which does not fit an 8 GiB Pi 4
-+ * (1920+1024+4096+1024+Xen+gpu = 8204 MiB). Both now say 2048.
++ * /etc/xen/{domu,doma}.cfg, except DomA's memory: doma.cfg takes it from
++ * meta-xt-rpi4's xt-xen-cfg-doma bbappend (2560 MiB, or 2048 MiB on the 4 GiB
++ * SKU with the Vulkan lane), and this entry carries the 2048 MiB value.
 + *
 + * WHO ACTUALLY CREATES THEM. Not Zephyr, in this configuration. These entries
 + * load their kernels through storage_image_kernel_read(), i.e. the FATFS disk
-+ * backend, and boards/rpi_4b.conf sets CONFIG_DISK_DRIVER_SDMMC=n because the SD
++ * backend, and neither board .conf sets CONFIG_DISK_DRIVER_SDMMC: the SD
 + * controller is passed through to DomD (an enabled SDHC node with unmapped MMIO
-+ * would hang Dom0). With no disk driver there is no volume to read from, so — as
-+ * on RPi5, whose rpi_5.conf sets exactly the same CONFIG_DISK_DRIVER_SDMMC=n —
-+ * the production path is `xl create` inside DomD, and these dom_cfg entries are
++ * would hang Dom0), upstream defines no SDHC node for either board, and without
++ * one the symbol is invisible and the disk driver is not built. With no disk
++ * driver there is no volume to read from, so — on RPi4 as on RPi5 —
 + * reachable only from the Zephyr shell (`xu create rpi_4b_sodev_domu`) and only
 + * if a disk is given back to Dom0. They are kept because they are the single
 + * place the guest layout is written down, and because the RPi5 file keeps its
 + * equivalents for the same reason.
 + *
 + * [rpi4] MEMORY BUDGET differs from RPi5. RPi5 ran DomU 1 GiB + DomA 4 GiB on a
-+ * 16 GiB board. An 8 GiB RPi4 has Dom0 256 MiB + DomD 1920 MiB committed by
-+ * bcm2711-raspberrypi4-64-xen.dtso, leaving about 5.9 GiB, so DomA is halved to
-+ * 2 GiB. That keeps roughly 2.9 GiB for the Xen heap, the boot modules and
-+ * headroom. Raising DomA back to 4 GiB is the first thing to try if AAOS is
-+ * memory-starved, and the first thing to cut if Xen runs out.
++ * 16 GiB board. On RPi4, Dom0 is 128 MiB (dom0_mem=128M in
++ * boot.cmd.xen.zephyr-dom0.in) and DomD is what bcm2711-raspberrypi4-64-xen.dtso
++ * commits as static-mem: 1920 MiB on the 8 GiB SKU, 1056 MiB (GL) or 1440 MiB
++ * (Vulkan) on the 4 GiB one (meta-xt-rpi4/README.md). DomU stays at 1 GiB.
++ * DomA's size is chosen per SKU by meta-xt-rpi4's xt-xen-cfg-doma bbappend:
++ * 2560 MiB, or 2048 MiB on the 4 GiB SKU with the Vulkan lane, where DomU and
++ * DomA cannot run at the same time. The entry below carries the 2048 MiB value.
 + * ---------------------------------------------------------------------------
 + */
 +
@@ -235,7 +244,8 @@ index 0000000..197b38d
 +
 +static struct xen_domain_cfg rpi_4b_sodev_doma = {
 +	.name = "rpi_4b_sodev_doma",
-+	.mem_kb = 2ULL * 1024 * 1024, /* 2 GiB -- see the MEMORY BUDGET note above */
++	.mem_kb = 2ULL * 1024 * 1024, /* 2 GiB: the 4 GiB SKU + Vulkan value; the 8 GiB
++				       * doma.cfg says 2560 -- see MEMORY BUDGET above */
 +	.flags = (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap),
 +	.max_evtchns = 10,
 +	.max_vcpus = 2,

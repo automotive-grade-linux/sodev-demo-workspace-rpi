@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 03:13:42 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] xrun: take the Xen public headers from zephyr-xenlib
 
 
@@ -15,7 +15,7 @@ build stops at:
   zephyr-xrun/src/xrun.c:18:10: fatal error: zephyr/xen/public/domctl.h:
       No such file or directory
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-xrun]
 ---

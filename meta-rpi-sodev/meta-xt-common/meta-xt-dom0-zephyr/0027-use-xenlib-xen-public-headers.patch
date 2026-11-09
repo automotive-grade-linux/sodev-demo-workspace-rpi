@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 03:13:42 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] dom0-xt: take the Xen public headers from zephyr-xenlib
 
 
@@ -29,7 +29,7 @@ which is why apply-zephyr-patches.sh no longer keeps them at the end of the seri
 
 Depends on 0020 for src/dom_cfg/rpi_4b.c.
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---

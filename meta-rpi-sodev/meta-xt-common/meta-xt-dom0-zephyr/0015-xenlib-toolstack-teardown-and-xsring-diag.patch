@@ -1,20 +1,40 @@
-From 071eefaf606a087415759aba983fc71775226dba Mon Sep 17 00:00:00 2001
+From c667f37bef42bbe426a4c1d907fb41691dc53b8e Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 08 Jul 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:35:01 +0900
 Subject: [PATCH] xenlib: toolstack teardown + xsring diagnostics
 
-
 Add toolstack-domain teardown and xenstore-ring diagnostics.
+
+unref_domain() is declared in domain.h next to get_domain()/put_domain();
+xen_cmds.c already reaches that header through xen_dom_mgmt.h.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ xen-dom-mgmt/include/domain.h   |  1 +
+ xen-dom-mgmt/src/mem-mgmt.c     |  5 ++-
+ xen-dom-mgmt/src/xen-dom-mgmt.c | 68 ++++++++++++++++++++++++++-------
+ xen-shell-cmd/src/xen_cmds.c    | 46 ++++++++++++++++++++++
+ 4 files changed, 106 insertions(+), 14 deletions(-)
+
+diff --git a/xen-dom-mgmt/include/domain.h b/xen-dom-mgmt/include/domain.h
+index f93746b..bc3da52 100644
+--- a/xen-dom-mgmt/include/domain.h
++++ b/xen-dom-mgmt/include/domain.h
+@@ -239,6 +239,7 @@ struct xen_domain {
+ 
+ struct xen_domain *get_domain(uint32_t domid);
+ void put_domain(struct xen_domain *domain);
++void unref_domain(struct xen_domain *domain);
+ 
+ #ifdef __cplusplus
+ }
 diff --git a/xen-dom-mgmt/src/mem-mgmt.c b/xen-dom-mgmt/src/mem-mgmt.c
-index efe3578..2384ddf 100644
+index 19ad108..4e6706b 100644
 --- a/xen-dom-mgmt/src/mem-mgmt.c
 +++ b/xen-dom-mgmt/src/mem-mgmt.c
-@@ -226,7 +226,10 @@ int xenmem_map_region(int domid, uint64_t nr_pages, uint64_t base_gfn,
+@@ -225,7 +225,10 @@ int xenmem_map_region(int domid, uint64_t nr_pages, uint64_t base_gfn,
  	return 0;
  
  err_out:
@@ -27,10 +47,10 @@ index efe3578..2384ddf 100644
  	}
  
 diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
-index f5c324f..02d2a6b 100644
+index 0389d8b..7e820b1 100644
 --- a/xen-dom-mgmt/src/xen-dom-mgmt.c
 +++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
-@@ -668,6 +668,27 @@ struct xen_domain *get_domain(uint32_t domid)
+@@ -717,6 +717,27 @@ struct xen_domain *get_domain(uint32_t domid)
  	return iter;
  }
  
@@ -58,7 +78,7 @@ index f5c324f..02d2a6b 100644
  void put_domain(struct xen_domain *domain)
  {
  	int rc;
-@@ -681,34 +702,44 @@ void put_domain(struct xen_domain *domain)
+@@ -730,34 +751,44 @@ void put_domain(struct xen_domain *domain)
  	k_mutex_lock(&dl_mutex, K_FOREVER);
  	domain->refcount--;
  	if (domain->refcount == 0) {
@@ -111,7 +131,7 @@ index f5c324f..02d2a6b 100644
  	}
  	k_mutex_unlock(&dl_mutex);
  }
-@@ -1350,6 +1381,19 @@ int xs_release_domain(uint32_t domid)
+@@ -1400,6 +1431,19 @@ int xs_release_domain(uint32_t domid)
  	 * destroys it itself; doing so here would be a double-destroy. The
  	 * teardown helpers do not re-take dl_mutex (same as put_domain). */
  	if (--domain->refcount == 0) {
@@ -131,7 +151,7 @@ index f5c324f..02d2a6b 100644
  		rc = xs_remove_xenstore_backends(domain);
  		if (rc) {
  			LOG_ERR("xs_release:domid:%u remove_backends err (%d)", domid, rc);
-@@ -1369,15 +1413,13 @@ int xs_release_domain(uint32_t domid)
+@@ -1419,15 +1463,13 @@ int xs_release_domain(uint32_t domid)
  		}
  #endif
  
@@ -151,10 +171,10 @@ index f5c324f..02d2a6b 100644
  	return 0;
  }
 diff --git a/xen-shell-cmd/src/xen_cmds.c b/xen-shell-cmd/src/xen_cmds.c
-index c34f99c..7f03556 100644
+index c34f99c..a1d0796 100644
 --- a/xen-shell-cmd/src/xen_cmds.c
 +++ b/xen-shell-cmd/src/xen_cmds.c
-@@ -325,6 +325,51 @@ out:
+@@ -325,6 +325,48 @@ out:
  	return ret;
  }
  
@@ -162,9 +182,6 @@ index c34f99c..7f03556 100644
 + * Added to root-cause the on-HW "DomD xenstore connection wedges" issue:
 + * shows whether requests sit unconsumed in the ring (req_cons != req_prod),
 + * whether replies are stuck (out bufs / rsp indexes) and the worker state. */
-+extern struct xen_domain *get_domain(uint32_t domid);
-+extern void unref_domain(struct xen_domain *domain);
-+
 +static int domain_xsring(const struct shell *shell, size_t argc, char **argv)
 +{
 +	uint32_t domid;
@@ -206,7 +223,7 @@ index c34f99c..7f03556 100644
  SHELL_STATIC_SUBCMD_SET_CREATE(
  	subcmd_xu,
  	SHELL_CMD_ARG(create, NULL,
-@@ -353,6 +398,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
+@@ -353,6 +395,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
  		      " Usage: console <domid|name>\n",
  		      domu_console_attach, 2, 0),
  #endif

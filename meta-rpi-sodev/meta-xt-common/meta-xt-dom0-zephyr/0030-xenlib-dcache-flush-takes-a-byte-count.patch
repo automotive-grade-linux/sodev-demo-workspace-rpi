@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] xen-dom-mgmt: flush the whole mapping, not nr_pages bytes
 
 
@@ -27,7 +27,7 @@ is used from the Dom0 shell.
 This is an upstream defect, not a rebase artifact; 0005 already passes a byte
 count in the initrd path it adds, and this brings the other three in line.
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---

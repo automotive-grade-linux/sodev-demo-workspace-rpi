@@ -17,7 +17,9 @@
 # The patch set is self-contained: on a clean checkout of the pinned revs it
 # adds every symbol the SoDeV guests need (Kconfig DOM_CFG_SODEV, the xenlib
 # storage initrd callbacks, and the rpi_5 dom_cfg entries). CONFIG_DOM_CFG_SODEV
-# is turned on by the moulin builder var in rpi5-sodev.yaml, not here.
+# is turned on by the moulin builder var in rpi5-sodev.yaml / rpi4-sodev.yaml,
+# not here; 0019's boards/rpi_4b.conf sets it as well, so a bare
+# `west build -b rpi_4b` gets the SoDeV guests too.
 #
 # This script also runs `west update` itself, once, in the middle: 0021 rewrites
 # zephyr-dom0-xt/west.yml (Zephyr 4.5.0 + zephyrproject-rtos xenlib + the
@@ -109,10 +111,11 @@ fi
 # `path:`, is covered without editing this script.
 #
 # The manifest repository is included. `west list` reports it as name=manifest with
-# url=N/A, and it is where most of this series lands (0002-0004, 0008, 0011, 0021,
-# 0025-0028) - skipping it because it has no URL leaves the previous run's patches
-# in place, and the next run then fails at 0002 with "neither applies to nor is
-# already applied". Only the remote reconciliation below cares about the URL.
+# url=N/A, and it is where most of this series lands (0002-0004, 0008, 0011,
+# 0019-0021, 0025-0028, 0034) - skipping it because it has no URL leaves the
+# previous run's patches in place, and the next run then fails at 0002 with
+# "neither applies to nor is already applied". Only the remote reconciliation
+# below cares about the URL.
 #
 # This loop is the LAST place the tree may be reset: everything from the 0021 call
 # onwards would be discarded by another reset.
@@ -123,6 +126,22 @@ printf '%s\n' "$projects" | while IFS='|' read -r name abspath url; do
 	git -C "$abspath" reset --hard -q "$rev"
 	git -C "$abspath" clean -fdq
 done
+
+# The manifest repository is checked out by moulin's west fetcher at the rev the
+# product yaml names, and that rev is the tag rpi5-v0.4.0: `west init --mr` takes a
+# branch or tag, not a SHA. A tag can be moved, so before patching on top of the
+# checkout compare it with the commit the tag named when it was pinned (the yamls
+# record the same SHA at their west sources).
+MANIFEST_PINNED_SHA=03b961479a6b56c99228aedbe206ba1ed6668b54
+manifest_head="$(git -C "$WS/zephyr-dom0-xt" rev-parse HEAD)"
+if [ "$manifest_head" != "$MANIFEST_PINNED_SHA" ]; then
+	echo "ERROR: $WS/zephyr-dom0-xt is at $manifest_head, not at the pinned" >&2
+	echo "       $MANIFEST_PINNED_SHA (what tag rpi5-v0.4.0 named when it was pinned)." >&2
+	echo "       Either the tag moved or the checkout did. Re-fetch the workspace, or" >&2
+	echo "       change the pin in rpi5-sodev.yaml / rpi4-sodev.yaml and this constant" >&2
+	echo "       together." >&2
+	exit 1
+fi
 
 # Apply one patch idempotently and with an actionable message on drift.
 apply_one() {

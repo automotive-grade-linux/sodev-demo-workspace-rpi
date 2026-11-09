@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 10 Nov 2026 01:09:27 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] boards/rpi_5: adapt the board to Zephyr 4.4 and 4.5
 
 
@@ -53,25 +53,25 @@ the
      Zephyr defaults to 0x15; every sysctl then fails its version check and
      `xu list` / `xstat physinfo` print nothing at all, silently.
 
-   - - CONFIG_PCIE=n. With pcie1/pcie2 disabled, drivers/pcie/host/pcie.c is
+   - CONFIG_PCIE=n. With pcie1/pcie2 disabled, drivers/pcie/host/pcie.c is
      still compiled (the board defconfig sets PCIE=y) and still does
      DEVICE_DT_GET(DT_CHOSEN(zephyr_pcie_controller)), which no longer
      resolves: "error: '__device_dts_ord_12' undeclared".
 
-   - - gio_aon and the leds node that references it are disabled too. gio_aon
+   - gio_aon and the leds node that references it are disabled too. gio_aon
      is harmless only while CONFIG_GPIO is off, and that is one `select GPIO`
      away.
-   - - VolToPart[0] is {0, 2}, not {3, 2}: upstream resolves pd by indexing
+   - VolToPart[0] is {0, 2}, not {3, 2}: upstream resolves pd by indexing
      pdrv_str[] = {FF_VOLUME_STRS}, so 3 is out of bounds with FF_VOLUMES ==
      1. A BUILD_ASSERT pins that assumption.
-   - - the chosen zephyr,pcie-controller / zephyr,entropy properties are
+   - the chosen zephyr,pcie-controller / zephyr,entropy properties are
      deleted, not merely left pointing at the now-disabled pcie1/rng.
      gen_defines resolves a chosen phandle regardless of status, so the first
      subsystem to select the matching driver expands
      DEVICE_DT_GET(DT_CHOSEN(...)) to a __device_dts_ord_N that was never
      emitted. That is the same failure CONFIG_PCIE=n works around above;
      deleting the property removes the class of bug instead of one instance.
-   - - CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME is left to the moulin
+   - CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME is left to the moulin
      builder var in rpi5-sodev.yaml, which wins over the board .conf anyway.
 
 4. Zephyr 4.5 adds two things on top:
@@ -86,7 +86,7 @@ the
 
 Depends on 0008 (boards/rpi_5.{conf,overlay}) and 0026 (src/storage.c).
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
