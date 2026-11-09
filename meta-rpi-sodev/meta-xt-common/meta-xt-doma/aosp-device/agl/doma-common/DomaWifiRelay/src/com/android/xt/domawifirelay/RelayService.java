@@ -3,11 +3,17 @@
  */
 package com.android.xt.domawifirelay;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.net.NetworkInfo;
+import android.net.wifi.ScanResult;
 import android.net.wifi.SupplicantState;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiInfo;
@@ -17,7 +23,10 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Process;
+import android.os.RemoteException;
+import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.os.UserHandle;
 import android.provider.Settings;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -29,9 +38,18 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Makes an arbitrary real AP connectable from the AAOS Wi-Fi screen.
@@ -65,10 +83,17 @@ import java.util.Set;
  *   <li>reads the plaintext passphrase with
  *       {@link WifiManager#getPrivilegedConfiguredNetworks()} (the only sanctioned
  *       route; it returns {@code preSharedKey} unmasked),</li>
- *   <li>hands it to {@code /vendor/bin/doma-wifi-relay}, which puts it into
- *       {@code aps.conf}, regenerates {@code hostapd.conf}, restarts hostapd and
- *       forwards a {@code connect} message to DomD over virtio-serial,</li>
- *   <li>calls {@link WifiManager#connect(int, WifiManager.ActionListener)}, which
+ *   <li>hands it to {@code /vendor/bin/doma-wifi-relay}, which forwards a
+ *       {@code connect} message to DomD over virtio-serial and, once DomD has joined
+ *       the real AP with it, puts it into {@code aps.conf}, regenerates
+ *       {@code hostapd.conf}, restarts hostapd and writes {@code online} to
+ *       {@link #STATE},</li>
+ *   <li>holds the network back meanwhile ({@link #holdBack}): the disable is cleared
+ *       without a connect, so the Wi-Fi screen does not tell the user to check a
+ *       password that may be right, and auto-join is off for it, so the framework
+ *       does not try it against the placeholder again,</li>
+ *   <li>on that {@code online}, calls
+ *       {@link WifiManager#connect(int, WifiManager.ActionListener)}, which
  *       clears the permanent disable unconditionally:
  *       {@code ConnectHelper.connectToNetwork()} then
  *       {@code WifiConfigManager.updateBeforeConnect()} then {@code enableNetwork()}
@@ -79,6 +104,11 @@ import java.util.Set;
  * </ol>
  *
  * <p>The retry therefore succeeds: hostapd now holds the passphrase the user typed.
+ * Until DomD has joined with it, DomA's station joins nothing, so the screen does not
+ * show the network as connected for a passphrase the real AP refuses (before
+ * 2026-11-08 it did, until DomD's answer). When DomD refuses it, the network is
+ * connected once, against the row's PSK, which the passphrase does not match, so that
+ * it is disabled for a wrong password again and the screen asks for the password.
  *
  * <p>Besides that repair, it does what the daemons ask for through the drop-box and may
  * not do themselves from a vendor domain: the Wi-Fi cycle doma-shadow-ap needs once
@@ -86,11 +116,15 @@ import java.util.Set;
  *
  * <h2>Loop safety</h2>
  * Every (netId, passphrase) pair is attempted at most once. If the passphrase really is
- * wrong for the real AP, DomD's association fails while the local one succeeds, and the
- * user sees "connected, no internet" rather than an endless reconnect storm. Typing a
+ * wrong for the real AP, DomD's association fails, and the network goes back to
+ * disabled for a wrong password rather than into an endless reconnect storm. When DomD
+ * fails it for another reason (the AP not found, no answer), the attempt is returned,
+ * and auto-join stays off for the network until it next associates: the user's tap
+ * tries it again, and auto-join does not, round after round. Typing a
  * different password produces a different pair and gets one fresh attempt, and so does
  * a network that has since joined the shadow AP successfully (see
- * {@link #forgetAttemptsOfAssociated}).
+ * {@link #forgetAttemptsOfAssociated}). A passphrase DomD has refused stays spent
+ * across reboots ({@link #REFUSED}).
  *
  * <h2>"No internet" from before DomD had the network</h2>
  * DomA's station joins the shadow BSS at once, while DomD may still be joining the real
@@ -140,11 +174,48 @@ public final class RelayService extends Service {
     private static final File REQ = new File(REQ_DIR, "relay.req");
     private static final File REQ_TMP = new File(REQ_DIR, "relay.req.tmp");
     /**
+     * Where the daemon moves {@link #REQ} while it handles it, and removes it from
+     * after: a request is handled only once both are gone.
+     */
+    private static final File REQ_BUSY = new File(REQ_DIR, "relay.req.busy");
+    /**
+     * The networks {@link #holdBack} has turned auto-join off for, one netId per line:
+     * turned on again when the network associates, and at the start of this service,
+     * so that a process killed during a wait does not leave one off for good. In this
+     * app's device-protected storage.
+     */
+    private static final String AUTOJOIN_OFF = "autojoin-off";
+    /**
+     * The (SSID, passphrase) pairs DomD has refused ({@code offline:wrong-key}), one
+     * {@code "<SSID mac>TAB<pair mac>"} per line ({@link #refusedEntry}): no plaintext,
+     * and keyed by the SSID, not the netId, which the framework hands out again at each
+     * boot in the order of its store. In this app's device-protected storage, so that a reboot does not
+     * send DomD a passphrase it has refused again: the network stays disabled for a
+     * wrong password across reboots (WifiConfigStore), {@link #mAttempted} does not,
+     * and the sweep of each boot repaired it, which told the user without a tap that
+     * the password is not correct (RPi4 2026-11-08). An entry goes when a network of its
+     * SSID associates ({@link #forgetAttemptsOfAssociated}) or is forgotten (the
+     * framework's CHANGE_REASON_REMOVED, and at {@link #sweep} when none of the SSID is
+     * saved any more: forget and add again tries the passphrase again); a new
+     * passphrase is another pair. Typing the same passphrase again on the same saved
+     * network does not: the framework's broadcast does not tell that from its own
+     * status changes.
+     */
+    private static final String REFUSED = "refused";
+    /** The device's random key of the macs in {@link #REFUSED}, so that the file cannot
+     *  be checked against a list of passphrases elsewhere. */
+    private static final String REFUSED_KEY = "refused.key";
+    /**
      * Written by the daemon, one line {@code "<kind>\t<seq>\t<SSID>"}: {@code up} when it
      * starts (no SSID; a sweep then runs, since the daemon may start after this
-     * service's first sweep), {@code online} each time DomD has joined an SSID, and
-     * {@code offline} when DomD has lost it or could not join it. {@code <seq>} is new
-     * on every write.
+     * service's first sweep), {@code pending} when it has forwarded a connect for the
+     * SSID to DomD, {@code online} each time DomD has joined an SSID, and
+     * {@code offline:<reason>} when DomD has lost it ({@code lost}) or could not join it
+     * ({@code not-found}, {@code wrong-key}, {@code rejected}, {@code timeout},
+     * {@code error}; {@code retry} while a later connect for it is still pending). A
+     * daemon from before the reasons writes a bare {@code offline} and no
+     * {@code pending}. {@code <seq>} is new on every write. A line that answers a request
+     * of this app's has a fourth field, the request's token (see {@link #onWaitState}).
      */
     private static final File STATE = new File(REQ_DIR, "relay.state");
     /**
@@ -164,31 +235,28 @@ public final class RelayService extends Service {
     private static final long WATCH_RETRY_MS = 5000;
 
     /**
-     * One polling window. The daemon's own loop reads the channel with {@code read -t 2},
-     * so 4 s is two of its ticks. Waiting too little is the failure that matters:
-     * connect() would race hostapd, fail the handshake again and re-arm
-     * DISABLED_BY_WRONG_PASSWORD.
+     * How often {@link #connectWhenConsumed} looks whether the daemon has handled the
+     * request. Short, since the user is waiting; the daemon itself picks the request up
+     * within its {@code read -t 2}.
      */
-    private static final long DAEMON_GRACE_MS = 4000;
+    private static final long POLL_MS = 250;
 
     /**
-     * How many {@link #DAEMON_GRACE_MS} windows to wait for the daemon to take the
-     * request. {@link #connectWhenConsumed} looks at the drop-box each window
-     * and only connects once the request is gone.
+     * How many {@link #POLL_MS} looks to wait for the daemon to handle the request, i.e.
+     * for {@link #REQ} and {@link #REQ_BUSY} to be gone.
      *
      * <p>The bound comes from the daemon's own worst case rather than from its poll
      * interval. In one iteration of doma-wifi-relay.sh, {@code restart_hostapd} can
      * spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
-     * {@code confirm_hostapd_running} (6 x 0.5 s) -- about 13 s; its own
-     * comment says the wait STALLS THE MAIN LOOP FOR UP TO 10 s -- and BOTH
+     * {@code confirm_hostapd_running} (6 x 0.25 s) -- about 11.5 s -- and BOTH
      * {@code handle_aps} and {@code flush_pending_restart} can fire it in the
      * same iteration, with
-     * {@code read -t 2} on top: roughly 28 s. (The one figure actually measured on a PC
+     * {@code read -t 2} on top: roughly 25 s. (The one figure actually measured on a PC
      * is 10.371 s for a single restart_hostapd, which does not include the confirm
-     * window.) 10 x 4 s = 40 s therefore covers a healthy-but-busy daemon, and the cost
-     * is zero on the normal path, where the request is gone at the first check.
+     * window.) 160 x 250 ms = 40 s therefore covers a healthy-but-busy daemon, and the
+     * cost is zero on the normal path, where the request is handled within 2 s.
      */
-    private static final int REQ_POLLS = 10;
+    private static final int REQ_POLLS = 160;
 
     /**
      * The daemon's init service state: the on/off switch of this service, not a liveness
@@ -207,6 +275,14 @@ public final class RelayService extends Service {
     private static final String PROP_RELAY_SVC_STATE = "init.svc.doma_wifi_relay";
 
     private WifiManager mWifi;
+    /**
+     * Tells the user what DomD's real join is doing (see {@link #notifyState}). DomA's
+     * station joins the SHADOW BSS within seconds whatever happens to the real AP, so the
+     * Wi-Fi screen alone shows a network as joined while DomD is still looking for it,
+     * and drops it without a reason when DomD fails (2026-11-06: an SSID DomD could not
+     * find looked joined for 30 s). Null if the service is not there.
+     */
+    private NotificationManager mNm;
     private HandlerThread mThread;
     private Handler mHandler;
     /** Watches {@link #REQ_DIR}; null until the directory can be reached. */
@@ -236,6 +312,37 @@ public final class RelayService extends Service {
      */
     private final Set<String> mAttempted = new HashSet<>();
 
+    /** A repair waiting for the daemon and for DomD (see {@link #repair}). */
+    private static final class Wait {
+        final int netId;
+        final String ssid;
+        final String key;
+        /** Sent with the request; the daemon gives it back in each {@link #STATE} line
+         *  that answers it, so no other connect's line is taken for its answer. */
+        final String token;
+        /** {@link #STATE}'s {@code <seq>} just before the request was written: a line
+         *  with it is from before the request (see {@link #onWaitState}). */
+        final String startSeq;
+        /** Its {@link #REFUSED} entry, should DomD refuse the passphrase. */
+        final String refused;
+
+        Wait(int netId, String ssid, String key, String token, String startSeq,
+                String refused) {
+            this.netId = netId;
+            this.ssid = ssid;
+            this.key = key;
+            this.token = token;
+            this.startSeq = startSeq;
+            this.refused = refused;
+        }
+    }
+
+    private final SecureRandom mRandom = new SecureRandom();
+
+    /** The one repair under way, or null; one at a time, as the drop-box holds one. */
+    private Wait mWait;
+    private final Runnable mWaitTimeout = () -> finishWait(mWait, "timeout");
+
     /** init has the daemon running, i.e. the switch is on (see {@link #PROP_RELAY_SVC_STATE}). */
     static boolean isEnabled() {
         return "running".equals(SystemProperties.get(PROP_RELAY_SVC_STATE, ""));
@@ -244,12 +351,45 @@ public final class RelayService extends Service {
     private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
-                mHandler.post(RelayService.this::forgetAttemptsOfAssociated);
+            if (Intent.ACTION_LOCALE_CHANGED.equals(intent.getAction())) {
+                mHandler.post(RelayService.this::createChannels);
+            } else if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
+                final NetworkInfo ni = intent.getParcelableExtra(
+                        WifiManager.EXTRA_NETWORK_INFO, NetworkInfo.class);
+                final boolean connected = ni != null && ni.isConnected();
+                mHandler.post(() -> {
+                    forgetAttemptsOfAssociated();
+                    onStationConnected(connected);
+                });
+            } else if (WifiManager.SCAN_RESULTS_AVAILABLE_ACTION.equals(intent.getAction())) {
+                mHandler.post(RelayService.this::onScanResults);
+            } else if (WifiManager.CONFIGURED_NETWORKS_CHANGED_ACTION.equals(intent.getAction())
+                    && intent.getIntExtra(WifiManager.EXTRA_CHANGE_REASON, -1)
+                            == WifiManager.CHANGE_REASON_REMOVED) {
+                // The copy for the system user carries the network (WifiConfigManager
+                //   sendConfiguredNetworkChangedBroadcast): a forgotten network's refused
+                //   pairs go with it (REFUSED), whatever the next sweep reads.
+                final WifiConfiguration gone = intent.getParcelableExtra(
+                        WifiManager.EXTRA_WIFI_CONFIGURATION, WifiConfiguration.class);
+                final String ssid = gone == null ? "" : unquote(gone.SSID);
+                mHandler.post(() -> {
+                    if (!ssid.isEmpty()) {
+                        refusedForget(ssid);
+                    }
+                    sweep();
+                });
             } else if (WifiManager.WIFI_STATE_CHANGED_ACTION.equals(intent.getAction())
                     && intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, -1)
                             == WifiManager.WIFI_STATE_DISABLED) {
                 mHandler.post(RelayService.this::finishWifiCycle);
+            } else if (WifiManager.CONFIGURED_NETWORKS_CHANGED_ACTION.equals(intent.getAction())) {
+                // The system user's copy names the network (see the REMOVED branch).
+                final WifiConfiguration changed = intent.getParcelableExtra(
+                        WifiManager.EXTRA_WIFI_CONFIGURATION, WifiConfiguration.class);
+                mHandler.post(() -> {
+                    onRefusedConnectFailed(changed);
+                    sweep();
+                });
             } else {
                 mHandler.post(RelayService.this::sweep);
             }
@@ -277,6 +417,13 @@ public final class RelayService extends Service {
             stopSelf();
             return;
         }
+        mNm = getSystemService(NotificationManager.class);
+        if (mNm != null) {
+            createChannels();
+            // One left by an earlier process of this app (killed, then restarted) names
+            // a join nobody will answer to this one.
+            mNm.cancelAsUser(null, NOTE_ID, UserHandle.ALL);
+        }
         mThread = new HandlerThread(TAG);
         mThread.start();
         mHandler = new Handler(mThread.getLooper());
@@ -291,8 +438,14 @@ public final class RelayService extends Service {
         filter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
         // And the station's state, to re-arm a network once it has associated.
         filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+        // And scan results, to connect once the restarted shadow BSS is seen
+        //   (connectAfterScan).
+        filter.addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
+        // And the language, to rename the notification channels (see createChannels).
+        filter.addAction(Intent.ACTION_LOCALE_CHANGED);
         registerReceiver(mReceiver, filter);
         Log.i(TAG, "started (" + PROP_RELAY_SVC_STATE + "=" + relaySvcState() + ")");
+        mHandler.post(this::restoreAllAutojoin);
         mHandler.post(this::sweep);
         mHandler.post(this::watchReqDir);
     }
@@ -321,15 +474,45 @@ public final class RelayService extends Service {
                     // dead, so watch the one init or the daemon makes next.
                     mHandler.post(RelayService.this::rewatchReqDir);
                 } else if (STATE.getName().equals(path)) {
-                    mHandler.post(RelayService.this::handleState);
+                    mHandler.post(() -> handleState(true));
                 } else if (WIFI_CYCLE.getName().equals(path)) {
                     mHandler.post(RelayService.this::handleWifiCycle);
                 }
             }
         };
         mObserver.startWatching();
-        handleState();
+        // Not notified on the first watch of this process: the line can be from long
+        // before it (a restart of the app), and a "connecting" it names may never be
+        // answered. A later watch (the directory was made again while this process
+        // ran) is: the line was written while it ran, and one already acted on is
+        // skipped by its seq.
+        handleState(mWatchedOnce);
+        mWatchedOnce = true;
         handleWifiCycle();
+    }
+
+    /** {@link #watchReqDir} has run once in this process (see there). */
+    private boolean mWatchedOnce;
+
+    /**
+     * Create the notification channels, or rename them after a change of language: the
+     * process is persistent, so names taken at onCreate only would stay in the language
+     * of the boot. Creating a channel that exists updates its name and nothing else.
+     */
+    private void createChannels() {
+        if (mNm == null) {
+            return;
+        }
+        // LOW: progress and success, in the shade without a sound or a heads-up.
+        // HIGH: a failure, as a heads-up, since the user is waiting on the Wi-Fi
+        // screen for a network that will not come. No sound on either.
+        final NotificationChannel status = new NotificationChannel(CH_STATUS,
+                getString(R.string.channel_status), NotificationManager.IMPORTANCE_LOW);
+        final NotificationChannel failure = new NotificationChannel(CH_FAILURE,
+                getString(R.string.channel_failure), NotificationManager.IMPORTANCE_HIGH);
+        failure.setSound(null, null);
+        mNm.createNotificationChannel(status);
+        mNm.createNotificationChannel(failure);
     }
 
     private void rewatchReqDir() {
@@ -403,26 +586,734 @@ public final class RelayService extends Service {
         Log.i(TAG, "wifi-cycle: Wi-Fi on again");
     }
 
-    /** A new {@link #STATE} line: act on it once. */
-    private void handleState() {
-        final String line;
-        try {
-            line = new String(Files.readAllBytes(STATE.toPath()), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            return;  // not written yet
-        }
-        final String[] f = line.endsWith("\n")
-                ? line.substring(0, line.length() - 1).split("\t", 3) : new String[0];
+    /**
+     * A new {@link #STATE} line: act on it once.
+     *
+     * @param notify tell the user about it ({@link #notifyState}); false for the line
+     *     found when the watch starts
+     */
+    private void handleState(boolean notify) {
+        final String[] f = readState();
         if (f.length < 2 || f[1].equals(mStateSeq)) {
             return;
         }
         mStateSeq = f[1];
         mReEnabled.clear();
-        mOnlineSsid = "online".equals(f[0]) && f.length == 3 && !f[2].isEmpty() ? f[2] : null;
+        mOnlineSsid = "online".equals(f[0]) && f.length >= 3 && !f[2].isEmpty() ? f[2] : null;
+        mConnectIssued = -1;
+        if (mWait != null) {
+            onWaitState(mWait, f[0], f[1], f.length == 4 ? f[3] : "");
+        }
+        if (mWait == null && mOnlineSsid != null) {
+            connectHeldBack(mOnlineSsid);
+        }
+        if (notify) {
+            // Each line replaces the notification, and the "Connected" one held back for
+            //   an earlier line with it.
+            dropConnectedNote();
+            if (mOnlineSsid != null && mConnectIssued != -1) {
+                // This app has just started DomA's station on the network: "Connected"
+                //   once the station is (onStationConnected), not now, while the screen
+                //   still shows it connecting (2026-11-08: 8 s before it). The
+                //   "Connecting" notification stays until then.
+                holdConnectedNote(mOnlineSsid, mConnectIssued);
+            } else {
+                notifyState(f[0], f.length >= 3 ? f[2] : "");
+            }
+        }
         if ("up".equals(f[0])) {
             sweep();
         } else {
             recheckInternet();
+        }
+    }
+
+    /** {@link #STATE}'s fields, or none when it is not there or not a whole line. */
+    private static String[] readState() {
+        final String line;
+        try {
+            line = new String(Files.readAllBytes(STATE.toPath()), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return new String[0];  // not written yet
+        }
+        return line.endsWith("\n")
+                ? line.substring(0, line.length() - 1).split("\t", 4) : new String[0];
+    }
+
+    /**
+     * A {@link #STATE} line while a repair waits: one with its token answers it --
+     * connect the network on DomD's {@code online}, give up on a failure. Any other is
+     * about another connect (the mirror's, an earlier one) and changes nothing, but
+     * {@code up}: the daemon restarted, and no answer will come -- unless the line is
+     * from before the request (the first read of {@link #STATE} in this process can
+     * come after the request was written, and finds the daemon's start), or the request
+     * is still in the drop-box, where the new daemon picks it up (2026-11-08: the wait
+     * was given up on an old {@code up}, the daemon then sent the request to DomD, and
+     * its answer told the user of a failure no one waited for).
+     */
+    private void onWaitState(Wait w, String kind, String seq, String token) {
+        if ("up".equals(kind)) {
+            // REQ.busy too: the new daemon removes it before its "up", so one after
+            //   that is the request, taken by the new daemon.
+            if (seq.equals(w.startSeq) || requestPending() || REQ_BUSY.exists()) {
+                Log.i(TAG, "the daemon is up; netId=" + w.netId + " still waits for DomD");
+                return;
+            }
+            finishWait(w, "up");
+        } else if (w.token.equals(token)
+                && ("online".equals(kind) || kind.startsWith("offline"))) {
+            finishWait(w, kind);        // offline:retry too: its connect failed
+        }
+    }
+
+    /**
+     * End the repair w: on {@code online} connect the network; on a refused passphrase
+     * connect it too, against the row's PSK (the placeholder, or a seed or learned one
+     * that this passphrase does not match), so that it is disabled for a wrong
+     * password again and the screen asks for one (the attempt stays spent, so it is not
+     * repaired again); on anything else return the attempt and leave auto-join off
+     * (see Loop safety), unless the daemon never took the request.
+     */
+    private void finishWait(Wait w, String outcome) {
+        if (w == null || w != mWait) {
+            return;
+        }
+        mWait = null;
+        mHandler.removeCallbacks(mWaitTimeout);
+        if ("online".equals(outcome)) {
+            restoreAutojoin(w.netId);
+            Log.i(TAG, "DomD joined " + w.ssid + "; connecting netId=" + w.netId
+                    + " once its shadow BSS is seen");
+            connectAfterScan(w.netId, w.ssid);
+        } else if ("offline:wrong-key".equals(outcome)) {
+            restoreAutojoin(w.netId);
+            if (w.refused != null) {
+                refusedSet(w.refused, true);
+            }
+            Log.i(TAG, "DomD refused the passphrase for " + w.ssid + "; connecting netId="
+                    + w.netId);
+            mRefusedConnectNetId = w.netId;
+            mRefusedConnectUntil = SystemClock.elapsedRealtime() + REFUSED_CONNECT_WINDOW_MS;
+            connect(w.netId);
+        } else {
+            mAttempted.remove(w.key);
+            if ("unconsumed".equals(outcome)) {
+                restoreAutojoin(w.netId);
+            }
+            Log.i(TAG, "DomD did not join " + w.ssid + " (" + outcome + "); netId=" + w.netId
+                    + " is left to the user's tap, attempt NOT spent");
+        }
+        mHandler.post(this::sweep);
+    }
+
+    private void connect(final int netId) {
+        mWifi.connect(netId, new WifiManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                Log.i(TAG, "connect(" + netId + ") accepted");
+            }
+
+            @Override
+            public void onFailure(int reason) {
+                Log.w(TAG, "connect(" + netId + ") rejected, reason=" + reason);
+            }
+        });
+    }
+
+    /** How long {@link #connectAfterScan} waits for a scan that sees the network. */
+    private static final long SCAN_WAIT_MS = 5000;
+    /** How long a held-back "Connected" waits for the station (see {@link #handleState}). */
+    private static final long CONNECTED_NOTE_WAIT_MS = 30_000;
+    /** The network {@link #connectAfterScan} waits to see, or -1; its SSID, and since when
+     *  (elapsed realtime, us: {@link ScanResult#timestamp}'s clock). */
+    private int mScanNetId = -1;
+    private String mScanSsid;
+    private long mScanSinceUs;
+    private final Runnable mScanTimeout = () -> connectScanned("no scan saw it in "
+            + SCAN_WAIT_MS + " ms");
+    /** The network a connect was started for, for the line handleState is acting on;
+     *  -1 if none. */
+    private int mConnectIssued = -1;
+    /** The SSID whose "Connected" waits for DomA's station, or null; and the network. */
+    private String mConnectedNote;
+    private int mConnectedNoteNetId = -1;
+    private final Runnable mConnectedNoteTimeout = this::dropConnectedNote;
+
+    /**
+     * Connect the network once a scan from now on sees its SSID. DomD's "online" for a
+     * typed passphrase comes once hostapd has restarted with it, and the restart
+     * replaces the shadow BSS: a connect right away failed at once against the BSS
+     * cached from before, and the station joined only after the framework's next scan
+     * (2026-11-08, about 4 s). After {@link #SCAN_WAIT_MS} it connects anyway.
+     */
+    private void connectAfterScan(int netId, String ssid) {
+        mConnectIssued = netId;
+        if (mScanNetId != -1 && mScanNetId != netId) {
+            connectScanned("another network is next");
+        }
+        mScanNetId = netId;
+        mScanSsid = ssid;
+        mScanSinceUs = SystemClock.elapsedRealtime() * 1000;
+        mHandler.removeCallbacks(mScanTimeout);
+        mHandler.postDelayed(mScanTimeout, SCAN_WAIT_MS);
+        if (!mWifi.startScan()) {
+            connectScanned("the scan was refused");
+        }
+    }
+
+    private void onScanResults() {
+        if (mScanNetId == -1) {
+            return;
+        }
+        final List<ScanResult> results = mWifi.getScanResults();
+        if (results == null) {
+            return;
+        }
+        for (ScanResult r : results) {
+            if (r != null && r.timestamp >= mScanSinceUs && mScanSsid.equals(unquote(r.SSID))) {
+                connectScanned("a scan sees it");
+                return;
+            }
+        }
+    }
+
+    private void connectScanned(String why) {
+        final int netId = mScanNetId;
+        if (netId == -1) {
+            return;
+        }
+        mScanNetId = -1;
+        mHandler.removeCallbacks(mScanTimeout);
+        Log.i(TAG, "connecting netId=" + netId + " (" + why + ")");
+        connect(netId);
+    }
+
+    private void holdConnectedNote(String ssid, int netId) {
+        if (stationConnectedTo(ssid, netId)) {
+            // Connected already (the framework joined it first): the connect does
+            //   nothing, and no NETWORK_STATE_CHANGED is to come.
+            notifyState("online", ssid);
+            return;
+        }
+        mConnectedNote = ssid;
+        mConnectedNoteNetId = netId;
+        mHandler.removeCallbacks(mConnectedNoteTimeout);
+        mHandler.postDelayed(mConnectedNoteTimeout, CONNECTED_NOTE_WAIT_MS);
+    }
+
+    /** Forget a held-back "Connected"; past its wait, take the "Connecting" down too. */
+    private void dropConnectedNote() {
+        if (mConnectedNote == null) {
+            return;
+        }
+        final boolean timedOut = !mHandler.hasCallbacks(mConnectedNoteTimeout);
+        mConnectedNote = null;
+        mHandler.removeCallbacks(mConnectedNoteTimeout);
+        if (timedOut && mNm != null) {
+            mNm.cancelAsUser(null, NOTE_ID, UserHandle.ALL);
+        }
+    }
+
+    /** DomA's station is connected (with an IP address) to the SSID: the last, sticky
+     *  NETWORK_STATE_CHANGED says connected, and the connection is that network's: not
+     *  another config of the SSID on the BSS from before hostapd's restart. */
+    private boolean stationConnectedTo(String ssid, int netId) {
+        final Intent last = registerReceiver(null,
+                new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
+        final NetworkInfo ni = last == null ? null
+                : last.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO, NetworkInfo.class);
+        if (ni == null || !ni.isConnected()) {
+            return false;
+        }
+        final WifiInfo wi = mWifi.getConnectionInfo();
+        return wi != null && wi.getNetworkId() == netId && ssid.equals(unquote(wi.getSSID()));
+    }
+
+    /** DomA's station is connected (with an IP address), or not: a held-back "Connected"
+     *  for its SSID is shown now. */
+    private void onStationConnected(boolean connected) {
+        if (mConnectedNote == null || !connected) {
+            return;
+        }
+        final WifiInfo wi = mWifi.getConnectionInfo();
+        if (wi != null && wi.getNetworkId() == mConnectedNoteNetId
+                && mConnectedNote.equals(unquote(wi.getSSID()))) {
+            final String ssid = mConnectedNote;
+            mConnectedNote = null;
+            mHandler.removeCallbacks(mConnectedNoteTimeout);
+            notifyState("online", ssid);
+        }
+    }
+
+    /**
+     * The framework's own "Failed to connect" for the network (WrongPasswordNotifier,
+     * NOTE_WIFI_WRONG_PASSWORD = 42 with the tag {@code com.android.wifi}, posted by
+     * package {@code android} for the current user), which the station's first
+     * handshake against the placeholder posts while DomD is still trying the
+     * passphrase: taken down, since the passphrase may be right. Through
+     * INotificationManager with {@code android} as both the package and the op package:
+     * NotificationManager names this app's package, also from
+     * createPackageContextAsUser("android"), which for "android" copies this app's
+     * own context (ContextImpl), and so finds nothing. NotificationManagerService
+     * takes it from uid system (resolveNotificationUid compares the app id, and with
+     * the two packages the same there is no op package check); the current user is
+     * the driver's, to whom the framework posts it (WifiNotificationManager). Also the
+     * one the connect after DomD has refused the passphrase posts
+     * ({@link #onRefusedConnectFailed}): this app's own notice already says the
+     * password is not correct, with a tap to the Wi-Fi settings, which is all the
+     * framework's tap opens on this product (its {@code wifi_start_connect_ssid} extra
+     * has no reader in Car Settings).
+     */
+    private void cancelFrameworkWrongPassword() {
+        try {
+            NotificationManager.getService().cancelNotificationWithTag("android", "android",
+                    WIFI_NOTE_TAG, WIFI_NOTE_WRONG_PASSWORD, UserHandle.USER_CURRENT);
+        } catch (RemoteException | RuntimeException e) {
+            Log.w(TAG, "cannot take down the framework's wrong-password notification", e);
+        }
+    }
+
+    /**
+     * The connect finishWait issues after DomD has refused a passphrase fails against
+     * the row's PSK by design, and the framework then posts its "Failed to connect"
+     * (ClientModeImpl: onWrongPasswordError, then the network is disabled, which sends
+     * CONFIGURED_NETWORKS_CHANGED with the network): seen 8 s after the connect on the
+     * board (2026-11-08), next to this app's own notice. Taken down until this time
+     * (elapsedRealtime) on that broadcast for that network
+     * ({@link #mRefusedConnectNetId}) disabled for a wrong password -- not for one the
+     * user tapped meanwhile, whose notice is the only one there is -- now and once more
+     * 1 s later in case the post lands after it. The window stays open after a hit: the
+     * auto-join this branch turns on again sends a broadcast of its own, which can still
+     * carry the network disabled from the placeholder's failure, before the connect.
+     */
+    private long mRefusedConnectUntil;
+    private int mRefusedConnectNetId = -1;
+    private static final long REFUSED_CONNECT_WINDOW_MS = 20_000;
+
+    private void onRefusedConnectFailed(WifiConfiguration changed) {
+        if (mRefusedConnectNetId == -1) {
+            return;
+        }
+        if (SystemClock.elapsedRealtime() >= mRefusedConnectUntil) {
+            mRefusedConnectNetId = -1;
+            return;
+        }
+        if (changed == null || changed.networkId != mRefusedConnectNetId
+                || changed.getNetworkSelectionStatus() == null
+                || changed.getNetworkSelectionStatus().getNetworkSelectionDisableReason()
+                        != WifiConfiguration.NetworkSelectionStatus.DISABLED_BY_WRONG_PASSWORD) {
+            return;
+        }
+        cancelFrameworkWrongPassword();
+        mHandler.postDelayed(this::cancelFrameworkWrongPassword, 1000);
+    }
+
+    private static final String WIFI_NOTE_TAG = "com.android.wifi";
+    private static final int WIFI_NOTE_WRONG_PASSWORD = 42;
+
+    /** {@link #REFUSED}'s entry for the pair, {@code "<mac of SSID>TAB<mac of SSID, NUL,
+     *  passphrase>"} (HMAC-SHA-256 with {@link #refusedKey}, hex); null if there is no
+     *  key (nothing is then kept). */
+    private String refusedEntry(String ssid, String psk) {
+        final String sm = refusedMac(ssid.getBytes(StandardCharsets.UTF_8), null);
+        final String pm = refusedMac(ssid.getBytes(StandardCharsets.UTF_8),
+                psk.getBytes(StandardCharsets.UTF_8));
+        return sm == null || pm == null ? null : sm + "\t" + pm;
+    }
+
+    /** The SSID part of {@link #refusedEntry}, with its TAB; null if there is no key. */
+    private String refusedPrefix(String ssid) {
+        final String sm = refusedMac(ssid.getBytes(StandardCharsets.UTF_8), null);
+        return sm == null ? null : sm + "\t";
+    }
+
+    private String refusedMac(byte[] a, byte[] b) {
+        final byte[] key = refusedKey();
+        if (key == null) {
+            return null;
+        }
+        try {
+            final Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            mac.update(a);
+            if (b != null) {
+                mac.update((byte) 0);
+                mac.update(b);
+            }
+            final StringBuilder h = new StringBuilder();
+            for (byte x : mac.doFinal()) {
+                h.append(String.format("%02x", x & 0xff));
+            }
+            return h.toString();
+        } catch (GeneralSecurityException e) {
+            Log.e(TAG, "no HmacSHA256", e);
+            return null;
+        }
+    }
+
+    /** {@link #REFUSED_KEY}, made on the first use; null if it can be neither read nor
+     *  made. */
+    private byte[] refusedKey() {
+        if (mRefusedKey != null) {
+            return mRefusedKey;
+        }
+        final File f = new File(createDeviceProtectedStorageContext().getFilesDir(),
+                REFUSED_KEY);
+        try {
+            final byte[] k = Files.readAllBytes(f.toPath());
+            if (k.length == 32) {
+                return mRefusedKey = k;
+            }
+            // torn (cut off by a power loss): made again below
+        } catch (NoSuchFileException e) {
+            // not made yet
+        } catch (IOException e) {
+            // There but not readable now: no key this time, rather than a new one,
+            //   which would drop every entry.
+            Log.e(TAG, "cannot read " + f, e);
+            return null;
+        }
+        final byte[] k = new byte[32];
+        mRandom.nextBytes(k);
+        final File tmp = new File(f.getPath() + ".tmp");
+        try {
+            Files.write(tmp.toPath(), k);
+            if (!tmp.renameTo(f)) {
+                Log.e(TAG, "cannot rename " + tmp + " to " + f);
+                return null;
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "cannot write " + tmp, e);
+            return null;
+        }
+        // A new key: entries made with another one would never match.
+        refusedWrite(new HashSet<>());
+        return mRefusedKey = k;
+    }
+
+    private byte[] mRefusedKey;
+
+    /** {@link #REFUSED}, read once per process (see {@link #autojoinOffMap}). */
+    private Set<String> refusedSet() {
+        if (mRefused == null) {
+            mRefused = new HashSet<>();
+            try {
+                for (String l : Files.readAllLines(refusedFile().toPath(),
+                        StandardCharsets.UTF_8)) {
+                    if (l.indexOf('\t') > 0) {
+                        mRefused.add(l);
+                    }
+                }
+            } catch (IOException e) {
+                // none yet
+            }
+        }
+        return mRefused;
+    }
+
+    private Set<String> mRefused;
+
+    private File refusedFile() {
+        return new File(createDeviceProtectedStorageContext().getFilesDir(), REFUSED);
+    }
+
+    /** Add (on) or remove an entry of {@link #REFUSED}. */
+    private void refusedSet(String entry, boolean on) {
+        final Set<String> set = new HashSet<>(refusedSet());
+        if (on ? !set.add(entry) : !set.remove(entry)) {
+            return;
+        }
+        refusedWrite(set);
+    }
+
+    /** The SSID's entries go. */
+    private void refusedForget(String ssid) {
+        final String pre = refusedPrefix(ssid);
+        if (pre != null) {
+            refusedRetain(e -> !e.startsWith(pre));
+        }
+    }
+
+    /** Keep the entries {@code keep} accepts, the others go. */
+    private void refusedRetain(Predicate<String> keep) {
+        final Set<String> set = new HashSet<>(refusedSet());
+        if (set.removeIf(keep.negate())) {
+            refusedWrite(set);
+        }
+    }
+
+    private void refusedWrite(Set<String> set) {
+        mRefused = set;
+        final File f = refusedFile();
+        final File tmp = new File(f.getPath() + ".tmp");
+        final StringBuilder b = new StringBuilder();
+        for (String e : set) {
+            b.append(e).append('\n');
+        }
+        try {
+            Files.write(tmp.toPath(), b.toString().getBytes(StandardCharsets.UTF_8));
+            if (!tmp.renameTo(f)) {
+                Log.e(TAG, "cannot rename " + tmp + " to " + f);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "cannot write " + tmp, e);
+        }
+    }
+
+    /**
+     * Clear the network's disable without connecting it, and turn its auto-join off
+     * while DomD tries the passphrase: enableNetwork(netId, false) resets the status, the
+     * reason and the counter (WifiBlocklistMonitor.setNetworkSelectionEnabled) without
+     * an attempt (WifiServiceImpl.enableNetwork), so the screen no longer says to check
+     * the password; with auto-join on, the framework would try it against the
+     * placeholder again and disable it again. Auto-join first: both run on the wifi
+     * thread in this order. The cost: allowAutojoin() also drops the user's connect
+     * choices (WifiConfigManager), which turning it on again does not bring back.
+     */
+    private void holdBack(WifiConfiguration c) {
+        if (c.allowAutojoin) {
+            autojoinOff(c.networkId, unquote(c.SSID));
+            mWifi.allowAutojoin(c.networkId, false);
+        }
+        mWifi.enableNetwork(c.networkId, false);
+    }
+
+    private File autojoinFile() {
+        return new File(createDeviceProtectedStorageContext().getFilesDir(), AUTOJOIN_OFF);
+    }
+
+    /**
+     * {@link #AUTOJOIN_OFF}: netId to the SSID it had when auto-join was turned off. Read
+     * once per process and kept in {@link #mAutojoinOff}, so that a write that fails
+     * does not make a network come back on every DomD report.
+     */
+    private Map<Integer, String> autojoinOffMap() {
+        if (mAutojoinOff == null) {
+            mAutojoinOff = readAutojoinOff();
+        }
+        return new HashMap<>(mAutojoinOff);
+    }
+
+    private Map<Integer, String> mAutojoinOff;
+
+    private Map<Integer, String> readAutojoinOff() {
+        final Map<Integer, String> ids = new HashMap<>();
+        try {
+            for (String l : Files.readAllLines(autojoinFile().toPath(),
+                    StandardCharsets.UTF_8)) {
+                final int tab = l.indexOf('\t');
+                if (tab <= 0) {
+                    continue;   // a torn line
+                }
+                try {
+                    ids.put(Integer.parseInt(l.substring(0, tab)), l.substring(tab + 1));
+                } catch (NumberFormatException ignored) {
+                    // a torn line
+                }
+            }
+        } catch (IOException e) {
+            // none yet
+        }
+        return ids;
+    }
+
+    /** Record (ssid non-null) or forget that this app turned a network's auto-join off. */
+    private void autojoinOff(int netId, String ssid) {
+        final Map<Integer, String> ids = autojoinOffMap();
+        if (ssid != null ? ssid.equals(ids.put(netId, ssid)) : ids.remove(netId) == null) {
+            return;
+        }
+        mAutojoinOff = ids;
+        final File f = autojoinFile();
+        final File tmp = new File(f.getPath() + ".tmp");
+        final StringBuilder b = new StringBuilder();
+        for (Map.Entry<Integer, String> e : ids.entrySet()) {
+            b.append(e.getKey()).append('\t').append(e.getValue()).append('\n');
+        }
+        try {
+            Files.write(tmp.toPath(), b.toString().getBytes(StandardCharsets.UTF_8));
+            if (!tmp.renameTo(f)) {
+                Log.e(TAG, "cannot rename " + tmp + " to " + f);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "cannot write " + tmp, e);
+        }
+    }
+
+    /**
+     * Turn the network's auto-join on again if this app turned it off -- only while the
+     * netId still names a network of that SSID: a netId is handed out again once its
+     * network is forgotten, and the new one's auto-join is the user's.
+     */
+    private boolean restoreAutojoin(int netId) {
+        final String ssid = autojoinOffMap().get(netId);
+        if (ssid == null) {
+            return false;
+        }
+        final List<WifiConfiguration> configs = mWifi.getConfiguredNetworks();
+        if (configs == null || configs.isEmpty()) {
+            return false;   // not loaded yet (early in a boot): the record stays
+        }
+        // The record goes once the netId is looked at: back on, or no longer that
+        //   SSID's (forgotten, its netId handed out again).
+        autojoinOff(netId, null);
+        for (WifiConfiguration c : configs) {
+            if (c != null && c.networkId == netId && ssid.equals(unquote(c.SSID))) {
+                mWifi.allowAutojoin(netId, true);
+                Log.i(TAG, "netId=" + netId + ": auto-join on again");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * At the start of this service (see {@link #AUTOJOIN_OFF}); again at each sweep until
+     * the saved networks have been read, which they may not be yet so early in a boot.
+     */
+    private void restoreAllAutojoin() {
+        if (!mRestoreAtStart) {
+            return;
+        }
+        final List<WifiConfiguration> configs = mWifi.getConfiguredNetworks();
+        if (configs == null || configs.isEmpty()) {
+            return;
+        }
+        mRestoreAtStart = false;
+        for (int id : autojoinOffMap().keySet()) {
+            restoreAutojoin(id);
+        }
+    }
+
+    /** {@link #restoreAllAutojoin} has yet to run with the saved networks read. */
+    private boolean mRestoreAtStart = true;
+
+    /**
+     * DomD has the SSID while no repair is waiting: a network of it this app left held
+     * back (a join that took longer than DomD's answer, which DomD then completed, or a
+     * restart of hostapd that came late) is connected now, with auto-join on again.
+     */
+    private void connectHeldBack(String ssid) {
+        int first = -1;
+        for (Map.Entry<Integer, String> e : autojoinOffMap().entrySet()) {
+            if (ssid.equals(e.getValue()) && restoreAutojoin(e.getKey()) && first == -1) {
+                first = e.getKey();
+            }
+        }
+        // Auto-join on again for each, a connect for one: a second would replace it.
+        if (first != -1) {
+            Log.i(TAG, "DomD has " + ssid + "; connecting netId=" + first
+                    + ", held back since its repair");
+            connectAfterScan(first, ssid);
+        }
+    }
+
+    private static final String CH_STATUS = "doma_wifi_status";
+    private static final String CH_FAILURE = "doma_wifi_failure";
+    /** One notification, replaced by each report: only the latest join matters. */
+    private static final int NOTE_ID = 1;
+    /** A "connecting" goes after this long: DomD's agent answers a connect in 75 s at
+     *  most (a 30 s join, then up to 6 DHCP tries), and a lost answer must not leave it. */
+    private static final long CONNECTING_TIMEOUT_MS = 90_000;
+    private static final long CONNECTED_TIMEOUT_MS = 10_000;
+    private static final long FAILED_TIMEOUT_MS = 300_000;
+
+    /**
+     * Show what DomD's real join is doing, as one notification for every user. This
+     * service runs as the system user only (see onCreate), which is headless on AAOS, so
+     * the notification is posted to {@link UserHandle#ALL} -- posted to the system user
+     * it would never reach the driver. A failure opens the Wi-Fi settings on a tap, for
+     * the current user (a plain PendingIntent made here would start them as the
+     * system user). The app is uid system, which holds
+     * POST_NOTIFICATIONS without asking (PermissionManager.checkPermission grants
+     * SYSTEM_UID unconditionally).
+     *
+     * @param kind {@link #STATE}'s first field
+     * @param ssid its third field, empty if there is none
+     */
+    private void notifyState(String kind, String ssid) {
+        if (mNm == null) {
+            return;
+        }
+        if ("up".equals(kind)) {
+            // The daemon (re)started: a connect it had forwarded will not be answered
+            // to it. Not while a repair still waits (onWaitState): its answer comes.
+            if (mWait == null) {
+                mNm.cancelAsUser(null, NOTE_ID, UserHandle.ALL);
+            }
+            return;
+        }
+        if (ssid.isEmpty()) {
+            return;  // nothing to name
+        }
+        // offline:retry: DomD failed an earlier connect for the SSID and the later one
+        // is still under way, so it is still "connecting" -- posted again, which also
+        // starts its timeout again (two connects in a row are answered one after the
+        // other, which can take longer than one timeout).
+        final boolean connecting = "pending".equals(kind) || "offline:retry".equals(kind);
+        final String title;
+        String text = null;
+        final boolean failure;
+        final long timeout;
+        if (connecting) {
+            title = getString(R.string.connecting, ssid);
+            text = getString(R.string.connecting_text);
+            failure = false;
+            timeout = CONNECTING_TIMEOUT_MS;
+        } else if ("online".equals(kind)) {
+            title = getString(R.string.connected, ssid);
+            failure = false;
+            timeout = CONNECTED_TIMEOUT_MS;
+        } else if ("offline:lost".equals(kind)) {
+            title = getString(R.string.lost, ssid);
+            text = getString(R.string.lost_text);
+            failure = true;
+            timeout = FAILED_TIMEOUT_MS;
+        } else if (kind.startsWith("offline:")) {
+            title = getString(R.string.failed, ssid);
+            text = getString(failureText(kind.substring("offline:".length())));
+            failure = true;
+            timeout = FAILED_TIMEOUT_MS;
+        } else {
+            return;  // a bare "offline" (an older daemon) says too little to show
+        }
+        final Notification.Builder b = new Notification.Builder(this,
+                failure ? CH_FAILURE : CH_STATUS)
+                .setSmallIcon(failure ? android.R.drawable.stat_sys_warning : R.drawable.ic_wifi)
+                .setContentTitle(title)
+                .setOnlyAlertOnce(!failure)
+                .setOngoing(connecting)
+                .setTimeoutAfter(timeout)
+                .setCategory(failure ? Notification.CATEGORY_ERROR : Notification.CATEGORY_STATUS);
+        if (failure) {
+            // A tap opens the Wi-Fi settings, for the current (driver) user: this app runs
+            //   as the system user, which has no screen on this headless product.
+            b.setContentIntent(PendingIntent.getActivityAsUser(this, 0,
+                    new Intent(Settings.ACTION_WIFI_SETTINGS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                                    | Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                    PendingIntent.FLAG_IMMUTABLE, null, UserHandle.CURRENT))
+                    .setAutoCancel(true);
+        }
+        if (text != null) {
+            b.setContentText(text);
+            b.setStyle(new Notification.BigTextStyle().bigText(text));
+        }
+        mNm.notifyAsUser(null, NOTE_ID, b.build(), UserHandle.ALL);
+    }
+
+    private static int failureText(String reason) {
+        switch (reason) {
+            case "not-found":
+                return R.string.reason_not_found;
+            case "wrong-key":
+                return R.string.reason_wrong_key;
+            case "rejected":
+                return R.string.reason_rejected;
+            case "timeout":
+                return R.string.reason_timeout;
+            default:
+                return R.string.reason_error;
         }
     }
 
@@ -497,6 +1388,7 @@ public final class RelayService extends Service {
         }
         // A "no internet" verdict that came after DomD's report (see recheckInternet).
         recheckInternet();
+        restoreAllAutojoin();
         final List<WifiConfiguration> configs;
         try {
             configs = mWifi.getPrivilegedConfiguredNetworks();
@@ -517,6 +1409,17 @@ public final class RelayService extends Service {
             Log.w(TAG, "getPrivilegedConfiguredNetworks returned null");
             return;
         }
+        if (!configs.isEmpty()) {
+            // A refused pair of an SSID no longer saved goes (see REFUSED).
+            final Set<String> saved = new HashSet<>();
+            for (WifiConfiguration c : configs) {
+                final String pre = c == null ? null : refusedPrefix(unquote(c.SSID));
+                if (pre != null) {
+                    saved.add(pre);
+                }
+            }
+            refusedRetain(e -> saved.contains(e.substring(0, e.indexOf('\t') + 1)));
+        }
         for (WifiConfiguration c : configs) {
             if (c == null || c.getNetworkSelectionStatus() == null) {
                 continue;
@@ -535,11 +1438,28 @@ public final class RelayService extends Service {
                 continue;
             }
             final String key = c.networkId + " " + psk;
+            if (mWait != null && mWait.key.equals(key)) {
+                // Tapped while DomD is still trying it: the local handshake failed on the
+                // placeholder. Held back again, without a second request.
+                Log.i(TAG, "netId=" + c.networkId + " is waiting for DomD; held back again");
+                mWifi.enableNetwork(c.networkId, false);
+                cancelFrameworkWrongPassword();
+                continue;
+            }
+            if (!mAttempted.contains(key)
+                    && refusedSet().contains(refusedEntry(ssid, psk))) {
+                // DomD refused this very passphrase before this process (a reboot):
+                //   a new password is a new pair, and forget+re-add drops the entry.
+                Log.i(TAG, "netId=" + c.networkId + ": DomD refused this passphrase before;"
+                        + " left to the user");
+                mAttempted.add(key);
+                continue;
+            }
             if (mAttempted.contains(key)) {
                 Log.i(TAG, "already attempted netId=" + c.networkId + "; leaving disabled");
                 continue;
             }
-            if (!repair(c.networkId, ssid, psk, key)) {
+            if (!repair(c, ssid, psk, key)) {
                 // Nothing was written, so nothing is spent: try the next candidate.
                 // continue rather than return -- the drop-box is untouched so there is
                 // no race to lose, and no connect() was issued so this cannot loop.
@@ -590,6 +1510,8 @@ public final class RelayService extends Service {
         if (mAttempted.removeIf(k -> k.startsWith(prefix))) {
             Log.i(TAG, "netId=" + wi.getNetworkId() + " associated; its repair is re-armed");
         }
+        refusedForget(unquote(wi.getSSID()));
+        restoreAutojoin(wi.getNetworkId());
     }
 
     /**
@@ -618,7 +1540,9 @@ public final class RelayService extends Service {
      * @return true if a request was written -- i.e. if the caller should spend the
      *         attempt. False means nothing was written and nothing is spent.
      */
-    private boolean repair(final int netId, String ssid, String psk, final String key) {
+    private boolean repair(final WifiConfiguration c, String ssid, String psk,
+            final String key) {
+        final int netId = c.networkId;
         if (requestPending()) {
             Log.w(TAG, "a request is still unconsumed in " + REQ + "; the daemon is not"
                     + " reading it (" + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
@@ -627,59 +1551,74 @@ public final class RelayService extends Service {
                     + " logcat -s doma-wifi-relay");
             return false;
         }
-        Log.i(TAG, "repairing netId=" + netId + " ssid=" + ssid);
-        if (!writeRequest(ssid, psk)) {
+        if (mWait != null) {
+            Log.i(TAG, "netId=" + mWait.netId + " is still waiting for DomD; netId=" + netId
+                    + " after it -- attempt NOT spent");
             return false;
         }
-        connectWhenConsumed(netId, key, REQ_POLLS);
+        Log.i(TAG, "repairing netId=" + netId + " ssid=" + ssid);
+        final String token = String.format("%016x", mRandom.nextLong());
+        final String[] st = readState();
+        final String startSeq = st.length >= 2 ? st[1] : "";
+        if (!writeRequest(ssid, psk, token)) {
+            return false;
+        }
+        final Wait w = new Wait(netId, ssid, key, token, startSeq,
+                refusedEntry(ssid, psk));
+        mWait = w;
+        holdBack(c);
+        // The framework's "Failed to connect" from the placeholder's handshake, now and
+        //   once more in case it is posted just after.
+        cancelFrameworkWrongPassword();
+        mHandler.postDelayed(() -> {
+            if (mWait == w) {
+                cancelFrameworkWrongPassword();
+            }
+        }, 1000);
+        connectWhenConsumed(w, REQ_POLLS);
         return true;
     }
 
     /**
-     * Wait for the daemon to take the request, then re-trigger the connect. If it never
-     * takes it, return the attempt to the pool instead of burning it.
+     * Wait for the daemon to handle the request, then for DomD's answer (up to
+     * {@link #CONNECTING_TIMEOUT_MS}, see {@link #onWaitState}). If it never takes the
+     * request, return the attempt to the pool instead of burning it.
      */
-    private void connectWhenConsumed(final int netId, final String key, final int polls) {
+    private void connectWhenConsumed(final Wait w, final int polls) {
         mHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (requestPending()) {
+                if (w != mWait) {
+                    return;     // answered already (a request the daemon dropped)
+                }
+                if (requestPending() || REQ_BUSY.exists()) {
                     if (polls > 1) {
-                        connectWhenConsumed(netId, key, polls - 1);
+                        connectWhenConsumed(w, polls - 1);
                         return;
                     }
-                    mAttempted.remove(key);
                     Log.w(TAG, "daemon did not consume the request within "
-                            + (REQ_POLLS * DAEMON_GRACE_MS) + " ms ("
+                            + (REQ_POLLS * POLL_MS) + " ms ("
                             + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
-                            + "); not connecting netId=" + netId
-                            + ", attempt NOT spent. Check: logcat -s doma-wifi-relay");
+                            + "); not connecting netId=" + w.netId
+                            + ". Check: logcat -s doma-wifi-relay");
+                    finishWait(w, "unconsumed");
                     return;
                 }
-                Log.i(TAG, "re-triggering connect netId=" + netId);
-                mWifi.connect(netId, new WifiManager.ActionListener() {
-                    @Override
-                    public void onSuccess() {
-                        Log.i(TAG, "connect(" + netId + ") accepted");
-                    }
-
-                    @Override
-                    public void onFailure(int reason) {
-                        Log.w(TAG, "connect(" + netId + ") rejected, reason=" + reason);
-                    }
-                });
+                Log.i(TAG, "the daemon has the request for netId=" + w.netId
+                        + "; waiting for DomD");
+                mHandler.postDelayed(mWaitTimeout, CONNECTING_TIMEOUT_MS);
             }
-        }, DAEMON_GRACE_MS);
+        }, POLL_MS);
     }
 
     /**
-     * Write one tab-separated {@code psk} request line for the daemon.
+     * Write one tab-separated {@code psk#<token>} request line for the daemon.
      *
      * <p>Written to a temporary name and renamed, so the daemon can never read a partial
      * line: it polls for the final name only, and its own first action is to move the
      * file aside.
      */
-    private boolean writeRequest(String ssid, String psk) {
+    private boolean writeRequest(String ssid, String psk, String token) {
         if (!REQ_DIR.isDirectory()) {
             // isDirectory() is also false when the directory exists but a parent denies
             // search, which is the failure this path actually hit (see the field's
@@ -692,7 +1631,7 @@ public final class RelayService extends Service {
         }
         try (FileOutputStream fos = new FileOutputStream(REQ_TMP);
                 OutputStreamWriter w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
-            w.write("psk\t" + ssid + "\t" + psk + "\n");
+            w.write("psk#" + token + "\t" + ssid + "\t" + psk + "\n");
             w.flush();
             fos.getFD().sync();
             // Group-readable for the daemon (uid wifi, group system); see REQ_DIR.
