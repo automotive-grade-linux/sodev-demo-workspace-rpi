@@ -18,7 +18,7 @@ chardev, which gnss_replay.py records as well.
 PROTOCOL -- one JSON object per line, both directions:
     ->  {"t":"aps","v":[{"ssid":..,"bssid":..,"sec":<see below>,
                          "freq":2462,"dbm":-59}, ..]}
-    <-  {"t":"connect","id":"<id>","ssid":"<SSID-A>","psk":"..."}
+    <-  {"t":"connect","id":"<id>","ssid":"<SSID-A>","psk":"...","kind":"u"}
     ->  {"t":"state","ssid":..,"state":"COMPLETED","ip":"<from the AP's DHCP>","id":..}
     ->  {"t":"state","ssid":..,"state":"FAILED","error":"<why>","id":..}
     ->  {"t":"state","ssid":..,"state":"LOST","error":"wpa_state <state>"}
@@ -26,7 +26,10 @@ PROTOCOL -- one JSON object per line, both directions:
 
 COMPLETED and FAILED answer a connect, one for each, in the order they came, and
 carry its "id" back (when it had one), by which the relay tells which passphrase the
-answer is for. LOST is sent unasked, once, when the network last joined for DomA has
+answer is for. "kind" "u" marks a passphrase the user has just typed on DomA's screen
+(the relay's handle_psk); a connect without it (the relay's mirror of a passphrase
+DomA keeps, or an older relay) is never cut short by a WRONG_KEY (see WPA_SUPPLICANT).
+LOST is sent unasked, once, when the network last joined for DomA has
 stopped being COMPLETED (see link_lost()): without it DomA's station stays on that
 SSID's shadow BSS, and the screen shows a network DomD no longer has as connected.
 BACK is sent once, unasked (or after the answer to a connect for that SSID that came
@@ -84,6 +87,40 @@ DomD's working link each time. It only takes a lease when wlan0 has no IPv4 addr
 (the first DHCP may have found no server). A join that does not reach COMPLETED in
 time is answered FAILED, so the same connect re-joins -- unless wpa_supplicant, still
 trying it, has completed it by then (then it is "current").
+
+A WRONG_KEY is wpa_supplicant's guess, not a verdict: it reports one for any 4-way
+handshake that fails, also one cut short by a weak signal, and the next attempt may
+complete. Android draws a line between passphrases (ClientModeImpl's
+isPermanentWrongPasswordFailure(): one failure for a network never connected,
+config_wifiDisableReasonByWrongPasswordThreshold = 1; three for one connected before,
+config_wifiPreviouslyConnectedNetworkWrongPasswordThreshold), and so does this agent:
+a join with a passphrase the user has just typed ("kind" "u") that this SSID has never
+been COMPLETED with on DomD (JOINED_FILE) is answered FAILED at the first
+SSID-TEMP-DISABLED reason=WRONG_KEY, or for SAE at the first CTRL-EVENT-AUTH-REJECT
+auth_type=3 status_code=15 from a BSS of the SSID, so that the user learns why at once
+rather than after JOIN_WAIT_S, and its network is removed, so that wpa_supplicant
+does not go on to join it behind DomA's back (DomA shows the passphrase as refused).
+Every other join keeps the whole JOIN_WAIT_S on a WRONG_KEY, as on every other
+failure: one with a passphrase COMPLETED before, and every connect the relay sends
+of its own for a passphrase DomA keeps, also while JOINED_FILE is empty (just after
+this version was installed, or after DomD's card was written again without DomA's
+partition).
+SAE reports no WRONG_KEY: a wrong password fails the SAE confirm, and the AP
+answers status_code=15 (WLAN_STATUS_CHALLENGE_FAIL), which wpa_supplicant 2.11 passes
+on as an AUTH-REJECT with no id= or ssid= (the SSID-TEMP-DISABLED that follows says
+CONN_FAILED, as for an AP that does not answer at all). Unlike a WRONG_KEY it is the
+AP's verdict on the frames it got, not a guess from a handshake cut short, so the
+first one ends the wait; its BSS is checked against the network's SSID (BSS <bssid>),
+and it must follow wpa_supplicant's "Trying to authenticate with" (or "associate
+with") that BSS, since an answer for the network removed may still arrive after the
+Monitor was drained. A join that ran its whole JOIN_WAIT_S after one has
+"SAE: WRONG_KEY" in its error all the same, so that the relay takes the passphrase
+as refused, as it does for a WRONG_KEY then, and its network is removed as well.
+One with no attempt announced before it is only mentioned in the error, without
+WRONG_KEY.
+The cost, unlike on Android: a correct passphrase typed for the first time whose
+handshake a weak signal cut short is answered as refused, and the relay drops the
+same passphrase typed again for its FAIL_HOLD_S (300 s); another one is taken.
 Any other connect re-joins, and takes a new DHCP lease: the address left on wlan0
 from the previous AP is flushed first, so it is never reported for the new one.
 
@@ -111,6 +148,15 @@ RECONNECT do neither on a network that is enabled and not disconnected). Resets 
 RESET_MIN_S apart, twice as far after each one that is not followed by COMPLETED, up
 to RESET_MAX_S.
 
+CONTROL SOCKET TIMEOUTS
+wpa_supplicant can leave its control socket unanswered for seconds (seen for 17 s
+during an SAE authentication on a Raspberry Pi 4, 2026-11-08). A command that times
+out is not fatal: the join wait goes on polling until its JOIN_WAIT_S, a connect that
+cannot be carried out is answered FAILED ("wpa_supplicant ctrl did not answer"), a
+scan that cannot be read is published at the next one, and the PING at start is tried
+CTRL_TRIES times. An agent that exited here would leave the connect it was answering
+without an answer, and DomA waiting on it.
+
 SECURITY, STATED PLAINLY
 A passphrase typed on the AAOS screen travels this channel in the clear, because
 the shadow AP cannot learn a PSK from a 4-way handshake -- only a MIC crosses
@@ -118,6 +164,7 @@ the air. Lab use only; do not ship it to a vehicle.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -178,11 +225,11 @@ class Supplicant:
 
     def cmd(self, text):
         if self.sock is None:
-            self.open()             # a reopen after a timeout failed (see below)
-        self.sock.send(text.encode())
+            self.open()             # a reopen after a failure (see below)
         # Unsolicited events are only delivered after ATTACH, which is sent on the
         # Monitor's socket only, so the next datagram here is the reply to this command.
         try:
+            self.sock.send(text.encode())
             return self.sock.recv(65536).decode("utf-8", "replace")
         except socket.timeout:
             # The late reply would answer the NEXT command, and every one after it
@@ -190,6 +237,11 @@ class Supplicant:
             # (see open) leaves the late reply behind. Raised on, as before.
             self.close()
             self.open()
+            raise
+        except OSError:
+            # wpa_supplicant restarted (ECONNREFUSED, then ENOTCONN on this socket):
+            #   the next command opens a new one, which reaches the new instance.
+            self.close()
             raise
 
     def status(self):
@@ -207,6 +259,13 @@ class Monitor(Supplicant):
         super().__init__(path, timeout=1.0, suffix=".ev")
         self.ok = False
         self.reason = ""
+        # the id= of the last SSID-TEMP-DISABLED with reason=WRONG_KEY (wait_state)
+        self.wrong_key_id = None
+        # the BSSIDs of the AUTH-REJECTs for a wrong SAE password, with whether an
+        #   attempt on that BSS was announced before it (wait_state)
+        self.sae_wrong = []
+        # the BSSIDs wpa_supplicant has said it is trying since the last drain
+        self.tried = set()
 
     def attach(self):
         self.close()
@@ -220,6 +279,12 @@ class Monitor(Supplicant):
         return self.ok
 
     def _note(self, ev):
+        # An attempt on a BSS ("SME: Trying to authenticate with", "Trying to
+        #   associate with", both wpa_msg() at MSG_INFO, so sent to the Monitor).
+        t = re.search(r"Trying to (?:authenticate|associate) with ([0-9a-fA-F:]{17})\b",
+                      ev)
+        if t:
+            self.tried.add(t.group(1).lower())
         # Why a join failed, as wpa_supplicant says it; these events carry the SSID
         # and codes only, never a key.
         for name, key in (("CTRL-EVENT-SSID-TEMP-DISABLED", "reason"),
@@ -227,8 +292,20 @@ class Monitor(Supplicant):
                           ("CTRL-EVENT-AUTH-REJECT", "status_code"),
                           ("CTRL-EVENT-NETWORK-NOT-FOUND", None)):
             if name in ev:
-                m = re.search(r"\b%s=(\S+)" % key, ev) if key else None
-                self.reason = name + (" %s=%s" % (key, m.group(1)) if m else "")
+                # The last match: the code comes after ssid="..", which may hold
+                #   "reason=" itself. One datagram is one event, so the id= is its own.
+                m = re.findall(r"\b%s=(\S+)" % key, ev) if key else None
+                self.reason = name + (" %s=%s" % (key, m[-1]) if m else "")
+                if (name == "CTRL-EVENT-SSID-TEMP-DISABLED" and m
+                        and m[-1] == "WRONG_KEY"):
+                    i = re.search(r"\bid=(\d+)", ev)
+                    self.wrong_key_id = i.group(1) if i else None
+                if name == "CTRL-EVENT-AUTH-REJECT" and m and m[-1] == "15":
+                    # SAE (auth_type=3) refused the password (see WPA_SUPPLICANT)
+                    b = re.search(r"CTRL-EVENT-AUTH-REJECT ([0-9a-fA-F:]{17})\b", ev)
+                    if b and re.search(r"\bauth_type=3\b", ev):
+                        k = b.group(1).lower()
+                        self.sae_wrong.append((k, k in self.tried))
 
     def drain(self):
         """Read what is queued, so wpa_supplicant never finds this socket full."""
@@ -473,6 +550,53 @@ def network_for(sec, psk):
 
 # The network last applied by connect_real_ap(): (ssid, key_mgmt, ieee80211w, psk).
 _applied = None
+# How far connect_real_ap() got, for a control socket that times out on the way (see
+# CONTROL SOCKET TIMEOUTS): (stage, network). "start" until it removes the previous
+# network, "removed" after, "selected" once SELECT_NETWORK has been sent.
+_progress = ("start", None)
+
+
+# The passphrases each SSID has been COMPLETED with on DomD, as sha256 of the SSID, a
+# NUL and the psk argument (connect_real_ap()'s), the newest JOINED_MAX, one per line:
+# a join with one of them is not cut short by a WRONG_KEY (see WPA_SUPPLICANT above).
+# Kept across a boot of DomD (its rootfs is ext4 on the SD card). Hashed only so that
+# no passphrase is written to the card in the clear: an unsalted sha256 is no
+# protection against a guess of a known SSID's passphrase.
+JOINED_FILE = "/var/lib/domd-wifi-agent/joined"
+JOINED_MAX = 64
+
+
+def _joined_key(want):
+    return hashlib.sha256(want[0].encode() + b"\0" + want[3].encode()).hexdigest()
+
+
+def _joined_read():
+    try:
+        with open(JOINED_FILE, encoding="ascii") as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def joined_has(want):
+    """Whether this SSID has been COMPLETED with this passphrase before."""
+    return want is not None and bool(want[3]) and _joined_key(want) in _joined_read()
+
+
+def joined_add(want):
+    """Remember a passphrase this SSID is COMPLETED with (joined_has())."""
+    if want is None or not want[3]:
+        return                      # an open network: no passphrase, no WRONG_KEY
+    k = _joined_key(want)
+    rows = [r for r in _joined_read() if r != k][-(JOINED_MAX - 1):] + [k]
+    try:
+        os.makedirs(os.path.dirname(JOINED_FILE), mode=0o700, exist_ok=True)
+        fd = os.open(JOINED_FILE + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write("".join(r + "\n" for r in rows))
+        os.replace(JOINED_FILE + ".new", JOINED_FILE)
+    except OSError as e:
+        log("cannot record the passphrase as joined (%s)" % e)
 
 
 # The network of a join answered FAILED for the time, which wpa_supplicant keeps
@@ -482,8 +606,10 @@ _waiting = None
 
 
 def forget_applied():
-    """The last join did not complete in time: the next connect for it re-joins,
-    unless wpa_supplicant has completed it by then (_waiting, connect_real_ap())."""
+    """The last join failed (not COMPLETED in time, or a WRONG_KEY that ended its wait):
+    the next connect for it re-joins, unless wpa_supplicant, still trying it, has
+    completed it by then (_waiting, connect_real_ap(); not after a WRONG_KEY that
+    ended the wait, as its network is removed then)."""
     global _applied, _waiting
     _waiting = _applied
     _applied = None
@@ -637,7 +763,7 @@ def flush(chan, outbox):
 
 
 def watch_failed(ssid, reason):
-    """After a join answered FAILED for the time (reason: mon.reason): watch its
+    """After a join answered FAILED (reason: its error, with mon.reason): watch its
     network as if lost, as wpa_supplicant keeps trying it, so that a later COMPLETED is
     reported BACK, with a lease. Not after WRONG_KEY: the relay then takes the
     passphrase as rejected, which a BACK does not undo, so DomA would show the network
@@ -696,6 +822,15 @@ def network_ssid(sup):
     if not cols or len(cols[0]) < 2 or not cols[0][1]:
         return None
     return unescape_ssid(cols[0][1]).decode("utf-8", "replace")
+
+
+def bss_ssid(sup, bssid):
+    """The SSID of a BSS in wpa_supplicant's table, or None if it has none. Raises
+    OSError when the control socket does not answer (the caller asks again)."""
+    for kv in sup.cmd("BSS %s" % bssid).splitlines():
+        if kv.startswith("ssid="):
+            return unescape_ssid(kv[5:]).decode("utf-8", "replace")
+    return None
 
 
 def driver_stuck(sup, iface):
@@ -836,19 +971,22 @@ def ensure_up(sup, iface):
     return True
 
 
-def connect_real_ap(sup, ssid, psk, sec=None, iface="wlan0"):
+def connect_real_ap(sup, ssid, psk, sec=None, iface="wlan0", mon=None):
     """Select the network for a real AP. Returns (True, "joining" | "current"), or
     (False, error): refused before touching wpa_supplicant (the watch stays as it
     was), or failed after the previous network was removed (the watch is dropped).
 
     sec is the SSID's "sec" in the latest scan, or None if it was not in it; the
-    key management follows it (see WPA_SUPPLICANT above).
+    key management follows it (see WPA_SUPPLICANT above). mon, the Monitor, is
+    drained once the previous network is removed (see wait_state()).
     """
     if psk and sec == "open":
         # The DomA row still holds a PSK (the relay keeps a real one when an AP turns
         # open), but the AP takes none.
         log("%r is open in the latest scan; joining without the psk" % ssid)
         psk = ""
+    global _progress
+    _progress = ("start", None)
     km, pmf, arg = network_for(sec, psk)
     if km is None:
         return False, arg
@@ -860,13 +998,25 @@ def connect_real_ap(sup, ssid, psk, sec=None, iface="wlan0"):
         return True, "current"
     # Nothing is joined for DomA from here until this join completes (link_set), also
     #   when a step below fails: this agent must not watch the network removed. A step
-    #   that times out ends the agent (Supplicant.cmd raises), and the one that starts
-    #   again watches only what wpa_supplicant is COMPLETED on (link_adopt).
+    #   that times out raises (Supplicant.cmd), and main() answers the connect FAILED
+    #   (see CONTROL SOCKET TIMEOUTS).
     _set_applied(None)
     link_set(False)
     # One network at a time: nothing else adds networks (the config file has
     # none), and without this every connect request would leave one more behind.
+    _progress = ("removed", want)
     sup.cmd("REMOVE_NETWORK all")
+    # An event of the network removed (a WRONG_KEY of an earlier passphrase, as
+    #   wpa_supplicant kept trying it) must not end this join's wait: ADD_NETWORK below
+    #   hands out the same id again (0 when none is left), so wait_state() cannot tell
+    #   by the id. Every event wpa_supplicant wrote before it answered the REMOVE is in
+    #   the Monitor's socket by now, and after it there are none for the network
+    #   removed, so they are read and dropped here.
+    if mon is not None:
+        mon.drain()
+        mon.wrong_key_id = None
+        mon.sae_wrong = []
+        mon.tried = set()
     nid = sup.cmd("ADD_NETWORK").strip()
     if not nid.isdigit():
         return False, "ADD_NETWORK -> %r" % nid
@@ -881,6 +1031,7 @@ def connect_real_ap(sup, ssid, psk, sec=None, iface="wlan0"):
             return False, "%s %s -> %r" % (s.split()[0], s.split()[2], r)
     # The previous AP's lease must not outlive it (see WPA_SUPPLICANT above).
     drop_lease(iface)
+    _progress = ("selected", want)
     sup.cmd("SELECT_NETWORK %s" % nid)
     _set_applied(want)
     return True, "joining"
@@ -890,25 +1041,77 @@ JOIN_WAIT_S = 30
 SCAN_WAIT_S = 15
 
 
-def wait_state(sup, mon, want="COMPLETED", secs=JOIN_WAIT_S, iface=None):
-    """The wpa_state reached within secs: polls STATUS, and meanwhile listens on the
-    Monitor for why a join fails (mon.reason). With iface, a driver found stuck (see
-    DRIVER RESET) is reset once, within the same wait while enough of it is left for
-    the reset (else main() resets it after the answer)."""
+def wait_state(sup, mon, want="COMPLETED", secs=JOIN_WAIT_S, iface=None,
+               wrong_key_ends=False):
+    """(wpa_state, wrong_key, sae_now, sae_late): the wpa_state reached within secs,
+    whether the wait ended early on a wrong passphrase, and whether a BSS of the
+    network's SSID refused its SAE password after an attempt on it (sae_now), or with
+    no attempt announced before (sae_late, see WPA_SUPPLICANT). Polls STATUS, and
+    meanwhile listens on the Monitor for why a join fails (mon.reason).
+
+    With wrong_key_ends, an SSID-TEMP-DISABLED with reason=WRONG_KEY for the network
+    selected now (its id; connect_real_ap() drops the events of the network it
+    removed), or sae_now, ends the wait at once. A control socket that does not
+    answer is logged once and asked again until secs are up (see CONTROL SOCKET
+    TIMEOUTS); the time left is looked at between commands, so the wait runs over by
+    about one command's timeout at most. With iface, a driver found stuck (see DRIVER
+    RESET) is reset once, within the same wait while enough of it is left for the
+    reset (else main() resets it after the answer)."""
     end = time.monotonic() + secs
     last = ""
     mon.reason = ""
+    mon.wrong_key_id = None
+    mon.sae_wrong = []
+    mon.tried = set()
+    nid = network_id(sup)
+    ssid = network_ssid(sup)
+    seen = 0                # mon.sae_wrong looked at so far
+    sae_now = False         # refused on a BSS of the SSID after an attempt on it
+    sae_late = False        # refused on one, with no attempt seen (see below)
     reset = False
+    quiet = False
     while time.monotonic() < end:
-        last = sup.status().get("wpa_state", "")
+        t0 = time.monotonic()
+        try:
+            if nid is None:
+                nid = network_id(sup)
+            if ssid is None:
+                ssid = network_ssid(sup)
+            while (ssid is not None and not sae_now and seen < len(mon.sae_wrong)
+                   and time.monotonic() < end):
+                b, after_try = mon.sae_wrong[seen]
+                if bss_ssid(sup, b) == ssid:
+                    # One without an attempt announced before it may be the answer
+                    #   to the network removed for this join: it is only mentioned.
+                    if after_try:
+                        sae_now = True
+                    else:
+                        sae_late = True
+                seen += 1       # not on a timeout: that one is asked again
+            if wrong_key_ends and (sae_now
+                                   or (nid is not None and mon.wrong_key_id == nid)):
+                return last, True, sae_now, sae_late
+            if time.monotonic() >= end:
+                break
+            last = sup.status().get("wpa_state", "")
+        except OSError as e:
+            if not quiet:
+                log("wpa_supplicant ctrl during the join: %s; polling on until the %d s"
+                    " are up" % (e, secs))
+                quiet = True
+            # A refused connect (wpa_supplicant gone) fails at once: not a busy loop.
+            time.sleep(max(0.0, min(1.0, end - time.monotonic())
+                           - (time.monotonic() - t0)))
+            continue
         if last == want:
-            return last
+            return last, False, sae_now, sae_late
         if (iface and not reset and end - time.monotonic() > 2 * IFACE_WAIT_S
                 and driver_stuck(sup, iface)):
             reset_iface(sup, iface)
             reset = True
-        mon.wait((), min(1.0, max(0.0, end - time.monotonic())))
-    return last
+        mon.wait(("CTRL-EVENT-SSID-TEMP-DISABLED", "CTRL-EVENT-AUTH-REJECT"),
+                 min(1.0, max(0.0, end - time.monotonic())))
+    return last, False, sae_now, sae_late
 
 
 UDHCPC_PID = "/run/domd-wifi-agent.udhcpc.pid"
@@ -1018,7 +1221,49 @@ def connect_channel(path, tries=0):
             time.sleep(2)
 
 
+# How many times a command at start is tried (each waits up to Supplicant's 5 s), see
+# CONTROL SOCKET TIMEOUTS.
+CTRL_TRIES = 6
+
+
+def ctrl_retry(sup, text):
+    """sup.cmd(text), tried up to CTRL_TRIES times while it times out; None if never."""
+    for i in range(CTRL_TRIES):
+        try:
+            return sup.cmd(text).strip()
+        except OSError as e:
+            log("%s: %s (try %d of %d)" % (text.split()[0], e, i + 1, CTRL_TRIES))
+    return None
+
+
+def sweep_sockets(prefix="/tmp/domd_wifi_agent_"):
+    """Remove the bound paths an agent that died left behind (Supplicant.base and
+    the paths derived from it): wpa_supplicant detaches a Monitor it cannot write to,
+    but the files stay in /tmp."""
+    d, head = os.path.split(prefix)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        m = re.match(re.escape(head) + r"(\d+)", n)
+        if not m or int(m.group(1)) == os.getpid():
+            continue
+        try:
+            os.kill(int(m.group(1)), 0)
+            continue            # alive (or not ours to signal): left alone
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        try:
+            os.unlink(os.path.join(d, n))
+        except OSError:
+            pass
+
+
 def main():
+    global JOINED_FILE
     ap = argparse.ArgumentParser()
     ap.add_argument("-s", "--socket", default="/run/android_vm_virtconsole5",
                     help="qemu virtio-serial chardev socket (DomA side is /dev/hvc4)")
@@ -1028,8 +1273,12 @@ def main():
                     help="how many SSIDs to publish (strongest first)")
     ap.add_argument("--interval", type=float, default=20.0,
                     help="seconds between scans")
+    ap.add_argument("--joined", default=JOINED_FILE,
+                    help="where the passphrases joined are kept (see JOINED_FILE)")
     args = ap.parse_args()
+    JOINED_FILE = args.joined
 
+    sweep_sockets()
     sup = Supplicant(args.ctrl)
     try:
         sup.open()
@@ -1037,13 +1286,19 @@ def main():
         log("cannot open %s: %s -- is wpa_supplicant running on %s?"
             % (args.ctrl, e, args.iface))
         return 1
-    log("wpa_supplicant ctrl %s: %s" % (args.ctrl, sup.cmd("PING").strip()))
+    _CLOSE.append(sup)
+    pong = ctrl_retry(sup, "PING")
+    if pong is None:
+        log("wpa_supplicant ctrl %s does not answer" % args.ctrl)
+        return 1
+    log("wpa_supplicant ctrl %s: %s" % (args.ctrl, pong))
     # Global, so once: both SAE PWE methods (hash-to-element and hunting-and-pecking),
     # whichever the AP asks for. Not fatal -- without it SAE still works against an AP
     # that offers hunting-and-pecking. Restart=always runs this again whenever the
     # agent comes back after wpa_supplicant restarted.
-    log("SET sae_pwe 2: %s" % sup.cmd("SET sae_pwe 2").strip())
+    log("SET sae_pwe 2: %s" % ctrl_retry(sup, "SET sae_pwe 2"))
     mon = Monitor(args.ctrl)
+    _CLOSE.append(mon)
     log("event socket: %s" % ("attached" if mon.attach() else "not attached; fixed waits"))
     link_adopt(sup)
     ensure_up(sup, args.iface)      # a reset cut short by the restart this follows
@@ -1083,7 +1338,11 @@ def main():
             if not mon.ok:
                 mon.attach()        # wpa_supplicant restarted, or events stopped
             mon.drain()
-            r = sup.cmd("SCAN").strip()
+            try:
+                r = sup.cmd("SCAN").strip()
+            except OSError as e:
+                log("SCAN: %s" % e)
+                r = ""
             # Read the BSS table once this scan (or the one already running, on
             # FAIL-BUSY) has finished, not after a guess: read early, it still holds
             # the previous scan's view, sec_of with it. Up to SCAN_WAIT_S; a scan of
@@ -1096,7 +1355,12 @@ def main():
                     mon.ok = False          # re-ATTACH before the next scan
             else:
                 time.sleep(3)
-            found = parse_scan_results(sup.cmd("SCAN_RESULTS"))
+            try:
+                found = parse_scan_results(sup.cmd("SCAN_RESULTS"))
+            except OSError as e:
+                log("SCAN_RESULTS: %s; publishing at the next scan" % e)
+                next_scan = now + SCAN_WAIT_S
+                continue
             sec_of = {a["ssid"]: a["sec"] for a in top_n(found)}
             aps = top_n(found, args.top)
             msg = json.dumps({"t": "aps", "v": aps}, ensure_ascii=False)
@@ -1132,6 +1396,9 @@ def main():
                     ip = dhcp(args.iface)
                 back_msg = {"t": "state", "ssid": back, "state": "BACK", "ip": ip}
                 log("link back: %s" % back_msg)
+                # COMPLETED with the passphrase of the join that timed out (_waiting)
+                if _waiting is not None and _waiting[0] == back:
+                    joined_add(_waiting)
                 outbox.append(back_msg)
                 continue
             if driver_stuck(sup, args.iface):
@@ -1174,44 +1441,91 @@ def main():
             # the watch as it was: connect_real_ap and link_set below change it
             watched = _applied[0] if _applied is not None else _link["ssid"]
             was_lost = _link["lost"]
-            ok, info = connect_real_ap(sup, ssid, psk, sec_of.get(ssid), args.iface)
-            timed_out = False
+            join_failed = False
             back_due = False
-            if not ok:
-                reply = {"t": "state", "ssid": ssid, "state": "FAILED",
-                         "error": info}
-            elif info == "current":
-                log("already COMPLETED on %r with this key; not re-joining" % ssid)
-                ip = iface_ip(args.iface)
-                if not ip:
-                    log("no IPv4 address on %s; taking a lease" % args.iface)
-                    ip = dhcp(args.iface)
-                reply = {"t": "state", "ssid": ssid, "state": "COMPLETED", "ip": ip}
-                # Back after a LOST or a timed-out join, and asked again before the
-                #   link check saw it: link_set below ends that watch, so the BACK the
-                #   relay waits for (to list the SSID again) is sent here.
-                if was_lost and watched == ssid:
-                    back_msg = {"t": "state", "ssid": ssid, "state": "BACK", "ip": ip}
-                    back_due = True         # written right after the answer, below
-            else:
-                state = wait_state(sup, mon, iface=args.iface)
-                if state == "COMPLETED":
-                    # always a new lease: the old one belonged to the previous AP
-                    reply = {"t": "state", "ssid": ssid, "state": state,
-                             "ip": dhcp(args.iface)}
-                else:
-                    forget_applied()
-                    timed_out = True
+            try:
+                ok, info = connect_real_ap(sup, ssid, psk, sec_of.get(ssid), args.iface,
+                                           mon)
+                if not ok:
                     reply = {"t": "state", "ssid": ssid, "state": "FAILED",
-                             "error": "not associated within %d s (wpa_state %s%s)"
-                             % (JOIN_WAIT_S, state or "unknown",
-                                "; " + mon.reason if mon.reason else "")}
+                             "error": info}
+                elif info == "current":
+                    log("already COMPLETED on %r with this key; not re-joining" % ssid)
+                    ip = iface_ip(args.iface)
+                    if not ip:
+                        log("no IPv4 address on %s; taking a lease" % args.iface)
+                        ip = dhcp(args.iface)
+                    reply = {"t": "state", "ssid": ssid, "state": "COMPLETED", "ip": ip}
+                    # Back after a LOST or a timed-out join, and asked again before the
+                    #   link check saw it: link_set below ends that watch, so the BACK the
+                    #   relay waits for (to list the SSID again) is sent here.
+                    if was_lost and watched == ssid:
+                        back_msg = {"t": "state", "ssid": ssid, "state": "BACK", "ip": ip}
+                        back_due = True         # written right after the answer, below
+                else:
+                    t_join = time.monotonic()
+                    new_key = req.get("kind") == "u" and not joined_has(_applied)
+                    state, wrong_key, sae_now, sae_late = wait_state(
+                        sup, mon, iface=args.iface, wrong_key_ends=new_key)
+                    if state == "COMPLETED":
+                        # always a new lease: the old one belonged to the previous AP
+                        reply = {"t": "state", "ssid": ssid, "state": state,
+                                 "ip": dhcp(args.iface)}
+                    else:
+                        forget_applied()
+                        join_failed = True
+                        if wrong_key:
+                            what = ("WRONG_KEY for a passphrase never joined, after %d s"
+                                    % round(time.monotonic() - t_join))
+                        else:
+                            what = "not associated within %d s" % JOIN_WAIT_S
+                        # Not to be joined behind DomA's back (WPA_SUPPLICANT above): also
+                        #   after a whole wait, an SAE refusal is the AP's verdict.
+                        if wrong_key or sae_now:
+                            try:
+                                sup.cmd("REMOVE_NETWORK all")
+                            except OSError as e:
+                                log("REMOVE_NETWORK after the refusal: %s" % e)
+                        # A whole wait after an SAE refusal is a refused passphrase too,
+                        #   for the relay; one that may be the removed network's is only
+                        #   mentioned (see WPA_SUPPLICANT above).
+                        if sae_now and not wrong_key:
+                            sae = ("; CTRL-EVENT-AUTH-REJECT auth_type=3 status_code=15"
+                                   " (SAE: WRONG_KEY)")
+                        elif sae_late and not wrong_key:
+                            sae = ("; CTRL-EVENT-AUTH-REJECT status_code=15 before this"
+                                   " join's attempt")
+                        else:
+                            sae = ""
+                        reply = {"t": "state", "ssid": ssid, "state": "FAILED",
+                                 "error": "%s (wpa_state %s%s%s)"
+                                 % (what, state or "unknown",
+                                    "; " + mon.reason if mon.reason else "", sae)}
+            except OSError as e:
+                # See CONTROL SOCKET TIMEOUTS. Before connect_real_ap() removed the
+                #   previous network nothing changed, and its watch stays (ok False).
+                #   Once it is selected, wpa_supplicant may still join it: watched
+                #   for a BACK, as after a join answered FAILED for the time.
+                stage, net = _progress
+                log("connect for %r: wpa_supplicant ctrl: %s (%s)" % (ssid, e, stage))
+                ok, info, back_due = stage != "start", "error", False
+                join_failed = stage == "selected"
+                if join_failed:
+                    _set_applied(net)
+                if ok:
+                    forget_applied()
+                reply = {"t": "state", "ssid": ssid, "state": "FAILED",
+                         "error": "wpa_supplicant ctrl did not answer (%s), %s"
+                         % (e, "after SELECT_NETWORK" if join_failed
+                            else "before SELECT_NETWORK")}
             if isinstance(req.get("id"), str):
                 reply["id"] = req["id"]
             log("result: %s" % reply)
+            if reply["state"] == "COMPLETED":
+                joined_add(_applied)
             if ok:      # when not, connect_real_ap has dropped the watch if it had to
                 link_set(reply["state"] == "COMPLETED")
-            if timed_out:
+            if join_failed:
                 watch_failed(ssid, reply["error"])
             if back_due:
                 _watch_write(ssid, lost=True)   # until the BACK is written (back_sent)
@@ -1232,8 +1546,16 @@ def main():
                 next_scan = 0.0
 
 
+# The sockets main() opened, closed on the way out (also on an exception), so that
+# their bound paths do not stay behind in /tmp (sweep_sockets() is for a kill).
+_CLOSE = []
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         pass
+    finally:
+        for _s in _CLOSE:
+            _s.close()
