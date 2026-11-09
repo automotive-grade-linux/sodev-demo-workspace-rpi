@@ -41,9 +41,22 @@
 #                                 (COMPLETED and FAILED answer a connect, with its id;
 #                                  LOST and BACK come unasked -- see handle_state)
 #                            out: {"t":"connect","id":"N","ssid":"X","psk":"Y"}   (ours,
-#                                  compact; the id, see PENDING)
+#                                  compact; the id, see PENDING), with ,"kind":"u" at
+#                                  the end for a passphrase typed on screen (handle_psk):
+#                                  DomD answers FAILED at the first WRONG_KEY (or SAE
+#                                  refusal) for one it has never been COMPLETED with,
+#                                  and every other failure only after its 30 s
+#
+# A TYPED PASSPHRASE REACHES THE SHADOW AP ONLY ONCE DomD HAS JOINED WITH IT. Until
+# then its row keeps what it had (the placeholder, a seed or a learned PSK), so
+# DomA's station does not join the shadow BSS with a passphrase the real AP may
+# refuse and show it as connected; DomaWifiRelay holds the network back meanwhile
+# and connects it on the "online" handle_state writes after hostapd has the
+# passphrase (see handle_psk, handle_state and $STATE_FILE).
 #   $REQ   .../relay.req     one line per request from DomaWifiRelay (the priv-app):
-#                                 psk<TAB><SSID><TAB><PSK>
+#                                 psk[#<token>]<TAB><SSID><TAB><PSK>
+#                            (the token, up to 16 hex digits, comes back in each
+#                            relay.state line that answers the request)
 #                            The app has NETWORK_SETTINGS + READ_WIFI_CREDENTIAL and
 #                            reads the PSK with WifiManager.getPrivilegedConfiguredNetworks().
 #
@@ -69,6 +82,30 @@ TAG=doma-wifi-relay
 #   FATAL).
 log() { echo "$TAG: $*"; /vendor/bin/log -t "$TAG" "$*" 2>/dev/null; :; }
 
+# now_s -- set _now to the seconds since boot, from $UPTIME_FILE (/proc/uptime, the
+#   kernel's CLOCK_BOOTTIME), with the builtin read: no fork. EVERY INTERVAL HERE IS
+#   MEASURED WITH IT, NOT WITH mksh's $SECONDS, which is gettimeofday(), the wall clock
+#   (external/mksh/src/var.c, sh.h mksh_TIME). DomA sets that clock by NTP once its
+#   first network is validated -- on the board, 2026-11-08, a step of +2984 s right
+#   after the user's first join -- and every wait then ended at once: a hostapd
+#   restart deferred for BOUNCE_MIN_S ran on the next tick and dropped the shadow BSS
+#   the app was about to connect to. Unreadable (it is proc_uptime, which the domain
+#   may read: doma_shadow_ap.te), $SECONDS, logged once.
+UPTIME_FILE=${UPTIME_FILE:-/proc/uptime}
+now_s() {
+    _now=""
+    { read -r _now _ < "$UPTIME_FILE"; } 2>/dev/null
+    _now=${_now%%.*}
+    case "$_now" in
+        ''|*[!0-9]*)
+            _now=$SECONDS
+            if [ "${UPTIME_LOGGED:-0}" != 1 ]; then
+                UPTIME_LOGGED=1
+                log "WARNING: cannot read $UPTIME_FILE -- timing by the wall clock, which NTP can step"
+            fi;;
+    esac
+}
+
 # THE PATHS CAN BE OVERRIDDEN FROM THE ENVIRONMENT, so the script also runs on a
 #   PC against a scratch directory. Nothing sets them on the device.
 CONF_DIR=${CONF_DIR:-/data/vendor/wifi/shadow}
@@ -91,7 +128,10 @@ REQ_DIR=${REQ_DIR:-$CONF_DIR/req}
 REQ=${REQ:-$REQ_DIR/relay.req}
 # For DomaWifiRelay: one line "<kind><TAB><seq><TAB><SSID>", rewritten when this
 #   script starts and each time DomD reports it joined, lost or could not join an
-#   SSID (see state_publish).
+#   SSID (see state_publish). For a typed passphrase's connect, "online" comes only
+#   once the row has it and hostapd beacons it (handle_state), and a request
+#   handle_psk drops is answered too ("offline:wrong-key" or "offline:error"): the
+#   app connects the network it holds back on the first and gives up on the others.
 STATE_FILE=${STATE_FILE:-$REQ_DIR/relay.state}
 # $CHAN is the hvc node, not /dev/vport2p4. The Wi-Fi channel in doma.cfg is
 #   declared as `-device virtconsole,chardev=virts_chardev5`, i.e. AS A CONSOLE
@@ -239,8 +279,9 @@ SEED=${SEED:-/vendor/etc/doma-shadow-aps.conf}
 # (A PSK repair -- the restart after the user types a passphrase on screen -- always
 #  happens, independently of this flag.)
 BOUNCE_ON_APS=${BOUNCE_ON_APS:-}
-# With BOUNCE_ON_APS false, the least number of seconds between two hostapd restarts
-#   for AP-list changes; 0 or unset keeps false as described above. With it set, an
+# With BOUNCE_ON_APS false, the least number of seconds from a hostapd restart (any,
+#   see LAST_BOUNCE) to one for an AP-list change; 0 or unset keeps false as described
+#   above. With it set, an
 #   aps message restarts hostapd as auto does (only while no station is associated),
 #   but at most once per this many seconds: a change that comes sooner is deferred
 #   (RESTART_PENDING) and flush_pending_restart applies it once the time has passed
@@ -248,25 +289,28 @@ BOUNCE_ON_APS=${BOUNCE_ON_APS:-}
 #   the restarts that took 17% of DomA's CPU on the RPi4 (2026-10-11) are cut to one
 #   per interval. getprop'd per message, like the flag:
 #   persist.vendor.doma.wifi_relay_bounce_min_s; the environment variable
-#   BOUNCE_MIN_S takes precedence if set. Measured with mksh's $SECONDS.
+#   BOUNCE_MIN_S takes precedence if set. Measured with now_s (time since boot).
 BOUNCE_MIN_S=${BOUNCE_MIN_S:-}
-# $SECONDS at the last hostapd restart for an AP-list change, empty before the
-#   first (a restart for a passphrase or for DomD's state does not count, so it
-#   does not hold the list back); and the interval a deferred restart is waiting
-#   for (0: none).
+# now_s at the last hostapd restart, empty before the first; and the interval a
+#   deferred restart is waiting for (0: none). EVERY RESTART COUNTS, for a passphrase
+#   DomD joined or for DomD's state as for the list: each drops DomA's station, and
+#   the list change right after a passphrase's restart (on the board, 2026-11-08, 1.4 s
+#   after it, with the app about to join the BSS that restart brought up) is what the
+#   interval is for. Such a restart beacons $APS as it is then (write_hostapd_conf),
+#   so the list it carries is current.
 LAST_BOUNCE=""
 BOUNCE_WAIT=0
-RESTART_FOR_LIST=0  # 1 while the deferred restart is one for a list change
 # The connects sent that DomD has not answered yet, "<id>TAB<SSID>TAB<since>TAB<kind>
 #   TAB<PSK>" per line, newline-framed, oldest first. Each connect carries an id that
 #   DomD's answer (COMPLETED or FAILED) carries back, so an answer is matched to its
 #   own connect: counting answers instead goes wrong whenever one is lost (a write
 #   that failed, the agent restarting mid-join, this daemon restarting). The id is
 #   "<pid>-<n>", so an answer to a connect from before a restart of this daemon
-#   matches nothing. kind is "u" for a passphrase typed on screen (handle_psk) and
-#   "m" for the row's own PSK (mirror_station). A typed one is put in $APS at once
-#   (the local handshake needs it), but into $LEARNED only on DomD's COMPLETED for it
-#   (see handle_state). DomD handles the connects one at a time, in order, so an
+#   matches nothing. kind is "u" for a passphrase typed on screen (handle_psk; "u#<token>"
+#   with the app's token for the request) and
+#   "m" for the row's own PSK (mirror_station). A typed one goes into $APS and
+#   $LEARNED only on DomD's COMPLETED for it (see handle_state). DomD handles the
+#   connects one at a time, in order, so an
 #   answer also means every connect sent before it has been answered: those entries
 #   go. An entry no answer has come for in PENDING_TTL_S (300 s) goes as well.
 PENDING=""          # newline-framed; set once NL is defined below
@@ -275,15 +319,15 @@ PENDING_SEQ=0
 #   lease drop and a scan of up to 15 s), so 300 s covers four queued ones.
 PENDING_TTL_S=${PENDING_TTL_S:-300}
 case "$PENDING_TTL_S" in ''|*[!0-9]*) PENDING_TTL_S=300;; esac
-# The last passphrase DomD rejected with WRONG_KEY, and when: the app asks again with
-#   the same one once the framework has joined the shadow BSS with it, and taking it
-#   again would restart hostapd and make DomD try for 30 s, round after round.
+# The last passphrase DomD rejected with WRONG_KEY, and when: asked for again (the
+#   app restarted, or a connect from the screen with it), it is not sent to DomD
+#   again but answered "offline:wrong-key" at once (handle_psk).
 #   Dropped for FAIL_HOLD_S seconds, or until DomD joins the SSID.
 REJECT_SSID=""
 REJECT_PSK=""
 REJECT_T=0
 # SSIDs DomD failed to join for a reason other than the key, or lost, while DomA's
-#   station was on them, "<SSID>TAB<$SECONDS>" per line: handle_state removed their
+#   station was on them, "<SSID>TAB<now_s>" per line: handle_state removed their
 #   rows, and handle_aps does not add one back for FAIL_HOLD_S seconds, or until it
 #   leaves DomD's scans and returns to them (FAIL_HOLDS_GONE), or for a lost one until
 #   DomD reports it BACK. Without this the next publication brings it
@@ -600,7 +644,27 @@ sta_carrier_up() {
     [ "$_cr" = 1 ]
 }
 
+# join_waiting -- 0 while the app is about to join JOIN_WAIT_SSID (see there).
+join_waiting() {
+    [ -n "$JOIN_WAIT_SSID" ] || return 1
+    now_s
+    if [ $((_now-JOIN_WAIT_T)) -ge "$JOIN_WAIT_S" ]; then
+        log "aps: DomA has not joined $JOIN_WAIT_SSID within $JOIN_WAIT_S s -- no longer holding hostapd for it"
+        JOIN_WAIT_SSID=""
+        return 1
+    fi
+    return 0
+}
+
 stations_present() {
+    # 0. The app about to join a BSS (JOIN_WAIT_SSID): as good as a station.
+    if join_waiting; then
+        if [ "$JOIN_WAIT_LOGGED" != 1 ]; then
+            JOIN_WAIT_LOGGED=1
+            log "aps: DomA is about to join $JOIN_WAIT_SSID -- counted as a station, so hostapd is not restarted under the connect"
+        fi
+        return 0
+    fi
     _known=0
     # 1. DomA's own station -- unless mirror_station saw it on the hidden idle BSS,
     #    which carries no AP anyone uses: a restart there loses nothing, and counting
@@ -673,9 +737,14 @@ sta_is_up() {
 #   INVALID, including a wrong owner or mode (the measured "12 times, 5.0 s
 #   apart" in write_hostapd_conf).
 #
-# init's `restart_period` defaults to 5 s, so sampling a 3 s window every 0.5 s
-# (6 samples) is guaranteed to catch a non-running state at least once during a
-# crash loop. The values can be overridden from the environment.
+# A hostapd that cannot use its conf exits while parsing it, within a fraction of a
+# second of the start, and init then shows a non-running state for its
+# `restart_period` (5 s by default). Sampling a 1.5 s window every 0.25 s (6
+# samples) therefore catches that crash loop. A hostapd that died later than 1.5 s
+# after its start would not be caught here; the window was 3 s (6 x 0.5 s) until
+# 2026-11-08, and the user's "online" waits on it (typed_joined: 4 s from DomD's
+# COMPLETED to the restart on the board), so it is the shorter one. The values can be
+# overridden from the environment.
 # The hostapd init service, vendor.doma_shadow_hostapd in init.xenvm-hwsim.rc.
 #   `setprop ctl.restart` exits non-zero when init has no service of that name:
 #   init's control-message handler replies PROP_ERROR_HANDLE_CONTROL_MESSAGE,
@@ -702,7 +771,7 @@ svc_is_running() {
 }
 
 CONFIRM_SAMPLES=${CONFIRM_SAMPLES:-6}
-CONFIRM_SLEEP=${CONFIRM_SLEEP:-0.5}
+CONFIRM_SLEEP=${CONFIRM_SLEEP:-0.25}
 confirm_hostapd_running() {
     _n=0
     while [ "$_n" -lt "$CONFIRM_SAMPLES" ]; do
@@ -745,12 +814,15 @@ restart_hostapd() {
         if svc_is_running; then
             # Do not call this a success yet (see the confirm_hostapd_running comment).
             if confirm_hostapd_running; then
-                RESTART_PENDING=0; BOUNCE_WAIT=0; RESTART_FOR_LIST=0
+                RESTART_PENDING=0; BOUNCE_WAIT=0
+                now_s; LAST_BOUNCE=$_now
                 # what is beaconed now (see LIVE)
                 cp "$CONF" "$LIVE.new" 2>/dev/null && chmod 0600 "$LIVE.new" 2>/dev/null \
                     && mv -f "$LIVE.new" "$LIVE" 2>/dev/null \
                     || log "WARNING: cannot update $LIVE"
                 log "hostapd restarted via init ($(grep -c '^ssid=' "$CONF") SSID(s))"
+                # what ONLINE_DUE waits for is on the air now (flush_due writes it)
+                [ -n "$ONLINE_DUE" ] && ONLINE_READY=1
                 return 0
             fi
             RESTART_PENDING=1
@@ -1182,7 +1254,7 @@ handle_aps() {
         rm -f "$_tmp"
         return 0
     fi
-    # By rename, as handle_psk does: this daemon runs on every boot, so init's
+    # By rename, as set_row_psk does: this daemon runs on every boot, so init's
     # SIGKILL at shutdown can land mid-write, and a truncated $APS loses every
     # PSK in it. The temporary file is in the same directory, so it has the same label.
     chmod 0660 "$_tmp" 2>/dev/null
@@ -1199,7 +1271,10 @@ handle_aps() {
         # The idle-only exception (see BOUNCE_ON_APS): nothing to disrupt.
         if conf_is_idle "$LIVE"; then
             log "aps: hostapd beacons only the hidden idle BSS -- applying the list despite ...wifi_relay_bounce_on_aps=false"
-            write_hostapd_conf && restart_hostapd
+            # Not counted for BOUNCE_MIN_S: it took down no AP anyone uses, and the
+            #   first list after boot is short (the scans are still coming in), so the
+            #   fuller one 20 s later must not wait out the interval.
+            write_hostapd_conf && restart_hostapd && LAST_BOUNCE=""
             return 0
         fi
         # The rate-limited form (see BOUNCE_MIN_S).
@@ -1208,32 +1283,36 @@ handle_aps() {
         if [ "$_min" -gt 0 ]; then
             write_hostapd_conf || return 0
             if cmp -s "$CONF" "$LIVE" 2>/dev/null; then
-                RESTART_PENDING=0; BOUNCE_WAIT=0; RESTART_FOR_LIST=0
+                RESTART_PENDING=0; BOUNCE_WAIT=0
                 return 0
             fi
+            now_s
             if stations_present; then
-                RESTART_PENDING=1; BOUNCE_WAIT=$_min; RESTART_FOR_LIST=1
+                RESTART_PENDING=1; BOUNCE_WAIT=$_min
                 log "aps: a station is associated -- deferring the hostapd restart (rate-limited to one per $_min s)"
-            elif [ -n "$LAST_BOUNCE" ] && [ $((SECONDS-LAST_BOUNCE)) -lt "$_min" ]; then
-                RESTART_PENDING=1; BOUNCE_WAIT=$_min; RESTART_FOR_LIST=1
-                log "aps: hostapd restarted $((SECONDS-LAST_BOUNCE)) s ago -- deferring this list until $_min s have passed"
+            elif [ -n "$LAST_BOUNCE" ] && [ $((_now-LAST_BOUNCE)) -lt "$_min" ]; then
+                RESTART_PENDING=1; BOUNCE_WAIT=$_min
+                log "aps: hostapd restarted $((_now-LAST_BOUNCE)) s ago -- deferring this list until $_min s have passed"
             else
-                # A failed restart is retried by flush_pending_restart as a list one.
-                RESTART_FOR_LIST=1
-                restart_hostapd && LAST_BOUNCE=$SECONDS
+                # A failed restart is retried by flush_pending_restart.
+                restart_hostapd
             fi
             return 0
         fi
         # hostapd is not restarted, so a hostapd.conf written now would not be read before
-        #   the next boot (doma-shadow-ap regenerates it from $APS then) or a PSK repair
-        #   (handle_psk writes it itself). Skipping it saves ~0.4 s of CPU per publication
-        #   that changes the list (2026-10-11, measured on RPi4 DomA). A restart an
-        #   earlier publication deferred would apply a conf older than $APS: drop it.
-        if [ "$RESTART_PENDING" = 1 ]; then
-            RESTART_PENDING=0; RESTART_FOR_LIST=0
+        #   the next boot (doma-shadow-ap regenerates it from $APS then) or a passphrase
+        #   DomD has joined (typed_joined writes it itself). Skipping it saves ~0.4 s of
+        #   CPU per publication that changes the list (2026-10-11, measured on RPi4
+        #   DomA). A restart an earlier publication deferred would apply a conf older
+        #   than $APS: drop it -- unless it carries a passphrase whose "online" waits for
+        #   it (ONLINE_DUE), which then takes a conf of $APS as it is now.
+        if [ "$RESTART_PENDING" = 1 ] && [ -n "$ONLINE_DUE" ]; then
+            write_hostapd_conf || log "WARNING: aps: could not update hostapd.conf for the deferred restart"
+        elif [ "$RESTART_PENDING" = 1 ]; then
+            RESTART_PENDING=0
             log "aps: dropping the deferred hostapd restart (...wifi_relay_bounce_on_aps=false; its conf is out of date)"
         fi
-        log "aps: $APS updated only (...wifi_relay_bounce_on_aps=false); hostapd.conf follows at the next boot or on a PSK repair"
+        log "aps: $APS updated only (...wifi_relay_bounce_on_aps=false); hostapd.conf follows at the next boot or with a passphrase DomD joins"
         return 0
     fi
     write_hostapd_conf || return 0
@@ -1241,11 +1320,11 @@ handle_aps() {
     #   rewrite that only added the last newline): no restart, and none pending.
     if cmp -s "$CONF" "$LIVE" 2>/dev/null; then
         [ "$RESTART_PENDING" = 1 ] && log "aps: hostapd.conf is back to what hostapd beacons -- the deferred restart is not needed"
-        RESTART_PENDING=0; RESTART_FOR_LIST=0
+        RESTART_PENDING=0
         return 0
     fi
     if [ "$_bounce" != true ] && stations_present; then
-        RESTART_PENDING=1; RESTART_FOR_LIST=1
+        RESTART_PENDING=1
         log "aps: a station is associated -- deferring the hostapd restart (the conf is already updated; it will be applied once the station leaves)"
     else
         restart_hostapd
@@ -1266,8 +1345,9 @@ flush_pending_restart() {
     # then costs no exec per tick.
     stations_present && return 0
     # A restart deferred by BOUNCE_MIN_S waits for its interval as well.
+    now_s
     [ "$BOUNCE_WAIT" -gt 0 ] && [ -n "$LAST_BOUNCE" ] \
-        && [ $((SECONDS-LAST_BOUNCE)) -lt "$BOUNCE_WAIT" ] && return 0
+        && [ $((_now-LAST_BOUNCE)) -lt "$BOUNCE_WAIT" ] && return 0
     # NOT WHILE doma_shadow_ap IS ITSELF BRINGING hostapd UP. Both run at
     # sys.boot_completed, and on the board a deferred restart that landed
     # between the oneshot's `ctl.start` and its confirmation left the log saying
@@ -1276,10 +1356,7 @@ flush_pending_restart() {
     # until then.
     [ "$(getprop init.svc.vendor.doma_shadow_ap 2>/dev/null)" = running ] && return 0
     log "applying deferred hostapd conf (no station associated)"
-    # Counted as a list restart only when a list change deferred it (not a retry of
-    #   a restart for a passphrase or for DomD's state that failed).
-    _fl=$RESTART_FOR_LIST
-    restart_hostapd && [ "$_fl" = 1 ] && LAST_BOUNCE=$SECONDS
+    restart_hostapd
 }
 
 # set_row_psk <ssid> <psk> -- give the SSID's row in $APS this PSK (appending the row
@@ -1335,17 +1412,19 @@ state_restart() {
 pending_add() {
     PENDING_SEQ=$((PENDING_SEQ+1))
     _pid=$$-$PENDING_SEQ
-    _pnew=$_pid$TAB$1$TAB$SECONDS$TAB$3$TAB$2$NL
+    now_s
+    _pnew=$_pid$TAB$1$TAB$_now$TAB$3$TAB$2$NL
 }
 pending_commit() {
     PENDING=$PENDING$_pnew
 }
 pending_expire() {
+    now_s
     _pk2=$NL; _pr=${PENDING#"$NL"}
     while [ -n "$_pr" ]; do
         _pl=${_pr%%"$NL"*}; _pr=${_pr#*"$NL"}
         _pt=${_pl#*"$TAB"}; _pt=${_pt#*"$TAB"}; _pt=${_pt%%"$TAB"*}
-        [ $((SECONDS-_pt)) -lt "$PENDING_TTL_S" ] && _pk2=$_pk2$_pl$NL
+        [ $((_now-_pt)) -lt "$PENDING_TTL_S" ] && _pk2=$_pk2$_pl$NL
     done
     PENDING=$_pk2
 }
@@ -1381,7 +1460,8 @@ hold_add() {
     hold_active "$1"
     case "$FAIL_HOLDS" in *"$NL$1$TAB"*) _hr=${FAIL_HOLDS#*"$NL$1$TAB"}
         FAIL_HOLDS=${FAIL_HOLDS%%"$NL$1$TAB"*}$NL${_hr#*"$NL"};; esac
-    FAIL_HOLDS=$FAIL_HOLDS$1$TAB$SECONDS$NL
+    now_s
+    FAIL_HOLDS=$FAIL_HOLDS$1$TAB$_now$NL
 }
 hold_del() {
     case "$FAIL_HOLDS" in *"$NL$1$TAB"*) ;; *) return 1;; esac
@@ -1408,34 +1488,103 @@ holds_seen() {
     done
     FAIL_HOLDS_GONE=$_gone
 }
-# state_publish online|offline <ssid> | up -- one line in $STATE_FILE for
+# state_publish online|offline|pending <ssid> [<token>] | up -- one line in $STATE_FILE
+#   ("<kind>TAB<seq>TAB<ssid>", then TAB<token> when it answers a request of the app's
+#   that carried one: DomaWifiRelay tells its own answers from the others by it) for
 #   DomaWifiRelay, which watches the file. <seq> is new on every write, so the app acts
 #   once per line.
-#   online: DomD has joined <ssid> (COMPLETED or BACK). If DomA's station checked the
+#   online: DomD has joined <ssid> (COMPLETED or BACK); for a passphrase typed on
+#     screen, only once the row has it and hostapd beacons it, as the app connects
+#     the network it holds back on this (typed_joined). If DomA's station checked the
 #     network for internet access before DomD had a link, AAOS disabled it as
 #     NO_INTERNET_PERMANENT (a network that has never had internet: not joined again
 #     on its own); while DomD has it, the app enables it again.
 #   offline: DomD lost <ssid> or could not join it (LOST, FAILED); DomD's
-#     wpa_supplicant holds one network, so it then has none.
+#     wpa_supplicant holds one network, so it then has none. Written as
+#     offline:<reason> (see fail_reason) so the app can tell the user why; LOST is
+#     offline:lost, a FAILED while a later connect for the SSID is still pending
+#     is offline:retry (DomD's answer to that one is still to come), and a FAILED
+#     that answers no connect of this daemon's stays a bare offline.
+#   pending: a connect for <ssid> has just been forwarded to DomD (handle_psk,
+#     mirror_station), so the app can show that the real join is under way (2026-11-06:
+#     an SSID DomD could not find looked joined for 30 s, then dropped without a word);
+#     also for a COMPLETED while a later connect for the SSID is still pending.
+#   offline:wrong-key and offline:error also answer a request handle_psk drops (the
+#     passphrase DomD has just refused, or one that is not valid), so that the app
+#     does not wait for an answer that will not come.
 #   up: this script has started, so the app sweeps (it reads only the init.svc state of
 #     this service, and may have swept before the start).
+#   The reason goes into the kind, not into the fourth field, which holds only the
+#     token of the request a line answers (DomaWifiRelay splits at most four fields).
 state_publish() {
     STATE_SEQ=$((STATE_SEQ+1))
-    if printf '%s\t%s\t%s\n' "$1" "$$-$STATE_SEQ" "${2-}" > "$STATE_FILE.new" 2>/dev/null \
+    if printf '%s\t%s\t%s%s\n' "$1" "$$-$STATE_SEQ" "${2-}" "${3:+$TAB$3}" > "$STATE_FILE.new" 2>/dev/null \
         && chmod 0640 "$STATE_FILE.new" 2>/dev/null \
         && chgrp system "$STATE_FILE.new" 2>/dev/null \
         && mv -f "$STATE_FILE.new" "$STATE_FILE" 2>/dev/null; then
-        :
+        # Only for a BSS hostapd beacons ($LIVE; one with no row yet comes up with
+        #   the next list, which must not be held back for it), and not while the
+        #   station is on it already.
+        if [ "$1" = online ] && [ -n "${3:-}" ] && [ "$2" != "$STA_LAST_SSID" ] \
+            && live_psk_of "$2" >/dev/null; then
+            now_s
+            JOIN_WAIT_SSID=$2; JOIN_WAIT_T=$_now; JOIN_WAIT_LOGGED=0
+        fi
     else
         log "WARNING: cannot write $STATE_FILE ($1 ${2-})"
     fi
 }
 STATE_SEQ=0
+# The SSID whose "online" waits for hostapd to beacon the passphrase typed_joined put
+#   in its row (or whose offline:* waits for the row a FAILED undid): written by
+#   flush_due once restart_hostapd has restarted hostapd on it; dropped by a FAILED or
+#   a LOST for the SSID.
+ONLINE_DUE=""
+ONLINE_TOK=""       # the token of the request it answers
+ONLINE_KIND=online  # the line to write: online, or a FAILED's offline:* (handle_state)
+ONLINE_READY=0      # 1 once hostapd has restarted on it
+# The SSID of the last "online" written as the answer to a request of the app's (with
+#   its token) for a BSS hostapd beacons, and now_s then: the app connects to that
+#   shadow BSS on it, within seconds (a scan, then the connect). Until DomA's station associates
+#   (mirror_station), DomD reports FAILED or LOST for the SSID, or JOIN_WAIT_S has
+#   passed, stations_present counts it as a station, so no restart for the list
+#   (handle_aps, flush_pending_restart) takes that BSS down under the connect -- on
+#   the board, 2026-11-08, one did, 2 s after the "online", and the join took 4 s
+#   longer. A restart for DomD's state (state_restart) is not held by it.
+JOIN_WAIT_SSID=""
+JOIN_WAIT_T=0
+JOIN_WAIT_LOGGED=0
+JOIN_WAIT_S=${JOIN_WAIT_S:-30}
+case "$JOIN_WAIT_S" in ''|*[!0-9]*) JOIN_WAIT_S=30;; esac
+# A typed passphrase DomD answered FAILED for the time (not refused), "<SSID>" and
+#   "<PSK>": wpa_supplicant goes on trying it, and when DomD reports the SSID BACK it
+#   is the one joined, so it goes into the row then (typed_joined). Dropped by the
+#   next connect sent, which replaces DomD's network.
+TIMEDOUT_SSID=""
+TIMEDOUT_PSK=""
+# fail_reason <error> -- set _fr to a short token for the "error" of DomD's FAILED
+#   (domd_wifi_agent.py): the app maps it to a sentence. Never the raw text, which can
+#   change with the agent. No fork (a case, not a subshell).
+#   wrong-key  CTRL-EVENT-SSID-TEMP-DISABLED reason=WRONG_KEY
+#   not-found  CTRL-EVENT-NETWORK-NOT-FOUND: the AP was not in DomD's scans
+#   rejected   CTRL-EVENT-ASSOC-REJECT / AUTH-REJECT
+#   timeout    any other "not associated within N s"
+#   error      the join could not even start (e.g. no usable key management)
+fail_reason() {
+    case "$1" in
+        *WRONG_KEY*) _fr=wrong-key;;
+        *NETWORK-NOT-FOUND*) _fr=not-found;;
+        *ASSOC-REJECT*|*AUTH-REJECT*) _fr=rejected;;
+        "not associated within"*) _fr=timeout;;
+        *) _fr=error;;
+    esac
+}
 hold_active() {
     case "$FAIL_HOLDS" in *"$NL$1$TAB"*) ;; *) return 1;; esac
     _hr=${FAIL_HOLDS#*"$NL$1$TAB"}
     _ht=${_hr%%"$NL"*}
-    [ $((SECONDS-_ht)) -lt "$FAIL_HOLD_S" ] && return 0
+    now_s
+    [ $((_now-_ht)) -lt "$FAIL_HOLD_S" ] && return 0
     FAIL_HOLDS=${FAIL_HOLDS%%"$NL$1$TAB"*}$NL${_hr#*"$NL"}
     return 1
 }
@@ -1453,12 +1602,83 @@ state_sta() {
     fi
 }
 
+# flush_due -- write ONLINE_DUE's line once hostapd has restarted on it.
+flush_due() {
+    [ "$ONLINE_READY" = 1 ] || return 0
+    ONLINE_READY=0
+    [ -n "$ONLINE_DUE" ] || return 0
+    state_publish "$ONLINE_KIND" "$ONLINE_DUE" "$ONLINE_TOK"
+    ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online
+}
+
+# publish_line <kind> <ssid> [<token>] -- state_publish for handle_state, with a due
+#   line (flush_due) of the same pass written around it so that a line with a token,
+#   the answer DomaWifiRelay waits for, is the last: $STATE_FILE holds one line, and
+#   the app may read only the last of two written together.
+publish_line() {
+    if [ -n "${3:-}" ]; then
+        flush_due
+        state_publish "$1" "$2" "$3"
+    else
+        state_publish "$1" "$2"
+        flush_due
+    fi
+}
+
+# online_now <ssid> [<token>] -- "online" for it, unless a later connect for it is still to be
+#   answered: the app connects on "online", with the passphrase of that later one, so
+#   it gets "pending" then; nor while hostapd does not beacon the passphrase of its row
+#   yet (ONLINE_DUE).
+online_now() {
+    if [ "$1" = "$ONLINE_DUE" ] && [ "$ONLINE_KIND" = online ]; then
+        # hostapd does not beacon the row's passphrase yet: its "online" comes then
+        [ -n "${2:-}" ] && ONLINE_TOK=$2
+    elif pending_has "$1"; then
+        publish_line pending "$1" "${2:-}"
+    else
+        publish_line online "$1" "${2:-}"
+    fi
+}
+
+# typed_joined <ssid> <psk> [<token>] -- DomD has joined the SSID with a passphrase typed on
+#   screen: into $LEARNED, and into the row if the SSID still has one (one that has
+#   left the list gets it from $LEARNED when it comes back, handle_aps), then
+#   "online" once hostapd beacons it (ONLINE_DUE). A restart that fails says
+#   "offline:error" now: the app would connect with a passphrase hostapd does not
+#   beacon, and the network be disabled for it. The "online" still comes with the
+#   next restart that succeeds. With no row left, "online" at once: DomD has the
+#   SSID, and once it is listed again it has this passphrase from $LEARNED.
+typed_joined() {
+    learned_put "$1" "$2"
+    log "psk: DomD joined $1; its passphrase is kept"
+    if pending_has "$1"; then
+        _rp=""      # a later connect decides the row (online_now says pending)
+    elif _rp=$(psk_of "$1" 2>/dev/null) \
+        && { [ "$_rp" != "$2" ] || [ "$(live_psk_of "$1")" != "$2" ]; }; then
+        # Also a row that has it already while hostapd does not beacon it yet (a
+        #   restart for it failed, or is deferred).
+        if [ "$_rp" != "$2" ]; then
+            set_row_psk "$1" "$2"
+            log "psk: $1's row takes the passphrase DomD joined with"
+        fi
+        ONLINE_DUE=$1; ONLINE_TOK=${3:-}; ONLINE_KIND=online
+        if ! state_restart; then
+            log "WARNING: state: hostapd did not take $1's passphrase"
+            publish_line offline:error "$1" "${3:-}"
+        fi
+        return 0
+    fi
+    online_now "$1" "${3:-}"
+}
+
 # handle_state <json-line> -- DomD's report on the network it joined for DomA:
 #   COMPLETED or FAILED answers a connect (its "id", see PENDING), LOST comes unasked
 #   once the joined network has stopped being COMPLETED (domd_wifi_agent.py,
 #   link_lost). Without acting on them, DomA's station stays on a shadow BSS DomD has
 #   no link behind, and the screen shows "Connected" for it.
-#   COMPLETED for a typed passphrase's connect in PENDING: it works -- into $LEARNED.
+#   COMPLETED for a typed passphrase's connect in PENDING: it works -- into $LEARNED
+#     and its row, and "online" once hostapd beacons it (typed_joined). Any other
+#     COMPLETED: "online" (online_now).
 #   FAILED for a connect in PENDING: with WRONG_KEY, its passphrase is remembered as
 #     rejected (REJECT_*), and forgotten from $LEARNED if that is the one kept there
 #     (the AP's key changed). An answer that matches no connect (from before a restart
@@ -1475,7 +1695,8 @@ state_sta() {
 #   LOST while DomA's station is on the SSID: the row goes (drop_row) and is held as
 #     above, until BACK.
 #   BACK (DomD rejoined the SSID on its own): its hold goes, so the next publication
-#     lists it again.
+#     lists it again; a typed passphrase DomD answered FAILED for the time goes into
+#     the row then, as on a COMPLETED (TIMEDOUT_SSID).
 #   Each of COMPLETED, BACK, LOST and FAILED is also written to $STATE_FILE
 #   (state_publish).
 #   Anything else is only logged. Each restart waits for doma_shadow_ap
@@ -1491,26 +1712,61 @@ handle_state() {
     case "$_hst" in COMPLETED|FAILED)
         json_str id "$1" && pending_take "$_js" && [ "$_pp_s" = "$_hs" ] && _tk=1;;
     esac
+    # a typed passphrase's connect ("u", with the app's token after a #: handle_psk)
+    _tu=0; _tok=""
+    if [ "$_tk" = 1 ]; then
+        case "$_pp_k" in u) _tu=1;; u#*) _tu=1; _tok=${_pp_k#u#};; esac
+    fi
     case "$_hst" in
         COMPLETED)
-            # A typed passphrase only: the row's own PSK (a mirror connect) is already
-            #   what the row gets, and an open row has none.
-            if [ "$_tk" = 1 ] && [ "$_pp_k" = u ]; then
-                learned_put "$_hs" "$_pp"
-                log "psk: DomD joined $_hs; its passphrase is kept"
-            fi
             [ "$_hs" = "$REJECT_SSID" ] && { REJECT_SSID=""; REJECT_PSK=""; }
-            state_publish online "$_hs";;
+            # A typed passphrase only: the row's own PSK (a mirror connect) is already
+            #   what the row gets, and an open row has none (see typed_joined).
+            [ "$_hs" = "$TIMEDOUT_SSID" ] && { TIMEDOUT_SSID=""; TIMEDOUT_PSK=""; }
+            if [ "$_tu" = 1 ]; then
+                typed_joined "$_hs" "$_pp" "$_tok"
+            else
+                online_now "$_hs"
+            fi;;
         FAILED)
-            state_publish offline "$_hs"
             case "$_her" in *WRONG_KEY*) _wk=1;; *) _wk=0;; esac
+            [ "$_hs" = "$ONLINE_DUE" ] && { ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online; }
+            [ "$_hs" = "$JOIN_WAIT_SSID" ] && JOIN_WAIT_SSID=""
+            # A typed passphrase not refused, which DomD's wpa_supplicant goes on
+            #   trying: in the row if DomD reports the SSID BACK (see TIMEDOUT_SSID). Not
+            #   while a later connect is pending (DomD has that one's network), nor for
+            #   one that never got to SELECT_NETWORK.
+            case "$_her" in
+                "not associated within"*|*"did not answer"*"after SELECT_NETWORK"*) _tw=1;;
+                *) _tw=0;;
+            esac
+            if [ "$_tk" = 1 ] && [ "$_tu" = 1 ] && [ "$_wk" = 0 ] && [ "$_tw" = 1 ] \
+                && ! pending_has "$_hs"; then
+                TIMEDOUT_SSID=$_hs; TIMEDOUT_PSK=$_pp
+            elif [ "$_hs" = "$TIMEDOUT_SSID" ]; then
+                TIMEDOUT_SSID=""; TIMEDOUT_PSK=""
+            fi
             if [ "$_wk" = 1 ] && [ "$_tk" = 1 ]; then
-                REJECT_SSID=$_hs; REJECT_PSK=$_pp; REJECT_T=$SECONDS
+                now_s
+                REJECT_SSID=$_hs; REJECT_PSK=$_pp; REJECT_T=$_now
                 _lp=$(learned_psk_of "$_hs") && [ "$_lp" = "$_pp" ] && learned_del "$_hs"
             fi
             if pending_has "$_hs"; then
+                publish_line offline:retry "$_hs" "$_tok"
                 log "state: DomD did not join $_hs with an earlier passphrase -- waiting for its answer to the later one"
                 return 0
+            fi
+            # A reason only for an answer to a connect of this daemon's: one that
+            #   matches none (from before a restart, or after its entry expired) is
+            #   not what the user is waiting on, so it goes out as a bare offline,
+            #   which the app does not show. Written after the row is undone and
+            #   hostapd restarted: the app connects on offline:wrong-key, and must
+            #   meet the PSK the row goes back to.
+            if [ "$_tk" = 1 ]; then
+                fail_reason "$_her"
+                _fk=offline:$_fr
+            else
+                _fk=offline
             fi
             # Only a row that is there: an SSID out of the list stays out. An open
             #   row (empty PSK) has no passphrase to undo.
@@ -1522,7 +1778,16 @@ handle_state() {
                 if [ "$_rp" != "$_sp" ]; then
                     set_row_psk "$_hs" "$_sp"
                     log "state: DomD did not accept the passphrase for $_hs -- its row is back to the $_src PSK"
-                    state_restart
+                    # Written once hostapd beacons the row's PSK again (flush_due), so
+                    #   that the app's connect meets it; if the restart fails, now.
+                    if [ -z "$ONLINE_DUE" ]; then
+                        ONLINE_DUE=$_hs; ONLINE_TOK=$_tok; ONLINE_KIND=$_fk
+                        state_restart || { publish_line "$_fk" "$_hs" "$_tok"; ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online; }
+                    else
+                        state_restart
+                        publish_line "$_fk" "$_hs" "$_tok"
+                    fi
+                    flush_due
                     return 0
                 fi
             fi
@@ -1530,9 +1795,12 @@ handle_state() {
             if [ -n "$_sta" ] && [ "$_hs" = "$_sta" ]; then
                 hold_add "$_hs"
                 drop_row "$_hs" "DomD could not join it; not listed again for $FAIL_HOLD_S s"
-            fi;;
+            fi
+            publish_line "$_fk" "$_hs" "$_tok";;
         LOST)
-            state_publish offline "$_hs"
+            [ "$_hs" = "$ONLINE_DUE" ] && { ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online; }
+            [ "$_hs" = "$JOIN_WAIT_SSID" ] && JOIN_WAIT_SSID=""
+            publish_line offline:lost "$_hs"
             state_sta
             if [ -n "$_sta" ] && [ "$_hs" = "$_sta" ]; then
                 hold_add "$_hs"
@@ -1540,17 +1808,27 @@ handle_state() {
             fi;;
         BACK)
             hold_del "$_hs" && log "state: DomD has $_hs back; it is listed again from the next publication"
-            state_publish online "$_hs";;
+            # DomD completed the typed passphrase it answered FAILED for the time:
+            #   that one is in it now (see TIMEDOUT_SSID).
+            if [ "$_hs" = "$TIMEDOUT_SSID" ]; then
+                _tp=$TIMEDOUT_PSK; TIMEDOUT_SSID=""; TIMEDOUT_PSK=""
+                typed_joined "$_hs" "$_tp"
+            else
+                online_now "$_hs"
+            fi;;
     esac
 }
 
 # handle_psk <ssid> <psk> -- the user typed a passphrase; make it work.
 #
-# Order matters: hostapd must know the PSK BEFORE the app re-triggers the
-# connect, or the retry fails the same way. DomD is told in parallel so the real
-# association is under way while the local one completes.
+# DomD first: the passphrase is only forwarded here, and its row keeps its PSK until
+# DomD reports COMPLETED for this connect (handle_state puts it in then, restarts
+# hostapd, and writes "online", on which the app connects). Put in at once, as
+# before 2026-11-08, it let DomA's station join the shadow BSS with any passphrase
+# and show the network as connected until DomD's answer, and a wrong one stayed in
+# $APS when DomD's answer named no WRONG_KEY (an SAE AP).
 handle_psk() {
-    _s=$1; _p=$2
+    _s=$1; _p=$2; _t=${3:-}
     # A PSK psk_valid refuses goes nowhere, neither into $APS nor to DomD, and
     #   the log names neither the value nor its length. NOR DOES AN EMPTY ONE: it
     #   would make the row open, a secured SSID's open shadow BSS is the dead end
@@ -1558,39 +1836,34 @@ handle_psk() {
     #   row comes only from DomD's "sec".
     if [ -z "${_p:-}" ] || ! psk_valid "$_p"; then
         log "WARNING: psk: PSK for $_s is empty, or not 8..63 bytes or 64 hex; dropped"
+        state_publish offline:error "$_s" "$_t"
         return 0
     fi
     # The passphrase DomD has just rejected, asked for again (see REJECT_SSID).
     if [ "$_s" = "$REJECT_SSID" ] && [ "$_p" = "$REJECT_PSK" ] \
-        && [ $((SECONDS-REJECT_T)) -lt "$FAIL_HOLD_S" ]; then
+        && now_s && [ $((_now-REJECT_T)) -lt "$FAIL_HOLD_S" ]; then
         log "psk: the passphrase DomD rejected for $_s came again -- dropped for $FAIL_HOLD_S s"
+        state_publish offline:wrong-key "$_s" "$_t"
         return 0
     fi
     cur=$(psk_of "$_s" 2>/dev/null) || cur=""
     if [ "$cur" = "$_p" ]; then
         log "psk: $_s already current; only forwarding to DomD"
     else
-        set_row_psk "$_s" "$_p"
-        # If generating the conf failed, do not touch hostapd. `ctl.restart` is a
-        #   SIGKILL, so dropping it while the old conf is still in place gains nothing
-        #   and merely loses DomA's only way in.
-        #   The connect forward below (handing the real PSK to DomD, the only route to
-        #   the real AP) MUST still run even if this fails. Do not return here.
-        if write_hostapd_conf; then
-            restart_hostapd
-        else
-            log "WARNING: could not update hostapd.conf, so hostapd is not restarted (the connect is still forwarded)"
-        fi
+        log "psk: forwarding $_s to DomD; its row takes the passphrase once DomD has joined with it"
     fi
     # Do not write `A && log ... || log ...` (see log() at the top).
-    # Into $LEARNED only once DomD reports COMPLETED for it (see handle_state).
-    pending_add "$_s" "$_p" u
-    if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s"}\n' "$_pid" "$(json_esc "$_s")" "$(json_esc "$_p")" >&3; then
+    # Into $APS and $LEARNED only once DomD reports COMPLETED for it (handle_state).
+    pending_add "$_s" "$_p" "u${_t:+#$_t}"
+    if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s","kind":"u"}\n' "$_pid" "$(json_esc "$_s")" "$(json_esc "$_p")" >&3; then
         pending_commit
+        TIMEDOUT_SSID=""; TIMEDOUT_PSK=""
         log "psk: forwarded connect($_s) to DomD"
         mirror_mark_write "$_s" "$_p"      # the mirror must not send this connect again
+        state_publish pending "$_s" "$_t"
     else
         log "WARNING: could not write connect($_s) to $CHAN"
+        state_publish offline:error "$_s" "$_t"
     fi
 }
 
@@ -1657,6 +1930,9 @@ mirror_station() {
     fi
     STA_LAST_SSID=$_ss
     STA_LAST_UPC=$_uc
+    # The app's join has happened (the station is protected for itself now,
+    #   stations_present step 1).
+    [ "$_ss" = "$JOIN_WAIT_SSID" ] && JOIN_WAIT_SSID=""
     # The PSK of the BSS the station joined: from $LIVE, what hostapd beacons. $APS can
     # be ahead of it while a restart is deferred -- an open BSS still on the air while
     # its row already holds the placeholder, say -- and the station joined the beacon.
@@ -1700,8 +1976,10 @@ mirror_station() {
     pending_add "$_ss" "$_pk" m
     if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s"}\n' "$_pid" "$(json_esc "$_ss")" "$(json_esc "$_pk")" >&3; then
         pending_commit
+        TIMEDOUT_SSID=""; TIMEDOUT_PSK=""   # DomD's network is this one now
         log "mirror: station associated with $_ss -> forwarded connect($_ss) to DomD (psk $_how)"
         mirror_mark_write "$_ss" "$_pk" "$_as"
+        state_publish pending "$_ss"
     else
         log "WARNING: mirror: could not write connect($_ss) to $CHAN"
     fi
@@ -1775,6 +2053,10 @@ fi
 # fragment; this keeps the channel clean for an agent that does not.)
 printf '\n' >&3 2>/dev/null || log "WARNING: chan: could not write the flushing newline to $CHAN"
 
+# A request a killed instance was handling: DomaWifiRelay takes a request as handled
+#   only once $REQ.busy is gone too, so a left one would make it wait out its whole
+#   window. Its connect, if sent, is answered to no one ("up").
+rm -f "$REQ.busy"
 log "started (chan=$CHAN aps=$APS req=$REQ)"
 state_publish up
 
@@ -1853,15 +2135,22 @@ while :; do
 
     # A request stays in place while the toggle is off, and one left from the previous
     # boot waits for doma_shadow_ap to finish, as the publications above do: until then
-    # wlan0 may not exist, so sta_is_up cannot tell, and handle_psk's restart would race
-    # the oneshot's.
+    # wlan0 may not exist, so sta_is_up cannot tell, and the restart for DomD's answer
+    # would race the oneshot's (state_restart waits for it as well).
     if [ "$_up" = 1 ] && [ -s "$REQ" ] && [ "$(getprop init.svc.vendor.doma_shadow_ap 2>/dev/null)" != running ]; then
         # Move before reading so a request cannot be handled twice if hostapd's
-        # restart takes longer than the poll interval.
+        # restart takes longer than the poll interval. Removed only once it has been
+        # handled: DomaWifiRelay waits for that (see the rm above).
         mv "$REQ" "$REQ.busy" 2>/dev/null || continue
         while IFS="$TAB" read -r verb a b; do
+            # psk#<token>: DomaWifiRelay's token for this request, given back with
+            #   every relay.state line that answers it (state_publish). Hex only.
             case "$verb" in
-                psk) [ -n "${a:-}" ] && handle_psk "$a" "${b:-}";;
+                psk|psk#*)
+                    _rt=${verb#psk}; _rt=${_rt#\#}
+                    case "$_rt" in *[!0-9a-f]*) _rt="";; esac
+                    [ ${#_rt} -le 16 ] || _rt=""
+                    [ -n "${a:-}" ] && handle_psk "$a" "${b:-}" "$_rt";;
                 '')  ;;
                 *)   log "unknown request verb: $verb";;
             esac
@@ -1871,5 +2160,15 @@ while :; do
 
     mirror_station
     flush_pending_restart
-    [ "$STATE_RESTART" = 1 ] && state_restart
+    if [ "$STATE_RESTART" = 1 ] && ! state_restart && [ "$STATE_RESTART" = 0 ] \
+        && [ -n "$ONLINE_DUE" ]; then
+        if [ "$ONLINE_KIND" = online ]; then
+            log "WARNING: state: hostapd did not take $ONLINE_DUE's passphrase"
+            state_publish offline:error "$ONLINE_DUE" "$ONLINE_TOK"   # online with the next restart
+        else
+            state_publish "$ONLINE_KIND" "$ONLINE_DUE" "$ONLINE_TOK"
+            ONLINE_DUE=""; ONLINE_TOK=""; ONLINE_KIND=online
+        fi
+    fi
+    flush_due       # a restart of this pass (handle_aps, flush_pending_restart, above)
 done
