@@ -4,7 +4,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # Opt-in (devel) weston-init overlay. Installs the diagnostic weston.ini
 # variants and the weston-simple-egl GPU-validation service that were split
 # out of the shipping meta-xt-driver-domain weston-init.bbappend. The shipping
-# append still installs the active weston.ini + the 95/97/98 drop-ins; this
+# append still installs the active weston.ini + the 95/96/97/98 drop-ins; this
 # append only adds development-time extras. Both appends apply when this layer
 # is opted in.
 

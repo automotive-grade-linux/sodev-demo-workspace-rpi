@@ -1,5 +1,5 @@
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 14:24:14 +0900
+Date: Wed, 11 Nov 2026 08:37:44 +0900
 Subject: [PATCH] show the window from linear dma-buf buffers
 
 The receiver's window was an XRGB8888 wl_shm buffer, redrawn black
@@ -32,7 +32,7 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
 diff --git a/app/main.cpp b/app/main.cpp
-index cb6218b..1090bc0 100644
+index cb6218b..2dcec54 100644
 --- a/app/main.cpp
 +++ b/app/main.cpp
 @@ -31,19 +31,26 @@
@@ -62,7 +62,7 @@ index cb6218b..1090bc0 100644
  
  #include <gst/video/videooverlay.h>
  #include <gst/wayland/wayland.h>
-@@ -88,12 +95,27 @@ struct display {
+@@ -88,11 +95,25 @@ struct display {
  	struct xdg_wm_base *wm_base;
  
  	int has_xrgb;
@@ -86,11 +86,9 @@ index cb6218b..1090bc0 100644
 +	struct gbm_bo *bo;
 +	int width, height;
  	int busy;
-+	int failed;
  };
  
- struct window {
-@@ -110,8 +132,9 @@ struct window {
+@@ -110,8 +131,9 @@ struct window {
  
  	int fullscreen, maximized;
  
@@ -101,7 +99,7 @@ index cb6218b..1090bc0 100644
  };
  
  
-@@ -120,18 +143,17 @@ struct cluster_receiver_data {
+@@ -120,18 +142,17 @@ struct cluster_receiver_data {
  
  	GstElement *pipeline;
  	GstVideoOverlay *overlay;
@@ -127,7 +125,7 @@ index cb6218b..1090bc0 100644
  
  static void
  buffer_release(void *data, struct wl_buffer *buffer)
-@@ -323,69 +345,186 @@ create_shm_buffer(struct display *display, struct buffer *buffer,
+@@ -323,69 +344,185 @@ create_shm_buffer(struct display *display, struct buffer *buffer,
  	return 0;
  }
  
@@ -145,9 +143,8 @@ index cb6218b..1090bc0 100644
 +static void
 +dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
 +{
-+	struct buffer *buffer = static_cast<struct buffer *>(data);
++	(void)data;
 +
-+	buffer->failed = 1;
 +	zwp_linux_buffer_params_v1_destroy(params);
 +}
 +
@@ -354,7 +351,7 @@ index cb6218b..1090bc0 100644
  }
  
  static void
-@@ -491,7 +630,6 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t id,
+@@ -491,7 +628,6 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t id,
  		       const char *interface, uint32_t version)
  {
  	struct display *d = static_cast<struct display *>(data);
@@ -362,7 +359,7 @@ index cb6218b..1090bc0 100644
  
  	if (strcmp(interface, "wl_compositor") == 0) {
  		d->wl_compositor =
-@@ -505,6 +643,10 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t id,
+@@ -505,6 +641,10 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t id,
  		d->shm = static_cast<struct wl_shm *>(wl_registry_bind(registry,
  				id, &wl_shm_interface, 1));
  		wl_shm_add_listener(d->shm, &shm_listener, d);
@@ -373,7 +370,7 @@ index cb6218b..1090bc0 100644
  	} else if (strcmp(interface, "wl_output") == 0) {
  		d->wl_output = static_cast<struct wl_output *>(wl_registry_bind(registry, id,
  					     &wl_output_interface, 1));
-@@ -594,6 +736,66 @@ drop:
+@@ -594,6 +734,66 @@ drop:
  	return GST_BUS_DROP;
  }
  
@@ -440,7 +437,7 @@ index cb6218b..1090bc0 100644
  static void
  handle_xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial)
  {
-@@ -601,9 +803,10 @@ handle_xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t s
+@@ -601,9 +801,10 @@ handle_xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t s
  
  	xdg_surface_ack_configure(surface, serial);
  
@@ -452,7 +449,7 @@ index cb6218b..1090bc0 100644
  	}
  }
  
-@@ -712,6 +915,7 @@ create_window(struct display *display, int width, int height, const char *app_id
+@@ -712,6 +913,7 @@ create_window(struct display *display, int width, int height, const char *app_id
  
  	window->callback = NULL;
  	window->display = display;
@@ -460,7 +457,7 @@ index cb6218b..1090bc0 100644
  	window->width = width;
  	window->height = height;
  	window->surface = wl_compositor_create_surface(display->wl_compositor);
-@@ -745,6 +949,9 @@ destroy_window(struct window *window)
+@@ -745,6 +947,9 @@ destroy_window(struct window *window)
  	if (window->callback)
  		wl_callback_destroy(window->callback);
  
@@ -470,7 +467,7 @@ index cb6218b..1090bc0 100644
  	if (window->xdg_toplevel)
  		xdg_toplevel_destroy(window->xdg_toplevel);
  
-@@ -799,6 +1006,15 @@ create_display(int argc, char *argv[])
+@@ -799,6 +1004,15 @@ create_display(int argc, char *argv[])
  		return NULL;
  	}
  
@@ -486,7 +483,7 @@ index cb6218b..1090bc0 100644
  	return display;
  }
  
-@@ -811,6 +1027,13 @@ destroy_display(struct display *display)
+@@ -811,6 +1025,13 @@ destroy_display(struct display *display)
  	if (display->wm_base)
  		xdg_wm_base_destroy(display->wm_base);
  
@@ -500,7 +497,7 @@ index cb6218b..1090bc0 100644
  	if (display->wl_compositor)
  		wl_compositor_destroy(display->wl_compositor);
  
-@@ -880,13 +1103,21 @@ int main(int argc, char *argv[])
+@@ -880,13 +1101,21 @@ int main(int argc, char *argv[])
  	gargv[0] = strdup(argv[0]);
  	gargv[1] = strdup("--gst-debug-level=2");
  
@@ -525,7 +522,7 @@ index cb6218b..1090bc0 100644
  
  	gst_init(&gargc, &gargv);
  
-@@ -919,7 +1150,7 @@ int main(int argc, char *argv[])
+@@ -919,7 +1148,7 @@ int main(int argc, char *argv[])
  			  window->width, window->height);
  
  	if (!window->wait_for_configure)
@@ -534,7 +531,7 @@ index cb6218b..1090bc0 100644
  
  	GstElement *pipeline = gst_parse_launch(pipeline_str.c_str(), NULL);
  	if (!pipeline) {
-@@ -928,6 +1159,15 @@ int main(int argc, char *argv[])
+@@ -928,6 +1157,15 @@ int main(int argc, char *argv[])
  	}
  	receiver_data.pipeline = pipeline;
  
@@ -550,7 +547,7 @@ index cb6218b..1090bc0 100644
  	GstBus *bus = gst_element_get_bus(pipeline);
  	gst_bus_add_signal_watch(bus);
  
-@@ -938,15 +1178,64 @@ int main(int argc, char *argv[])
+@@ -938,15 +1176,64 @@ int main(int argc, char *argv[])
  	gst_element_set_state(pipeline, GST_STATE_PLAYING);
  	std::cout << "gstreamer pipeline running" << std::endl;
  

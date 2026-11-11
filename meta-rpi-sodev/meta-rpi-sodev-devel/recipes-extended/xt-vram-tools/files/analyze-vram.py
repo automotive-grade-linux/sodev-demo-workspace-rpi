@@ -19,7 +19,6 @@ from PIL import Image
 
 # Framebuffer geometry to look for. These are search parameters, not a claim about
 # the panel: override with FB_W / FB_H in the environment to match your output.
-CMA_BASE = int(os.environ.get("CMA_BASE", "0x34000000"), 0)
 FB_W = int(os.environ.get("FB_W", "1920"))
 FB_H = int(os.environ.get("FB_H", "720"))
 PITCH = FB_W * 4   # XRGB8888
@@ -36,6 +35,22 @@ def fast_xrgb_decode(buf, w=FB_W, h=FB_H):
         out[3*i+2] = buf[4*i]    # B
     return Image.frombytes("RGB", (w, h), bytes(out))
 
+def cma_base(dump_path):
+    """CPU physical address of the dump's first byte: CMA_BASE from the
+    environment, else the <dump>.base file dump-cma.sh writes beside the dump,
+    else None (offsets are then reported without an address)."""
+    v = os.environ.get("CMA_BASE")
+    if not v:
+        try:
+            with open(dump_path + ".base") as f:
+                v = f.read().strip()
+        except OSError:
+            v = None
+    return int(v, 0) if v else None
+
+def pa_str(base, off):
+    return f"CPU PA 0x{base+off:08x}" if base is not None else "CPU PA unknown"
+
 def main():
     if len(sys.argv) < 2:
         print(f"usage: {sys.argv[0]} <cma-dump.bin> [out-dir]")
@@ -43,10 +58,13 @@ def main():
     dump_path = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "/tmp/vram-png"
     os.makedirs(out_dir, exist_ok=True)
+    base = cma_base(dump_path)
 
     with open(dump_path, "rb") as f:
         data = f.read()
-    print(f"CMA dump: {dump_path} ({len(data)/1024/1024:.1f} MiB)")
+    print(f"CMA dump: {dump_path} ({len(data)/1024/1024:.1f} MiB)"
+          + (f" at CPU PA 0x{base:08x}" if base is not None
+             else " (CMA base unknown: no CMA_BASE and no .base file)"))
 
     # Scan for non-empty 64 KiB chunks
     scan_step = 64 * 1024
@@ -70,14 +88,14 @@ def main():
     for rs, re in regions:
         size = re - rs
         print(f"  offset 0x{rs:08x} - 0x{re:08x}  ({size/1024/1024:.2f} MiB)  "
-              f"CPU PA 0x{CMA_BASE+rs:08x}")
+              f"{pa_str(base, rs)}")
 
     big_regions = [(rs, re) for (rs, re) in regions if re - rs >= FB_SIZE]
     print(f"\nRegions >= {FB_SIZE/1024/1024:.1f} MiB (probable {FB_W}x{FB_H} fb):"
           f" {len(big_regions)}")
 
     for i, (rs, _re) in enumerate(big_regions[:6]):
-        print(f"\nRegion #{i} at offset 0x{rs:08x} (CPU PA 0x{CMA_BASE+rs:08x}):")
+        print(f"\nRegion #{i} at offset 0x{rs:08x} ({pa_str(base, rs)}):")
         fb_buf = data[rs:rs+FB_SIZE]
         p0 = struct.unpack('<I', fb_buf[0:4])[0]
         mid_row, last_row = FB_H // 2, FB_H - 1

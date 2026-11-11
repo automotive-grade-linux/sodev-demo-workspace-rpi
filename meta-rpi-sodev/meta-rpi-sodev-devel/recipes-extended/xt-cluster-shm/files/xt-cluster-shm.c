@@ -86,6 +86,15 @@ struct shm_buffer {
 	bool              busy;
 };
 #define NUM_BUFFERS 2
+static struct shm_buffer buffers[NUM_BUFFERS];
+
+static struct app *g_app;	/* for buffer_release, whose data is the buffer */
+/* Set when redraw() found both buffers held by the compositor; the next
+ * release draws. The frame callback cannot do it: redraw() is the only
+ * place that requests one, and it did not get to. */
+static bool pending_redraw;
+
+static void redraw(struct app *app);
 
 /* ----- shm helpers ------------------------------------------------------- */
 
@@ -93,7 +102,12 @@ static int memfd_anon(size_t size)
 {
 	int fd = syscall(SYS_memfd_create, "xt-cluster", MFD_CLOEXEC);
 	if (fd < 0) return -1;
-	if (ftruncate(fd, size) < 0) { close(fd); return -1; }
+	if (ftruncate(fd, size) < 0) {
+		int err = errno;
+		close(fd);
+		errno = err;
+		return -1;
+	}
 	return fd;
 }
 
@@ -102,6 +116,10 @@ static void buffer_release(void *data, struct wl_buffer *wl_buffer)
 	struct shm_buffer *b = data;
 	(void)wl_buffer;
 	b->busy = false;
+	if (pending_redraw) {
+		pending_redraw = false;
+		redraw(g_app);
+	}
 }
 static const struct wl_buffer_listener buffer_listener = {
 	.release = buffer_release,
@@ -114,7 +132,13 @@ static int alloc_buffer(struct app *app, struct shm_buffer *b)
 	int fd = memfd_anon(size);
 	if (fd < 0) return -1;
 	b->data = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-	if (b->data == MAP_FAILED) { close(fd); return -1; }
+	if (b->data == MAP_FAILED) {
+		int err = errno;
+		b->data = NULL;
+		close(fd);
+		errno = err;
+		return -1;
+	}
 	struct wl_shm_pool *pool = wl_shm_create_pool(app->shm, fd, size);
 	b->buffer = wl_shm_pool_create_buffer(pool, 0, app->width, app->height,
 					      stride, WL_SHM_FORMAT_ARGB8888);
@@ -124,6 +148,20 @@ static int alloc_buffer(struct app *app, struct shm_buffer *b)
 	b->size = size;
 	b->busy = false;
 	return 0;
+}
+
+/* All of them, or exit: a buffer without memory behind it would be drawn
+ * into (SIGSEGV in cairo), and the tool exists to say whether the
+ * display path works, not to die quietly in front of it. */
+static void alloc_buffers(struct app *app)
+{
+	for (int i = 0; i < NUM_BUFFERS; i++) {
+		if (alloc_buffer(app, &buffers[i]) < 0) {
+			fprintf(stderr, "cannot allocate a %dx%d shm buffer: %s\n",
+				app->width, app->height, strerror(errno));
+			exit(1);
+		}
+	}
 }
 
 /* ----- cairo rendering --------------------------------------------------- */
@@ -242,10 +280,8 @@ static void draw_speedometer(cairo_t *cr, int W, int H,
 
 /* ----- frame loop -------------------------------------------------------- */
 
-static struct shm_buffer buffers[NUM_BUFFERS];
 static int next_buf = 0;
 
-static void redraw(struct app *app);
 static const struct wl_callback_listener frame_listener;
 
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
@@ -265,7 +301,12 @@ static void redraw(struct app *app)
 		int idx = (next_buf + i) % NUM_BUFFERS;
 		if (!buffers[idx].busy) { b = &buffers[idx]; next_buf = (idx + 1) % NUM_BUFFERS; break; }
 	}
-	if (!b) return; /* both held by compositor; new frame_done will retry */
+	if (!b) {
+		/* Both held by the compositor. There is no frame callback
+		 * outstanding, so the next buffer_release draws. */
+		pending_redraw = true;
+		return;
+	}
 
 	double t = now_seconds(app);
 	double speed = speed_kmh(t);
@@ -298,6 +339,11 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t s
 	if (!app->configured) {
 		app->configured = true;
 		redraw(app);
+	} else if (pending_redraw) {
+		/* The toplevel configure before this replaced the buffers the
+		 * compositor held; their release will never come. Draw now. */
+		pending_redraw = false;
+		redraw(app);
 	}
 }
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -317,9 +363,12 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *t,
 				wl_buffer_destroy(buffers[i].buffer);
 				munmap(buffers[i].data, buffers[i].size);
 				buffers[i].buffer = NULL;
+				buffers[i].data = NULL;
+				buffers[i].size = 0;
+				buffers[i].busy = false;
 			}
 		}
-		for (int i = 0; i < NUM_BUFFERS; i++) alloc_buffer(app, &buffers[i]);
+		alloc_buffers(app);
 	}
 }
 static void xdg_toplevel_close(void *data, struct xdg_toplevel *t)
@@ -374,6 +423,7 @@ int main(int argc, char **argv)
 {
 	(void)argc; (void)argv;
 	struct app app = { .width = 1280, .height = 720, .running = true };
+	g_app = &app;
 	clock_gettime(CLOCK_MONOTONIC, &app.t0);
 
 	app.display = wl_display_connect(NULL);
@@ -397,7 +447,7 @@ int main(int argc, char **argv)
 
 	/* Pre-allocate buffers at the default size; they'll be re-created
 	 * on toplevel.configure if the compositor picks a different one. */
-	for (int i = 0; i < NUM_BUFFERS; i++) alloc_buffer(&app, &buffers[i]);
+	alloc_buffers(&app);
 
 	while (app.running && wl_display_dispatch(app.display) != -1) { /* spin */ }
 

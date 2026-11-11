@@ -1,5 +1,5 @@
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 06 Sep 2026 01:20:01 +0900
+Date: Tue, 22 Sep 2026 15:07:01 +0900
 Subject: [PATCH] impeller: do not request 4x MSAA for the onscreen swapchain
 
 ADOPTED 2026-09-04 for this product, after the visual check described below and a

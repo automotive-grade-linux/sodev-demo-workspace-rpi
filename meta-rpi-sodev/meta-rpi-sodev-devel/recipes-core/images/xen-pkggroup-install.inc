@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # DomD debug-image package set: the Xen toolstack + flat-bridge network helpers.
 #
-# Gated on the DomD MACHINE (raspberrypi5). This .inc is required from
+# Gated on the DomD MACHINEs through meta-raspberrypi's SOC_FAMILY override
+# `rpi` (raspberrypi5 and raspberrypi4-64 both carry it). This .inc is required from
 # core-image-minimal.bbappend / core-image-weston.bbappend, which land on the
 # GENERIC core-image-* recipes. bitbake applies a .bbappend to its target recipe
 # regardless of the layer subdir it lives in, so without a gate the DomU build
@@ -13,7 +14,7 @@
 # NOTE: the Xen block-device scripts are provided by xen-tools-scripts-block
 # (present below). A bare "block" PN does not exist anywhere in the tree, so it
 # was removed to avoid a do_rootfs failure on opt-in builds.
-IMAGE_INSTALL:append:raspberrypi5 = " \
+IMAGE_INSTALL:append:rpi = " \
     xen \
     xen-tools-devd \
     xen-tools-scripts-network \

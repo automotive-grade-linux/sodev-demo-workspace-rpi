@@ -17,7 +17,7 @@
 backend=drm-backend.so
 shell=desktop-shell.so
 idle-time=0
-# weston 13.x: force the pixman (software) renderer; bypass V3D Mesa Gallium.
+# Force the pixman (software) renderer; bypass V3D Mesa Gallium.
 renderer=pixman
 
 [keyboard]
