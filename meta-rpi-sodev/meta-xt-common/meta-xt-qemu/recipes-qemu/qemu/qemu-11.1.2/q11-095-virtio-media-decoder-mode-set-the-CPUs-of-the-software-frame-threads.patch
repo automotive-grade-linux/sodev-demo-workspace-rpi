@@ -29,7 +29,7 @@ Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
  3 files changed, 63 insertions(+), 3 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index a129190ca..b3d3cbd3b 100644
+index 917e793ce..5904546ff 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -79,6 +79,7 @@
@@ -40,7 +40,7 @@ index a129190ca..b3d3cbd3b 100644
  #include <linux/dma-buf.h>
  #include <linux/dma-heap.h>
  
-@@ -3491,11 +3492,17 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+@@ -3505,11 +3506,17 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
   * CPU with them evenly. The main loop's own nice value is never changed, so
   * nothing has to be raised back (which would need CAP_SYS_NICE). A device
   * model under a real-time policy is unaffected: nice does not apply to it.
@@ -58,7 +58,7 @@ index a129190ca..b3d3cbd3b 100644
      int ret;
  } DecOpen;
  
-@@ -3504,10 +3511,25 @@ static void *dec_open_run(void *opaque)
+@@ -3518,10 +3525,25 @@ static void *dec_open_run(void *opaque)
      DecOpen *o = opaque;
  
      /* Linux: PRIO_PROCESS 0 is the calling thread */
@@ -85,7 +85,7 @@ index a129190ca..b3d3cbd3b 100644
      o->ret = avcodec_open2(o->avctx, o->codec, NULL);
      return NULL;
  }
-@@ -3515,10 +3537,12 @@ static void *dec_open_run(void *opaque)
+@@ -3529,10 +3551,12 @@ static void *dec_open_run(void *opaque)
  static int dec_avcodec_open(VirtIOMediaSession *s, const AVCodec *codec)
  {
      VirtIOMediaDec *d = s->dec;
@@ -101,7 +101,7 @@ index a129190ca..b3d3cbd3b 100644
      }
      qemu_thread_create(&t, "vmedia-open", dec_open_run, &o,
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 460b0a3a8..4cc5b4128 100644
+index 19b367fb2..e01736cb2 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -12,9 +12,12 @@
@@ -117,7 +117,7 @@ index 460b0a3a8..4cc5b4128 100644
  #include "qemu/iov.h"
  #include "qemu/log.h"
  #include "qemu/main-loop.h"
-@@ -3378,6 +3381,30 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -3449,6 +3452,30 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
                     "-20 to 19 (or 20, the default: inherited)");
          return;
      }
@@ -148,7 +148,7 @@ index 460b0a3a8..4cc5b4128 100644
      if (vm->host_sand && (!vm->host_nv12 || !vm->gpu_xfer)) {
          warn_report("virtio-media: host-sand has no effect without "
                      "host-nv12=on and gpu-xfer=on");
-@@ -3539,6 +3566,7 @@ static const Property virtio_media_properties[] = {
+@@ -3610,6 +3637,7 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
      DEFINE_PROP_INT32("dec-sw-nice", VirtIOMedia, dec_sw_nice,
                        VIRTIO_MEDIA_DEC_SW_NICE_INHERIT),
@@ -157,10 +157,10 @@ index 460b0a3a8..4cc5b4128 100644
  
  static void virtio_media_class_init(ObjectClass *klass, const void *data)
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index f06aa146e..9f2faf557 100644
+index 426c2459d..6c4dda719 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -442,6 +442,14 @@ struct VirtIOMedia {
+@@ -447,6 +447,14 @@ struct VirtIOMedia {
       * realize refuses anything else outside -20 to 19.
       */
      int32_t dec_sw_nice;
@@ -175,6 +175,3 @@ index f06aa146e..9f2faf557 100644
  
      VirtQueue *command_vq;
      VirtQueue *event_vq;
--- 
-2.43.0
-

@@ -50,10 +50,10 @@ Upstream-Status: Inappropriate [non-standard virtio-gpu command; needs this laye
  7 files changed, 144 insertions(+), 3 deletions(-)
 
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 25d3156..bfea271 100644
+index 0a5321d1f..f899250fa 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -807,6 +807,36 @@ static void virgl_cmd_set_overlay_pos(VirtIOGPU *g,
+@@ -817,6 +817,36 @@ static void virgl_cmd_set_overlay_pos(VirtIOGPU *g,
      }
  }
  
@@ -90,7 +90,7 @@ index 25d3156..bfea271 100644
  static void virgl_cmd_set_scanout(VirtIOGPU *g,
                                    struct virtio_gpu_ctrl_command *cmd)
  {
-@@ -870,6 +900,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+@@ -880,6 +910,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
      } else {
          qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
          qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
@@ -100,7 +100,7 @@ index 25d3156..bfea271 100644
      }
      g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
  }
-@@ -1368,6 +1401,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+@@ -1378,6 +1411,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
      case VIRTIO_GPU_CMD_SET_OVERLAY_POS:
          virgl_cmd_set_overlay_pos(g, cmd);
          break;
@@ -111,10 +111,10 @@ index 25d3156..bfea271 100644
          virgl_cmd_resource_unref(g, cmd, &cmd_suspended);
          break;
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index 07d0401..4cb84c9 100644
+index a5112f31c..b98c0abcc 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -148,6 +148,19 @@ struct virtio_gpu_base_conf {
+@@ -147,6 +147,19 @@ struct virtio_gpu_base_conf {
   * scanout_id (one of the extra scanouts) at x, y on scanout 0.
   */
  #define VIRTIO_GPU_CMD_SET_OVERLAY_POS 0x0120
@@ -135,7 +135,7 @@ index 07d0401..4cb84c9 100644
      struct virtio_gpu_ctrl_hdr hdr;
      uint32_t scanout_id;
 diff --git a/include/ui/console.h b/include/ui/console.h
-index be5a94f..d47bc4c 100644
+index 54736e4eb..2bd647b25 100644
 --- a/include/ui/console.h
 +++ b/include/ui/console.h
 @@ -234,6 +234,10 @@ typedef struct DisplayChangeListenerOps {
@@ -149,7 +149,7 @@ index be5a94f..d47bc4c 100644
      /* optional */
      void (*dpy_gl_release_dmabuf)(DisplayChangeListener *dcl,
                                    QemuDmaBuf *dmabuf);
-@@ -317,6 +321,9 @@ void qemu_console_gl_cursor_position(QemuConsole *con,
+@@ -319,6 +323,9 @@ void qemu_console_gl_cursor_position(QemuConsole *con,
  void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
                               uint32_t tex_id, bool y0_top, uint32_t tex_w,
                               uint32_t tex_h, int32_t x, int32_t y);
@@ -160,13 +160,13 @@ index be5a94f..d47bc4c 100644
                                      QemuDmaBuf *dmabuf);
  void qemu_console_gl_update(QemuConsole *con,
 diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
-index 524024b..6c44a68 100644
+index 6e24d881a..b3353bd1b 100644
 --- a/include/ui/sdl2.h
 +++ b/include/ui/sdl2.h
 @@ -58,6 +58,9 @@ struct sdl2_console {
          int32_t x, y;
          bool y0_top, on;
-     } ovl[3];
+     } ovl[QEMU_CONSOLE_MAX_OVERLAYS];
 +    /* q11-primary-rect: the scanout at prim_x, prim_y, prim_w x prim_h of prim_cw x prim_ch */
 +    int32_t prim_x, prim_y;
 +    uint32_t prim_w, prim_h, prim_cw, prim_ch;
@@ -184,10 +184,10 @@ index 524024b..6c44a68 100644
                             uint32_t x, uint32_t y, uint32_t w, uint32_t h);
  void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
 diff --git a/ui/console.c b/ui/console.c
-index c9b872f..7703655 100644
+index f60137283..9aef18aaf 100644
 --- a/ui/console.c
 +++ b/ui/console.c
-@@ -1019,6 +1019,24 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+@@ -1022,6 +1022,24 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
      }
  }
  
@@ -213,7 +213,7 @@ index c9b872f..7703655 100644
                               uint32_t tex_id, bool y0_top, uint32_t tex_w,
                               uint32_t tex_h, int32_t x, int32_t y)
 diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
-index 8b00001..7eb5b95 100644
+index 8b00001c3..7eb5b955c 100644
 --- a/ui/sdl2-gl.c
 +++ b/ui/sdl2-gl.c
 @@ -233,6 +233,60 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
@@ -311,7 +311,7 @@ index 8b00001..7eb5b95 100644
                           scon->x, scon->y, scon->w, scon->h);
      } else {
 diff --git a/ui/sdl2.c b/ui/sdl2.c
-index 4b0e1af..3717786 100644
+index 4b0e1af32..3717786e8 100644
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
 @@ -835,6 +835,7 @@ static const DisplayChangeListenerOps dcl_gl_ops = {

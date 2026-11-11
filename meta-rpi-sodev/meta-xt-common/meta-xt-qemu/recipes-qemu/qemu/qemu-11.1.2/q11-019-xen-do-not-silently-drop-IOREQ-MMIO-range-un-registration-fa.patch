@@ -1,12 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:31 +0900
+Date: Wed, 11 Nov 2026 08:33:55 +0900
 Subject: [PATCH] xen: do not silently drop IOREQ MMIO range (un)registration
  failures; self-heal -EEXIST partial overlaps
 
 qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0120-xen-do-not-silently-drop-IOREQ-MMIO-range-registrati.patch;
 that patch's description has the reasoning and the measurements.
+
+Most of this patch is replaced by q11-035 (the port of 0232, which came
+after 0120 in the 10.0.2 series as well): that patch rewrites
+xen_map_memory_section() and xen_unmap_memory_section() so that ranges
+are never unregistered, and drops the EEXIST unmap-and-re-add self-heal
+and the unmap error_report() added here. What survives of this patch
+in the series' final tree is the two includes and the `int rc` of the
+map side. It is kept as the step the port took, so that the q11 series
+mirrors the 0NNN one patch for patch.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>

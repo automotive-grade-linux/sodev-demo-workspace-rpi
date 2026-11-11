@@ -1,38 +1,45 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:30 +0900
+Date: Wed, 11 Nov 2026 08:33:34 +0900
 Subject: [PATCH] configure: use the host python and meson instead of a venv
 
 qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0114-configure-use-the-host-python-and-meson-not-a-venv.patch;
 that patch's description has the reasoning and the measurements.
 
-Ported: Same host python/mkvenv replacement; qemu 11.1.2's configure
-computes the venv meson in a new block (get_pwd, EXESUF, Haiku), so
-instead of replacing that line the port overrides meson with the host
-one right after it.
+Ported: Same drop of the venv. The host python that configure found with
+`command -v` stays $python (0114 set python=python3; the found one is
+the interpreter the recipe passes with --python), and the `if test "$?"`
+check that followed the venv line goes with it: after a plain
+assignment it was always false, and its message spoke of a venv that is
+no longer made. qemu 11.1.2 computes the venv meson in a new block
+(get_pwd, EXESUF, Haiku); the port replaces that block's one meson line
+with the host meson, as 0114 did, so its `cd pyvenv/bin` no longer fails
+in the configure log. The comments name this patch, q11-013, and the
+0114 it ports.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [oe specific; see the oe-core originals]
 ---
- configure | 7 +++++--
- 1 file changed, 5 insertions(+), 2 deletions(-)
+ configure | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
 
 diff --git a/configure b/configure
-index 6ddfe4b53..5cbdccb03 100755
+index 6ddfe4b53..26e636427 100755
 --- a/configure
 +++ b/configure
-@@ -937,14 +937,14 @@ python="$(command -v "$python")"
+@@ -937,14 +937,11 @@ python="$(command -v "$python")"
  echo "python determined to be '$python'"
  echo "python version: $($python --version)"
  
 -python="$($python -B "${source_path}/python/scripts/mkvenv.py" create pyvenv)"
-+python=python3
- if test "$?" -ne 0 ; then
-     error_exit "python venv creation failed"
- fi
- 
+-if test "$?" -ne 0 ; then
+-    error_exit "python venv creation failed"
+-fi
+-
++# Yocto (q11-013, the port of 0114): no venv. $python stays the host interpreter
++# found above, and mkvenv is a no-op (the host meson is taken below).
  # Suppress writing compiled files
  python="$python -B"
 -mkvenv="$python ${source_path}/python/scripts/mkvenv.py"
@@ -40,13 +47,13 @@ index 6ddfe4b53..5cbdccb03 100755
  
  # Finish preparing the virtual environment using vendored .whl files.
  # Even if PyPI is allowed, we disallow it here to force installation
-@@ -978,6 +978,9 @@ if test "$host_os" = "haiku" && test ! -e "$meson" ; then
-     meson="$(cd pyvenv/non-packaged/bin; get_pwd)/meson"
- fi
+@@ -967,7 +964,8 @@ get_pwd() {
+     fi
+ }
  
-+# Yocto (0114): use the host meson from PATH, not the venv one; mkvenv is disabled above.
+-meson="$(cd pyvenv/bin; get_pwd)/meson"
++# Yocto (q11-013, the port of 0114): the host meson from PATH, not the venv one.
 +meson=$(command -v meson)
-+
- mkvenv_online_flag=""
- if test "$download" = "enabled" ; then
-     mkvenv_online_flag=" --online"
+ if [ -f "$meson$EXESUF" ]; then
+   meson="$meson$EXESUF"
+ fi

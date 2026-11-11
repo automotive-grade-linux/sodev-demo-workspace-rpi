@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:31 +0900
+Date: Wed, 11 Nov 2026 08:53:15 +0900
 Subject: [PATCH] hw/virtio: add a native virtio-media device
 
 qemu 11.1.2 port of
@@ -12,6 +12,21 @@ hw/core/qdev-properties.h and system/address-spaces.h, the virtio name
 table now ends at VIRTIO_ID_SPI, and the device-id comment says 11.1.2's
 header stops at 45.
 
+Changed in the q11 series (review 2026-11-11): VIDIOC_CREATE_BUFS is no
+longer in the ioctl table. It passed through with memory=USERPTR and
+left this device's mirror of the pool (num_bufs, host_map) behind, so a
+buffer it made could never be queued; the guest now gets ENOTTY, as for
+any ioctl not listed, and v4l2_codec2 uses REQBUFS only. The table
+entries carry the code alone (the name was never read). REQBUFS
+detaches the fd handler after it releases a queue, so the handler is
+attached only while a queue streams, as virtio_media_update_fd_handler()
+says. A CAPTURE buffer whose copy to the guest fails is marked not
+queued before the error event. virtio_media_sg_copy() fails when the SG
+list covers less than the host length instead of returning true with
+the copy short. The comment on VIRTIO_MEDIA_CMD_BUF_SIZE gives the
+entry count that fits (about 16K of 16 bytes, not 1024).
+include/hw/virtio/virtio-media.h carries the SPDX tag the .c files have.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [native virtio-media device model for Xen; upstream qemu has none and hosts virtio-media via vhost-user, which cannot work under Xen]
@@ -19,11 +34,11 @@ Upstream-Status: Inappropriate [native virtio-media device model for Xen; upstre
  hw/virtio/Kconfig                           |    8 +
  hw/virtio/meson.build                       |    2 +
  hw/virtio/virtio-media-pci.c                |   92 ++
- hw/virtio/virtio-media.c                    | 1301 +++++++++++++++++++
+ hw/virtio/virtio-media.c                    | 1307 +++++++++++++++++++
  hw/virtio/virtio.c                          |    3 +-
- include/hw/virtio/virtio-media.h            |  233 ++++
+ include/hw/virtio/virtio-media.h            |  235 ++++
  include/standard-headers/linux/virtio_ids.h |    8 +
- 7 files changed, 1646 insertions(+), 1 deletion(-)
+ 7 files changed, 1654 insertions(+), 1 deletion(-)
  create mode 100644 hw/virtio/virtio-media-pci.c
  create mode 100644 hw/virtio/virtio-media.c
  create mode 100644 include/hw/virtio/virtio-media.h
@@ -161,10 +176,10 @@ index 000000000..26cfe4e34
 +type_init(virtio_media_pci_register);
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
 new file mode 100644
-index 000000000..e4d1e609e
+index 000000000..3c014d953
 --- /dev/null
 +++ b/hw/virtio/virtio-media.c
-@@ -0,0 +1,1301 @@
+@@ -0,0 +1,1307 @@
 +/*
 + * VIRTIO-MEDIA device model.
 + *
@@ -213,10 +228,9 @@ index 000000000..e4d1e609e
 + */
 +typedef struct {
 +    unsigned long code;
-+    const char *name;
 +} VirtIOMediaIoctl;
 +
-+#define IOCTL_ENTRY(x) { x, #x }
++#define IOCTL_ENTRY(x) { x }
 +
 +static const VirtIOMediaIoctl virtio_media_ioctls[] = {
 +    /* Capability and format negotiation. */
@@ -233,7 +247,6 @@ index 000000000..e4d1e609e
 +    IOCTL_ENTRY(VIDIOC_REQBUFS),
 +    IOCTL_ENTRY(VIDIOC_QUERYBUF),
 +    IOCTL_ENTRY(VIDIOC_QBUF),
-+    IOCTL_ENTRY(VIDIOC_CREATE_BUFS),
 +    IOCTL_ENTRY(VIDIOC_STREAMON),
 +    IOCTL_ENTRY(VIDIOC_STREAMOFF),
 +    /* Controls. */
@@ -405,6 +418,11 @@ index 000000000..e4d1e609e
 +            remaining -= mapped;
 +        }
 +    }
++    if (done < host_len) {
++        error_report("virtio-media: the SG list covers %zu of the %zu bytes to copy",
++                     done, host_len);
++        return false;
++    }
 +    return true;
 +}
 +
@@ -547,6 +565,7 @@ index 000000000..e4d1e609e
 +                    if (!virtio_media_sg_copy(vm, &gb->planes[p],
 +                                              q->host_map[evt.buffer.index][p],
 +                                              used, true)) {
++                        gb->queued = false;
 +                        virtio_media_send_error_event(s, EFAULT);
 +                        return;
 +                    }
@@ -747,6 +766,7 @@ index 000000000..e4d1e609e
 +
 +    /* A count of zero frees the pool; do the same on both sides. */
 +    virtio_media_queue_release(s, q);
++    virtio_media_update_fd_handler(s);
 +
 +    host_rb = *rb;
 +    host_rb.memory = V4L2_MEMORY_MMAP;
@@ -831,6 +851,7 @@ index 000000000..e4d1e609e
 +
 +fail:
 +    virtio_media_queue_release(s, q);
++    virtio_media_update_fd_handler(s);
 +    return ret;
 +}
 +
@@ -1482,10 +1503,10 @@ index daa560733..1392cd880 100644
  static const char *virtio_id_to_name(uint16_t device_id)
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
 new file mode 100644
-index 000000000..c990d788f
+index 000000000..1900afac3
 --- /dev/null
 +++ b/include/hw/virtio/virtio-media.h
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,235 @@
 +/*
 + * VIRTIO-MEDIA device -- proxies a host V4L2 device into the guest.
 + *
@@ -1528,6 +1549,8 @@ index 000000000..c990d788f
 + * queue->pending_dqbufs list (virtio_media_ioctls.c virtio_media_dqbuf), which
 + * is filled by VIRTIO_MEDIA_EVT_DQBUF events on the event queue. So buffer
 + * completion is an event this device sends, not an ioctl it answers.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
 + */
 +
 +#ifndef QEMU_VIRTIO_MEDIA_H
@@ -1633,9 +1656,9 @@ index 000000000..c990d788f
 +/*
 + * Enough for any single V4L2 ioctl payload plus the arrays that follow it: a
 + * v4l2_buffer with VIDEO_MAX_PLANES planes and one SG list per plane. A 4 KiB
-+ * page holds 4096 bytes, so 1024 entries covers a 4 MiB plane -- larger than
-+ * any 4K NV12 plane -- and the guest's own descriptor chain is bounded well
-+ * below that anyway (DESC_CHAIN_MAX_LEN).
++ * page is one 16-byte entry, so after the headers about 16K entries fit --
++ * 64 MiB of pages against the 12.4 MB of a 4K NV12 frame -- and the guest's
++ * own descriptor chain is bounded well below that anyway (DESC_CHAIN_MAX_LEN).
 + */
 +#define VIRTIO_MEDIA_CMD_BUF_SIZE (256 * 1024)
 +

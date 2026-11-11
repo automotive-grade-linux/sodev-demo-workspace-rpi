@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 00:09:57 +0900
+Date: Wed, 11 Nov 2026 08:33:48 +0900
 Subject: [PATCH] virtio-media: decoder mode: drain after the backlog
 
 A drain (DECODER_CMD STOP, or an empty OUTPUT buffer) went to
@@ -22,16 +22,16 @@ all 896 frames, HEVC at 61.0 and 61.1 fps.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
 ---
  hw/virtio/virtio-media-decoder.c | 31 +++++++++++++++++++++++++++++--
  1 file changed, 29 insertions(+), 2 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index ed6a98a..3fbac88 100644
+index 7648287ce..9a64f5b6f 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -352,6 +352,7 @@ struct VirtIOMediaDec {
+@@ -359,6 +359,7 @@ struct VirtIOMediaDec {
  
      /* Stateful drain, driven by VIDIOC_DECODER_CMD(V4L2_DEC_CMD_STOP). */
      bool draining;
@@ -39,7 +39,7 @@ index ed6a98a..3fbac88 100644
      bool drain_done;
  
      /* libavcodec. */
-@@ -2092,6 +2093,23 @@ static void dec_backlog_clear(VirtIOMediaDec *d)
+@@ -2097,6 +2098,23 @@ static void dec_backlog_clear(VirtIOMediaDec *d)
          av_packet_free(&p);
      }
      d->backlog_bytes = 0;
@@ -63,7 +63,7 @@ index ed6a98a..3fbac88 100644
  }
  
  /*
-@@ -2112,11 +2130,20 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+@@ -2117,11 +2135,20 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
          av_packet_free(&p);
          if (r < 0 && r != AVERROR_EOF && !dec_ds_starved(d, r) &&
              !dec_bad_data(r)) {
@@ -84,7 +84,7 @@ index ed6a98a..3fbac88 100644
  }
  
  /*
-@@ -2940,7 +2967,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -2949,7 +2976,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
              if (!d->draining) {
                  d->draining = true;
                  d->drain_done = false;
@@ -93,7 +93,7 @@ index ed6a98a..3fbac88 100644
              }
              dec_complete_buffer(s, 0, b->index, 0, 0, DEC_IN_PTS(b));
              dec_pump(s);
-@@ -3137,7 +3164,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+@@ -3145,7 +3172,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
          if (!d->draining) {
              d->draining = true;
              d->drain_done = false;

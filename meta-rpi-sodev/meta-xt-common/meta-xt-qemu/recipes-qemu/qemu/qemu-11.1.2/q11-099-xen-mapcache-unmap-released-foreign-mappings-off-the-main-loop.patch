@@ -25,10 +25,10 @@ Upstream-Status: Inappropriate [this layer's Xen device model]
  1 file changed, 91 insertions(+), 4 deletions(-)
 
 diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
-index 4c7cd1755..817110f5e 100644
+index 6bd78f7d1..aaeb31bec 100644
 --- a/hw/xen/xen-mapcache.c
 +++ b/hw/xen/xen-mapcache.c
-@@ -18,6 +18,8 @@
+@@ -19,6 +19,8 @@
  #include "hw/xen/xen_native.h"
  #include "qemu/bitmap.h"
  #include "qemu/timer.h"
@@ -37,7 +37,7 @@ index 4c7cd1755..817110f5e 100644
  
  #include "system/ramlist.h"
  #include "system/runstate.h"
-@@ -110,6 +112,86 @@ static unsigned long xen_mc_remaps, xen_mc_replaced, xen_mc_chain_idx,
+@@ -111,6 +113,86 @@ static unsigned long xen_mc_remaps, xen_mc_replaced, xen_mc_chain_idx,
                       xen_mc_chain_size, xen_mc_evictions;
  static int64_t xen_mc_unmap_ns;
  
@@ -124,7 +124,7 @@ index 4c7cd1755..817110f5e 100644
  static int xen_mc_munmap(MapCache *mc, MapCacheEntry *entry)
  {
      int64_t t0 = get_clock();
-@@ -311,11 +393,13 @@ static void xen_remap_bucket(MapCache *mc,
+@@ -320,11 +402,13 @@ static void xen_remap_bucket(MapCache *mc,
              info_report("xen mapcache: %lu remaps (%lu replaced a live mapping),"
                          " new chained entries: other index %lu, other size %lu;"
                          " %lu evictions, %" PRIu64 " of %" PRIu64 " MB mapped,"
@@ -140,7 +140,7 @@ index 4c7cd1755..817110f5e 100644
          }
      }
  
-@@ -344,7 +428,8 @@ static void xen_remap_bucket(MapCache *mc,
+@@ -353,7 +437,8 @@ static void xen_remap_bucket(MapCache *mc,
           */
          assert(!vaddr || (entry->vaddr_base == vaddr && entry->size == size));
  
@@ -150,7 +150,7 @@ index 4c7cd1755..817110f5e 100644
              perror("unmap fails");
              exit(-1);
          }
-@@ -477,7 +562,7 @@ static void xen_map_cache_evict(MapCache *mc, MapCacheEntry *keep)
+@@ -486,7 +571,7 @@ static void xen_map_cache_evict(MapCache *mc, MapCacheEntry *keep)
          if (!(e->flags & XEN_MAPCACHE_ENTRY_DUMMY)) {
              ram_block_notify_remove(e->vaddr_base, e->size, e->size);
          }
@@ -159,7 +159,7 @@ index 4c7cd1755..817110f5e 100644
              perror("unmap fails");
              exit(-1);
          }
-@@ -809,6 +894,8 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+@@ -818,6 +903,8 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
      if (entry->flags & XEN_MAPCACHE_ENTRY_GRANT) {
          rc = xengnttab_unmap(xen_region_gnttabdev, entry->vaddr_base,
                               entry->size >> mc->bucket_shift);

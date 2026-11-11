@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 27 Oct 2026 22:42:21 +0900
+Date: Wed, 11 Nov 2026 08:33:47 +0900
 Subject: [PATCH] ui/sdl2-wl-scanout: give a plane its producer's buffer
 
 The plane handoff (q11-066) hands weston each guest plane as the export
@@ -97,7 +97,7 @@ display (a comment at virtio_media_isp_catch_up says the same).
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [this layer's q11 plane handoff and decoder mode]
 ---
  hw/virtio/virtio-media-decoder.c |   5 +-
  hw/virtio/virtio-media.c         |  23 +++-
@@ -108,10 +108,10 @@ Upstream-Status: Pending
  6 files changed, 301 insertions(+), 43 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 93d268d37..c97e9f8b2 100644
+index 052729dee..b12ef85b0 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -918,7 +918,7 @@ static void dec_ds_unpend(VirtIOMediaDec *d, uint32_t res)
+@@ -923,7 +923,7 @@ static void dec_ds_unpend(VirtIOMediaDec *d, uint32_t res)
   * The blits are on one GL context, so the GPU runs them in order and the last
   * one's fence covers the others: one wait.
   */
@@ -120,7 +120,7 @@ index 93d268d37..c97e9f8b2 100644
  {
      VirtIOMediaDec *d = owner;
      void *last = NULL;
-@@ -939,6 +939,7 @@ static void dec_ds_catch_up(void *owner)
+@@ -944,6 +944,7 @@ static void dec_ds_catch_up(void *owner)
      if (last && virtio_media_gpu_wait(last) < 0) {
          warn_report_once("virtio-media/dec: host-sand: GPU wait failed");
      }
@@ -128,7 +128,7 @@ index 93d268d37..c97e9f8b2 100644
  }
  
  /* Every entry goes (dec_gpu_clear): the display forgets this owner's buffers. */
-@@ -1195,7 +1196,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1200,7 +1201,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
             dec_ds_keep(d, (unsigned)(e - d->gpu),
                         (unsigned)(gb - s->queues[1].guest), fr,
                         desc->objects[0].size, d->avctx->has_b_frames);
@@ -138,10 +138,10 @@ index 93d268d37..c97e9f8b2 100644
      if (!skip) {
          r = virtio_media_gpu_blit(e->handle, gb->virgl_res);
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index e4f52002b..b7e3b2946 100644
+index da80bf033..6c320861a 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -829,7 +829,7 @@ static bool virtio_media_sand_skip_on(void)
+@@ -857,7 +857,7 @@ static bool virtio_media_sand_skip_on(void)
  }
  
  static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_t except);
@@ -150,7 +150,7 @@ index e4f52002b..b7e3b2946 100644
  
  /*
   * q11-sand-catchup: the GL path's import of decoder buffer idx (as in host_readable_body), so a
-@@ -889,7 +889,7 @@ static bool virtio_media_sand_skip(VirtIOMediaSession *s, VirtIOMediaQueue *q, u
+@@ -917,7 +917,7 @@ static bool virtio_media_sand_skip(VirtIOMediaSession *s, VirtIOMediaQueue *q, u
  
      if (!virtio_media_sand_skip_on() || !virtio_media_sand_on() || !q->isp ||
          idx >= VIRTIO_MEDIA_MAX_BUFFERS || !q->isp_src_fd[idx] || q->isp_src_busy[idx] ||
@@ -159,7 +159,7 @@ index e4f52002b..b7e3b2946 100644
          return false;
      }
      tex = virtio_media_gpu_res_tex(res);
-@@ -943,7 +943,7 @@ static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_
+@@ -971,7 +971,7 @@ static void virtio_media_isp_drop_res(VirtIOMediaQueue *q, uint32_t res, uint32_
  
  static bool virtio_media_isp_skip(VirtIOMediaQueue *q)
  {
@@ -168,7 +168,7 @@ index e4f52002b..b7e3b2946 100644
          return false;
      }
      if (q->isp_pending_n >= VIRTIO_MEDIA_ISP_PENDING_MAX) {
-@@ -953,8 +953,18 @@ static bool virtio_media_isp_skip(VirtIOMediaQueue *q)
+@@ -981,8 +981,18 @@ static bool virtio_media_isp_skip(VirtIOMediaQueue *q)
      return true;
  }
  
@@ -189,7 +189,7 @@ index e4f52002b..b7e3b2946 100644
  {
      VirtIOMediaQueue *q = owner;
      uint32_t j;
-@@ -980,7 +990,7 @@ static void virtio_media_isp_catch_up(void *owner)
+@@ -1008,7 +1018,7 @@ static void virtio_media_isp_catch_up(void *owner)
          }
      }
      if (!q->isp_pending_n) {
@@ -198,7 +198,7 @@ index e4f52002b..b7e3b2946 100644
      }
      for (j = 0; j < VIRTIO_MEDIA_ISP_RING; j++) {
          if (q->isp_ring_pending[j]) {
-@@ -1000,6 +1010,7 @@ static void virtio_media_isp_catch_up(void *owner)
+@@ -1028,6 +1038,7 @@ static void virtio_media_isp_catch_up(void *owner)
          }
      }
      q->isp_pending_n = 0;
@@ -379,10 +379,10 @@ index 7ce4ef82a..cfd1afc42 100644
      if (entries) {
          g_hash_table_foreach_remove(entries, of_owner, owner);
 diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
-index 24bcd5874..cec7558eb 100644
+index 8e0dcd64a..b74e15b5e 100644
 --- a/ui/sdl2-gl.c
 +++ b/ui/sdl2-gl.c
-@@ -418,6 +418,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+@@ -426,6 +426,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
  
          if (!why) {
              sdl2_wl_planes_off(); /* q11-plane-handoff */
@@ -390,7 +390,7 @@ index 24bcd5874..cec7558eb 100644
              direct_scanout_note_flush(true); /* q11-isp-skip-copy */
              if (t0) {
                  qemu_lat_diag_add(LAT_SDL_BLIT,
-@@ -429,15 +430,20 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+@@ -437,15 +438,20 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
      } else {
          sdl2_wl_scanout_off(); /* no waiting direct frame may follow this one */
      }
@@ -415,10 +415,10 @@ index 24bcd5874..cec7558eb 100644
      egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
      /*
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
-index aec8bf276..e459f7e1d 100644
+index 1e7b46b44..097573cdc 100644
 --- a/ui/sdl2-wl-scanout.c
 +++ b/ui/sdl2-wl-scanout.c
-@@ -514,6 +514,16 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
+@@ -512,6 +512,16 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
      if (!wl_init(scon->real_window) || d->width < w || d->height < h) {
          return false; /* counted by the caller (sdl2_wl_scanout_miss) */
      }
@@ -435,7 +435,7 @@ index aec8bf276..e459f7e1d 100644
      sdl2_wl_scanout_dispatch();
      b = wl_buf_for(d, w, h);
      if (!b->ready) {
-@@ -568,10 +578,11 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
+@@ -566,10 +576,11 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
   * with a wp_viewport), and weston composites them. RPi4, local 720p60 in the HMI layout:
   * 52 -> 57 fps, Chromium drops 8 -> 2%, V3D render (qemu + weston) 37.5 -> 16.6%; a streamed
   * video in the HMI layout 32.7 -> 42.6 (DomA CPU is the limit there).
@@ -451,7 +451,7 @@ index aec8bf276..e459f7e1d 100644
   *  - GL texture names are recycled: a cache keyed by name and size handed weston another
   *    resource's old dmabuf (the launcher shown instead of the app, flashing video) -> the
   *    cache is keyed by the virtio resource too and drops a resource the guest unrefs;
-@@ -611,6 +622,11 @@ static struct {
+@@ -609,6 +620,11 @@ static struct {
      uint64_t geom, name_reuse, gone; /* per stats line */
      uint64_t blobs; /* q11-blob-handoff: guest dma-bufs handed over */
      bool blob_off;  /* q11-blob-handoff: weston refused one; blit them from now on */
@@ -463,7 +463,7 @@ index aec8bf276..e459f7e1d 100644
  } pl;
  
  static bool planes_flag(void)
-@@ -626,6 +642,64 @@ static bool planes_flag(void)
+@@ -624,6 +640,64 @@ static bool planes_flag(void)
      return on;
  }
  
@@ -528,7 +528,7 @@ index aec8bf276..e459f7e1d 100644
  static bool plane_in_use(WlPlaneBuf *b)
  {
      for (int i = 0; i < WL_PLANES; i++) {
-@@ -1091,9 +1165,51 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
+@@ -1127,9 +1201,51 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
      pl.cur[i] = b;
  }
  
@@ -580,7 +580,7 @@ index aec8bf276..e459f7e1d 100644
      bool rect = scon->prim_w && scon->prim_h && scon->prim_cw && scon->prim_ch;
      uint32_t cw = rect ? scon->prim_cw : (scon->w ? scon->w : (uint32_t)ww);
      uint32_t ch = rect ? scon->prim_ch : (scon->h ? scon->h : (uint32_t)wh);
-@@ -1110,14 +1226,54 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+@@ -1146,14 +1262,54 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
          return false;
      }
      sdl2_wl_scanout_dispatch();
@@ -633,13 +633,13 @@ index aec8bf276..e459f7e1d 100644
      if (!b[0]) {
          return false;
      }
-     for (int i = 0; i < 3; i++) {
+     for (int i = 0; i < QEMU_CONSOLE_MAX_OVERLAYS; i++) {
 -        if (scon->ovl[i].on && scon->ovl[i].fb.texture) {
 +        if (scon->ovl[i].on && scon->ovl[i].fb.texture && !b[i + 1]) {
              b[i + 1] = plane_buf(scon->ovl[i].fb.texture, scon->ovl[i].fb.width,
                                   scon->ovl[i].fb.height, q11_overlay_resource_id[i]);
              if (!b[i + 1]) {
-@@ -1130,6 +1286,9 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+@@ -1166,6 +1322,9 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
          int sw = scon->w ? (int)scon->w : scon->guest_fb.width;
          int sh = scon->h ? (int)scon->h : scon->guest_fb.height;
  
@@ -649,9 +649,9 @@ index aec8bf276..e459f7e1d 100644
          if (rect) {
              backdrop_show(ww, wh); /* q11-plane-backdrop */
              plane_show(0, b[0], scon->y0_top, sx, sy, sw, sh, scon->prim_x * fx,
-@@ -1141,23 +1300,33 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+@@ -1177,23 +1336,33 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
      }
-     for (int i = 0; i < 3; i++) {
+     for (int i = 0; i < QEMU_CONSOLE_MAX_OVERLAYS; i++) {
          if (b[i + 1]) {
 -            plane_show(i + 1, b[i + 1], scon->ovl[i].y0_top, 0, 0, scon->ovl[i].fb.width,
 -                       scon->ovl[i].fb.height, scon->ovl[i].x * fx, scon->ovl[i].y * fy,

@@ -1,11 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 14 Oct 2026 00:47:10 +0900
+Date: Wed, 11 Nov 2026 09:16:20 +0900
 Subject: [PATCH] virtio-gpu: clear overlay and handed-off plane state on reset
  and on errors
 
 Three cases left stale display state behind once overlay planes
-(q11-051) or the plane handoff (q11-066) were in use:
+(q11-051) or the plane handoff (q11-066) were in use. The 10.0.2 series
+has the three in 0250 itself; q11-051, the port of 0250, does not carry
+them, and this patch is where this series adds them:
 
 - A device reset only cleared the outputs' scanouts, not the overlay
   planes' extra ones, and did not take the overlays off the display:
@@ -31,12 +33,12 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [fixes this layer's overlay-plane and plane-handoff patches]
 ---
  hw/display/virtio-gpu-base.c  |  4 +++-
- hw/display/virtio-gpu-virgl.c | 29 +++++++++++++++++++++++------
+ hw/display/virtio-gpu-virgl.c | 31 +++++++++++++++++++++++++------
  ui/sdl2-gl.c                  |  5 ++++-
- 3 files changed, 30 insertions(+), 8 deletions(-)
+ 3 files changed, 32 insertions(+), 8 deletions(-)
 
 diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
-index 9ce9038..824a7d6 100644
+index ccff25c94..083de2d9f 100644
 --- a/hw/display/virtio-gpu-base.c
 +++ b/hw/display/virtio-gpu-base.c
 @@ -28,7 +28,8 @@ virtio_gpu_base_reset(VirtIOGPUBase *g)
@@ -58,10 +60,10 @@ index 9ce9038..824a7d6 100644
  
  void
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 6a85f4b..54cafa6 100644
+index 97796465a..fb6b44480 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -770,14 +770,16 @@ static void virgl_cmd_set_overlay(VirtIOGPU *g,
+@@ -781,14 +781,16 @@ static void virgl_cmd_set_overlay(VirtIOGPU *g,
          if (virgl_renderer_resource_get_info(ss->resource_id, &info)) {
              qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal resource specified %d\n",
                            __func__, ss->resource_id);
@@ -84,7 +86,7 @@ index 6a85f4b..54cafa6 100644
      }
      b->scanout[ss->scanout_id].resource_id = b->overlay[k].on ? ss->resource_id : 0;
      if (k < ARRAY_SIZE(q11_overlay_resource_id)) { /* q11-plane-handoff */
-@@ -1761,6 +1763,21 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
+@@ -1785,6 +1787,23 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
      for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
          qemu_console_set_surface(g->parent_obj.scanout[i].con, NULL);
          qemu_console_gl_scanout_disable(g->parent_obj.scanout[i].con);
@@ -93,9 +95,11 @@ index 6a85f4b..54cafa6 100644
 +    }
 +    q11_scanout0_resource_id = 0; /* q11-plane-handoff */
 +    /*
-+     * Drop the overlays from the display before their textures go away (the
-+     * reset's resource cleanup and virgl_renderer_reset() delete them).
-+     * virtio_gpu_base_reset() has already cleared their state.
++     * Drop the overlays from the display before virgl_renderer_reset() deletes
++     * their textures (the reset's resource cleanup, virtio_gpu_reset(), has
++     * already run by now). virtio_gpu_base_reset() has already cleared their
++     * state, and the scanout disable above has taken the handed-off planes
++     * off and dropped their cache (q11-066).
 +     */
 +    for (i = 0; i < g->parent_obj.conf.overlay_planes; i++) {
 +        if (i < ARRAY_SIZE(q11_overlay_resource_id)) { /* q11-plane-handoff */
@@ -107,10 +111,10 @@ index 6a85f4b..54cafa6 100644
  }
  
 diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
-index e0a1e35..aa91f59 100644
+index 1339e495b..a5e17fd5c 100644
 --- a/ui/sdl2-gl.c
 +++ b/ui/sdl2-gl.c
-@@ -297,7 +297,10 @@ void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
+@@ -305,7 +305,10 @@ void sdl2_gl_overlay(DisplayChangeListener *dcl, unsigned int idx, bool on,
          return;
      }
      SDL_GL_MakeCurrent(scon->real_window, scon->winctx);

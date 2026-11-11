@@ -35,8 +35,10 @@ BBCLASSEXTEND = ""
 # '=' not ':append': oe-core's SRC_URI is its own tarball, its patches against it and
 # three data files in oe-core's qemu/ directory that FILESPATH -- rooted at THIS
 # recipe's directory -- cannot see. The tarball already contains the meson subprojects
-# (keycodemapdb, berkeley-softfloat-3/testfloat-3, ...). run-ptest is kept because
-# `inherit ptest` expects it; this layer's qemu/ directory provides it.
+# (keycodemapdb, berkeley-softfloat-3/testfloat-3, ...). run-ptest is this layer's
+# copy of oe-core's runner: `SRC_URI =` drops oe-core's, and a conf with ptest in
+# DISTRO_FEATURES would otherwise get the tests do_install_ptest installs with no
+# runner. The DomD confs leave ptest out, so nothing of it is installed here.
 SRC_URI = "https://download.qemu.org/qemu-${PV}.tar.xz \
            file://run-ptest \
            "
@@ -64,6 +66,15 @@ SYSTEMD_SERVICE:${PN}-guest-agent = ""
 # `bb.utils.filter('DISTRO_FEATURES', 'alsa pulseaudio xen', d)` would otherwise
 # add a pulseaudio DEPENDS to the DomD build.
 PACKAGECONFIG:remove = "pulseaudio"
+
+# alsa is named here rather than left to DISTRO_FEATURES: the DomD confs take alsa
+# out of DISTRO_FEATURES, so the 10.2.0 recipe's filter() does not add it, and the
+# ALSA backend has only been built because alsa-lib reached the recipe sysroot
+# through libsdl2 -> pulseaudio. DomA's cfg plays through -audiodev alsa, and
+# q11-092's tx-no-bql (on by default for qemu 11 in both boards' xt-xen-cfg-doma)
+# makes realize refuse a device model built without CONFIG_AUDIO_ALSA. With the
+# PACKAGECONFIG set, alsa-lib is a DEPENDS of this recipe's own.
+PACKAGECONFIG:append:class-target = " alsa"
 
 # libavcodec for the decoder mode q11-041 adds and q11-042 drives, and ONLY for the
 # Raspberry Pi 5.
@@ -101,10 +112,15 @@ PACKAGECONFIG[glusterfs] = ""
 # The q11 patches apply in the order listed here, which is not their numbers' order: they
 # are grouped by the series that brings them (qemu 11.1.2 itself, the display path,
 # HEVC, H.264, 4K60, then the groups listed after 4K60), and the numbers follow the
-# order they were written in up to q11-085; any later number follows the order listed.
+# order they were written in up to q11-085, except q11-081, which was rewritten on
+# 2026-10-27 (after q11-082..085) and kept its number; any later number follows the
+# order listed. A patch's Date: is that of its last edit, not of its first.
 #
 # qemu 11.1.2 itself.
-# q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one).
+# q11-001..012: the twelve xen-troops v10.0.2-xt commits (Origin: lines name each one),
+# carried whole so that the series mirrors the fork's: q11-005 patches
+# hw/i386/xen/xen_platform.c, which the aarch64 target list does not compile, and
+# q11-012 reverts q11-009, so the two together leave xen-mapcache.c as it was.
 SRC_URI:append:class-target = " file://q11-001-xen-block-Do-not-write-frontend-nodes.patch"
 SRC_URI:append:class-target = " file://q11-002-xen-bus-Do-not-destroy-frontend-backend-directories.patch"
 SRC_URI:append:class-target = " file://q11-003-xen-bus-Set-offline-if-backend-s-state-is-XenbusStateClosed.patch"

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:39:33 +0900
 Subject: [PATCH] hw/virtio-media: invalidate the RGBA target before the NV12
  draw
 
@@ -10,16 +10,16 @@ that patch's description has the reasoning and the measurements.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-virgl.c | 11 +++++++++++
  1 file changed, 11 insertions(+)
 
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index 5ec4e01c9..72e53c31e 100644
+index ac5b0e2f9..f3c4a3a6d 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -489,6 +489,7 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+@@ -503,6 +503,7 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
      float cscale = full ? 1.0f : 255.0f / 224.0f;
      float c[4] = { coef[0] * cscale, coef[1] * cscale, coef[2] * cscale,
                     coef[3] * cscale };
@@ -27,7 +27,7 @@ index 5ec4e01c9..72e53c31e 100644
      GLenum status;
  
      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
-@@ -499,6 +500,16 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+@@ -513,6 +514,16 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
          glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
          return -EIO;
      }

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:57:51 +0900
 Subject: [PATCH] hw/virtio-media: do not fail an OUTPUT QBUF when the decoder
  is full
 
@@ -8,15 +8,24 @@ qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0219-v10-hw-virtio-media-do-not-fail-an-OUTPUT-QBUF-when-the-decoder-is-full.patch;
 that patch's description has the reasoning and the measurements.
 
+Two things the series fixes later, noted so that this patch is read as
+the step it was: a drain (DECODER_CMD STOP, or an empty OUTPUT buffer)
+went to libavcodec at once, ahead of the packets still in the backlog,
+which then came back AVERROR_EOF and were dropped as consumed; q11-075
+makes the drain wait for the backlog. And when a send fails and the
+backlog is cleared, the guest is not told; q11-077's stream-failure
+path (a CAPTURE buffer back with V4L2_BUF_FLAG_ERROR, then EIO) is where
+that belongs.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-decoder.c | 150 +++++++++++++++++++++++++++++--
  1 file changed, 145 insertions(+), 5 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 322f56cfd..7ac6fcb92 100644
+index ff2a1eb0e..97d2af9c5 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -109,6 +109,15 @@
@@ -48,7 +57,7 @@ index 322f56cfd..7ac6fcb92 100644
      struct SwsContext *sws; /* only if the decoder does not give us NV12 */
      /*
       * The full cache key. Input geometry is part of it: see dec_write_frame.
-@@ -464,6 +479,86 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+@@ -459,6 +474,86 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
      return true;
  }
  
@@ -135,7 +144,7 @@ index 322f56cfd..7ac6fcb92 100644
  /*
   * Pull frames out of libavcodec while the guest has buffers to put them in.
   *
-@@ -489,6 +584,14 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -484,6 +579,14 @@ static void dec_pump(VirtIOMediaSession *s)
          av_frame_free(&d->held);
      }
  
@@ -150,7 +159,7 @@ index 322f56cfd..7ac6fcb92 100644
      /*
       * BOUNDED. This runs on the QEMU main loop from a virtqueue handler, and the
       * guest can have 32 CAPTURE buffers queued, so an unbounded loop let one
-@@ -732,6 +835,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -731,6 +834,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
      }
  
      d = g_new0(VirtIOMediaDec, 1);
@@ -158,7 +167,7 @@ index 322f56cfd..7ac6fcb92 100644
      d->coded_w = DEC_MIN_W;
      d->coded_h = DEC_MIN_H;
      d->visible_w = DEC_MIN_W;
-@@ -794,6 +898,8 @@ fail:
+@@ -793,6 +897,8 @@ fail:
      av_frame_free(&d->frame);
      av_frame_free(&d->swframe);
      av_buffer_unref(&d->hwdev);
@@ -167,7 +176,7 @@ index 322f56cfd..7ac6fcb92 100644
      g_free(d);
      return ENOMEM;
  }
-@@ -813,6 +919,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -812,6 +918,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
      av_frame_free(&d->held);
      av_frame_free(&d->swframe);
      av_buffer_unref(&d->hwdev);
@@ -176,7 +185,7 @@ index 322f56cfd..7ac6fcb92 100644
      sws_freeContext(d->sws);
      g_free(d);
      s->dec = NULL;
-@@ -1179,7 +1287,25 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -1178,7 +1286,25 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
          d->pkt->pts = (int64_t)b->timestamp.tv_sec * 1000000 +
                        b->timestamp.tv_usec;
  
@@ -203,7 +212,7 @@ index 322f56cfd..7ac6fcb92 100644
          /*
           * NOTE: EAGAIN MEANS THE PACKET WAS NOT CONSUMED, SO IT MUST BE RESENT.
           *
-@@ -1197,14 +1323,26 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -1196,14 +1322,26 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
           */
          if (r == AVERROR(EAGAIN)) {
              dec_pump(s);
@@ -234,7 +243,7 @@ index 322f56cfd..7ac6fcb92 100644
               */
              gb->queued = false;
              return EAGAIN;
-@@ -1248,6 +1386,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+@@ -1247,6 +1385,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
              /* Input stopped: the decoder's state is no longer meaningful. */
              avcodec_flush_buffers(d->avctx);
              av_frame_free(&d->held);
@@ -242,7 +251,7 @@ index 322f56cfd..7ac6fcb92 100644
              d->draining = false;
              d->drain_done = false;
          }
-@@ -1318,6 +1457,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
+@@ -1317,6 +1456,7 @@ static int dec_decoder_cmd(VirtIOMediaSession *s, struct v4l2_decoder_cmd *cmd,
          if (d->draining) {
              avcodec_flush_buffers(d->avctx);
              av_frame_free(&d->held);

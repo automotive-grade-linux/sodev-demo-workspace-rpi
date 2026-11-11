@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:31 +0900
+Date: Wed, 11 Nov 2026 08:38:21 +0900
 Subject: [PATCH] hw/arm: share device-model RAM into the guest's physmap
 
 qemu 11.1.2 port of
@@ -18,14 +18,14 @@ were shortened.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [upstream wants the XSM question settled first, and probably a machine property to gate it. The pagemap route here has no real pin; 0121 gives the shmem-backed blobs one through udmabuf, and a dma-buf is pinned by the gntdev import, so what is left unpinned upstream would object to is the anonymous-memory case]
+Upstream-Status: Inappropriate [upstream wants the XSM question settled first, and probably a machine property to gate it. The pagemap route here has no real pin; q11-020 (the port of 0121) gives the shmem-backed blobs one through udmabuf, and a dma-buf is pinned by the gntdev import, so what is left unpinned upstream would object to is the anonymous-memory case]
 ---
  hw/arm/xen-stubs.c            | 512 ++++++++++++++++++++++++++++++++++
- hw/display/virtio-gpu-gl.c    |  10 +-
+ hw/display/virtio-gpu-gl.c    |  11 +-
  hw/display/virtio-gpu-virgl.c |  80 ++++++
  hw/i386/xen/xen-hvm.c         |  26 ++
  include/system/xen.h          |  30 ++
- 5 files changed, 657 insertions(+), 1 deletion(-)
+ 5 files changed, 658 insertions(+), 1 deletion(-)
 
 diff --git a/hw/arm/xen-stubs.c b/hw/arm/xen-stubs.c
 index 00bc31025..e526a6f97 100644
@@ -564,7 +564,7 @@ index 00bc31025..e526a6f97 100644
  
  void xen_hvm_modified_memory(ram_addr_t start, ram_addr_t length)
 diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
-index 2b7a41c46..8d6369c81 100644
+index 2b7a41c46..3ee9f346b 100644
 --- a/hw/display/virtio-gpu-gl.c
 +++ b/hw/display/virtio-gpu-gl.c
 @@ -20,6 +20,7 @@
@@ -575,13 +575,14 @@ index 2b7a41c46..8d6369c81 100644
  #include "hw/virtio/virtio-gpu-bswap.h"
  #include "hw/virtio/virtio-gpu-pixman.h"
  #include "hw/core/qdev-properties.h"
-@@ -143,7 +144,14 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+@@ -143,7 +144,15 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
  #endif
  
  #if !defined(CONFIG_WIN32)
 -    if (virtio_gpu_hostmem_enabled(b->conf)) {
 +    /*
-+     * Not under Xen (0116): the device model shares each blob's own frames
++     * Not under Xen (q11-015, the port of 0116): the device model shares each
++     * blob's own frames
 +     * into the guest's p2m as the blob is mapped, and a 256 MiB anonymous
 +     * background region under the whole window would be shared too, then
 +     * shadowed by every blob subregion. Blobs are mapped one region each,

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 18:32:48 +0900
+Date: Wed, 11 Nov 2026 09:16:22 +0900
 Subject: [PATCH] ui/sdl2: hand a guest dma-buf scanout to weston too
 
 q11-066 hands the guest's scanout to the host compositor as a plane
@@ -24,10 +24,15 @@ window); until weston answers, the frame is blitted as before, and
 once weston refuses one, the blob handoff stays off.
 
 Buffers are cached by resource, dma-buf inode, size, format and
-stride. An entry weston has not answered for is never freed. One
-whose resource is gone is freed at once unless it is on screen or
-still waiting, and then when weston answers; the cache can grow past
-its size while every entry is on screen or waiting.
+stride (a dma-buf's inode is not reused while the process runs: Linux
+takes it from a counter). An entry weston has not answered for is
+never freed. One whose resource is gone is freed at once unless it is
+on screen (then by the LRU, once the plane shows another buffer) or
+still waiting (then when weston answers). The cache can grow past its
+size while every entry is on screen or waiting, but at most
+WL_PLANE_PENDING_MAX (8) creates wait at a time -- past that a frame is
+blitted -- and once the connection to weston is dead (no listener will
+fire) the waiting entries are freed too.
 
 sdl2_gl_scanout_texture() now also clears guest_fb.dmabuf, and
 sdl2_gl_release_dmabuf() clears it when it is the one released, as
@@ -36,24 +41,25 @@ the blit the old rectangle.
 
 Not covered: the guest is not held while weston shows its buffer, the
 same as for textures, so a guest that renders into the image on
-screen would tear. A refusal from weston is not retried, and a
-virtio-gpu reset does not empty the cache.
+screen would tear. A refusal from weston is not retried. A virtio-gpu
+reset empties the cache through the scanout disable (q11-066), the
+waiting entries once weston answers.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [extends this layer's plane handoff (q11-066) and primary rect (q11-064), which upstream qemu does not have]
 ---
  hw/display/virtio-gpu-virgl.c |   3 +
  include/ui/sdl2.h             |   2 +
  ui/sdl2-gl.c                  |  17 +++
- ui/sdl2-wl-scanout.c          | 206 +++++++++++++++++++++++++++++++---
- 4 files changed, 210 insertions(+), 18 deletions(-)
+ ui/sdl2-wl-scanout.c          | 247 +++++++++++++++++++++++++++++++---
+ 4 files changed, 249 insertions(+), 20 deletions(-)
 
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 54cafa6..203815d 100644
+index fb6b44480..39a4ceacc 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -1360,6 +1360,9 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+@@ -1384,6 +1384,9 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
      }
  
      virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
@@ -64,7 +70,7 @@ index 54cafa6..203815d 100644
  #endif
  
 diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
-index cede5ff..26b2c85 100644
+index 89f72fb6b..fb71a09b8 100644
 --- a/include/ui/sdl2.h
 +++ b/include/ui/sdl2.h
 @@ -61,6 +61,8 @@ struct sdl2_console {
@@ -77,7 +83,7 @@ index cede5ff..26b2c85 100644
  };
  
 diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
-index aa91f59..24bcd58 100644
+index a5e17fd5c..8e0dcd64a 100644
 --- a/ui/sdl2-gl.c
 +++ b/ui/sdl2-gl.c
 @@ -205,6 +205,7 @@ void sdl2_gl_scanout_disable(DisplayChangeListener *dcl)
@@ -86,9 +92,9 @@ index aa91f59..24bcd58 100644
      scon->h = 0;
 +    scon->blob = NULL; /* q11-blob-handoff */
      sdl2_set_scanout_mode(scon, false);
- }
- 
-@@ -225,6 +226,13 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+     /*
+      * q11-plane-handoff: nobody flushes a disabled scanout, so the planes come off
+@@ -233,6 +234,13 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
      scon->w = w;
      scon->h = h;
      scon->y0_top = backing_y_0_top;
@@ -102,7 +108,7 @@ index aa91f59..24bcd58 100644
  
      SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
  
-@@ -480,6 +488,7 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+@@ -488,6 +496,7 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
                              qemu_dmabuf_get_width(dmabuf),
                              qemu_dmabuf_get_height(dmabuf),
                              NULL);
@@ -110,7 +116,7 @@ index aa91f59..24bcd58 100644
  
      if (qemu_dmabuf_get_allow_fences(dmabuf)) {
          scon->guest_fb.dmabuf = dmabuf;
-@@ -489,6 +498,14 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+@@ -497,6 +506,14 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
  void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
                              QemuDmaBuf *dmabuf)
  {
@@ -126,10 +132,10 @@ index aa91f59..24bcd58 100644
  }
  
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
-index ae7c292..e7ae32e 100644
+index a8f0715c3..ccdf15f08 100644
 --- a/ui/sdl2-wl-scanout.c
 +++ b/ui/sdl2-wl-scanout.c
-@@ -578,6 +578,14 @@ typedef struct WlPlaneBuf {
+@@ -576,6 +576,14 @@ typedef struct WlPlaneBuf {
      uint32_t res; /* virtio resource (0 = unknown) */
      struct wl_buffer *wb;
      int64_t used;
@@ -144,7 +150,7 @@ index ae7c292..e7ae32e 100644
  } WlPlaneBuf;
  
  static struct {
-@@ -590,6 +598,8 @@ static struct {
+@@ -588,6 +596,8 @@ static struct {
      GPtrArray *cache;
      uint64_t presents, exports, export_fail, evicted;
      uint64_t geom, name_reuse, gone; /* per stats line */
@@ -153,7 +159,7 @@ index ae7c292..e7ae32e 100644
  } pl;
  
  static bool planes_flag(void)
-@@ -615,6 +625,8 @@ static bool plane_in_use(WlPlaneBuf *b)
+@@ -613,6 +623,8 @@ static bool plane_in_use(WlPlaneBuf *b)
      return false;
  }
  
@@ -162,7 +168,7 @@ index ae7c292..e7ae32e 100644
  static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
  {
      int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-@@ -673,6 +685,12 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+@@ -671,6 +683,26 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
          info_report("sdl2: plane-handoff: texture %u %ux%u fourcc %.4s modifier 0x%016" PRIx64
                      " planes %d", tex, w, h, (char *)&fourcc, (uint64_t)mod, np);
      }
@@ -172,10 +178,24 @@ index ae7c292..e7ae32e 100644
 +
 +static void pl_cache_add(WlPlaneBuf *b)
 +{
++    if (wl_display_get_error(wl.dpy)) {
++        /* the connection is dead: no listener will fire, so the waiting entries can go too */
++        for (guint i = pl.cache->len; i-- > 0;) {
++            WlPlaneBuf *o = g_ptr_array_index(pl.cache, i);
++
++            if (!plane_in_use(o)) {
++                if (o->wb) {
++                    wl_buffer_destroy(o->wb);
++                }
++                g_free(o);
++                g_ptr_array_remove_index_fast(pl.cache, i);
++            }
++        }
++    }
      if (pl.cache->len >= WL_PLANE_CACHE) { /* drop the least recently used, not on screen */
          guint lru = 0;
          int64_t t = INT64_MAX;
-@@ -680,33 +698,178 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+@@ -678,21 +710,179 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
          for (guint i = 0; i < pl.cache->len; i++) {
              WlPlaneBuf *o = g_ptr_array_index(pl.cache, i);
  
@@ -277,6 +297,8 @@ index ae7c292..e7ae32e 100644
 +    blob_created, blob_failed,
 +};
 +
++#define WL_PLANE_PENDING_MAX 8 /* guest dma-buf creates weston may owe an answer for */
++
 +static WlPlaneBuf *blob_buf(QemuDmaBuf *dmabuf, uint32_t res)
 +{
 +    int nfds = 0, nstrides = 0, noffsets = 0;
@@ -301,12 +323,32 @@ index ae7c292..e7ae32e 100644
 +    if (!pl.cache) {
 +        pl.cache = g_ptr_array_new();
 +    }
++    /*
++     * The inode names the dma-buf: Linux gives every dma-buf a fresh inode number
++     * from a counter (dma_buf_getfile), so one is not reused while this process runs.
++     */
 +    for (guint i = 0; i < pl.cache->len; i++) {
 +        b = g_ptr_array_index(pl.cache, i);
 +        if (b->ino == st.st_ino && b->w == w && b->h == h && b->fourcc == fourcc &&
 +            b->stride == strides[0]) {
 +            b->used = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 +            return b->ready ? b : NULL;
++        }
++    }
++    /*
++     * A create weston has not answered is its listener's data and cannot be freed, so
++     * only so many may wait: past WL_PLANE_PENDING_MAX this frame is blitted instead.
++     */
++    {
++        guint waiting = 0;
++
++        for (guint i = 0; i < pl.cache->len; i++) {
++            if (((WlPlaneBuf *)g_ptr_array_index(pl.cache, i))->pending) {
++                waiting++;
++            }
++        }
++        if (waiting >= WL_PLANE_PENDING_MAX) {
++            return NULL;
 +        }
 +    }
 +    b = g_new0(WlPlaneBuf, 1);
@@ -332,40 +374,42 @@ index ae7c292..e7ae32e 100644
 +}
 +
 +/*
-+ * The guest unref'd res (virtio-gpu-virgl.c): its buffers are never matched again. A
-+ * guest dma-buf's is freed now unless it is on screen or weston has not answered yet,
-+ * so that weston drops its import of the guest's memory; the rest wait for the LRU.
++ * The guest unref'd res (virtio-gpu-virgl.c): its buffers are never matched again and
++ * are freed now, so that weston drops its import of the guest's memory, unless one is
++ * on screen (the LRU frees it once the plane shows another) or weston has not answered
++ * its create yet (blob_drop_if_gone() frees it with the answer).
 + */
  static void pl_resource_gone(uint32_t res)
  {
      if (!pl.cache) {
-         return;
-     }
--    for (guint i = 0; i < pl.cache->len; i++) {
-+    for (guint i = pl.cache->len; i-- > 0;) {
+@@ -701,18 +891,21 @@ static void pl_resource_gone(uint32_t res)
+     for (guint i = pl.cache->len; i-- > 0;) {
          WlPlaneBuf *b = g_ptr_array_index(pl.cache, i);
  
--        if (b->res == res && b->tex) {
--            b->tex = 0; /* the LRU frees it once it is off screen */
--            pl.gone++;
+-        if (b->res != res || !b->tex) {
 +        if (b->res != res || !(b->tex || b->ino)) {
-+            continue;
+             continue;
          }
-+        pl.gone++;
-+        if (b->ino && !plane_in_use(b) && !b->pending) {
+         pl.gone++;
+-        if (!plane_in_use(b)) {
+-            /* weston's import pins the texture's BO: let it go now, not at the LRU */
+-            wl_buffer_destroy(b->wb);
++        /* texture or guest dma-buf: weston's import pins the BO, so let it go now */
++        if (!plane_in_use(b) && !b->pending) {
 +            if (b->wb) {
 +                wl_buffer_destroy(b->wb);
 +            }
-+            g_free(b);
-+            g_ptr_array_remove_index_fast(pl.cache, i);
-+            continue;
-+        }
-+        b->tex = 0; /* the LRU frees it once it is off screen */
+             g_free(b);
+             g_ptr_array_remove_index_fast(pl.cache, i);
+             continue;
+         }
+-        b->tex = 0; /* on screen: the LRU frees it once the plane shows another buffer */
++        b->tex = 0; /* on screen or unanswered: freed when the plane moves on / weston answers */
 +        b->ino = 0;
      }
  }
  
-@@ -811,13 +974,20 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+@@ -817,13 +1010,20 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
      uint32_t ch = rect ? scon->prim_ch : (scon->h ? scon->h : (uint32_t)wh);
      double fx = (double)ww / cw, fy = (double)wh / ch;
  
@@ -389,7 +433,7 @@ index ae7c292..e7ae32e 100644
      if (!b[0]) {
          return false;
      }
-@@ -856,10 +1026,10 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+@@ -862,10 +1062,10 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
      pl.shown = true;
      if ((pl.presents++ % 600) == 0) {
          info_report("sdl2: plane-handoff: %" PRIu64 " presents, %" PRIu64 " exports (%"
@@ -404,3 +448,19 @@ index ae7c292..e7ae32e 100644
          pl.geom = pl.name_reuse = pl.gone = 0;
      }
      return true;
+@@ -896,7 +1096,14 @@ void sdl2_wl_planes_drop(void)
+         if (plane_in_use(b)) {
+             continue; /* planes_off() came first; a plane still shown keeps its buffer */
+         }
+-        wl_buffer_destroy(b->wb);
++        if (b->pending) { /* the listener's data: blob_drop_if_gone() frees it when weston answers */
++            b->tex = 0;
++            b->ino = 0;
++            continue;
++        }
++        if (b->wb) {
++            wl_buffer_destroy(b->wb);
++        }
+         g_free(b);
+         g_ptr_array_remove_index_fast(pl.cache, i);
+     }

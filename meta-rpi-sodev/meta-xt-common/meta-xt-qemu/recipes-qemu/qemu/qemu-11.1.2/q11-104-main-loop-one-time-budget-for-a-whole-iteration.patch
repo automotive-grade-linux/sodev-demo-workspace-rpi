@@ -198,10 +198,10 @@ index bd46d3527..8d4e6ae31 100644
  
  typedef struct VirtIOBlockReq {
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index 0229a6275..41f2cbdac 100644
+index b4b17860c..7aa309a19 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -255,6 +255,7 @@ struct VirtIOGPU {
+@@ -254,6 +254,7 @@ struct VirtIOGPU {
      int64_t cmdq_submit_ns;
      int64_t cmdq_budget_t0;
      unsigned cmdq_bh_cmds;

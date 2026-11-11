@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 27 Oct 2026 22:42:21 +0900
+Date: Wed, 11 Nov 2026 09:06:50 +0900
 Subject: [PATCH] ui/virtio-media: scan video out on weston planes via ISP or
  SAND
 
@@ -68,9 +68,10 @@ Switches (/run/qemu-*) and their defaults when the file is absent:
     at 2 and the best flip rate at 4.
   - isp-skip-copy: skip the copy into the guest resource while the last
     30 flushes were direct and the last hit is fresher than 100 ms
-    (off). On a miss every skipped copy is made and waited for
-    before the display samples the texture; at most 12 copies are
-    pending.
+    (off). On a miss the skipped copies of the producer that published
+    last are made and waited for before the display samples the
+    texture (one catch-up owner is kept here; q11-081 keeps one per
+    producer); at most 12 copies are pending.
   - sand-scanout: publish the decoder's SAND buffer instead of the ISP
     ring (off). Once weston refuses such a buffer it is not offered
     again. At most 4 guest QBUFs are deferred; beyond that the buffer
@@ -109,7 +110,24 @@ conversion.
 Adds ui/linux-dmabuf-unstable-v1-protocol.c and
 ui/linux-dmabuf-unstable-v1-client-protocol.h, generated with
 wayland-scanner 1.24.0. They are built only when wayland-client is
-found; without it the direct scanout functions are stubs.
+found, and the same meson test defines CONFIG_SDL_WL_SCANOUT, on which
+ui/sdl2-wl-scanout.c is the real thing or its stubs.
+
+Changed in the q11 series (review 2026-11-11): the deferred QBUF of a
+sand-scanout buffer that fails gives the buffer back to the guest with
+V4L2_BUF_FLAG_ERROR instead of leaving it queued on neither side; when
+the GL imports of the ISP ring fail with -EAGAIN (no GL context yet)
+the ISP stays open and only the imports are retried with the next
+frame, instead of the ISP being closed and REQBUFS'd again every frame
+until GL is up; the stub condition of ui/sdl2-wl-scanout.c is the meson
+define above rather than __has_include, so the stubs and the protocol
+code cannot disagree; virtio_media_isp_ring_size(), which nothing
+called, is gone; the per-slot arrays of VirtIOMediaQueue are sized by
+VIRTIO_MEDIA_ISP_MAX_RING rather than a literal 24; the compositor
+refusal message no longer prints a modifier it does not know; and the
+comments give the ring's size (24), the luma rows the ISP is given
+(1088 of a 1632-line column) and the frame-callback depth (4, 1..6) as
+the code has them. The generated protocol files carry an SPDX tag.
 
 Left for later (2026-10-27, Raspberry Pi 4): the CAPTURE ring is
 allocated whole (24 frames, about 88 MB of CMA at 720p) on the main
@@ -125,25 +143,25 @@ Upstream-Status: Inappropriate [Raspberry Pi 4 specific (bcm2835 ISP, SAND, vc4 
 ---
  hw/display/virtio-gpu.c                       |    2 +
  hw/virtio/meson.build                         |    2 +-
- hw/virtio/virtio-media-isp.c                  |  342 ++++++
+ hw/virtio/virtio-media-isp.c                  |  338 +++++
  hw/virtio/virtio-media-virgl-stub.c           |    5 +
  hw/virtio/virtio-media-virgl.c                |   12 +
- hw/virtio/virtio-media.c                      | 1040 +++++++++++++++-
+ hw/virtio/virtio-media.c                      | 1077 +++++++++++++++-
  include/hw/virtio/virtio-gpu.h                |    3 +-
- include/hw/virtio/virtio-media-isp.h          |   51 +
+ include/hw/virtio/virtio-media-isp.h          |   54 +
  include/hw/virtio/virtio-media-virgl.h        |    2 +
- include/hw/virtio/virtio-media.h              |   64 +
+ include/hw/virtio/virtio-media.h              |   65 +
  include/ui/direct-scanout.h                   |   57 +
  include/ui/egl-helpers.h                      |    3 +
  include/ui/sdl2.h                             |    7 +
  ui/direct-scanout.c                           |  125 ++
  ui/egl-helpers.c                              |   85 +-
- ui/linux-dmabuf-unstable-v1-client-protocol.h | 1084 +++++++++++++++++
- ui/linux-dmabuf-unstable-v1-protocol.c        |  120 ++
- ui/meson.build                                |    6 +-
+ ui/linux-dmabuf-unstable-v1-client-protocol.h | 1085 +++++++++++++++++
+ ui/linux-dmabuf-unstable-v1-protocol.c        |  121 ++
+ ui/meson.build                                |   10 +-
  ui/sdl2-gl.c                                  |   75 +-
- ui/sdl2-wl-scanout.c                          |  558 +++++++++
- 20 files changed, 3623 insertions(+), 20 deletions(-)
+ ui/sdl2-wl-scanout.c                          |  556 +++++++++
+ 20 files changed, 3664 insertions(+), 20 deletions(-)
  create mode 100644 hw/virtio/virtio-media-isp.c
  create mode 100644 include/hw/virtio/virtio-media-isp.h
  create mode 100644 include/ui/direct-scanout.h
@@ -180,10 +198,10 @@ index 0ecc6d4d9..4c88c28a9 100644
  # so virtio-media.c needs no #ifdef and a build without ffmpeg still links.
 diff --git a/hw/virtio/virtio-media-isp.c b/hw/virtio/virtio-media-isp.c
 new file mode 100644
-index 000000000..ebf6ade43
+index 000000000..7ef588556
 --- /dev/null
 +++ b/hw/virtio/virtio-media-isp.c
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,338 @@
 +/*
 + * virtio-media: host-isp -- convert the codec's NV12 CAPTURE frames to RGBA with the
 + * VideoCore ISP (bcm2835-codec-isp, an M2M device) instead of the GL shader, so V3D
@@ -231,7 +249,7 @@ index 000000000..ebf6ade43
 +    uint32_t src_in_flight;
 +};
 +
-+/* CmaFree from /proc/meminfo in kB, or -1: the ring is 4-6 x 3.7 MB of the CMA pool */
++/* CmaFree from /proc/meminfo in kB, or -1: the ring (VIRTIO_MEDIA_ISP_RING) is 24 x 3.7 MB of the CMA pool */
 +static long isp_cma_free_kb(void)
 +{
 +    g_autofree char *mi = NULL;
@@ -335,7 +353,8 @@ index 000000000..ebf6ade43
 +     * NV12, or NV12_COL128 (SAND, the codec's native output: 11.2 ms per 1080p frame on the
 +     * VPU instead of 15 ms with the firmware's NV12 conversion). For SAND, bytesperline is
 +     * the column height in lines and must be at least height * 3 / 2, so the caller passes
-+     * the visible luma rows (1080 for a 1620-line column), not the padded 1088.
++     * the luma rows of the column (virtio_media_sand_luma_rows: 1088 for a 1632-line
++     * column); the visible 1080 are the crop.
 +     */
 +    r = isp_set_fmt(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, src_fourcc, src_w,
 +                    src_h, src_bpl, src_len, matrix, false, &bpl, &size);
@@ -421,11 +440,6 @@ index 000000000..ebf6ade43
 +uint32_t virtio_media_isp_in_flight(VirtIOMediaIsp *isp)
 +{
 +    return isp->cap_in_flight + isp->src_in_flight;
-+}
-+
-+uint32_t virtio_media_isp_ring_size(VirtIOMediaIsp *isp)
-+{
-+    return isp->nring;
 +}
 +
 +int virtio_media_isp_ring_fd(VirtIOMediaIsp *isp, uint32_t k, uint32_t *len)
@@ -543,10 +557,10 @@ index 307a4fafc..d8326d7cf 100644
  {
      return -ENOTSUP;
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index 6baf08ce4..fa9096583 100644
+index 876a12b85..16db48e86 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -888,6 +888,18 @@ out_fail:
+@@ -898,6 +898,18 @@ out_fail:
      return NULL;
  }
  
@@ -566,21 +580,24 @@ index 6baf08ce4..fa9096583 100644
  {
      VirtIOMediaGpuBuf *b = handle;
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index f6c590ae6..e4f52002b 100644
+index 1e3904cae..da80bf033 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -25,6 +25,10 @@
+@@ -25,9 +25,13 @@
  #include "hw/virtio/virtio-media.h"
  #include "hw/virtio/virtio-gpu.h"
  #include "hw/virtio/virtio-media-virgl.h"
 +#include "hw/virtio/virtio-media-isp.h"
 +#include "ui/direct-scanout.h"
-+
-+static void virtio_media_isp_teardown(VirtIOMediaQueue *q);
  #include "standard-headers/linux/virtio_ids.h"
  #include "system/dma.h"
  
-@@ -171,6 +175,9 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
++static void virtio_media_isp_teardown(VirtIOMediaQueue *q);
++
+ /* ------------------------------------------------------------------------- */
+ /* ioctl code table                                                          */
+ /* ------------------------------------------------------------------------- */
+@@ -169,6 +173,9 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
      q->num_host_planes = 0;
      q->streaming = false;
      q->gpu_failed = false;
@@ -590,7 +607,7 @@ index f6c590ae6..e4f52002b 100644
      g_free(q->conv_scratch);
      q->conv_scratch = NULL;
      q->conv_scratch_len = 0;
-@@ -266,6 +273,23 @@ static inline bool virtio_media_pf_is_host_yuv(uint32_t pf)
+@@ -264,6 +271,23 @@ static inline bool virtio_media_pf_is_host_yuv(uint32_t pf)
  }
  
  /* host-sand: remember whether the host frame is SAND, and its column height. */
@@ -614,7 +631,7 @@ index f6c590ae6..e4f52002b 100644
  static void virtio_media_note_sand(VirtIOMediaQueue *q, const struct v4l2_format *f)
  {
      q->sand = virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_NV12_COL128;
-@@ -421,12 +445,48 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
+@@ -419,12 +443,48 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
   * because one QEMU serves every DomA virtio device, would take the guest's
   * rootfs disk down with it.
   */
@@ -663,7 +680,7 @@ index f6c590ae6..e4f52002b 100644
      for (i = 0; i < sg->nents && done < host_len; i++) {
          hwaddr gpa = sg->ents[i].start;
          size_t remaining = sg->ents[i].len;
-@@ -518,6 +578,843 @@ void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
+@@ -521,6 +581,880 @@ void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
   * first frame with nothing in the log to say why.
   */
  /* Called only when POLLPRI is set. Drains every pending V4L2 event. */
@@ -691,7 +708,6 @@ index f6c590ae6..e4f52002b 100644
 + */
 +#define VIRTIO_MEDIA_ISP_RING 24
 +QEMU_BUILD_BUG_ON(VIRTIO_MEDIA_ISP_RING > VIRTIO_MEDIA_ISP_MAX_RING);
-+QEMU_BUILD_BUG_ON(ARRAY_SIZE(((VirtIOMediaQueue *)0)->isp_gpu) < VIRTIO_MEDIA_ISP_MAX_RING);
 +
 +/* a held frame whose ISP side has not gone ready by then is given up (see _frame) */
 +#define VIRTIO_MEDIA_ISP_STALL_NS (250 * SCALE_MS)
@@ -793,8 +809,34 @@ index f6c590ae6..e4f52002b 100644
 +        hb.m.planes = q->sand_hp[idx];
 +    }
 +    if (ioctl(s->fd, VIDIOC_QBUF, &hb) < 0) {
++        /*
++         * The buffer is on neither side now: give it back to the guest with
++         * V4L2_BUF_FLAG_ERROR, as a host DQBUF with the error flag would (not
++         * VIRTIO_MEDIA_EVT_ERROR, on which the guest driver frees the session).
++         */
++        struct virtio_media_event_dqbuf evt = {
++            .hdr = { .event = VIRTIO_MEDIA_EVT_DQBUF, .session_id = s->id },
++        };
++
 +        q->sand_qbuf_err++;
 +        warn_report_once("virtio-media: sand-scanout: deferred QBUF %u failed (%d)", idx, errno);
++        evt.buffer = hb;
++        evt.buffer.flags = (hb.flags & ~(V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_DONE)) |
++                           V4L2_BUF_FLAG_ERROR;
++        evt.buffer.bytesused = 0;
++        evt.buffer.memory = V4L2_MEMORY_USERPTR;
++        memset(&evt.buffer.m, 0, sizeof(evt.buffer.m));
++        if (V4L2_TYPE_IS_MULTIPLANAR(hb.type)) {
++            uint32_t p;
++
++            for (p = 0; p < MIN(hb.length, VIDEO_MAX_PLANES); p++) {
++                evt.planes[p] = q->sand_hp[idx][p];
++                evt.planes[p].bytesused = 0;
++                memset(&evt.planes[p].m, 0, sizeof(evt.planes[p].m));
++            }
++        }
++        q->guest[idx].queued = false;
++        virtio_media_send_event(s->vm, &evt, sizeof(evt));
 +        return;
 +    }
 +    q->sand_hostq[idx] = true;
@@ -1370,23 +1412,31 @@ index f6c590ae6..e4f52002b 100644
 +     * rows (where the chroma starts) as its height. A padded column (q11-sand-stride,
 +     * 720p: 1152) keeps the stream's luma rows (720) in q->sand_luma.
 +     */
-+    q->isp = virtio_media_isp_open(q->sand ? V4L2_PIX_FMT_NV12_COL128 : V4L2_PIX_FMT_NV12,
-+                                   q->width,
-+                                   q->sand ? (q->sand_luma ? q->sand_luma
-+                                              : virtio_media_sand_luma_rows(q->sand_col_height))
-+                                           : q->height,
-+                                   q->sand ? q->sand_col_height : q->bytesperline, src_used,
-+                                   dst_w, dst_h, dst_bpl,
-+                                   q->host_vis_w, q->host_vis_h, q->guest_vis_w,
-+                                   q->guest_vis_h, q->matrix, q->num_bufs,
-+                                   VIRTIO_MEDIA_ISP_RING, &e);
 +    if (!q->isp) {
-+        return e ? e : -EIO;
++        q->isp = virtio_media_isp_open(q->sand ? V4L2_PIX_FMT_NV12_COL128
++                                               : V4L2_PIX_FMT_NV12,
++                                       q->width,
++                                       q->sand ? (q->sand_luma ? q->sand_luma
++                                                  : virtio_media_sand_luma_rows(q->sand_col_height))
++                                               : q->height,
++                                       q->sand ? q->sand_col_height : q->bytesperline,
++                                       src_used, dst_w, dst_h, dst_bpl,
++                                       q->host_vis_w, q->host_vis_h, q->guest_vis_w,
++                                       q->guest_vis_h, q->matrix, q->num_bufs,
++                                       VIRTIO_MEDIA_ISP_RING, &e);
++        if (!q->isp) {
++            return e ? e : -EIO;
++        }
 +    }
++    /* An import that failed with -EAGAIN last time (no GL yet) is tried again here. */
 +    for (k = 0; k < VIRTIO_MEDIA_ISP_RING; k++) {
 +        uint32_t len = 0;
-+        int fd = virtio_media_isp_ring_fd(q->isp, k, &len);
++        int fd;
 +
++        if (q->isp_gpu[k]) {
++            continue;
++        }
++        fd = virtio_media_isp_ring_fd(q->isp, k, &len);
 +        if (fd >= 0) {
 +            fd = fcntl(fd, F_DUPFD_CLOEXEC, 0); /* the import owns its fd */
 +        }
@@ -1422,11 +1472,15 @@ index f6c590ae6..e4f52002b 100644
 +        r = -EINVAL;
 +        goto fail;
 +    }
-+    if (!q->isp) {
++    /* isp_gpu[] is filled in slot order, so the last slot says whether the imports are done */
++    if (!q->isp || !q->isp_gpu[VIRTIO_MEDIA_ISP_RING - 1]) {
 +        r = virtio_media_isp_start(s, q, src_used, dst_w, dst_h, dst_bpl);
 +        if (r == -EAGAIN) {
-+            /* no GL context yet: this frame takes the GL path, try again next frame */
-+            virtio_media_isp_teardown(q);
++            /*
++             * No GL context yet: this frame takes the GL path. The ISP stays
++             * open with its ring (open and REQBUFS are not repeated); only
++             * the GL imports are tried again with the next frame.
++             */
 +            return r;
 +        }
 +        if (r) {
@@ -1507,7 +1561,7 @@ index f6c590ae6..e4f52002b 100644
  static void virtio_media_drain_events(VirtIOMediaSession *s)
  {
      for (;;) {
-@@ -703,6 +1600,8 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -706,6 +1640,8 @@ static void virtio_media_host_readable_body(void *opaque)
               * copied into the guest pages the guest gave us at QBUF time
               * before the guest is told the buffer is done.
               */
@@ -1516,7 +1570,7 @@ index f6c590ae6..e4f52002b 100644
              if (i == 1) {
                  for (p = 0; p < gb->num_planes; p++) {
                      size_t used = q->mplane ? evt.planes[p].bytesused
-@@ -740,6 +1639,29 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -743,6 +1679,29 @@ static void virtio_media_host_readable_body(void *opaque)
                                     (!q->nv12_host || q->sand ||
                                      q->bytesperline >= q->width);
  
@@ -1546,15 +1600,15 @@ index f6c590ae6..e4f52002b 100644
                      if (vm->gpu_xfer && gb->virgl_res && p == 0 &&
                          gb->num_planes == 1 && geom_ok && !q->gpu_failed) {
                          uint32_t idx = evt.buffer.index;
-@@ -769,14 +1691,15 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -772,14 +1731,15 @@ static void virtio_media_host_readable_body(void *opaque)
  
                                      /*
                                       * host-sand: a column is luma_rows lines of
 -                                     * Y then luma_rows / 2 of CbCr, 128 bytes
 -                                     * each, so luma_rows = col_height * 2 / 3
--                                     * (1620 -> 1080 for a 1088-line 1080p
--                                     * frame: the codec's SAND carries the
--                                     * visible rows only).
+-                                     * (1632 -> 1088 for 1080p: the codec pads
+-                                     * the frame to ALIGN(h, 16) lines and the
+-                                     * column is 3 / 2 of that).
 +                                     * Y then the CbCr lines, 128 bytes each;
 +                                     * luma_rows comes from the column height
 +                                     * (virtio_media_sand_luma_rows: 1632 ->
@@ -1568,7 +1622,7 @@ index f6c590ae6..e4f52002b 100644
  
                                      if (q->sand && vm->host_sand == 2) {
                                          q->gpu_buf[idx] =
-@@ -956,6 +1879,20 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -977,6 +1937,20 @@ static void virtio_media_host_readable_body(void *opaque)
                      memset(&evt.planes[p].m, 0, sizeof(evt.planes[p].m));
                  }
              }
@@ -1589,7 +1643,7 @@ index f6c590ae6..e4f52002b 100644
              virtio_media_send_event(vm, &evt, sizeof(evt));
          }
      }
-@@ -1306,6 +2243,9 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+@@ -1329,6 +2303,9 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
                  q->height = fmt.fmt.pix.height;
                  q->bytesperline = fmt.fmt.pix.bytesperline;
              }
@@ -1599,7 +1653,7 @@ index f6c590ae6..e4f52002b 100644
              /*
               * host-nv12 is armed by S_FMT; confirm the host really is NV12
               * now (a later S_FMT to something else would have cleared it).
-@@ -1516,6 +2456,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -1544,6 +2521,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
          return ret;
      }
      nplanes = gb->num_planes;
@@ -1612,7 +1666,7 @@ index f6c590ae6..e4f52002b 100644
  
      /*
       * An output buffer carries the bitstream the guest just wrote, so it has to
-@@ -1568,13 +2514,22 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -1596,13 +2579,22 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
              hb.m.offset = 0;
              hb.length = q->host_len[b->index][0];
          }
@@ -1635,7 +1689,7 @@ index f6c590ae6..e4f52002b 100644
      gb->queued = true;
  
      /* A queue got a buffer: the fd can become readable again, re-arm it. */
-@@ -1717,6 +2672,29 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1745,6 +2737,29 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
                      virtio_media_fmt_get_size(f, &guest_w, &guest_h);
                      virtio_media_fmt_set_size(f, q->host_w, q->host_h);
                  }
@@ -1665,7 +1719,7 @@ index f6c590ae6..e4f52002b 100644
              }
          }
          /* What the first attempt sends: a failing S_FMT/TRY_FMT may rewrite fields. */
-@@ -1732,6 +2710,38 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1760,6 +2775,38 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
              virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
              fmt_rc = ioctl(s->fd, code, payload);
          }
@@ -1704,7 +1758,7 @@ index f6c590ae6..e4f52002b 100644
          if (fmt_rc < 0) {
              int err = errno;
  
-@@ -1785,6 +2795,15 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1819,6 +2866,15 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
          struct v4l2_rect *r = &sel->r;
  
          q = &s->queues[virtio_media_queue_index(sel->type)];
@@ -1720,7 +1774,7 @@ index f6c590ae6..e4f52002b 100644
          if (q->nv12_host && q->scaled_w && q->host_w && q->host_h) {
              r->left = virtio_media_scale_coord(r->left, q->scaled_w, q->host_w);
              r->top = virtio_media_scale_coord(r->top, q->scaled_w, q->host_w);
-@@ -1793,6 +2812,10 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1827,6 +2883,10 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
              r->height = virtio_media_scale_coord(r->height, q->scaled_w,
                                                   q->host_w);
          }
@@ -1731,7 +1785,7 @@ index f6c590ae6..e4f52002b 100644
      }
  
      if (!ret && code == VIDIOC_QUERYBUF) {
-@@ -1825,6 +2848,11 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1859,6 +2919,11 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
              for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
                  q->guest[i].queued = false;
              }
@@ -1744,10 +1798,10 @@ index f6c590ae6..e4f52002b 100644
          virtio_media_update_fd_handler(s);
      }
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index 7970bdb12..07d0401c4 100644
+index d4d5ca497..a5112f31c 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -176,7 +176,8 @@ bool qemu_lat_diag(void);
+@@ -175,7 +175,8 @@ bool qemu_lat_diag(void);
  void qemu_lat_diag_add(int kind, int64_t ns);
  enum {
      LAT_GPU_FLUSH_Q, LAT_GPU_FLUSH, LAT_GPU_FLUSH_FENCED, LAT_GPU_SCANOUT,
@@ -1759,10 +1813,10 @@ index 7970bdb12..07d0401c4 100644
  struct VirtIOGPUBase {
 diff --git a/include/hw/virtio/virtio-media-isp.h b/include/hw/virtio/virtio-media-isp.h
 new file mode 100644
-index 000000000..e638b8ab6
+index 000000000..00414be89
 --- /dev/null
 +++ b/include/hw/virtio/virtio-media-isp.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +/*
 + * virtio-media: host-isp, see hw/virtio/virtio-media-isp.c.
 + *
@@ -1776,7 +1830,11 @@ index 000000000..e638b8ab6
 +#define V4L2_PIX_FMT_NV12_COL128 v4l2_fourcc('N', 'C', '1', '2')
 +#endif
 +
-+/* ISP CAPTURE ring size limit: 6 x 3.7 MB of CMA at 1280x726 RGBA */
++/*
++ * ISP CAPTURE ring size limit; the ring itself (VIRTIO_MEDIA_ISP_RING in virtio-media.c)
++ * is 24 slots of 3.7 MB of CMA at 1280x726 RGBA. Sizes the per-slot arrays of
++ * VirtIOMediaQueue as well.
++ */
 +#define VIRTIO_MEDIA_ISP_MAX_RING 24
 +
 +typedef struct VirtIOMediaIsp VirtIOMediaIsp;
@@ -1796,7 +1854,6 @@ index 000000000..e638b8ab6
 +                                      uint32_t nsrc, uint32_t nring, int *err);
 +int virtio_media_isp_fd(VirtIOMediaIsp *isp);
 +uint32_t virtio_media_isp_in_flight(VirtIOMediaIsp *isp);
-+uint32_t virtio_media_isp_ring_size(VirtIOMediaIsp *isp);
 +/* the dmabuf of ring buffer k (owned by the ISP: dup() it to keep it) and its length */
 +int virtio_media_isp_ring_fd(VirtIOMediaIsp *isp, uint32_t k, uint32_t *len);
 +/* convert codec buffer src_index (dmabuf src_fd) into ring buffer ring_index */
@@ -1828,10 +1885,18 @@ index 23a7a647c..701595d1e 100644
  /*
   * gpu-fence-fd: track the GPU copy with an EGL_ANDROID_native_fence_sync fd so
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index b050ca0de..2db633c01 100644
+index b0386272d..be70e4517 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -224,6 +224,12 @@ typedef struct VirtIOMediaQueue {
+@@ -52,6 +52,7 @@
+ #include "hw/virtio/virtio.h"
+ #include "qom/object.h"
+ #include "qemu/queue.h"
++#include "hw/virtio/virtio-media-isp.h"   /* VIRTIO_MEDIA_ISP_MAX_RING */
+ 
+ #define TYPE_VIRTIO_MEDIA "virtio-media-device"
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMedia, VIRTIO_MEDIA)
+@@ -226,6 +227,12 @@ typedef struct VirtIOMediaQueue {
       */
      bool sand;
      uint32_t sand_col_height;
@@ -1844,7 +1909,7 @@ index b050ca0de..2db633c01 100644
      uint32_t rgba_bytesperline;
      uint32_t rgba_sizeimage;
      uint32_t host_sizeimage;
-@@ -242,6 +248,64 @@ typedef struct VirtIOMediaQueue {
+@@ -244,6 +251,64 @@ typedef struct VirtIOMediaQueue {
      uint8_t *conv_scratch;
      size_t conv_scratch_len;
      uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
@@ -1863,23 +1928,23 @@ index b050ca0de..2db633c01 100644
 +    int isp_src_fd[VIRTIO_MEDIA_MAX_BUFFERS];
 +    bool isp_src_busy[VIRTIO_MEDIA_MAX_BUFFERS];
 +    QEMUTimer *isp_timer;
-+    void *isp_gpu[24];
-+    bool isp_ring_busy[24];
-+    uint32_t isp_ring_res[24];
-+    int64_t isp_t[24];
++    void *isp_gpu[VIRTIO_MEDIA_ISP_MAX_RING];
++    bool isp_ring_busy[VIRTIO_MEDIA_ISP_MAX_RING];
++    uint32_t isp_ring_res[VIRTIO_MEDIA_ISP_MAX_RING];
++    int64_t isp_t[VIRTIO_MEDIA_ISP_MAX_RING];
 +    uint32_t isp_ring_next;
 +    GQueue isp_fifo;
 +    uint64_t isp_frames;
 +    uint64_t isp_ring_full;
 +    /* isp-scanout: the display holds the buffer / content generation per slot */
-+    bool isp_ring_held[24];
-+    uint64_t isp_ring_seq[24];
++    bool isp_ring_held[VIRTIO_MEDIA_ISP_MAX_RING];
++    uint64_t isp_ring_seq[VIRTIO_MEDIA_ISP_MAX_RING];
 +    uint64_t isp_seq;
 +    uint64_t isp_epoch;
 +    uint32_t isp_dst_h, isp_dst_bpl;
 +    uint64_t isp_scan_stale, isp_scan_off;
 +    /* q11-isp-skip-copy: slots whose copy into isp_ring_res was skipped (kept for it) */
-+    bool isp_ring_pending[24];
++    bool isp_ring_pending[VIRTIO_MEDIA_ISP_MAX_RING];
 +    uint32_t isp_pending_n;
 +    uint64_t isp_skip_n, isp_lazy_n, isp_rel_n, isp_skip_cap_n;
 +    /*
@@ -1887,7 +1952,7 @@ index b050ca0de..2db633c01 100644
 +     * content generation, whether the host decoder has it (QBUF), whether the display holds it,
 +     * and the guest's QBUF deferred until the display lets go
 +     */
-+    uint32_t isp_ring_src[24];
++    uint32_t isp_ring_src[VIRTIO_MEDIA_ISP_MAX_RING];
 +    uint64_t sand_seq[VIRTIO_MEDIA_MAX_BUFFERS];
 +    bool sand_hostq[VIRTIO_MEDIA_MAX_BUFFERS];
 +    bool sand_held[VIRTIO_MEDIA_MAX_BUFFERS];
@@ -1987,7 +2052,7 @@ index 405ddd912..aef572896 100644
  void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int h);
  
 diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
-index 6509ef967..524024b33 100644
+index 08ec0b0e1..6e24d881a 100644
 --- a/include/ui/sdl2.h
 +++ b/include/ui/sdl2.h
 @@ -85,6 +85,13 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
@@ -2246,10 +2311,11 @@ index d689f187c..5e7eb5bdf 100644
      x2 = x1 + w;
 diff --git a/ui/linux-dmabuf-unstable-v1-client-protocol.h b/ui/linux-dmabuf-unstable-v1-client-protocol.h
 new file mode 100644
-index 000000000..88bcc1110
+index 000000000..d1c43095a
 --- /dev/null
 +++ b/ui/linux-dmabuf-unstable-v1-client-protocol.h
-@@ -0,0 +1,1084 @@
+@@ -0,0 +1,1085 @@
++/* SPDX-License-Identifier: MIT */
 +/* Generated by wayland-scanner 1.24.0 */
 +
 +#ifndef LINUX_DMABUF_UNSTABLE_V1_CLIENT_PROTOCOL_H
@@ -3336,10 +3402,11 @@ index 000000000..88bcc1110
 +#endif
 diff --git a/ui/linux-dmabuf-unstable-v1-protocol.c b/ui/linux-dmabuf-unstable-v1-protocol.c
 new file mode 100644
-index 000000000..d03908384
+index 000000000..b1989c25d
 --- /dev/null
 +++ b/ui/linux-dmabuf-unstable-v1-protocol.c
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
++/* SPDX-License-Identifier: MIT */
 +/* Generated by wayland-scanner 1.24.0 */
 +
 +/*
@@ -3461,7 +3528,7 @@ index 000000000..d03908384
 +};
 +
 diff --git a/ui/meson.build b/ui/meson.build
-index d345f6c70..eba6602cd 100644
+index d345f6c70..615bae7fd 100644
 --- a/ui/meson.build
 +++ b/ui/meson.build
 @@ -59,6 +59,7 @@ system_ss.add(files(
@@ -3472,15 +3539,19 @@ index d345f6c70..eba6602cd 100644
  ))
  system_ss.add(ui)
  system_ss.add(when: pixman, if_true: files('console-vc.c'), if_false: files('console-vc-stubs.c'))
-@@ -168,7 +169,10 @@ if sdl.found()
+@@ -168,7 +169,14 @@ if sdl.found()
      'sdl2-input.c',
      'sdl2.c',
    ))
 -  sdl_ss.add(when: opengl, if_true: files('sdl2-gl.c'))
 +  sdl_ss.add(when: opengl, if_true: files('sdl2-gl.c', 'sdl2-wl-scanout.c'))
++  # q11-isp-scanout: sdl2-wl-scanout.c is its stubs unless CONFIG_SDL_WL_SCANOUT is
++  # defined, and that is defined here by the test that adds the protocol code, so
++  # the two cannot disagree.
 +  sdl_wayland = dependency('wayland-client', required: false)
 +  sdl_ss.add(when: [opengl, sdl_wayland],
-+             if_true: [sdl_wayland, files('linux-dmabuf-unstable-v1-protocol.c')])
++             if_true: [sdl_wayland, files('linux-dmabuf-unstable-v1-protocol.c'),
++                       declare_dependency(compile_args: '-DCONFIG_SDL_WL_SCANOUT')])
    sdl_ss.add(when: x11, if_true: files('x_keymap.c'))
    ui_modules += {'sdl' : sdl_ss}
  endif
@@ -3597,10 +3668,10 @@ index 62a65dcaf..8b00001c3 100644
  
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
 new file mode 100644
-index 000000000..79f106d09
+index 000000000..28be48185
 --- /dev/null
 +++ b/ui/sdl2-wl-scanout.c
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,556 @@
 +/*
 + * q11-isp-scanout: present a published dmabuf (host-isp's CMA ring)
 + * straight on the SDL window's wl_surface, so weston can put it on a vc4 plane instead of
@@ -3614,7 +3685,8 @@ index 000000000..79f106d09
 + * Pacing: the guest's flushes come in bunches (2 in one vblank, none in the next); weston
 + * shows only the last buffer committed before its repaint, so with a commit per flush the
 + * HDMI got 45 flips/s of ~57 guest frames (2026-10-07). A commit therefore waits for the
-+ * previous one's wl_surface.frame done; up to 2 frames wait, the oldest is dropped.
++ * previous one's wl_surface.frame done; up to WL_SCAN_QUEUE_DEFAULT frames wait (4;
++ * /run/qemu-isp-scanout-depth sets 1..6), the oldest is dropped.
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later
 + */
@@ -3626,7 +3698,7 @@ index 000000000..79f106d09
 +#include "ui/sdl2.h"
 +#include "ui/direct-scanout.h"
 +
-+#if __has_include(<wayland-client.h>) && __has_include(<SDL_syswm.h>)
++#ifdef CONFIG_SDL_WL_SCANOUT /* ui/meson.build: wayland-client found */
 +#include <SDL_syswm.h>
 +#include <wayland-client.h>
 +#include "linux-dmabuf-unstable-v1-client-protocol.h"
@@ -3638,9 +3710,7 @@ index 000000000..79f106d09
 + * 4). Each waiting frame holds a ring slot (24); the guest's own backlog needs ~11.
 + */
 +#define WL_SCAN_QUEUE 6
-+#ifndef WL_SCAN_QUEUE_DEFAULT /* the host test builds with others */
 +#define WL_SCAN_QUEUE_DEFAULT 4
-+#endif
 +/* a frame callback weston never answers (window hidden): give up on it after this */
 +#define WL_SCAN_FRAME_TIMEOUT_NS (50 * SCALE_MS)
 +
@@ -3851,9 +3921,8 @@ index 000000000..79f106d09
 +    b->failed = true;
 +    zwp_linux_buffer_params_v1_destroy(params);
 +    direct_scanout_sand_set_failed();
-+    warn_report("sdl2: isp-scanout: the compositor refused a %.4s buffer %ux%u "
-+                "(modifier 0x%016" PRIx64 "): direct SAND scanout off", (char *)&b->fourcc,
-+                b->w, b->h, (uint64_t)0);
++    warn_report("sdl2: isp-scanout: the compositor refused a %.4s buffer %ux%u: "
++                "direct SAND scanout off", (char *)&b->fourcc, b->w, b->h);
 +    if (b->dead) {
 +        buf_free(b);
 +    }

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 5 Oct 2026 16:22:19 +0900
+Date: Wed, 11 Nov 2026 09:04:58 +0900
 Subject: [PATCH] virtio-media: host-sand=2 detiles SAND in the shader from a
  linear view
 
@@ -27,16 +27,23 @@ realize() refuses host-sand values other than 0, 1 and 2, and warns when
 host-sand is set without host-nv12=on and gpu-xfer=on, where it has no
 effect.
 
+The GPU buffer no longer stores stride and len (q11-032, review
+2026-11-11).
+
+The else branch of the import (the NV12 import that host-sand=2 does not
+take) is braced, as qemu's style asks even for one statement (review
+2026-11-11).
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on this layer's virtio-media device and RPi4 codec]
 ---
  hw/virtio/virtio-media-virgl-stub.c    |  13 ++
- hw/virtio/virtio-media-virgl.c         | 168 +++++++++++++++++++++++++
- hw/virtio/virtio-media.c               |  20 ++-
+ hw/virtio/virtio-media-virgl.c         | 166 +++++++++++++++++++++++++
+ hw/virtio/virtio-media.c               |  43 +++++--
  include/hw/virtio/virtio-media-virgl.h |  11 ++
  include/hw/virtio/virtio-media.h       |   4 +-
- 5 files changed, 214 insertions(+), 2 deletions(-)
+ 5 files changed, 224 insertions(+), 13 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
 index 08b4b2cb6..307a4fafc 100644
@@ -63,10 +70,10 @@ index 08b4b2cb6..307a4fafc 100644
  {
      return -ENOTSUP;
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index 0caf7f4f0..41bc35cae 100644
+index c28e38471..e2764e548 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -79,6 +79,9 @@ typedef struct VirtIOMediaGpuBuf {
+@@ -80,6 +80,9 @@ typedef struct VirtIOMediaGpuBuf {
      GLuint tex_uv;
      int matrix;
      bool sand;                /* planes are SAND128 external textures (host-sand) */
@@ -76,7 +83,7 @@ index 0caf7f4f0..41bc35cae 100644
  } VirtIOMediaGpuBuf;
  
  #define VM_DRM_FORMAT_R8    0x20203852u   /* 'R8  ' */
-@@ -117,6 +120,10 @@ static struct {
+@@ -118,6 +121,10 @@ static struct {
      GLuint prog_ext;
      GLint e_y, e_uv, e_src_size, e_scale, e_yoff, e_yscale, e_coef;
      bool prog_ext_failed;
@@ -87,7 +94,7 @@ index 0caf7f4f0..41bc35cae 100644
  } gpu;
  
  typedef struct GpuSaved {
-@@ -398,6 +405,55 @@ static const char *nv12_fs_ext =
+@@ -414,6 +421,55 @@ static const char *nv12_fs_ext =
      "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
      "}\n";
  
@@ -143,7 +150,7 @@ index 0caf7f4f0..41bc35cae 100644
  static GLuint gpu_compile(GLenum type, const char *src)
  {
      GLuint sh = glCreateShader(type);
-@@ -449,6 +505,31 @@ static GLuint gpu_link_nv12_program(const char *fs_src)
+@@ -465,6 +521,31 @@ static GLuint gpu_link_nv12_program(const char *fs_src)
      return prog;
  }
  
@@ -175,7 +182,7 @@ index 0caf7f4f0..41bc35cae 100644
  static bool gpu_build_nv12_program(bool ext)
  {
      GLuint p;
-@@ -562,6 +643,71 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+@@ -576,6 +657,69 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
      return b;
  }
  
@@ -226,8 +233,6 @@ index 0caf7f4f0..41bc35cae 100644
 +    b->luma_rows = luma_rows;
 +    b->scale_x = scale;
 +    b->scale_y = scale;
-+    b->stride = 2048;
-+    b->len = len;
 +    b->matrix = matrix;
 +    b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_ABGR8888, 512, len / 2048,
 +                              2048, 0, false, VM_DRM_FORMAT_MOD_LINEAR, false);
@@ -247,7 +252,7 @@ index 0caf7f4f0..41bc35cae 100644
  /* Draw the NV12 planes into the destination texture. Context is current. */
  static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
  {
-@@ -606,6 +752,28 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+@@ -620,6 +764,28 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
       * linear NV12 (host-sand falls back when the codec refuses), and import only built the
       * program of the buffer it imported.
       */
@@ -277,13 +282,24 @@ index 0caf7f4f0..41bc35cae 100644
          glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
          return -EIO;
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 48971cd50..b1c88105a 100644
+index 22dfac63e..b087173f8 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -778,6 +778,15 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -781,17 +781,27 @@ static void virtio_media_host_readable_body(void *opaque)
                                      uint32_t luma_rows = q->sand
                                          ? q->sand_col_height * 2 / 3 : q->height;
  
+-                                    q->gpu_buf[idx] =
+-                                        virtio_media_gpu_import_nv12(
+-                                            eb.fd, q->width, luma_rows,
+-                                            q->sand ? q->width : q->bytesperline,
+-                                            q->sand ? luma_rows * 128
+-                                                    : q->bytesperline * q->height,
+-                                            dst_bpl / 4, dst_h, scale,
+-                                            q->host_len[idx][p],
+-                                            q->matrix,
+-                                            q->sand ? q->sand_col_height : 0,
+-                                            &e);
 +                                    if (q->sand && vm->host_sand == 2) {
 +                                        q->gpu_buf[idx] =
 +                                            virtio_media_gpu_import_sand_linear(
@@ -292,11 +308,23 @@ index 48971cd50..b1c88105a 100644
 +                                                dst_bpl / 4, dst_h, scale,
 +                                                q->host_len[idx][p], q->matrix,
 +                                                &e);
-+                                    } else
-                                     q->gpu_buf[idx] =
-                                         virtio_media_gpu_import_nv12(
-                                             eb.fd, q->width, luma_rows,
-@@ -2107,6 +2116,15 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
++                                    } else {
++                                        q->gpu_buf[idx] =
++                                            virtio_media_gpu_import_nv12(
++                                                eb.fd, q->width, luma_rows,
++                                                q->sand ? q->width : q->bytesperline,
++                                                q->sand ? luma_rows * 128
++                                                        : q->bytesperline * q->height,
++                                                dst_bpl / 4, dst_h, scale,
++                                                q->host_len[idx][p],
++                                                q->matrix,
++                                                q->sand ? q->sand_col_height : 0,
++                                                &e);
++                                    }
+                                 } else {
+                                     q->gpu_buf[idx] = virtio_media_gpu_import(
+                                             eb.fd, q->bytesperline / 4,
+@@ -2140,6 +2150,15 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
          warn_report("virtio-media: host-max-width has no effect without "
                      "host-nv12=on and gpu-xfer=on, or in decoder mode");
      }
@@ -312,7 +340,7 @@ index 48971cd50..b1c88105a 100644
  
      /*
       * Decoder mode needs no host device, so v4l2-device is not required there;
-@@ -2236,7 +2254,7 @@ static const Property virtio_media_properties[] = {
+@@ -2269,7 +2288,7 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
      DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
@@ -344,10 +372,10 @@ index 3552dbf0a..23a7a647c 100644
  int virtio_media_gpu_wait(void *handle);
  /*
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 0794b067c..b050ca0de 100644
+index 70543787d..b0386272d 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -327,8 +327,10 @@ struct VirtIOMedia {
+@@ -331,8 +331,10 @@ struct VirtIOMedia {
       * host-sand (needs host-nv12 and gpu-xfer): ask the codec for NV12_COL128 instead of NV12
       * and let Mesa detile it. RPi4 bcm2835-codec decodes 1080p60 H.264 at 89 fps into SAND and
       * at 66 fps into NV12 (measured 2026-10-05). Falls back to NV12 if the codec refuses.

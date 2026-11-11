@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 13 Oct 2026 19:31:25 +0900
+Date: Wed, 11 Nov 2026 09:18:09 +0900
 Subject: [PATCH] ui/sdl2: hand guest display planes to weston subsurfaces
  (opt-in)
 
@@ -36,8 +36,14 @@ Design points:
   - GL texture names are recycled, so the dmabuf cache is keyed by the
     virtio resource id as well as the texture name and size, and an
     entry is dropped when the guest unrefs its resource (a hook in
-    virtio-gpu-virgl.c). Keying by name and size alone showed another
-    resource's old buffer.
+    virtio-gpu-virgl.c), its wl_buffer destroyed at once unless the
+    plane still shows it (weston's import pins the texture's BO). Keying
+    by name and size alone showed another resource's old buffer. A
+    scanout disabled (SET_SCANOUT of resource 0, a device reset) takes
+    the planes off and drops the whole cache: after a reset the guest
+    numbers its resources from 1 again and GL recycles texture names, so
+    the key alone could hit an old buffer. An overlay plane whose
+    resource the guest unrefs goes off with it.
   - A plane that moves or resizes is first unmapped in its own parent
     commit, and every plane is clipped to the window: otherwise weston
     can apply the new position before the new size and end the client
@@ -46,41 +52,69 @@ Design points:
     input stays with the SDL window.
 
 Adds ui/viewporter-protocol.c and ui/viewporter-client-protocol.h,
-generated with wayland-scanner from wayland-protocols
-stable/viewporter/viewporter.xml.
+generated with wayland-scanner 1.22.0 from wayland-protocols
+stable/viewporter/viewporter.xml (protocol version 1); q11-063's files
+are from 1.24.0, the version both boards build against, and these two
+have not been regenerated with it.
+
+The texture buffers are made with create_immed: a refused import is a
+protocol error that ends qemu's window, and it is taken here because
+weston's BROADCOM_UIF support on this board is known (q11-070 uses the
+asynchronous create for guest dma-bufs, whose formats are the guest's).
+There is no teardown of the subsurfaces, viewports and cached
+wl_buffers when the display goes: qemu exits with its window and weston
+reclaims them.
+
+Changed in the q11 series (review 2026-11-11): the immediate destroy
+of an unref'd resource's buffer, the drop of planes and cache on a
+disabled scanout, the overlay taken off on unref, scanout 0's tracked
+resource id cleared by SET_SCANOUT of resource 0, the overlay count
+taken from QEMU_CONSOLE_MAX_OVERLAYS (q11-051), the two notes above,
+and the SPDX tag on the two generated files.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on this layer's direct-scanout and primary-rect patches; RPi4 HMI tuning]
 ---
- hw/display/virtio-gpu-virgl.c   |   9 +
+ hw/display/virtio-gpu-virgl.c   |  23 ++
  include/ui/console.h            |   4 +
- include/ui/sdl2.h               |   3 +
+ include/ui/sdl2.h               |   4 +
  ui/console.c                    |   4 +
  ui/meson.build                  |   3 +-
- ui/sdl2-gl.c                    |   9 +
- ui/sdl2-wl-scanout.c            | 352 ++++++++++++++++++++++++++++
- ui/viewporter-client-protocol.h | 394 ++++++++++++++++++++++++++++++++
- ui/viewporter-protocol.c        |  74 ++++++
- 9 files changed, 851 insertions(+), 1 deletion(-)
+ ui/sdl2-gl.c                    |  17 ++
+ ui/sdl2-wl-scanout.c            | 381 ++++++++++++++++++++++++++++++
+ ui/viewporter-client-protocol.h | 395 ++++++++++++++++++++++++++++++++
+ ui/viewporter-protocol.c        |  75 ++++++
+ 9 files changed, 905 insertions(+), 1 deletion(-)
  create mode 100644 ui/viewporter-client-protocol.h
  create mode 100644 ui/viewporter-protocol.c
 
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index bfea271..6a85f4b 100644
+index f899250fa..97796465a 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -621,6 +621,9 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
+@@ -621,6 +621,20 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
          return;
      }
  
 +    if (q11_resource_gone_cb) {
 +        q11_resource_gone_cb(unref.resource_id); /* q11-plane-handoff */
 +    }
++    /* an overlay plane showing this resource goes off with it, not on with a dead name */
++    for (unsigned int k = 0; k < g->parent_obj.conf.overlay_planes &&
++                             k < ARRAY_SIZE(q11_overlay_resource_id); k++) {
++        if (q11_overlay_resource_id[k] == unref.resource_id) {
++            q11_overlay_resource_id[k] = 0;
++            g->parent_obj.overlay[k].on = false;
++            g->parent_obj.scanout[g->parent_obj.conf.max_outputs + k].resource_id = 0;
++            qemu_console_gl_overlay(g->parent_obj.scanout[0].con, k, false, 0,
++                                    false, 0, 0, 0, 0);
++        }
++    }
      virtio_gpu_virgl_resource_unref(g, res, cmd_suspended);
  }
  
-@@ -777,6 +780,9 @@ static void virgl_cmd_set_overlay(VirtIOGPU *g,
+@@ -777,6 +791,9 @@ static void virgl_cmd_set_overlay(VirtIOGPU *g,
          b->overlay[k].on = true;
      }
      b->scanout[ss->scanout_id].resource_id = b->overlay[k].on ? ss->resource_id : 0;
@@ -90,7 +124,7 @@ index bfea271..6a85f4b 100644
      virgl_renderer_force_ctx_0();
      virgl_overlay_publish(g, k);
      if (!b->overlay[k].on && b->scanout[0].width && b->scanout[0].height) {
-@@ -891,6 +897,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+@@ -901,6 +918,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
          qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                              ss.r.width, ss.r.height);
          virgl_renderer_force_ctx_0();
@@ -100,69 +134,95 @@ index bfea271..6a85f4b 100644
          qemu_console_gl_scanout_texture(
              g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
              info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
+@@ -910,6 +930,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
+     } else {
+         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
+         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
++        if (ss.scanout_id == 0) {
++            q11_scanout0_resource_id = 0; /* q11-plane-handoff */
++        }
+         /* q11-primary-rect: a disabled primary has no position; the guest resends it */
+         qemu_console_gl_primary_rect(g->parent_obj.scanout[ss.scanout_id].con,
+                                      0, 0, 0, 0, 0, 0);
 diff --git a/include/ui/console.h b/include/ui/console.h
-index d47bc4c..6afeefa 100644
+index 2bd647b25..9b8ffd61e 100644
 --- a/include/ui/console.h
 +++ b/include/ui/console.h
-@@ -321,6 +321,10 @@ void qemu_console_gl_cursor_position(QemuConsole *con,
+@@ -323,6 +323,10 @@ void qemu_console_gl_cursor_position(QemuConsole *con,
  void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
                               uint32_t tex_id, bool y0_top, uint32_t tex_w,
                               uint32_t tex_h, int32_t x, int32_t y);
 +/* q11-plane-handoff: the virtio resource last set on scanout 0 (texture names get reused) */
 +extern uint32_t q11_scanout0_resource_id;
-+extern uint32_t q11_overlay_resource_id[3];        /* the same for the overlay planes */
++extern uint32_t q11_overlay_resource_id[QEMU_CONSOLE_MAX_OVERLAYS]; /* the same for the overlays */
 +extern void (*q11_resource_gone_cb)(uint32_t res); /* the guest unref'd res */
  void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
                                    uint32_t w, uint32_t h, uint32_t crtc_w,
                                    uint32_t crtc_h); /* q11-primary-rect */
 diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
-index 6c44a68..cede5ff 100644
+index b3353bd1b..89f72fb6b 100644
 --- a/include/ui/sdl2.h
 +++ b/include/ui/sdl2.h
-@@ -93,6 +93,9 @@ typedef struct DirectScanout DirectScanout;
+@@ -93,6 +93,10 @@ typedef struct DirectScanout DirectScanout;
  void sdl2_wl_scanout_dispatch(void);
  void sdl2_wl_scanout_miss(const char *why);
  void sdl2_wl_scanout_off(void);
 +/* q11-plane-handoff: each guest plane on its own wl_subsurface (true: presented) */
 +bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh);
 +void sdl2_wl_planes_off(void);
++void sdl2_wl_planes_drop(void); /* forget the cached dmabufs (scanout off, reset) */
  bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t w,
                       uint32_t h);
  
 diff --git a/ui/console.c b/ui/console.c
-index 7703655..86a07ce 100644
+index 9aef18aaf..c1eb52d3c 100644
 --- a/ui/console.c
 +++ b/ui/console.c
-@@ -1020,6 +1020,10 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+@@ -1023,6 +1023,10 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
  }
  
  /* q11-primary-rect */
 +uint32_t q11_scanout0_resource_id; /* q11-plane-handoff */
-+uint32_t q11_overlay_resource_id[3];
++uint32_t q11_overlay_resource_id[QEMU_CONSOLE_MAX_OVERLAYS];
 +void (*q11_resource_gone_cb)(uint32_t res);
 +
  void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
                                    uint32_t w, uint32_t h, uint32_t crtc_w,
                                    uint32_t crtc_h)
 diff --git a/ui/meson.build b/ui/meson.build
-index eba6602..f83802f 100644
+index 615bae7fd..0f0c317a6 100644
 --- a/ui/meson.build
 +++ b/ui/meson.build
-@@ -172,7 +172,8 @@ if sdl.found()
-   sdl_ss.add(when: opengl, if_true: files('sdl2-gl.c', 'sdl2-wl-scanout.c'))
+@@ -175,7 +175,8 @@ if sdl.found()
+   # the two cannot disagree.
    sdl_wayland = dependency('wayland-client', required: false)
    sdl_ss.add(when: [opengl, sdl_wayland],
--             if_true: [sdl_wayland, files('linux-dmabuf-unstable-v1-protocol.c')])
+-             if_true: [sdl_wayland, files('linux-dmabuf-unstable-v1-protocol.c'),
 +             if_true: [sdl_wayland, files('linux-dmabuf-unstable-v1-protocol.c',
-+                                           'viewporter-protocol.c')]) # q11-plane-handoff
++                                           'viewporter-protocol.c'), # q11-plane-handoff
+                        declare_dependency(compile_args: '-DCONFIG_SDL_WL_SCANOUT')])
    sdl_ss.add(when: x11, if_true: files('x_keymap.c'))
    ui_modules += {'sdl' : sdl_ss}
- endif
 diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
-index 7eb5b95..e0a1e35 100644
+index 7eb5b955c..1339e495b 100644
 --- a/ui/sdl2-gl.c
 +++ b/ui/sdl2-gl.c
-@@ -406,6 +406,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+@@ -206,6 +206,14 @@ void sdl2_gl_scanout_disable(DisplayChangeListener *dcl)
+     scon->w = 0;
+     scon->h = 0;
+     sdl2_set_scanout_mode(scon, false);
++    /*
++     * q11-plane-handoff: nobody flushes a disabled scanout, so the planes come off
++     * here (SET_SCANOUT of resource 0, or a reset), and the cached dmabufs go: after
++     * a reset the guest numbers its resources from 1 again and GL recycles texture
++     * names, so a (texture, size, resource) key could hit an old buffer.
++     */
++    sdl2_wl_planes_off();
++    sdl2_wl_planes_drop();
+ }
+ 
+ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+@@ -406,6 +414,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
              !sdl2_wl_scanout(scon, &d, ww, wh) ? "wayland" : NULL;
  
          if (!why) {
@@ -170,7 +230,7 @@ index 7eb5b95..e0a1e35 100644
              direct_scanout_note_flush(true); /* q11-isp-skip-copy */
              if (t0) {
                  qemu_lat_diag_add(LAT_SDL_BLIT,
-@@ -419,6 +420,14 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+@@ -419,6 +428,14 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
      }
      /* q11-isp-skip-copy: the guest textures sampled below must be complete */
      direct_scanout_note_flush(false);
@@ -186,10 +246,10 @@ index 7eb5b95..e0a1e35 100644
      /*
       * q11-scanout-rect: only the guest's scanout rectangle (1280x720 of a 1280x726
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
-index 79f106d..ae7c292 100644
+index 28be48185..a8f0715c3 100644
 --- a/ui/sdl2-wl-scanout.c
 +++ b/ui/sdl2-wl-scanout.c
-@@ -27,6 +27,8 @@
+@@ -28,6 +28,8 @@
  #include <SDL_syswm.h>
  #include <wayland-client.h>
  #include "linux-dmabuf-unstable-v1-client-protocol.h"
@@ -198,7 +258,7 @@ index 79f106d..ae7c292 100644
  
  #define WL_DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' = V4L2 RGBA32 byte order */
  /*
-@@ -66,6 +68,10 @@ static struct {
+@@ -65,6 +67,10 @@ static struct {
      struct wl_surface *surf_q; /* wrapper of surf on our queue (for frame callbacks) */
      struct wl_event_queue *queue;
      struct zwp_linux_dmabuf_v1 *dmabuf;
@@ -209,7 +269,7 @@ index 79f106d..ae7c292 100644
      GPtrArray *bufs;
      struct wl_callback *frame_cb;
      int64_t frame_t;
-@@ -107,6 +113,13 @@ static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
+@@ -106,6 +112,13 @@ static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
          wl.dmabuf = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface,
                                       ver < 3 ? ver : 3);
          zwp_linux_dmabuf_v1_add_listener(wl.dmabuf, &dmabuf_listener, NULL);
@@ -223,7 +283,7 @@ index 79f106d..ae7c292 100644
      }
  }
  
-@@ -535,12 +548,351 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
+@@ -533,12 +546,380 @@ bool sdl2_wl_scanout(struct sdl2_console *scon, const DirectScanout *d, uint32_t
      return true;
  }
  
@@ -379,13 +439,21 @@ index 79f106d..ae7c292 100644
 +    if (!pl.cache) {
 +        return;
 +    }
-+    for (guint i = 0; i < pl.cache->len; i++) {
++    for (guint i = pl.cache->len; i-- > 0;) {
 +        WlPlaneBuf *b = g_ptr_array_index(pl.cache, i);
 +
-+        if (b->res == res && b->tex) {
-+            b->tex = 0; /* the LRU frees it once it is off screen */
-+            pl.gone++;
++        if (b->res != res || !b->tex) {
++            continue;
 +        }
++        pl.gone++;
++        if (!plane_in_use(b)) {
++            /* weston's import pins the texture's BO: let it go now, not at the LRU */
++            wl_buffer_destroy(b->wb);
++            g_free(b);
++            g_ptr_array_remove_index_fast(pl.cache, i);
++            continue;
++        }
++        b->tex = 0; /* on screen: the LRU frees it once the plane shows another buffer */
 +    }
 +}
 +
@@ -500,7 +568,7 @@ index 79f106d..ae7c292 100644
 +    if (!b[0]) {
 +        return false;
 +    }
-+    for (int i = 0; i < 3; i++) {
++    for (int i = 0; i < QEMU_CONSOLE_MAX_OVERLAYS; i++) {
 +        if (scon->ovl[i].on && scon->ovl[i].fb.texture) {
 +            b[i + 1] = plane_buf(scon->ovl[i].fb.texture, scon->ovl[i].fb.width,
 +                                 scon->ovl[i].fb.height, q11_overlay_resource_id[i]);
@@ -521,7 +589,7 @@ index 79f106d..ae7c292 100644
 +            plane_show(0, b[0], scon->y0_top, sx, sy, sw, sh, 0, 0, ww, wh, ww, wh);
 +        }
 +    }
-+    for (int i = 0; i < 3; i++) {
++    for (int i = 0; i < QEMU_CONSOLE_MAX_OVERLAYS; i++) {
 +        if (b[i + 1]) {
 +            plane_show(i + 1, b[i + 1], scon->ovl[i].y0_top, 0, 0, scon->ovl[i].fb.width,
 +                       scon->ovl[i].fb.height, scon->ovl[i].x * fx, scon->ovl[i].y * fy,
@@ -557,6 +625,24 @@ index 79f106d..ae7c292 100644
 +    pl.shown = false;
 +}
 +
++/* the scanout is disabled (resource 0, or a device reset): no cached buffer is valid */
++void sdl2_wl_planes_drop(void)
++{
++    if (!pl.cache) {
++        return;
++    }
++    for (guint i = pl.cache->len; i-- > 0;) {
++        WlPlaneBuf *b = g_ptr_array_index(pl.cache, i);
++
++        if (plane_in_use(b)) {
++            continue; /* planes_off() came first; a plane still shown keeps its buffer */
++        }
++        wl_buffer_destroy(b->wb);
++        g_free(b);
++        g_ptr_array_remove_index_fast(pl.cache, i);
++    }
++}
++
  #else
  
  void sdl2_wl_scanout_dispatch(void)
@@ -571,16 +657,20 @@ index 79f106d..ae7c292 100644
 +void sdl2_wl_planes_off(void)
 +{
 +}
++void sdl2_wl_planes_drop(void)
++{
++}
 +
  void sdl2_wl_scanout_miss(const char *why)
  {
  }
 diff --git a/ui/viewporter-client-protocol.h b/ui/viewporter-client-protocol.h
 new file mode 100644
-index 0000000..da9eb3a
+index 000000000..9df622d76
 --- /dev/null
 +++ b/ui/viewporter-client-protocol.h
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,395 @@
++/* SPDX-License-Identifier: MIT */
 +/* Generated by wayland-scanner 1.22.0 */
 +
 +#ifndef VIEWPORTER_CLIENT_PROTOCOL_H
@@ -977,10 +1067,11 @@ index 0000000..da9eb3a
 +#endif
 diff --git a/ui/viewporter-protocol.c b/ui/viewporter-protocol.c
 new file mode 100644
-index 0000000..fa70d5d
+index 000000000..eb01c033c
 --- /dev/null
 +++ b/ui/viewporter-protocol.c
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: MIT */
 +/* Generated by wayland-scanner 1.22.0 */
 +
 +/*

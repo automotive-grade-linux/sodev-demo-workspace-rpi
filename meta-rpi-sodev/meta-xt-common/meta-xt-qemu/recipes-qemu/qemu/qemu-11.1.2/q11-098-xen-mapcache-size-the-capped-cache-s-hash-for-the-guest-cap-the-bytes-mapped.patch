@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Sat, 24 Oct 2026 19:10:00 +0900
-Subject: [PATCH] xen-mapcache: size the capped cache's hash for the guest,
- cap the bytes mapped
+Subject: [PATCH] xen-mapcache: size the capped cache's hash for the guest, cap
+ the bytes mapped
 
 QEMU_XEN_MAPCACHE_MAX_MB (q11-053) sized the hash table of the foreign
 mapcache, so a 1024 MB cap over a 2 GB DomA gave every slot two guest
@@ -30,10 +30,10 @@ Upstream-Status: Inappropriate [this layer's Xen device model; switched by an en
  1 file changed, 149 insertions(+), 5 deletions(-)
 
 diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
-index c617c92ef..4c7cd1755 100644
+index e889010be..6bd78f7d1 100644
 --- a/hw/xen/xen-mapcache.c
 +++ b/hw/xen/xen-mapcache.c
-@@ -17,6 +17,7 @@
+@@ -18,6 +18,7 @@
  #include "hw/xen/xen-hvm-common.h"
  #include "hw/xen/xen_native.h"
  #include "qemu/bitmap.h"
@@ -41,7 +41,7 @@ index c617c92ef..4c7cd1755 100644
  
  #include "system/ramlist.h"
  #include "system/runstate.h"
-@@ -47,6 +48,7 @@ typedef struct MapCacheEntry {
+@@ -48,6 +49,7 @@ typedef struct MapCacheEntry {
  #define XEN_MAPCACHE_ENTRY_DUMMY (1 << 0)
  #define XEN_MAPCACHE_ENTRY_GRANT (1 << 1)
      uint8_t flags;
@@ -49,7 +49,7 @@ index c617c92ef..4c7cd1755 100644
      hwaddr size;
      struct MapCacheEntry *next;
  } MapCacheEntry;
-@@ -78,6 +80,12 @@ typedef struct MapCache {
+@@ -79,6 +81,12 @@ typedef struct MapCache {
      /* For most cases (>99.9%), the page address is the same. */
      MapCacheEntry *last_entry;
      unsigned long max_mcache_size;
@@ -62,7 +62,7 @@ index c617c92ef..4c7cd1755 100644
      unsigned int bucket_shift;
      unsigned long bucket_size;
  
-@@ -91,6 +99,31 @@ static MapCache *mapcache_grants_ro;
+@@ -92,6 +100,31 @@ static MapCache *mapcache_grants_ro;
  static MapCache *mapcache_grants_rw;
  static xengnttab_handle *xen_region_gnttabdev;
  
@@ -94,10 +94,10 @@ index c617c92ef..4c7cd1755 100644
  bool xen_map_cache_enabled(void)
  {
      /* Map cache enabled implies xen_enabled().  */
-@@ -205,9 +238,32 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
-         unsigned long mb = cap ? strtoul(cap, NULL, 10) : 0;
- 
-         if (mb >= 64 && (mb << 20) < max_mcache_size) {
+@@ -214,9 +247,32 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
+         }
+         /* mb < max >> 20 rather than mb << 20 < max: the shift must not wrap. */
+         if (mb >= 64 && mb < (max_mcache_size >> 20)) {
 -            info_report("xen mapcache: foreign cache capped at %lu MB", mb);
 +            /*
 +             * q11-098: the cap used to size the hash table, so a 1024 MB cap
@@ -129,7 +129,7 @@ index c617c92ef..4c7cd1755 100644
          } else {
              mapcache = xen_map_cache_init_single(f, opaque, bucket_shift,
                                                   max_mcache_size);
-@@ -246,6 +302,22 @@ static void xen_remap_bucket(MapCache *mc,
+@@ -255,6 +311,22 @@ static void xen_remap_bucket(MapCache *mc,
      hwaddr nb_pfn = size >> XC_PAGE_SHIFT;
  
      trace_xen_remap_bucket(address_index);
@@ -152,7 +152,7 @@ index c617c92ef..4c7cd1755 100644
  
      if (grant) {
          refs = g_new0(uint32_t, nb_pfn);
-@@ -272,10 +344,13 @@ static void xen_remap_bucket(MapCache *mc,
+@@ -281,10 +353,13 @@ static void xen_remap_bucket(MapCache *mc,
           */
          assert(!vaddr || (entry->vaddr_base == vaddr && entry->size == size));
  
@@ -167,7 +167,7 @@ index c617c92ef..4c7cd1755 100644
      }
      g_free(entry->valid_mapping);
      entry->valid_mapping = NULL;
-@@ -348,6 +423,7 @@ static void xen_remap_bucket(MapCache *mc,
+@@ -357,6 +432,7 @@ static void xen_remap_bucket(MapCache *mc,
      entry->vaddr_base = vaddr_base;
      entry->paddr_index = address_index;
      entry->size = size;
@@ -175,7 +175,7 @@ index c617c92ef..4c7cd1755 100644
      entry->valid_mapping = g_new0(unsigned long,
                                    BITS_TO_LONGS(size >> XC_PAGE_SHIFT));
  
-@@ -365,6 +441,58 @@ static void xen_remap_bucket(MapCache *mc,
+@@ -374,6 +450,58 @@ static void xen_remap_bucket(MapCache *mc,
      }
  }
  
@@ -234,7 +234,7 @@ index c617c92ef..4c7cd1755 100644
  static uint8_t *xen_map_cache_unlocked(MapCache *mc,
                                         hwaddr phys_addr, hwaddr size,
                                         ram_addr_t ram_offset,
-@@ -438,10 +566,22 @@ tryagain:
+@@ -447,10 +575,22 @@ tryagain:
          pentry = free_pentry;
      }
      if (!entry) {
@@ -257,7 +257,7 @@ index c617c92ef..4c7cd1755 100644
      } else if (!entry->lock) {
          if (!entry->vaddr_base || entry->paddr_index != address_index ||
                  entry->size != cache_size ||
-@@ -450,6 +590,9 @@ tryagain:
+@@ -459,6 +599,9 @@ tryagain:
                      entry->valid_mapping)) {
              xen_remap_bucket(mc, entry, NULL, cache_size, address_index, dummy,
                               grant, is_write, ram_offset);
@@ -267,7 +267,7 @@ index c617c92ef..4c7cd1755 100644
          }
      }
  
-@@ -473,6 +616,7 @@ tryagain:
+@@ -482,6 +625,7 @@ tryagain:
      }
  
      mc->last_entry = entry;
@@ -275,7 +275,7 @@ index c617c92ef..4c7cd1755 100644
      if (lock) {
          MapCacheRev *reventry = g_new0(MapCacheRev, 1);
          entry->lock++;
-@@ -666,7 +810,7 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+@@ -675,7 +819,7 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
          rc = xengnttab_unmap(xen_region_gnttabdev, entry->vaddr_base,
                               entry->size >> mc->bucket_shift);
      } else {
@@ -284,7 +284,7 @@ index c617c92ef..4c7cd1755 100644
      }
  
      if (rc) {
-@@ -762,7 +906,7 @@ static void xen_invalidate_map_cache_single(MapCache *mc)
+@@ -771,7 +915,7 @@ static void xen_invalidate_map_cache_single(MapCache *mc)
              continue;
          }
  

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:31 +0900
+Date: Wed, 11 Nov 2026 08:48:57 +0900
 Subject: [PATCH] virtio-media: copy decoded frames into the virgl resource on
  the GPU
 
@@ -8,17 +8,23 @@ qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0229-v10-virtio-media-gpu-copy-into-virgl-resource.patch;
 that patch's description has the reasoning and the measurements.
 
+Changed in the q11 series (review 2026-11-11): VirtIOMediaGpuBuf keeps
+width and height only; stride and len were stored and never read. The
+two EGL queries that can fail while the bridge context is made say so
+in the diag log (the failure is remembered and the GPU path stays off
+for the rest of the process, so a silent one could not be traced).
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/meson.build                  |   4 +-
  hw/virtio/virtio-media-virgl-stub.c    |  24 ++
- hw/virtio/virtio-media-virgl.c         | 389 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media-virgl.c         | 392 ++++++++++++++++++++++++-
  hw/virtio/virtio-media.c               |  66 +++++
  include/hw/virtio/virtio-media-virgl.h |  47 ++-
  include/hw/virtio/virtio-media.h       |  16 +
- 6 files changed, 539 insertions(+), 7 deletions(-)
+ 6 files changed, 542 insertions(+), 7 deletions(-)
 
 diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
 index bdf582b96..a9d1cfb2b 100644
@@ -68,7 +74,7 @@ index 8a5d052d6..093593a96 100644
 +{
 +}
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index 46f352877..de09cb288 100644
+index a761c1eaa..2b29ea3f3 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
 @@ -1,13 +1,24 @@
@@ -97,7 +103,7 @@ index 46f352877..de09cb288 100644
  
  int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
                                  uint32_t height, uint32_t stride,
-@@ -33,3 +44,379 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+@@ -34,3 +45,382 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
                                               (struct virgl_box *)&box,
                                               0, &iov, 1);
  }
@@ -107,7 +113,7 @@ index 46f352877..de09cb288 100644
 +
 +typedef struct VirtIOMediaGpuBuf {
 +    int fd;
-+    uint32_t width, height, stride, len;
++    uint32_t width, height;
 +    GLuint tex;
 +    GLuint read_fbo;          /* the blit's read FBO, made on first use */
 +    GLsync sync;              /* last copy that read this buffer, or NULL */
@@ -188,10 +194,15 @@ index 46f352877..de09cb288 100644
 +        EGLint attrs[] = { EGL_CONFIG_ID, 0, EGL_NONE };
 +
 +        if (!eglQueryContext(dpy, share, EGL_CONFIG_ID, &id)) {
++            qemu_log("virtio-media-diag: gpu_xfer: eglQueryContext(EGL_CONFIG_ID) "
++                     "failed (0x%x), GPU path disabled\n", eglGetError());
 +            return false;
 +        }
 +        attrs[1] = id;
 +        if (!eglChooseConfig(dpy, attrs, &cfg, 1, &n) || n != 1) {
++            qemu_log("virtio-media-diag: gpu_xfer: eglChooseConfig(config %d) "
++                     "found %d (0x%x), GPU path disabled\n", id, n,
++                     eglGetError());
 +            return false;
 +        }
 +    }
@@ -324,8 +335,6 @@ index 46f352877..de09cb288 100644
 +    b->fd = dmabuf_fd;
 +    b->width = width;
 +    b->height = height;
-+    b->stride = stride;
-+    b->len = len;
 +
 +    while (glGetError() != GL_NO_ERROR) {
 +        /* clear stale errors */
@@ -478,10 +487,10 @@ index 46f352877..de09cb288 100644
 +    }
 +}
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index f6acf1fe8..bc094b762 100644
+index 214ec1f70..6abbed5b5 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -153,6 +153,10 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+@@ -151,6 +151,10 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
      int i, p;
  
      for (i = 0; i < VIRTIO_MEDIA_MAX_BUFFERS; i++) {
@@ -492,7 +501,7 @@ index f6acf1fe8..bc094b762 100644
          for (p = 0; p < VIDEO_MAX_PLANES; p++) {
              if (q->host_map[i][p]) {
                  munmap(q->host_map[i][p], q->host_len[i][p]);
-@@ -165,6 +169,7 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+@@ -163,6 +167,7 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
      q->num_bufs = 0;
      q->num_host_planes = 0;
      q->streaming = false;
@@ -500,7 +509,7 @@ index f6acf1fe8..bc094b762 100644
  }
  
  static void virtio_media_session_free(VirtIOMediaSession *s)
-@@ -460,6 +465,58 @@ static void virtio_media_host_readable(void *opaque)
+@@ -463,6 +468,58 @@ static void virtio_media_host_readable(void *opaque)
                       * memory (see host_xfer in the header). Single-plane
                       * RGBA only; a planar format falls back to the copy.
                       */
@@ -559,7 +568,7 @@ index f6acf1fe8..bc094b762 100644
                      if (vm->host_xfer && gb->virgl_res && p == 0 &&
                          gb->num_planes == 1 && q->width && q->height) {
                          int r = virtio_media_virgl_transfer(
-@@ -938,6 +995,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -948,6 +1005,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
          }
      }
  
@@ -574,7 +583,7 @@ index f6acf1fe8..bc094b762 100644
      /* Now queue the host's own buffer, which is MMAP. */
      {
          struct v4l2_buffer hb = *b;
-@@ -1454,6 +1519,7 @@ static const VMStateDescription vmstate_virtio_media = {
+@@ -1464,6 +1529,7 @@ static const VMStateDescription vmstate_virtio_media = {
  static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
@@ -645,10 +654,10 @@ index 04a25e0f2..6193a4cfd 100644
 +
  #endif
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 19cc345e8..2da0ed63d 100644
+index 335c621ce..82caaa561 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -191,6 +191,14 @@ typedef struct VirtIOMediaQueue {
+@@ -193,6 +193,14 @@ typedef struct VirtIOMediaQueue {
      uint32_t bytesperline;
      /* Host MMAP buffers this device allocated on the host fd, mmap()ed. */
      void *host_map[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
@@ -663,7 +672,7 @@ index 19cc345e8..2da0ed63d 100644
      uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
      /* Guest buffers by index, mirrored onto the host buffer of the same index. */
      VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
-@@ -226,6 +234,14 @@ struct VirtIOMedia {
+@@ -228,6 +236,14 @@ struct VirtIOMedia {
       */
      bool host_xfer;
      uint64_t host_xfer_fail;
