@@ -52,10 +52,10 @@ means an open network. Only infrastructure BSSes are published ([MESH] and [IBSS
 are not), and only the strongest BSS of each SSID.
 
 WPA_SUPPLICANT
-Spoken to directly over its control socket. wpa_cli is not in the DomD image and
-python3 is, so there is nothing to add. The control interface is
-AF_UNIX/SOCK_DGRAM and the client must bind its own path first, which is why a
-plain connect() is not enough.
+Spoken to directly over its control socket. wpa_cli (wpa-supplicant-cli) is in the
+DomD image too, but the socket costs no dependency and no process per command. The
+control interface is AF_UNIX/SOCK_DGRAM and the client must bind its own path first,
+which is why a plain connect() is not enough.
 
 A second socket is ATTACHed for events (Monitor): a scan is read once
 CTRL-EVENT-SCAN-RESULTS has arrived rather than after a fixed wait, and a join
@@ -1488,13 +1488,14 @@ def main():
                                 log("REMOVE_NETWORK after the refusal: %s" % e)
                         # A whole wait after an SAE refusal is a refused passphrase too,
                         #   for the relay; one that may be the removed network's is only
-                        #   mentioned (see WPA_SUPPLICANT above).
+                        #   mentioned (see WPA_SUPPLICANT above), in words without a
+                        #   CTRL-EVENT-*-REJECT token: the relay's fail_reason takes that
+                        #   token for "the AP refused", and this join was not refused.
                         if sae_now and not wrong_key:
                             sae = ("; CTRL-EVENT-AUTH-REJECT auth_type=3 status_code=15"
                                    " (SAE: WRONG_KEY)")
                         elif sae_late and not wrong_key:
-                            sae = ("; CTRL-EVENT-AUTH-REJECT status_code=15 before this"
-                                   " join's attempt")
+                            sae = "; an SAE status 15 was seen before this join's attempt"
                         else:
                             sae = ""
                         reply = {"t": "state", "ssid": ssid, "state": "FAILED",

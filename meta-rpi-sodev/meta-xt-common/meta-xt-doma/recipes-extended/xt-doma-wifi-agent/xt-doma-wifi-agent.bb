@@ -14,8 +14,8 @@ DESCRIPTION = "\
     This side is the client; qemu listens. \
 \
     wpa_supplicant is driven directly over its control socket (AF_UNIX/SOCK_DGRAM at \
-    /run/wpa_supplicant/wlan0). wpa_cli is not in the image and python3 is, so nothing \
-    extra is needed. \
+    /run/wpa_supplicant/wlan0). wpa_cli (wpa-supplicant-cli) is in the image too, but \
+    speaking the socket from python3 adds no dependency and no process per command. \
 \
     NOTE: a passphrase typed on the AAOS screen crosses this channel in the clear. A \
     shadow AP cannot learn a PSK from a 4-way handshake -- only a MIC crosses the air -- \

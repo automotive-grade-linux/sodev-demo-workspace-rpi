@@ -256,8 +256,12 @@ on post-fs-data
     # Its label (doma_wifi_req_file) is newer than the directory on a /data that already
     # has it, and mkdir does not relabel an existing directory.
     restorecon_recursive /data/vendor/wifi/shadow/req
-    # The files the services wrote while they ran as root (before they ran as uid wifi),
-    # which uid wifi could otherwise not read. A missing file is only logged.
+    # Files under shadow/ that root owns: written by an image from before the services
+    # ran as uid wifi, or pushed or edited over `adb root` (the seed's header invites
+    # editing aps.conf on the device). uid wifi could not read a 0600 one (the relay
+    # would then rewrite aps.conf from the scan and lose the edit), and doma-shadow-ap
+    # writes aps.conf and hostapd.conf in place. Kept for the adb root case, so not tied
+    # to the old images. A missing file is only logged.
     chown wifi wifi /data/vendor/wifi/shadow/aps.conf
     chown wifi wifi /data/vendor/wifi/shadow/learned.conf
     chown wifi wifi /data/vendor/wifi/shadow/mirror.mark

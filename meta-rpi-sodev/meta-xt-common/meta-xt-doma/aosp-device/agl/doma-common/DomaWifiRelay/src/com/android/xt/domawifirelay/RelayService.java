@@ -246,13 +246,15 @@ public final class RelayService extends Service {
      * for {@link #REQ} and {@link #REQ_BUSY} to be gone.
      *
      * <p>The bound comes from the daemon's own worst case rather than from its poll
-     * interval. In one iteration of doma-wifi-relay.sh, {@code restart_hostapd} can
-     * spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
-     * {@code confirm_hostapd_running} (6 x 0.25 s) -- about 11.5 s -- and BOTH
-     * {@code handle_aps} and {@code flush_pending_restart} can fire it in the
-     * same iteration, with
-     * {@code read -t 2} on top: roughly 25 s. (The one figure actually measured on a PC
-     * is 10.371 s for a single restart_hostapd, which does not include the confirm
+     * interval. In one pass of doma-wifi-relay.sh's main loop, {@code restart_hostapd}
+     * can spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
+     * {@code confirm_hostapd_running} (6 x 0.25 s) -- about 11.5 s -- and a pass can
+     * reach it three times: from the {@code read} branch ({@code handle_aps}, or
+     * {@code handle_state} on a restart), from {@code flush_pending_restart} and from
+     * the STATE_RESTART block. A request that lands just after the read branch waits
+     * for the latter two, the next {@code read -t 2} and the next read branch:
+     * 3 x 11.5 + 2 = 36.5 s at worst. (The one figure actually measured on a PC is
+     * 10.371 s for a single restart_hostapd, which does not include the confirm
      * window.) 160 x 250 ms = 40 s therefore covers a healthy-but-busy daemon, and the
      * cost is zero on the normal path, where the request is handled within 2 s.
      */
@@ -1212,8 +1214,12 @@ public final class RelayService extends Service {
     private static final String CH_FAILURE = "doma_wifi_failure";
     /** One notification, replaced by each report: only the latest join matters. */
     private static final int NOTE_ID = 1;
-    /** A "connecting" goes after this long: DomD's agent answers a connect in 75 s at
-     *  most (a 30 s join, then up to 6 DHCP tries), and a lost answer must not leave it. */
+    /** A "connecting" goes after this long, so that a lost answer does not leave it.
+     *  DomD's agent can take longer than this: a 30 s join, then
+     *  {@code udhcpc -n -t 6 -T 3} under a 60 s timeout, then up to 10 s for the address
+     *  to appear -- about 100 s at worst. An "online" that arrives after this is still
+     *  handled: {@link #handleState} holds it back ({@code connectHeldBack}) and the join
+     *  completes, only the notification is gone by then. */
     private static final long CONNECTING_TIMEOUT_MS = 90_000;
     private static final long CONNECTED_TIMEOUT_MS = 10_000;
     private static final long FAILED_TIMEOUT_MS = 300_000;
@@ -1556,6 +1562,15 @@ public final class RelayService extends Service {
                     + " after it -- attempt NOT spent");
             return false;
         }
+        // The request line is tab-separated and ends at a newline, so a tab, CR or LF in
+        //   the SSID or the passphrase would split or cut it on the daemon's side (a
+        //   passphrase has no control character anyway; the daemon's psk_valid refuses
+        //   one). Nothing is written, so nothing is spent. Neither value is logged.
+        if (hasTabOrLineBreak(ssid) || hasTabOrLineBreak(psk)) {
+            Log.w(TAG, "netId=" + netId + ": the SSID or the passphrase has a tab or a"
+                    + " line break, which a request line cannot carry -- attempt NOT spent");
+            return false;
+        }
         Log.i(TAG, "repairing netId=" + netId + " ssid=" + ssid);
         final String token = String.format("%016x", mRandom.nextLong());
         final String[] st = readState();
@@ -1609,6 +1624,11 @@ public final class RelayService extends Service {
                 mHandler.postDelayed(mWaitTimeout, CONNECTING_TIMEOUT_MS);
             }
         }, POLL_MS);
+    }
+
+    /** True if {@code s} has a character a tab-separated, newline-terminated line cannot carry. */
+    private static boolean hasTabOrLineBreak(String s) {
+        return s.indexOf('\t') >= 0 || s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0;
     }
 
     /**
