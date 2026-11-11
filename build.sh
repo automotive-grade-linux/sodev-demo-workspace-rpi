@@ -119,8 +119,10 @@ Domain options:
                            (DomD 1440, DomA 2048 -- DomA gives up 128 MiB more to keep
                            its RAM in one memory zone); the 8g SKU is unchanged.
       --domains-only     Build the domains but skip SD-image assembly (no full.img;
-                         with -a this also skips the DomA p4 nested GPT, which rouge
-                         assembles only during SD-image assembly)
+                         refused together with -a or ENABLE_ANDROID=yes, because rouge
+                         assembles the DomA p4 nested GPT only during SD-image
+                         assembly; with an explicit --aaos=source|prebuilt and neither
+                         of those it warns and builds no DomA)
       --gpu=<stack>      vulkan (DEFAULT) | gl -- which graphics stack the guests get.
                            vulkan: DomA and DomU render with Vulkan through Venus. The
                              device model is qemu 11.1.2 on both boards (the venus=
@@ -173,7 +175,10 @@ DomA (AAOS) options:
                              A mismatch against --board / this tree's generation is
                              refused. A bundle with NO BUNDLE-INFO is refused unless
                              AAOS_PREBUILT_ASSUME_BOARD=<board> asserts what it is.
-      --aaos-src=<dir>       Reuse an existing AOSP checkout for source mode (skip repo sync)
+      --aaos-src=<dir>       Reuse an existing AOSP checkout for source mode: <dir> is
+                             symlinked in instead of cloned. moulin still runs an
+                             incremental 'repo sync' on it while this workspace has no
+                             sync stamp for it, or when <dir>/.repo is newer than the stamp
       --aaos-ref=<dir>       Repo OBJECT MIRROR for the AOSP tree: seed the checkout with
                              'repo init --reference=<dir>' so the sync is local. Accepts a
                              repo client, or a bare '*-project-objects' tree (a shim is
@@ -1269,9 +1274,9 @@ export BB_ENV_PASSTHROUGH_ADDITIONS="${BB_ENV_PASSTHROUGH_ADDITIONS:-} XT_SSTATE
 # Run a command inside a Docker image, mounting the workspace at the same path.
 in_docker() {  # $1=image, rest=command
   local img="$1"; shift
-  docker run --rm "${NET_OPTS[@]}" \
-    "${DOCKER_RUN_OPTS[@]}" ${STAGE_RUN_OPTS[@]+"${STAGE_RUN_OPTS[@]}"} \
-    -v "$workdir":"$workdir" "${CACHE_MOUNTS[@]}" -w "$workdir" \
+  docker run --rm ${NET_OPTS[@]+"${NET_OPTS[@]}"} \
+    ${DOCKER_RUN_OPTS[@]+"${DOCKER_RUN_OPTS[@]}"} ${STAGE_RUN_OPTS[@]+"${STAGE_RUN_OPTS[@]}"} \
+    -v "$workdir":"$workdir" ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} -w "$workdir" \
     -e HTTPS_PROXY -e HTTP_PROXY -e https_proxy -e http_proxy \
     -e NO_PROXY -e no_proxy \
     -e REPO_SKIP_SELF_UPDATE \
@@ -1326,7 +1331,7 @@ build_img() {  # $1=image tag, $2=dockerfile path relative to workdir
   done
   docker build ${BUILD_NET_OPTS[@]+"${BUILD_NET_OPTS[@]}"} -f "$workdir/$2" \
     --build-arg USER_ID="$(id -u)" --build-arg USER_GID="$(id -g)" \
-    "${pargs[@]}" \
+    ${pargs[@]+"${pargs[@]}"} \
     -t "$1" "$workdir/docker"
 }
 
@@ -1573,9 +1578,10 @@ fi
 #     (the AOSP toolchain is baked into Dockerfile.builder). Budget ~360 GiB free (334 GiB
 #     of workspace + the SD image, measured on Android 17 -- docs/BUILD.md "0. Check the
 #     host"); the Android 15 from-scratch run took 5 h 11 min and 17 is longer cold.
-#     --aaos-src reuses an existing checkout
-#     (skips the sync); --aaos-ref seeds it from a repo object mirror; omit -a for a
-#     DomA-less SD.
+#     --aaos-src reuses an existing checkout instead of cloning one (moulin's
+#     repo_sync edge still runs on it while the workspace has no .stamps entry for
+#     it, or when its .repo/ is newer than that stamp); --aaos-ref seeds it from a
+#     repo object mirror; omit -a for a DomA-less SD.
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "${AAOS_SRC_DIR}" ] && [ "${AAOS_SRC_DIR}" != "$workdir/$AAOS_DIR_NAME" ]; then
   # rouge + the doma component read the AOSP tree at the component build-dir, which the
   # yaml names per board (DOMA_DIR). When --aaos-src points at an external tree, symlink
@@ -1824,9 +1830,14 @@ AGLVENUS
     repo sync --no-clone-bundle -j\$(nproc) --retry-fetches=20
     source meta-agl/scripts/aglsetup.sh -m '${AGL_MACHINE}' -b build agl-demo agl-devel agl-kvm agl-ic
     # aglsetup sources oe-init-build-env, so CWD is now the build dir (agl/build)
-    # -- the same CWD the bitbake below relies on. Append the shared cache paths to
+    # -- the same CWD the bitbake below relies on. Write the shared cache paths into
     # conf/local.conf (relative to the build dir), last so they win over aglsetup's
-    # defaults. Values are host-expanded absolute paths.
+    # defaults. Values are host-expanded absolute paths. aglsetup keeps an existing
+    # conf/local.conf, so the lines an earlier run wrote are deleted first; appending
+    # alone added the pair again on every run. aglsetup's own DL_DIR and SSTATE_DIR
+    # lines are commented out, so the only plain assignments are these (a hand-added
+    # one goes too, but it was already overridden by the pair below).
+    sed -i -E '/^(DL_DIR|SSTATE_DIR) = /d' conf/local.conf
     printf '%s\n' 'DL_DIR = \"${AGL_DL_DIR}\"' 'SSTATE_DIR = \"${AGL_SSTATE_DIR}\"' >> conf/local.conf
     # The Venus conf lines, appended after the cache paths so they are last in the
     # file. Any block a PREVIOUS run left is deleted first: conf/local.conf is not
@@ -2162,10 +2173,12 @@ in_docker "$XT_DOCKER" "
   # The kill surfaces in soong's output rather than as a 137 exit status (moulin's ninja
   # turns it into a plain rc=1), so the output is what we check; rc 137 is checked too,
   # for a ninja killed directly. Match soong_ui's own wording -- 'ninja failed with:
-  # signal: killed' -- and not a bare 'signal: killed', which any build log is free to
-  # contain for reasons that have nothing to do with an OOM. The capture file is
-  # truncated per attempt (tee, not tee -a) so one attempt's output can never condemn a
-  # later one; the complete log is on stdout regardless.
+  # signal: killed', or, once Android 17 runs its steps under siso, the summary line
+  # 'N steps failed: exit=137 # signal:killed' (soong_build killed while it analyses
+  # the Android.bp files prints only that) -- and not a bare 'signal: killed', which
+  # any build log is free to contain for reasons that have nothing to do with an OOM.
+  # The capture file is truncated per attempt (tee, not tee -a) so one attempt's output
+  # can never condemn a later one; the complete log is on stdout regardless.
   ninja_out=\$(mktemp)
   # The brace group is load-bearing. NINJA_CMD is substituted into this script as TEXT and
   # can be a compound command ('ninja doma_kernel doma && ninja image-full'), and
@@ -2178,7 +2191,7 @@ in_docker "$XT_DOCKER" "
   tries=0
   until run_ninja; do
     rc=\$?
-    if [ \$rc -eq 137 ] || grep -q 'ninja failed with: signal: killed' \"\$ninja_out\"; then
+    if [ \$rc -eq 137 ] || grep -qE 'ninja failed with: signal: killed|steps failed: exit=137 # signal:killed' \"\$ninja_out\"; then
       echo \">> ninja was KILLED (rc=\$rc). This is the container OOM killer, not a transient\" >&2
       echo \">>   fetch: retrying cannot help. Confirm on the host with\" >&2
       echo \">>   'dmesg -T | grep -i oom-kill' (constraint=CONSTRAINT_MEMCG => the container).\" >&2
@@ -2244,7 +2257,7 @@ if [ "${ENABLE_DOMZ}" = "yes" ]; then
   echo "                   console: xl console DomZ  (from the toolstack domain)"
 fi
 if [ "${ENABLE_ANDROID}" = "yes" ]; then
-  echo "  moulin output  : artifacts/ , yocto/ , android/"
+  echo "  moulin output  : artifacts/ , yocto/ , ${AAOS_DIR_NAME}/"
 else
   echo "  moulin output  : artifacts/ , yocto/"
 fi

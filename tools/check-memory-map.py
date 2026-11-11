@@ -34,8 +34,8 @@ Exit status is non-zero only for 1-6 and 8 (mechanical inconsistencies). 7 is in
 by design, because the 8 GB usable figure is extrapolated rather than measured; use
 --strict-budget to make an over-commit fail too.
 
-Placement and scope: this lives at the workspace root next to build.sh and
-rpi5-sodev.yaml because it reads across BOTH of them and two different layers
+Placement and scope: this lives under tools/ at the workspace root, next to the other
+PC-side checks, because it reads across build.sh, rpi5-sodev.yaml and two different layers
 (meta-xt-rpi5's boot scripts and Xen overlay, meta-xt-common's Zephyr patch). It is
 deliberately NOT under meta-rpi-sodev/scripts/, which holds helpers scoped to a single
 layer. No recipe references it and nothing installs it into an image: it is a

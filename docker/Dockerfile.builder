@@ -93,8 +93,8 @@ RUN apt-get update && apt-get install -y \
     && apt-mark hold tar
 
 # moulin 0.28 (known-good git pin; pulls gpt-image, pyyaml,
-# mako, ...) + west (Zephyr meta-tool, required by the DOM0_OS=zephyr component)
-# + meson (AOSP host-tool build).
+# mako, ...) + meson (AOSP host-tool build). west is not installed here: it lives in
+# /opt/zephyr-venv below, and /usr/local/bin/west is the wrapper that runs it.
 #
 # Upstream also installed Zephyr's own python requirements here (pyelftools,
 # pykwalify, packaging, anytree, intelhex, pyyaml, canopen) against the distro
@@ -103,21 +103,36 @@ RUN apt-get update && apt-get install -y \
 # python3-yaml that moulin and bitbake use -- the collision that broke moulin once.
 RUN pip3 install --no-cache-dir \
         "git+https://github.com/xen-troops/moulin@83e80587c4b1348714237d3ff53129857288a420" \
-        west 'meson>=1.4.0' \
+        'meson>=1.4.0' \
     && ln -sf /usr/local/bin/meson /usr/bin/meson
 
 # Google repo + bazelisk (AOSP).
-# Pins for reproducibility: bazelisk is pinned to a fixed release (not
-# releases/latest) so the image is deterministic; bazelisk itself only launches the
-# bazel version each AOSP tree requests via .bazelversion. The `repo` launcher is
-# the canonical Google bootstrap — its effective version is pinned per-manifest by
-# the repo-rev and by REPO_SKIP_SELF_UPDATE=1 at sync time (see build.sh / README).
+# Both are pinned to a release AND to the sha256 of the file that release published, so
+# the image is deterministic and a download that is not the expected file fails the
+# build instead of being installed. bazelisk itself only launches the bazel version
+# each AOSP tree requests via .bazelversion. The `repo` launcher comes from a tag of
+# git-repo's own gerrit (storage.googleapis.com/git-repo-downloads/repo is always the
+# newest launcher, so that copy can neither be pinned nor checked; v2.71 is what it
+# served when this pin was taken). The launcher only bootstraps: `repo init` clones
+# the repo tool itself into .repo/repo from git-repo's `stable` branch, and
+# REPO_SKIP_SELF_UPDATE=1, when exported, keeps that clone from moving at sync time
+# (see build.sh / README).
+ARG REPO_VERSION=v2.71
 ARG BAZELISK_VERSION=v1.20.0
-RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
-        -o /usr/local/bin/repo \
+RUN curl -fsSL "https://gerrit.googlesource.com/git-repo/+/refs/tags/${REPO_VERSION}/repo?format=TEXT" \
+        | base64 -d > /usr/local/bin/repo \
+    && echo "05f571deafd6ed6da0d20fa707dde29aa5624dbf35553d697a40dbdd4c8d178a  /usr/local/bin/repo" \
+        | sha256sum -c - \
     && chmod 0755 /usr/local/bin/repo \
+    && arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+         amd64) bazelisk_sha=d9af1fa808c0529753c3befda75123236a711d971d3485a390507122148773a3 ;; \
+         arm64) bazelisk_sha=467ec3821aca5e278c8570b7c25e0dfc1a061d2873be89e4a266aaf488148426 ;; \
+         *) echo "no bazelisk sha256 pinned for $arch" >&2; exit 1 ;; \
+       esac \
     && curl -fsSL -o /usr/local/bin/bazel \
-        https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-$(dpkg --print-architecture) \
+        https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-${arch} \
+    && echo "${bazelisk_sha}  /usr/local/bin/bazel" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/bazel
 
 # Python 3.12 for the Zephyr build only.
@@ -198,18 +213,30 @@ ENV PIP_REQUIRE_VIRTUALENV=1
 #   - it must be unpacked under `gnu/`, not the SDK root. cmake/zephyr/gnu/generic.cmake
 #     globs ${ZEPHYR_SDK_INSTALL_DIR}/gnu/*-*zephyr-* and fails with "Unable to find
 #     'x86_64-zephyr-elf' or any other architecture" if the arch dir sits one level up.
+# Both tarballs are checked against the sha256 the release publishes in its sha256.sum,
+# for the two host architectures the image builds on.
 ARG ZSDK=1.0.1
 RUN cd /opt \
+    && m="$(uname -m)" \
+    && case "$m" in \
+         x86_64)  sdk_sha=ca9bc0ff66fafca1dac9d592a36d953cf16d096a9d09b1c0357f021cf9f6a7eb \
+                  gnu_sha=01c0cfe1daaab2d2a0f71165f11a066d983ef97e51c4a3753186afa6ae55c24b ;; \
+         aarch64) sdk_sha=d79c5bfc68e679488659bea289a4026e52a64f03338875c8c9c850fff13cee30 \
+                  gnu_sha=b3f217b7e099509e44d4eb98a0776f4782a05dfc8936b6dcbd2946134d0e13c3 ;; \
+         *) echo "no Zephyr SDK sha256 pinned for $m" >&2; exit 1 ;; \
+       esac \
     && curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
-        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/zephyr-sdk-${ZSDK}_linux-$(uname -m)_minimal.tar.xz \
-    && tar xf zephyr-sdk-${ZSDK}_linux-$(uname -m)_minimal.tar.xz \
-    && rm zephyr-sdk-${ZSDK}_linux-$(uname -m)_minimal.tar.xz \
+        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/zephyr-sdk-${ZSDK}_linux-${m}_minimal.tar.xz \
+    && echo "${sdk_sha}  zephyr-sdk-${ZSDK}_linux-${m}_minimal.tar.xz" | sha256sum -c - \
+    && tar xf zephyr-sdk-${ZSDK}_linux-${m}_minimal.tar.xz \
+    && rm zephyr-sdk-${ZSDK}_linux-${m}_minimal.tar.xz \
     && cd zephyr-sdk-${ZSDK} \
     && curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
-        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/toolchain_gnu_linux-$(uname -m)_aarch64-zephyr-elf.tar.xz \
+        -O https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK}/toolchain_gnu_linux-${m}_aarch64-zephyr-elf.tar.xz \
+    && echo "${gnu_sha}  toolchain_gnu_linux-${m}_aarch64-zephyr-elf.tar.xz" | sha256sum -c - \
     && mkdir -p gnu \
-    && tar xf toolchain_gnu_linux-$(uname -m)_aarch64-zephyr-elf.tar.xz -C gnu \
-    && rm toolchain_gnu_linux-$(uname -m)_aarch64-zephyr-elf.tar.xz \
+    && tar xf toolchain_gnu_linux-${m}_aarch64-zephyr-elf.tar.xz -C gnu \
+    && rm toolchain_gnu_linux-${m}_aarch64-zephyr-elf.tar.xz \
     && test -d gnu/aarch64-zephyr-elf
 # setup.sh -c writes the CMake package registry into $HOME/.cmake/packages, and $HOME
 # is /root at this point while the build runs as `builder` - so it would not be read.

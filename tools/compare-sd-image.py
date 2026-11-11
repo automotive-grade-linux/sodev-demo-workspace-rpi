@@ -187,7 +187,7 @@ def ext4_files(img, off):
         inode  mode  (type)  uid  gid  size  date...  name
     and the mode's leading digits give the type: 10 regular, 12 symlink, 4 directory.
     """
-    files, dirs, level = {}, [], ["/"]
+    files, level = {}, ["/"]
     for _depth in range(24):
         if not level:
             break
@@ -222,7 +222,6 @@ def ext4_files(img, off):
             # symlinks (12...) are skipped: their "size" is the target length, and a
             # target that differs is caught by the file set, not by a size compare.
         level = nxt
-        dirs.extend(nxt)
     return files
 
 
