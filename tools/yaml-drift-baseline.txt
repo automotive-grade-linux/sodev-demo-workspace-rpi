@@ -12,19 +12,9 @@
 +          BOARD_RAM: "4g"
 +          BOARD_RAM: "8g"
 +          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/ meta-xt-rpi5/recipes-extended/xt-xen-cfg-doma/ meta-xt-rpi5/recipes-extended/xt-aaos-host-services/"
-+        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-mmc.dtbo"
-+        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-pcie1.dtbo"
-+        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-usb.dtbo"
-+        - "tmp/deploy/images/%{MACHINE}/%{XT_DOMD_DTB_NAME}"
 +        - "tmp/deploy/images/%{MACHINE}/bcm2712-rpi-4-b.dtb"
 +        - "tmp/deploy/images/%{MACHINE}/bl31.bin"
-+        - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup_x.dat"
-+        - "tmp/deploy/images/%{MACHINE}/bootfiles/start_x.elf"
 +        - "tmp/deploy/images/%{MACHINE}/disable-bt.dtbo"
-+        - "tmp/deploy/images/%{MACHINE}/mmc-passthrough.dtbo"
-+        - "tmp/deploy/images/%{MACHINE}/pcie1-passthrough.dtbo"
-+        - "tmp/deploy/images/%{MACHINE}/rpi5-image-xt-domd-vc4-initramfs-%{MACHINE}.rootfs.cpio.gz"
-+        - "tmp/deploy/images/%{MACHINE}/usb-passthrough.dtbo"
 +        - ["IMAGE_CLASSES:remove", "sdcard_image-rpi"]
 +        - ["IMAGE_FSTYPES:remove", "rpi-sdimg"]
 +        - ["PREFERRED_PROVIDER_virtual/kernel", "linux-raspberrypi"]
@@ -35,8 +25,6 @@
 +      overrides:
 +    "4g":
 +    "8g":
-+    desc: "DomD rootfs only (RPi5)"
-+    desc: "Full RPi5(BCM2711)+Xen SD image (thin Linux or Zephyr Dom0 + dom0less DomD + DomU AGL + DomA AAOS)"
 +    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1440 MiB with GPU=vulkan, the default, or 1056 with gl; DomU or DomA, one at a time)"
 +  ANDROID_KERNEL_DIR: "android_kernel-rpi5"
 +  BOARD_RAM:
@@ -44,11 +32,9 @@
 +  DOMA_DIR: "android-rpi5"
 +  MACHINE: "raspberrypi5"   # meta-raspberrypi machine (SOC_FAMILY=rpi, MACHINEOVERRIDES raspberrypi5, DEFAULTTUNE cortexa76-nocrypto)
 +  XT_DOMA_SOURCE_GROUP: "default,rpi5"
-+  XT_DOMD_DTB_NAME: "%{SOC_FAMILY}-%{MACHINE}-domd.dtb"
 -                - [LICENSE_FLAGS_ACCEPTED:append:raspberrypi5, " commercial_rpidistro-ffmpeg"]
 -                - [PREFERRED_PROVIDER_ffmpeg:raspberrypi5, "rpidistro-ffmpeg"]
 -                - [PREFERRED_PROVIDER_libav:raspberrypi5, "rpidistro-ffmpeg"]
--                - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
 -          "%{XT_SCMI_HOST_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"
 -          "armstub8-2712.bin": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/armstub8-2712.bin"
 -          "bcm2712-rpi-5-b.dtb": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712-rpi-5-b.dtb"
@@ -72,9 +58,6 @@
 -      overrides:
 -    "16g":
 -    "8g":
--    - [BB_HASHSERVE_DB_DIR, "${SSTATE_DIR}"]
--    desc: "Full RPI image"
--    desc: "Full RPi5+Xen SD image (Dom0 + DomD, optional DomU AGL / DomA AAOS)"
 -    desc: "Target Raspberry Pi 5 SKU: 16g (default; full 4-domain cockpit) or 8g (DomD and DomA 3072 MiB each; the four domains then total 7680 MiB and fit an 8 GB board -- see the comment above)"
 -  ANDROID_KERNEL_DIR: "android_kernel"
 -  BOARD_RAM:

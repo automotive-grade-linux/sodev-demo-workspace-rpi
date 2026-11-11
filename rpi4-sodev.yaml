@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # ============================================================================
 # Raspberry Pi 4 / BCM2711 — SoDeV disaggregated cockpit on Xen 4.22
 # ============================================================================
@@ -18,12 +19,14 @@
 # this SoC and are absent here rather than remapped.
 #
 # STATUS. Both flavours build and assemble a full.img (`--board=rpi4 --dom0=linux`
-# and `--dom0=zephyr`). On hardware, the sending environment booted Dom0(Zephyr) +
-# dom0less DomD + DomA on a 4 GiB board, with AAOS reaching sys.boot_completed=1,
-# CarLauncher on the panel and touch input reaching the guest. That hardware run has
-# NOT been reproduced in the environment this file was contributed from; see
-# meta-xt-rpi4/README.md for what is verified where, and for the open items
-# (VL805 guest MSI, OP-TEE, A72 two-screen headroom).
+# and `--dom0=zephyr`). On a 4 GiB board, Dom0(Zephyr) + dom0less DomD + DomA booted
+# with the current memory map (DomD 1440 MiB, DomA 2048 MiB, Venus lane) on
+# 2026-09-23; the environment this port came from had booted the same domains
+# with the map of the time on 2026-08-07, with AAOS reaching sys.boot_completed=1,
+# CarLauncher on the panel and touch input reaching the guest. The gl lane and
+# the 8 GiB SKU have not been booted. meta-xt-rpi4/README.md records what is
+# verified where, and the open items (VL805 guest MSI, OP-TEE, A72 two-screen
+# headroom).
 #
 # NAMING. The layer is meta-xt-rpi4, but the IMAGE RECIPE names stay rpi5-image-*.
 # They are recipe names shared with meta-xt-common, not board names, and renaming
@@ -34,13 +37,15 @@
 desc: "Raspberry Pi 4 + Xen 4.22 — AGL SoDeV disaggregated cockpit (Zephyr or thin-Linux Dom0)"
 
 # Combining model (moulin has NO cross-file include):
-#   Dom0/DomD : rpi5 base. Component bodies live in the external/meta-xt-prod-devel-rpi5
-#               submodule (rpi5.yaml). The blocks below are thin wiring that reference those
-#               layers by path; bump the submodule to follow xen-troops.
+#   Dom0/DomD : derived from xen-troops' rpi5.yaml (the external/meta-xt-prod-devel-rpi5
+#               submodule, kept as the reference). The layers the components load are
+#               the vendored copies under meta-rpi-sodev/, not the submodule's.
 #   DomU      : AGL Flutter, built OUTSIDE moulin by build.sh (repo init + bitbake). Not a component here.
-#   DomA      : doma / doma_kernel components COPIED verbatim from the V4H AGL SoDeV yaml
-#               (external/sodev-demo-workspace/external/meta-rcar-demo/prod-devel-rcar4_new.yaml).
-#               Keep their manifest revs in sync via meta-rpi-sodev/scripts/sync-guest-pins.sh.
+#   DomA      : doma / doma_kernel components derived from the V4H AGL SoDeV yaml
+#               (external/sodev-demo-workspace/external/meta-rcar-demo/prod-devel-rcar4_new.yaml),
+#               with Android 17 pins of their own. meta-rpi-sodev/scripts/sync-guest-pins.sh
+#               --check prints the V4H pins next to ours and --print gives build.sh the AGL
+#               branch; its --apply refuses, so the pins here are edited by hand.
 
 variables:
   # --- RPi5 base ---
@@ -58,8 +63,8 @@ variables:
 
   # --- Zephyr Dom0 (main branch policy, copied from rpi5.yaml) ---
   ZEPHYR_DOM0_DIR: "zephyr"
-  # Zephyr's Raspberry Pi 4 board is spelled rpi_4b (boards/raspberrypi/rpi_4b
-  # upstream, boards/arm64/rpi_4b at the pinned xen-troops rev) — NOT "rpi_4".
+  # Zephyr's Raspberry Pi 4 board is spelled rpi_4b (boards/raspberrypi/rpi_4b in
+  # Zephyr v4.5.0) — NOT "rpi_4".
   # GIC_V2 is unchanged from rpi_5, but the board needs a pl011 node and its SRAM
   # base relinked to Xen's Dom0 bank[0] = 0x20000000. See
   # meta-xt-common/meta-xt-dom0-zephyr/README.md.
@@ -70,8 +75,9 @@ variables:
   # --- DomZ (Zephyr guest / DomU) ---------------------------------------------
   # DomZ is a SECOND, independent west workspace: the Dom0 one (%{ZEPHYR_DOM0_DIR})
   # only exists in the --DOM0_OS zephyr flavour, and DomZ must build in both. The
-  # manifest is the same repository as Dom0's (it is what pins xen-troops/zephyr,
-  # the tree that carries the xenvm board), but the application built out of it is
+  # manifest is the same repository as Dom0's (zephyr-dom0-xt, whose west.yml --
+  # as 0021 rewrites it -- pins upstream zephyrproject-rtos/zephyr v4.5.0, the tree
+  # that carries the xenvm board as boards/xen/xenvm), but the application built out of it is
   # this repo's meta-xt-domz/zephyr-apps/domz, referenced by a workspace-relative
   # path: moulin's zephyr builder runs `west build ... $target` from inside the
   # component build-dir, so a target outside the workspace is simply a relative
@@ -91,7 +97,6 @@ variables:
   # --- DomD / DomU build dirs + machines + image names (copied from rpi5.yaml) ---
   DOMU_MACHINE: "virtio-armv8-xt"
   XT_XEN_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen.dtbo"
-  XT_DOMD_DTB_NAME: "%{SOC_FAMILY}-%{MACHINE}-domd.dtb"
   # No XEN_DT_SCMI_NAME here, unlike rpi5-sodev.yaml: BCM2711 has no SCMI at all —
   # clocks and power come from the VideoCore firmware mailbox — so this layer carries
   # neither the SCMI overlays nor the SCMI Kconfig fragment.
@@ -112,23 +117,7 @@ variables:
   # What XT_DOMA_HWDEC is on the vulkan lane (see the GPU parameter). A Dom0
   # flavour whose DomD DT carries no decoder for DomA overrides it with "false".
   XT_DOMA_HWDEC_VULKAN: "true"
-  # Informational/unused: the shipping DomU is built by the AGL bitbake
-  # (agl-cluster-demo-flutter-guest); this workspace only harvests its kernel Image
-  # (see build_target below). The full DomU gfx image (rpi5-image-domu-gfx) moved to
-  # the opt-in meta-rpi-sodev-devel layer, so %{XT_DOMU_IMAGE} is not consumed here.
-  XT_DOMU_IMAGE: "rpi5-image-domu-gfx"
   DOMD_CAN_TYPE: ""
-  # DOMD_ROOTFS_DEV (usb default = /dev/sda1), kept sed-escaped to mirror rpi5.yaml.
-  # NOTE: INERT on this board. meta-xt-rpi4's xt-rpi-u-boot-scr (COMPATIBLE_MACHINE =
-  # ^raspberrypi4-64$; meta-xt-rpi5 carries a separate recipe of the same name for
-  # ^raspberrypi5$) has a do_compile:raspberrypi4-64 that installs a STATIC
-  # board-tuned boot.cmd (meta-xt-rpi4 boot.cmd.xen.{zephyr,linux}-dom0.in) with the
-  # DomD cmdline hard-coded;
-  # there is no `sed 's/@@..@@/../'` template substitution, so neither this value nor the
-  # DOMD_BOOTARGS that references it (below) reaches the boot script. Retained (escaping
-  # and all) only to keep the %{DOMD_ROOTFS_DEV} expansion in DOMD_BOOTARGS valid and to
-  # mirror rpi5.yaml; edit the .in template to change the real DomD root/cmdline.
-  DOMD_ROOTFS_DEV: "\\\\/dev\\\\/sda1"
 
   # --- DomA (Android) — copied from V4H prod-devel-rcar4_new.yaml ---
   # Board-suffixed, unlike the Pi 5's plain "android"/"android_kernel". A virtio guest
@@ -247,6 +236,16 @@ common_data:
     # bitbake via BB_ENV_PASSTHROUGH_ADDITIONS). Empty env = the defaults here.
     - [SSTATE_DIR, "${@os.getenv('XT_SSTATE_DIR') or d.expand('${TOPDIR}/../common_data/sstate')}"]
     - [DL_DIR, "${@os.getenv('XT_DL_DIR') or d.expand('${TOPDIR}/../common_data/downloads')}"]
+    # Keep the hash-equivalence database next to the sstate cache it describes.
+    # Its default is inside the build directory, so two build dirs sharing one
+    # SSTATE_DIR each keep their own view of "these different task hashes produce
+    # the same output" and cannot reuse each other's entries. That is so with the
+    # default SSTATE_DIR above as well; sanity.bbclass only WARNS about it, naming
+    # this variable, when SSTATE_DIR is outside the build tree (XT_SSTATE_DIR
+    # pointing at another workspace's cache). Moving it alongside SSTATE_DIR is
+    # what makes a shared cache actually shared. Harmless when the cache is not
+    # shared: the database simply lives one directory further out.
+    - [BB_HASHSERVE_DB_DIR, "${SSTATE_DIR}"]
     # DISTRO. With the poky combo-repo gone, meta-poky's poky.conf is added as an
     # explicit layer (common_yocto_layers) and DISTRO must be set here (the
     # poky-bundle local.conf.sample used to default it).
@@ -298,8 +297,8 @@ common_data:
     - [DISTRO_FEATURES_FILTER_NATIVESDK:append, " glvnd"]
     - [DISTRO_FEATURES_FILTER_NATIVE:append, " glvnd"]
     # [wrynose] BB_DANGLINGAPPENDS_WARNONLY removed in wrynose 5.2. The dangling
-    # appends it previously suppressed (shared meta-rpi5-domu/doma image .bbappends in
-    # configs lacking the base recipe) resolve cleanly after the Phase2 layer set; no
+    # appends it previously suppressed (shared DomU/DomA image .bbappends in
+    # configs lacking the base recipe) resolve cleanly with the full layer set; no
     # dangling-append errors remain, so no replacement is needed.
     # Init manager
     - [INIT_MANAGER, "systemd"]
@@ -318,16 +317,16 @@ parameters:
   # one variant's disjoint body is merged in (moulin overrides append to sequences /
   # add-or-replace mapping keys, so an empty base + full-body variant is unambiguous).
   #   zephyr (DEFAULT) = upstream/main policy: west source + zephyr builder, board
-  #     rpi_5, XEN_DOMCTL_INTERFACE_VERSION 0x18 (our Xen 4.22). Boot loads
+  #     rpi_4b, XEN_DOMCTL_INTERFACE_VERSION 0x18 (our Xen 4.22). Boot loads
   #     zephyr.bin as dom0. Requires meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/apply-zephyr-patches.sh after
-  #     `west update` (moulin has no apply_patch hook). See rpi5-sodev.yaml (--DOM0_OS zephyr).
+  #     `west update` (moulin has no apply_patch hook). See the zephyr variant below.
   #   linux            = our verified thin control domain: git source + yocto builder,
   #     rpi5-image-xt-dom0-thin. Boot loads the dom0-thin initramfs cpio.gz.
   # NOTE: the variant bodies use the *COMMON_YOCTO_SOURCES / *LINUX_DOMAIN_CONF /
   # *COMMON_YOCTO_LAYERS anchors (defined in common_data), so this whole `parameters`
   # block is placed AFTER common_data (YAML aliases must follow their anchor).
   DOM0_OS:
-    desc: "Dom0 OS: zephyr (xenstore-only disaggregated Dom0, pinned rpi5-v0.4.0) or linux (thin Linux control Dom0)"
+    desc: "Dom0 OS: zephyr (xenstore-only disaggregated Dom0, pinned to tag rpi5-v0.4.0 = 03b96147) or linux (thin Linux control Dom0)"
     zephyr:
       default: true
       overrides:
@@ -339,15 +338,19 @@ parameters:
           # %{YOCTOS_WORK_DIR}/ prefix -> yocto/build-domu/.../Image.
           DOM0_DOMU_KERNEL_DEP: "%{YOCTOS_WORK_DIR}/%{DOMU_BUILD_DIR}/tmp/deploy/images/%{DOMU_MACHINE}/Image"
         components:
-          # Zephyr Dom0 body (from rpi5-sodev.yaml (--DOM0_OS zephyr) dom0 component):
-          # zephyr-dom0-xt @ rpi5-v0.4.0, board rpi_5 (bcm2712), west source +
-          # zephyr builder. See rpi5-sodev.yaml (--DOM0_OS zephyr) for the full rationale
-          # (R1 0x18 ABI, hybrid dom_cfg, apply-zephyr-patches.sh).
+          # Zephyr Dom0 body: zephyr-dom0-xt @ rpi5-v0.4.0, board rpi_4b (bcm2711;
+          # 0019 adapts the board for Dom0, 0020 adds its dom_cfg), west source +
+          # zephyr builder. The rationale (R1 0x18 ABI, hybrid dom_cfg,
+          # apply-zephyr-patches.sh) is in meta-xt-dom0-zephyr/README.md.
           dom0:
             build-dir: "%{ZEPHYR_DOM0_DIR}"
             sources:
               - type: west
                 url: "https://github.com/xen-troops/zephyr-dom0-xt.git"
+                # A tag, not a SHA like the other sources: moulin hands rev to
+                # `west init --mr`, which west turns into `git clone --branch`, and
+                # that takes a branch or tag only. The tag named commit
+                # 03b961479a6b56c99228aedbe206ba1ed6668b54 when it was pinned.
                 rev: "rpi5-v0.4.0"
             builder:
               type: zephyr
@@ -461,8 +464,8 @@ parameters:
                 # xl-create-domz.service. Both this conf and the domd one set the
                 # two DomZ variables because meta-xt-domz is parsed by both
                 # builds; a variable read by a shared layer but set in only one
-                # component conf is the ExpansionError the DOMD_CAN_TYPE /
-                # XEN_DT_SCMI entries below document.
+                # component conf is the ExpansionError the DOMD_CAN_TYPE entry
+                # below documents.
                 - [XT_DOMZ_CFG_INSTALL, "%{XT_DOMZ_CFG_INSTALL}"]
                 # [GPU gate] The lane, for what Dom0 builds in this flavour.
                 # Its libxl builds every guest, so it needs the toolstack
@@ -498,19 +501,14 @@ parameters:
                 # DOMD_CAN_TYPE is unset the inline-python SRC_URI fails to expand
                 # (ExpansionError). Match the domd component.
                 - [DOMD_CAN_TYPE, "%{DOMD_CAN_TYPE}"]
-                # NOTE(2026-07-26): XT_DEVICE_TREES has NO consumer anywhere in the
-                # vendored layers or the fetched ones — grep finds only these two
-                # writes. It is kept because the upstream xen-troops recipes read it
-                # and dropping it would diverge from them for no gain; do not add
-                # logic that depends on it without first adding a reader.
-                - [XT_DEVICE_TREES, "%{XT_XEN_DTBO_NAME}"]
-                # NOT SET on this board, unlike rpi5-sodev.yaml: [XEN_DT_SCMI, ...].
-                # BCM2711 has no SCMI, so there is no bcm2711-*-xen-scmi.dtso to name.
-                # The recipe side had to change to match: meta-xt-driver-domain's
-                # linux-raspberrypi_6.18.bbappend used to add the five SCMI/WiFi .dtso
-                # entries to SRC_URI unconditionally, which made do_fetch look for
-                # bcm2711-raspberrypi4-64-domd-scmi.dtso and fail the parse. They are
-                # now scoped to :raspberrypi5 there.
+                # No [XEN_DT_SCMI, ...] here (rpi5-sodev.yaml sets it in its domd
+                # component only, for xt-prod-devel's pristine bbappend): BCM2711 has
+                # no SCMI, so there is no bcm2711-*-xen-scmi.dtso to name.
+                # meta-xt-driver-domain's linux-raspberrypi_6.18.bbappend used to add
+                # five SCMI/WiFi .dtso entries to SRC_URI unconditionally, which made
+                # do_fetch look for bcm2711-raspberrypi4-64-domd-scmi.dtso and fail the
+                # parse; they are gone from that bbappend altogether (nothing loaded
+                # them on either board).
                 # [Case-C] Select the Xen 4.22 recipes (xen_4.22.bb / xen-tools_4.22.bb,
                 # SRCREV d45d5687f1, branch stable-4.22). [4.22] These are INTERIM
                 # LOCAL recipes in meta-xt-common/meta-xt-domx (shared by both board
@@ -680,7 +678,7 @@ parameters:
           # xt-xen-cfg-domu carries the DomU xl guest cfg AND the auto-enabled
           # xl-create-domu.service. Gate its install on ENABLE_DOMU: a guest-less
           # build (=no) must NOT ship it, or xl-create-domu fails on every boot.
-          # Consumed by the DomD initramfs + dom0-thin (see their conf/recipes).
+          # Consumed by the DomD p2 rootfs image + dom0-thin (see their conf/recipes).
           XT_DOMU_CFG_INSTALL: ""
     "yes":
       overrides:
@@ -741,15 +739,10 @@ parameters:
     desc: "Reserve an empty SD p3 in place of the DomU rootfs so the DomA nested GPT stays at p4 in a DomU-less build. Derived by build.sh; do not set by hand."
     "no":
       default: true
-      overrides:
-        variables:
-          # No layout change. The variable exists so the parameter has a body and so
-          # the value is visible in the generated build.ninja for a DomU-less debug.
-          XT_SD_P3: "domu-rootfs-or-absent"
+      # No layout change. moulin wants a mapping here, so the body is an empty one.
+      overrides: {}
     "yes":
       overrides:
-        variables:
-          XT_SD_P3: "reserved-empty"
         images:
           full:
             partitions:
@@ -936,8 +929,8 @@ parameters:
   # (DomA touch) is carried as meta-xt-qemu's q11-017 (0118 for 10.0.2) and 0110
   # (virtio-pci ISR IOREQ range) as q11-019 (0120); 0101 (RESUME with no QMP monitor)
   # and 0103 (deferred autostart vm_start) are forward-ported as q11-021 (0201 for
-  # 10.0.2); 0112 (vTPM GUEST_TPM_BASE guard) and 0113 (sched_attr redefinition) do
-  # not apply. See meta-xt-driver-domain's qemu_%.bbappend for the per-patch statement
+  # 10.0.2); 0112 (vTPM GUEST_TPM_BASE guard) does not apply. See
+  # meta-xt-driver-domain's qemu_%.bbappend for the per-patch statement
   # and docs/VULKAN-VENUS.md for the whole procedure.
   #
   # "vulkan" is what the lines below describe; "gl" simply does not do them (and puts
@@ -1085,9 +1078,14 @@ parameters:
                 # RESOURCE_CREATE_BLOB (0x10c) answered VIRTIO_GPU_RESP_ERR_UNSPEC
                 # (0x1200), then vkCreateInstance returns
                 # ERROR_OUT_OF_HOST_MEMORY. Found by running an arm64 Venus guest on
-                # a PC before touching hardware; oe-core defaults this PACKAGECONFIG
-                # off, and FILES:${PN} already covers ${libexecdir}/* so the binary
-                # needs no packaging change.
+                # a PC before touching hardware. What brings the render server in is
+                # enabling Venus itself (XT_VIRGL_VENUS_REMOVE empty): virglrenderer
+                # builds it together with Venus (meson.build: with_render_server =
+                # with_venus) in 1.3.0 and in 1.2.0 alike, so this append is a no-op
+                # -- 1.2.0 lists render-server as deprecated and ignores it, and the
+                # 1.3.0 recipe accepts the name as an empty PACKAGECONFIG. It stays as
+                # the record of the requirement. FILES:${PN} already covers
+                # ${libexecdir}/*, so the binary needs no packaging change.
                 - ["PACKAGECONFIG:append:pn-virglrenderer", " render-server"]
                 # ...and minigbm_allocation, for the same reason one step further in. Also
                 # oe-core-default-off, also found by running a guest on a PC before hardware.
@@ -1218,12 +1216,12 @@ components:
   # =========================================================================
   # Dom0 / DomD — RPi5 base, copied verbatim from external/meta-xt-prod-devel-rpi5/rpi5.yaml.
   # =========================================================================
-  # Dom0 has two variants per upstream.txt (Dom0 Linux deviates from upstream):
-  #   main branch       = Zephyr Dom0 (RPi5 upstream policy)
-  #   linux-dom0 branch = Linux thin control domain (THIS — our verified Plan-B config).
-  # rpi5-image-xt-dom0-thin is NOT in upstream rpi5.yaml (built manually in a standalone
-  # bitbake build); MACHINE=raspberrypi5 and the layer set below are taken verbatim from
-  # that verified bblayers. Layer paths remapped to the meta-xt-prod-devel-rpi5 submodule.
+  # Dom0 has two variants (the Linux Dom0 deviates from the RPi5 upstream policy):
+  #   zephyr = Zephyr thin Dom0 (the RPi5 upstream policy, and the default here)
+  #   linux  = thin Linux control domain (the alternative flavour)
+  # rpi5-image-xt-dom0-thin is NOT in upstream rpi5.yaml; MACHINE=raspberrypi4-64, and
+  # the layer set below is the rpi5 sibling's with meta-xt-rpi4 in place of
+  # meta-xt-rpi5. The layers are the vendored copies under meta-rpi-sodev/.
   # dom0 is an EMPTY base: the DOM0_OS parameter (see `parameters:` above) supplies
   # the entire dom0 body (build-dir + sources + builder) for the selected OS, because
   # the Linux (git source + yocto builder) and Zephyr (west source + zephyr builder)
@@ -1265,7 +1263,6 @@ components:
         - [MACHINE, "%{MACHINE}"]
         - [RPI_SOC_FAMILY, "%{SOC_FAMILY}"]
         - [XT_DOM_NAME, "domd"]
-        - [XT_DEVICE_TREES, "%{XT_XEN_DTBO_NAME}"]
         - [DOM0_OS, "%{DOM0_OS}"]
         # Board SKU for the boot script's `setenv board_ram` (see the BOARD_RAM
         # parameter). The DomD build is the one that produces boot.scr. It also
@@ -1348,32 +1345,29 @@ components:
         # RPi4 build produces exactly the artifact set the RPi5 reference does.
         - ["IMAGE_FSTYPES:remove", "rpi-sdimg"]
         - ["IMAGE_CLASSES:remove", "sdcard_image-rpi"]
-        # meta-xt-qemu provides the xen-troops qemu 7.0.0-xt (xenpv machine +
-        # GPEX/pcie.0 + multi-vcpu + the 0110 virtio-pci IOREQ ISR fix) — the
-        # device-model qemu that libxl's `xl devd` spawns for DomU/DomA. Without
-        # this pin bitbake resolves the higher poky qemu (8.2.7), whose mainline
-        # hw/arm/xen_arm.c machine is "xenpvh" with max_cpus=1 and NO pcie.0, so the
-        # device-model dies ("unsupported machine type" → "Invalid SMP CPUs" →
-        # "Bus 'pcie.0' not found") and no DomU/DomA virtio surface is created.
-        # Same class of mis-resolve as the xen-tools 4.17 issue above.
+        # meta-xt-qemu carries three qemu recipes (7.0.0-xt, 10.0.2 and 11.1.2, the
+        # last with DEFAULT_PREFERENCE -1) and, as the higher-priority layer, is
+        # where bitbake chooses (the same rule as for weston and virglrenderer
+        # above): with no pin it would take 10.0.2. The gl lane wants the xen-troops
+        # 7.0.0-xt device model (xenpv machine + GPEX/pcie.0 + multi-vcpu + the 0110
+        # virtio-pci IOREQ ISR fix), the qemu that libxl's `xl devd` spawns for
+        # DomU/DomA, so it is pinned here; the vulkan lane sets the variable again
+        # to 11.1.2 (see the GPU parameter and XT_DOM0_QEMU_VERSION). Neither lane
+        # pins 10.0.2.
         - [PREFERRED_VERSION_qemu, "7.0.0"]
         # Remove the venus (Vulkan/V3DV) backend from virglrenderer in the
         # --gpu=gl lane only: XT_VIRGL_VENUS_REMOVE is "venus" there and empty
         # in the default Vulkan lane (see the GPU parameter). That lane's guests
         # use only GLES-on-virgl, so it gets the same pure-GL virglrenderer as
         # the pre-Venus known-working image, which did not link libvulkan.
-        # (Note: this line is NOT a fix for the V3D-D0 rendering hang #316/#319
-        # = a separate issue.)
         - ["PACKAGECONFIG:remove:pn-virglrenderer", "%{XT_VIRGL_VENUS_REMOVE}"]
-        # wrynose upgrade (Phase 3a): the self-built mesa 24.2.7 / libdrm 2.4.123 /
+        # wrynose upgrade: the self-built mesa 24.2.7 / libdrm 2.4.123 /
         # wayland-protocols 1.37 recipes and their PREFERRED_VERSION pins are
         # removed. wrynose oe-core ships mesa 26.0.5 / libdrm 2.4.131 /
-        # wayland-protocols 1.47, which already include the BCM2712 D0 (V3D 7.1.10)
-        # shader-state packet-shuffle support that 24.2.7 was pinned for, so the
-        # pins are obsolete. The 24.2.7 recipes were dropped (not disabled -- there
-        # are no .bb.disabled files in-tree); re-enabling them as a Phase4 V3D-D0
-        # regression fallback (if mesa 26 regresses on D0) would mean re-vendoring
-        # the 24.2.7 mesa/libdrm/wayland-protocols recipes.
+        # wayland-protocols 1.47. The 24.2.7 pin existed for the BCM2712 D0
+        # (V3D 7.1.10) shader-state support, which BCM2711 never needed. The 24.2.7
+        # recipes were dropped (not disabled -- there are no .bb.disabled files
+        # in-tree).
         # RPI specific
         - [ENABLE_UART, "1"]
         - [RPI_USE_U_BOOT, "1"]
@@ -1413,28 +1407,21 @@ components:
         # low bank, the one the VideoCore can reach.
         # NOTE: the effective DomD cmdline (incl. this cma= value) is hard-coded in
         # the STATIC boot.cmd template (meta-xt-rpi4 xt-rpi-u-boot-scr
-        # boot.cmd.xen.{zephyr,linux}-dom0.in, where the value actually lives), NOT
-        # in the DOMD_BOOTARGS below -- which is inert here (see the
-        # DOMD_ROOTFS_DEV note in the variables block). Edit the .in template to
-        # change the real value. tools/check-rpi4-memory-map.py prints the
-        # authoritative bank list for this board; the BCM2712 tool does not.
+        # boot.cmd.xen.{zephyr,linux}-dom0.in, where the value actually lives). Edit
+        # the .in template to change the real value. tools/check-rpi4-memory-map.py
+        # prints the authoritative bank list for this board; the BCM2712 tool does not.
         # Avoid swiotlb=force / iommu.passthrough=1 — those broke
         # v3d clock probe in 2026-05-06 testing.
-        # 5/7 verbose: drop `quiet`, raise loglevel + ignore_loglevel +
-        # printk.devkmsg=on to surface vc4_hdmi probe error messages that
-        # were suppressed by audit rate-limit on previous boots.
-        # 5/9 case-w: the vc_mem injection is for the new EEPROM (case-u), so revert it
-        # when booting on the old EEPROM environment (to keep compatibility).
-        - [DOMD_BOOTARGS, "console=ttyAMA0 earlycon=xen earlyprintk=xen clk_ignore_unused root=%{DOMD_ROOTFS_DEV} rootfstype=ext4 rootwait loglevel=8 ignore_loglevel printk.devkmsg=on no_console_suspend"]
         - [DOMD_CAN_TYPE, "%{DOMD_CAN_TYPE}"]
         # meta-xt-domu is now in this build's layers (xt-xen-cfg-domu
         # for the DomD toolstack); mask its DomU guest-side recipes like the dom0
         # build does.
         - [BBMASK, "meta-xt-domu/recipes-agl/"]
         # [ENABLE_DOMU gate] xt-xen-cfg-domu (DomU xl cfg + the auto-enabled
-        # xl-create-domu.service) is installed into the DomD initramfs only when a
+        # xl-create-domu.service) is installed into the DomD rootfs only when a
         # DomU is built. ENABLE_DOMU=no => "" so a guest-less build never ships the
-        # service (it would fail every boot). Consumed by rpi5-image-xt-domd-vc4-initramfs.
+        # service (it would fail every boot). Consumed by rpi5-image-xt-domd-vc4 (the
+        # SD p2 rootfs DomD actually boots).
         - [XT_DOMU_CFG_INSTALL, "%{XT_DOMU_CFG_INSTALL}"]
         # [ENABLE_DOMZ gate] Same for DomZ (Zephyr guest): in the zephyr flavour
         # DomD is the toolstack domain, so domz.cfg + xl-create-domz.service go
@@ -1463,7 +1450,7 @@ components:
         # linux-raspberrypi_6.18 DT/config bbappend, CMA/USB/DVFS rpi-config, and
         # the bcm2712-raspberrypi5-xen DT overlay. meta-xt-driver-domain carries
         # the DomD kernel body + V4H kernel/mesa/weston/qemu bbappends + all the
-        # DomD recipes/images (formerly meta-rpi5-domd + linux-dom0-poc DomD half).
+        # DomD recipes/images.
         - "../../meta-rpi-sodev/meta-xt-common/meta-xt-driver-domain"
         - "../../meta-rpi-sodev/meta-xt-common/meta-xt-security"
         - "../../meta-rpi-sodev/meta-xt-common/meta-xt-qemu"
@@ -1477,8 +1464,8 @@ components:
         # (meta-xt-rpi4/recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb), so
         # letting that bbappend attach would silently swap the source tree out.
         #
-        # Nothing else in that layer is needed: its include/dt_config.inc is also
-        # provided by meta-xt-driver-domain, and its xt-rpi-u-boot-scr.bbappend only
+        # Nothing else in that layer is needed: nothing on this board reads its
+        # include/dt_config.inc, and its xt-rpi-u-boot-scr.bbappend only
         # appends SCMI overlays, which this board has none of. rpi5-image-minimal-domd
         # comes from meta-xt-rpi4, above.
         # DomU integration layer: provides xt-xen-cfg-domu
@@ -1493,7 +1480,7 @@ components:
         - "../../meta-rpi-sodev/meta-xt-common/meta-xt-domz"
         # DomA integration layer (meta-xt-doma): stacks the vhost_xen kernel bbappend
         # on the DomD linux-raspberrypi build and installs xt-aaos-host-services
-        # (VHAL/dumpstate) + domd-vhost-xen-domid into the DomD image. Always in
+        # (VHAL/dumpstate) into the DomD image. Always in
         # layers (V4H style); under ENABLE_ANDROID=no all its recipes are BBMASK'd
         # via %{XT_DOMA_BBMASK} so a DomA-less DomD build does not parse the
         # AAOS-prebuilt SRC_URI.
@@ -1523,17 +1510,11 @@ components:
         # xen-tools is configured --disable-xsmpolicy. The artifact is not wanted here
         # either: XSM Flask is off (xsm=dummy) and boot.cmd does `fdt rm /chosen/xenpolicy`.
         - "tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
-        - "tmp/deploy/images/%{MACHINE}/%{XT_DOMD_DTB_NAME}"
-        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-mmc.dtbo"
-        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-usb.dtbo"
-        - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-pcie1.dtbo"
+        # NOT PRODUCED on this board: the SCMI host overlay (rpi5-sodev.yaml's
+        # %{XT_SCMI_HOST_DTBO_NAME}). BCM2711 has no SCMI and this layer carries no
+        # *-scmi*.dtso sources.
         - "tmp/deploy/images/%{MACHINE}/u-boot-%{MACHINE}.bin"
         - "tmp/deploy/images/%{MACHINE}/boot.scr"
-        # NOT PRODUCED on this board: the xen-scmi / domd-scmi / pcie1-scmi dtbos.
-        # BCM2711 has no SCMI and this layer carries no *-scmi.dtso sources.
-        - "tmp/deploy/images/%{MACHINE}/mmc-passthrough.dtbo"
-        - "tmp/deploy/images/%{MACHINE}/usb-passthrough.dtbo"
-        - "tmp/deploy/images/%{MACHINE}/pcie1-passthrough.dtbo"
         - "tmp/deploy/images/%{MACHINE}/bcm2711-rpi-4-b.dtb"
         # Not deployed here: bcm2712d0.dtbo. The D0-stepping overlay is BCM2712-only
         # and has no Raspberry Pi 4 equivalent.
@@ -1547,20 +1528,20 @@ components:
         - "tmp/deploy/images/%{MACHINE}/%{XT_DOMD_IMAGE}-%{MACHINE}.rootfs.ext4"
         - "tmp/deploy/images/%{MACHINE}/Image"
         - "tmp/deploy/images/%{MACHINE}/Image.gz"
-        # [full.img completeness] These two are produced by the same DomD v4h
-        # bitbake (via rpi5-image-xt-domd-v4h.bbappend do_image[depends]:
-        # domd-vc4 / vc4-initramfs) but were not declared as moulin outputs, so
-        # `ninja image-full` failed statically with "no known rule to make it".
+        # [full.img completeness] The DomD partial device tree is produced by the same
+        # DomD v4h bitbake (via rpi5-image-xt-domd-v4h.bbappend do_image[depends]:
+        # domd-vc4) but was not declared as a moulin output, so `ninja image-full`
+        # failed statically with "no known rule to make it".
         # (The aaos-android-kernel / aaos-vendor-boot-ramdisk outputs are
         # declared by the ENABLE_ANDROID=yes override — DomA-gated.)
         - "tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-domd-vc4.dtb"
-        - "tmp/deploy/images/%{MACHINE}/rpi5-image-xt-domd-vc4-initramfs-%{MACHINE}.rootfs.cpio.gz"
         # EL3 armstub = TF-A BL31 built by meta-xt-rpi4/recipes-bsp/trusted-firmware-a
         # with PLAT=rpi4. `bl31` is the only rpi4 build target and bl31.bin is itself a
         # valid armstub (4 KiB armstub8 header, magic 0x5afe570b). NOT armstub8-gic.bin:
         # that name belongs to raspberrypi/tools' own much thinner EL3 stub, which has no
         # PSCI 1.x and cannot host OP-TEE later. config.txt names it via `armstub=bl31.bin`
-        # and adds `enable_gic=1` (see recipes-bsp/bootfiles/rpi-config_git.bbappend).
+        # (recipes-bsp/bootfiles/rpi-config_git.bbappend); `enable_gic=1` comes from
+        # meta-virtualization's xen-raspberrypi4-64.inc.
         - "tmp/deploy/images/%{MACHINE}/bl31.bin"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/bootcode.bin"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/config.txt"
@@ -1568,7 +1549,6 @@ components:
         - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup.dat"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup_cd.dat"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup_db.dat"
-        - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup_x.dat"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup4.dat"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup4cd.dat"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/fixup4db.dat"
@@ -1576,7 +1556,6 @@ components:
         - "tmp/deploy/images/%{MACHINE}/bootfiles/start.elf"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/start_cd.elf"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/start_db.elf"
-        - "tmp/deploy/images/%{MACHINE}/bootfiles/start_x.elf"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/start4.elf"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/start4db.elf"
         - "tmp/deploy/images/%{MACHINE}/bootfiles/start4cd.elf"
@@ -1638,6 +1617,8 @@ components:
     sources:
       - type: west
         url: "https://github.com/xen-troops/zephyr-dom0-xt.git"
+        # A tag, not a SHA, for the reason given at the dom0 source above. The tag
+        # named commit 03b961479a6b56c99228aedbe206ba1ed6668b54 when it was pinned.
         rev: "rpi5-v0.4.0"
     builder:
       type: zephyr
@@ -1648,8 +1629,9 @@ components:
         - "%{ZEPHYR_DOMZ_BUILD_DIR}/zephyr/zephyr.bin"
 
   # =========================================================================
-  # DomA — COPIED from V4H AGL SoDeV (prod-devel-rcar4_new.yaml). Kept in sync
-  # via meta-rpi-sodev/scripts/sync-guest-pins.sh.  TARGET_BOARD_PLATFORM uses xenvm (VM), not
+  # DomA — derived from V4H AGL SoDeV (prod-devel-rcar4_new.yaml); the pins are this
+  # workspace's own (Android 17), and meta-rpi-sodev/scripts/sync-guest-pins.sh --check
+  # shows them next to V4H's. TARGET_BOARD_PLATFORM uses xenvm (VM), not
   # the host SoC, so it is NOT %{SOC_FAMILY} here (RPi5 deviation from V4H).
   #
   # AAOS version: Android 17 (AOSP tag android-17.0.0_r1) on the GKI android17-6.18
@@ -1802,12 +1784,12 @@ components:
 
 # =========================================================================
 # images — full + rootfs copied verbatim from external/meta-xt-prod-devel-rpi5/rpi5.yaml,
-# plus a DomA (AAOS) partition (see SODEV-FLUTTER-DOMU-RPI5-INTEGRATION-GAP-2026-06-14.md).
+# plus a DomA (AAOS) partition.
 # =========================================================================
 images:
   full:
     type: gpt
-    desc: "Full RPi4(BCM2711)+Xen SD image (thin Linux or Zephyr Dom0 + dom0less DomD + DomU AGL + DomA AAOS)"
+    desc: "Full RPi4+Xen SD image (Dom0 + DomD, optional DomU AGL / DomA AAOS)"
     sector_size: 512
     # The board-verified SD layout; moulin's image
     # builder (rouge) is userspace (mkfs.vfat/mkfs.ext4/mtools/dd — NO root/loop),
@@ -1874,10 +1856,6 @@ images:
           # parameter (see `parameters:`): linux -> initramfs-xt-dom0-thin.cpio.gz;
           # zephyr -> zephyr.bin. It is NOT in this common base so only the selected
           # dom0's kernel is depended on (the other dom0 component is never built).
-          # [v93] No DomD initramfs on p1 any more. DomD boots root=/dev/xvda from the
-          # p2 ext4 (the rootfs partition below) over PV block, so the RAM initramfs
-          # image recipe (rpi5-image-xt-domd-vc4-initramfs) was dropped upstream and
-          # boot.cmd no longer fatloads it.
           "%{SOC_FAMILY}-%{MACHINE}-domd-vc4.dtb": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{SOC_FAMILY}-%{MACHINE}-domd-vc4.dtb"
           # [wrynose] "linux-domu" (DomU Xen-aware kernel) boot item is ENABLE_DOMU=
           # yes-gated; the aaos-* boot items are likewise ENABLE_ANDROID=yes-gated
@@ -1909,8 +1887,8 @@ images:
       # combinations parse and rouge lists its images for each, so nothing fails at
       # build time — it fails at run time, because the guest configs address the
       # partitions by fixed device node, not by partlabel:
-      #   doma.cfg:126           -drive file=/dev/mmcblk0p4      (AAOS super.img)
-      #   domd.cfg:275,282       phy:/dev/mmcblk0p3 -> xvdb, phy:/dev/mmcblk0p4 -> xvdc
+      #   doma.cfg (the -drive line)   file=/dev/mmcblk0p4             (AAOS super.img)
+      #   domd.cfg (disk=)             phy:/dev/mmcblk0p3 -> xvdb, phy:/dev/mmcblk0p4 -> xvdc
       #   xl-create-doma.service qemu reads /dev/mmcblk0p4 directly
       # With DomU absent, DomA's data lands on p3 while qemu still opens p4, which
       # does not exist -> DomA would fail to start with an I/O error, not a clear
