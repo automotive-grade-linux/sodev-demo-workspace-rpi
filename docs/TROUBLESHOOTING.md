@@ -169,8 +169,11 @@ console receives your keystrokes.
 **DomU and DomA are *not* on this UART.** Both are `xl`-created (not dom0less) and have no
 vpl011, so each gets a Xen **PV console** (`hvc0`) instead — reach DomU with
 `xl console 3` and DomA with `xl console 2`, both from the toolstack domain.
-(Console access verified on hardware, both Dom0 flavours: `Ctrl-A ×3 → DOM1` → DomD root
-login; `xl console 3` → `domu login:`; `xl console 2` → `console:/ $`.)
+(Console access verified on hardware, both Dom0 flavours, on 2026-08-03 with the 7.0.0
+device model: `Ctrl-A ×3 → DOM1` → DomD root login; `xl console 3` → `domu login:`;
+`xl console 2` → `console:/ $`. `xl console 3` → `domu login:` again on 2026-11-11 with
+the default 11.1.2 device model. The 10.0.2 device model hid DomU's console -- see the
+console note at the end of `docs/VULKAN-VENUS.md` section 7a.)
 
 `xenconsole` calls `tcsetattr()` on stdin, so **`xl console` needs a tty**. Running it over
 a plain `ssh root@192.168.10.10 'xl console 2'` hangs with no output; use `ssh -tt`. An
@@ -199,7 +202,10 @@ the IVI panel, `kmscube`-class GL content renders via virtio-gpu-gl.
 
 **Symptom.** The AOSP step dies part-way (often 40-60 %) with
 `ninja failed with: signal: killed`, then `#### failed to build some targets ####`,
-then `FAILED: android/out/target/product/<device>/boot.img …`. Older `build.sh`
+then `FAILED: android/out/target/product/<device>/boot.img …`. On Android 17 the
+kill can also land while `soong_build` analyses the `Android.bp` files, before any
+compile step: then the log shows `Killed` under the `FAILED: out/soong/build.<product>.ninja`
+step and siso's summary `1 steps failed: exit=137 # signal:killed`. Older `build.sh`
 revisions reported it as a possible transient fetch/repo-sync abort and burned all
 five retries on it; it now stops on the first one with the remedy below.
 
@@ -219,14 +225,16 @@ overruns any `--memory` you set.
 `--cpus` does not, because it leaves `nproc` unchanged:
 
 ```sh
-XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh --aaos=source … --memory=44g
+XT_DOCKER_RUN_OPTS="--cpuset-cpus=0-15" ./build.sh --aaos=source … --memory=48g
 ```
 
-Re-run — the AOSP build resumes incrementally, so nothing is lost. For scale: on a
-32-core host with a 44 GiB cap, a cold AOSP build was killed at `nproc`=32 and peaked
-at ~19 GiB at `nproc`=16. Neither a warm `--aaos-src` tree (its `m` finishes in
-minutes) nor a resumed build reaches that peak, so verify the fix on a cold one. See
-*Bounding a cold AOSP build* (`docs/BUILD.md`).
+Re-run — the AOSP build resumes incrementally, so nothing is lost. For scale: on
+Android 17 `soong_build` alone peaks at 42.6 GiB, so the cap has to be 48g and the
+host wants 64 GiB. The Android 15 measurement (a cold build killed at `nproc`=32,
+peaking at ~19 GiB at `nproc`=16 under a 44 GiB cap) is kept in `docs/BUILD.md` only
+to show that the CPU count, not the cap, is what moves the peak. Neither a warm
+`--aaos-src` tree (its `m` finishes in minutes) nor a resumed build reaches that peak,
+so verify the fix on a cold one. See *Bounding a cold AOSP build* (`docs/BUILD.md`).
 
 ## A mistyped `--sstate` / `--dl` / `--west-cache` path
 
@@ -330,12 +338,6 @@ Run from the toolstack domain after boot:
 | `xl destroy DomU` then `xl create /etc/xen/domu.cfg` | destroy returns promptly and the re-created guest comes up (never destroy DomA — see Known issues) |
 
 ## Known issues
-- **`dumpstate_grpc_server` does not run.** The prebuilt binary is linked against
-  `libxml2.so.2` while wrynose ships `libxml2.so.16`, so it exits immediately. Its
-  unit is therefore deliberately left out of `SYSTEMD_SERVICE` (it is installed but
-  not enabled), and `SKIP_FILEDEPS` is set so the unprovidable `libxml2.so.2`
-  requirement does not fail `do_rootfs`. The fix is to rebuild it against the
-  wrynose libxml2; nothing in the demo depends on it in the meantime.
 - **DomA re-create**: the DomD vhost-Xen patch tracks a single guest domid, so
   `xl destroy` + `xl create` of DomA breaks vhost-vsock/-net mappings
   (`vhost_xen_map_desc: Failed to map pages`). Reboot the board to restart DomA
@@ -403,9 +405,9 @@ Run from the toolstack domain after boot:
   `0013` was really written for: the toolstack leaves stale
   `/local/domain/<DomD>/device-model/<domid>` nodes behind — `libxl__destroy_device_model()`
   only cleans the Dom0 path — and those can keep a last recorded state of `running`,
-  so no ordering of domids can distinguish them. The `domd-vhost-xen-domid` daemon is
-  retained for now as a belt-and-braces and can be dropped once the kernel-side fix
-  has been confirmed over several boots.
+  so no ordering of domids can distinguish them. The `domd-vhost-xen-domid` daemon
+  that papered over it has been removed; the kernel-side fix in `xen_patchset/0013`
+  is the only mechanism now.
 
   The V4H reference has the identical single-global-`guest_domid` limitation and no
   workaround at all; it avoids the symptom purely by creating DomA first
