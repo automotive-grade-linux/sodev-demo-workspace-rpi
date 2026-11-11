@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 15:58:51 +0900
+Date: Fri, 4 Sep 2026 15:58:51 +0900
 Subject: [PATCH] virtio-media: merge adjacent SG entries
 
 The guest driver hands over one virtio_media_sg_entry per page, whether or
@@ -14,6 +14,10 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media.c         | 25 ++++++++++++++++++++++---
+ include/hw/virtio/virtio-media.h |  2 +-
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
 index 23d4763d709..cb7b11695b8 100644
 --- a/hw/virtio/virtio-media.c
@@ -58,10 +62,10 @@ index 23d4763d709..cb7b11695b8 100644
  
      /*
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index bba5b9a981c..fd7836557fb 100644
+index 8a5d15b6aac..80e1d045dc5 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -161,7 +161,7 @@ struct virtio_media_event_event {
+@@ -163,7 +163,7 @@ struct virtio_media_event_event {
   * dozens of buffers queued. Pages are mapped at completion, copied, unmapped.
   */
  typedef struct VirtIOMediaPlaneSg {

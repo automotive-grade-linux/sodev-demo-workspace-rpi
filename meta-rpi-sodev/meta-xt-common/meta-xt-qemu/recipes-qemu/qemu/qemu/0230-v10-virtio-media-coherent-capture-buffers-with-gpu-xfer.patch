@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 01:08:17 +0900
-Subject: [PATCH] virtio-media: keep CAPTURE buffers coherent when the GPU copies them
+Date: Sat, 5 Sep 2026 01:08:17 +0900
+Subject: [PATCH] virtio-media: keep CAPTURE buffers coherent when the GPU
+ copies them
 
 0227 asked for non-coherent (cacheable) host buffers because the CPU read
 every decoded frame. With 0229 the GPU reads the CAPTURE buffer over a
@@ -14,8 +16,11 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index c45456fe6b5..fdc1254d2f3 100644
+index 789456dd5ca..c7ae782d20d 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -752,8 +752,21 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,

@@ -199,7 +199,7 @@ index 9bdc3f498dc..5ec4e01c93e 100644
      glUniform1f(gpu.u_yscale, yscale);
      glUniform4fv(gpu.u_coef, 1, c);
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index d1cbcc292ec..8b18ee5c12d 100644
+index b2ca1b46843..9221687f2d4 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -185,6 +185,30 @@ static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
@@ -377,7 +377,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
                      if (q->nv12_host) {
                          size_t need = (size_t)q->rgba_sizeimage;
  
-@@ -1149,9 +1231,10 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+@@ -1150,9 +1232,10 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
               */
              if (q->nv12_host &&
                  virtio_media_fmt_pixelformat(&fmt) == V4L2_PIX_FMT_NV12) {
@@ -389,7 +389,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
              }
          }
      }
-@@ -1531,6 +1614,7 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1533,6 +1616,7 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
          struct v4l2_format *f = (struct v4l2_format *)payload;
          bool capture = virtio_media_fmt_is_capture(f);
          bool want_rgba = false;
@@ -397,7 +397,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
  
          q = &s->queues[virtio_media_queue_index(f->type)];
          if (s->vm->host_nv12 && s->vm->gpu_xfer && capture) {
-@@ -1539,6 +1623,14 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1541,6 +1625,14 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
              } else if (virtio_media_fmt_pixelformat(f) == V4L2_PIX_FMT_RGBA32) {
                  want_rgba = true;
                  virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_NV12);
@@ -412,7 +412,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
              }
          }
          if (ioctl(s->fd, code, payload) < 0) {
-@@ -1547,11 +1639,15 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1549,11 +1641,15 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
              if (want_rgba && code != VIDIOC_G_FMT) {
                  /* Give the guest's format back untouched in the reply. */
                  virtio_media_fmt_set_pixelformat(f, V4L2_PIX_FMT_RGBA32);
@@ -429,7 +429,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
              if (code == VIDIOC_S_FMT && !q->nv12_host) {
                  q->nv12_host = true;
                  qemu_log("virtio-media-diag: host_nv12: CAPTURE %ux%u runs NV12 "
-@@ -1566,12 +1662,34 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1568,12 +1664,34 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
          } else if (code == VIDIOC_S_FMT && capture) {
              /* The host ended up in some other format: no translation. */
              q->nv12_host = false;
@@ -464,7 +464,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
      if (!ret && code == VIDIOC_QUERYBUF) {
          struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
  
-@@ -1887,6 +2005,22 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1889,6 +2007,22 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      struct v4l2_capability cap;
      int fd;
  
@@ -487,7 +487,7 @@ index d1cbcc292ec..8b18ee5c12d 100644
      /*
       * Decoder mode needs no host device, so v4l2-device is not required there;
       * virtio_media_dec_realize() sets device_caps from what the decoder
-@@ -2015,6 +2149,7 @@ static const Property virtio_media_properties[] = {
+@@ -2017,6 +2151,7 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
      DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
@@ -524,10 +524,10 @@ index 07b2e0069f9..5ff529be4da 100644
  int virtio_media_gpu_blit(void *handle, uint32_t res_id);
  int virtio_media_gpu_wait(void *handle);
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 12052fcac3b..b5ac4036589 100644
+index d4d055a17c0..c61646d963d 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -221,6 +221,16 @@ typedef struct VirtIOMediaQueue {
+@@ -223,6 +223,16 @@ typedef struct VirtIOMediaQueue {
      uint32_t rgba_sizeimage;
      uint32_t host_sizeimage;
      int matrix;
@@ -544,7 +544,7 @@ index 12052fcac3b..b5ac4036589 100644
      /* CPU fallback: RGBA scratch for frames that could not go through the GPU. */
      uint8_t *conv_scratch;
      size_t conv_scratch_len;
-@@ -306,6 +316,16 @@ struct VirtIOMedia {
+@@ -308,6 +318,16 @@ struct VirtIOMedia {
       * cannot take the GPU path are converted on the CPU (slow, correct).
       */
      bool host_nv12;

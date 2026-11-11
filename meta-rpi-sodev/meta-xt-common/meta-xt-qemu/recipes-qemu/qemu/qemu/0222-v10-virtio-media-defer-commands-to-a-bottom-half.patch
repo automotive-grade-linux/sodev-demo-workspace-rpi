@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 14:05:36 +0900
+Date: Fri, 4 Sep 2026 14:05:36 +0900
 Subject: [PATCH] virtio-media: process the command queue from a bottom half
 
 The command queue was drained straight from the virtqueue handler, so a host
@@ -43,6 +43,11 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c         | 31 +++++++++++++++++++++++++++--
+ include/hw/virtio/virtio-media.h | 34 ++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
 index 634ad26960f..674880e4751 100644
 --- a/hw/virtio/virtio-media.c
@@ -108,10 +113,10 @@ index 634ad26960f..674880e4751 100644
      vm->cmd_buf = NULL;
      virtio_delete_queue(vm->command_vq);
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index c990d788fbb..bba5b9a981c 100644
+index db854f9d3cc..8a5d15b6aac 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -209,6 +209,40 @@ struct VirtIOMedia {
+@@ -211,6 +211,40 @@ struct VirtIOMedia {
      VirtQueue *command_vq;
      VirtQueue *event_vq;
  

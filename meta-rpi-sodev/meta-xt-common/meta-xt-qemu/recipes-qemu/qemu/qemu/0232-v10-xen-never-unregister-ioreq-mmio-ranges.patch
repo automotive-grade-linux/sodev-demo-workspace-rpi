@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 17:40:58 +0900
+Date: Sat, 5 Sep 2026 17:40:58 +0900
 Subject: [PATCH] xen: never unregister IOREQ MMIO ranges
 
 The region_del/region_add pair that every memory-topology change produces
@@ -16,6 +16,10 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [workaround: makes IOREQ range unmapping a no-op
  for every Xen target to close an Arm trap_unmapped_accesses window]
+---
+ include/hw/xen/xen_native.h | 108 +++++++++++++++++++++---------------
+ 1 file changed, 62 insertions(+), 46 deletions(-)
+
 diff --git a/include/hw/xen/xen_native.h b/include/hw/xen/xen_native.h
 index 2df563a575c..92f9240e4b2 100644
 --- a/include/hw/xen/xen_native.h

@@ -1,6 +1,6 @@
 # meta-xt-driver-domain overlay on the PRISTINE meta-xt-common/meta-xt-qemu qemu recipe.
 #
-# Stacks on the base qemu_%.bbappend (meta-xt-qemu), carrying four RPi5/Xen qemu
+# Stacks on the base qemu_%.bbappend (meta-xt-qemu), carrying five RPi5/Xen qemu
 # deltas without editing meta-xt-qemu's qemu.inc / qemu-package-split.inc:
 #
 #   common-0001  package split: assign qemu-system-aarch64 to the
@@ -42,7 +42,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # Xen data abort and the resulting guest vp_interrupt panic. class-target only,
 # matching how the base qemu.inc appends cross.patch.
 #
-# ALL SIX patches below are written against 7.0.0 sources, so they are gated on
+# ALL FIVE patches below are written against 7.0.0 sources, so they are gated on
 # PV: meta-xt-qemu also carries the Venus-capable builds the DEFAULT lane
 # (--gpu=vulkan) selects -- qemu_11.1.2.bb on both boards, or qemu_10.0.2.bb where a
 # board selects it, see docs/VULKAN-VENUS.md -- and this bbappend applies to all
@@ -50,7 +50,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # so those lanes deliberately start with none of them and get back only what they
 # actually need.
 #
-# Status of all six against v10.0.2-xt (SRCREV f460a035). None is open any more,
+# Status of all five against v10.0.2-xt (SRCREV f460a035). None is open any more,
 # which is what allowed the default to move to the Vulkan lane:
 #   0101 RESUME/QAPI guard              -- FORWARD-PORTED, with 0103, as
 #                                          meta-xt-qemu's 0201 (listed with the
@@ -83,16 +83,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 #                                          the xen-pvh-common code), and GUEST_TPM_BASE
 #                                          appears nowhere in the tree -- checked in the
 #                                          fork at that SRCREV.
-#   0113 sched_attr redefinition guard  -- FIXED UPSTREAM. 10.0.2's own
-#                                          linux-user/syscall.c already wraps the local
-#                                          struct in #ifndef SCHED_ATTR_SIZE_VER0.
 QEMU_XT_7_0_0_PATCHES = " \
     file://0101-fix-qapi-event-emit-no-qmp-monitor-std.patch \
     file://0103-fix-defer-autostart-vmstart-to-main-loop.patch \
     file://0110-xen-ioreq-isr-range-fix.patch \
     file://0111-virtio-input-hid-send-BTN_TOUCH-event-for-virtio-tab.patch \
     file://0112-xen-arm-guard-vtpm-on-guest-tpm-base.patch \
-    file://0113-linux-user-guard-sched-attr-redefinition.patch \
 "
 # rpi5-0111 is in the list above because Android (DomA/AAOS) treats an ABS_X/ABS_Y
 # device as a touchscreen only when it also sends BTN_TOUCH -- required for the
@@ -101,21 +97,14 @@ QEMU_XT_7_0_0_PATCHES = " \
 # layout) from public/arch-arm.h, breaking qemu xen_arm.c xen_enable_tpm()
 # (referenced inside #ifdef CONFIG_TPM). vTPM is unused here; the patch guards the
 # wiring on the define so qemu builds against both 4.19 and 4.21 headers.
-# rpi5-0113 [wrynose / glibc 2.43]: qemu 7.0.0 linux-user/syscall.c defines its
-# own `struct sched_attr` ("not defined in glibc") which glibc 2.43 (wrynose)
-# now provides via <sched.h> -> "redefinition of struct sched_attr" in
-# do_compile. The patch guards the local definition with #ifndef
-# SCHED_ATTR_SIZE_VER0 (glibc's own struct guard); the two definitions are
-# field-identical.
 # startswith('7.'), not contains('PV', '7.0.0'): bb.utils.contains matches the
 # whole whitespace-separated token, so the moment PV becomes 7.0.0+git<sha> (a
-# SRCREV-following recipe, an AUTOREV experiment) the exact match fails and all six
-# patches disappear SILENTLY. Two of them -- 0112 (Xen 4.21 dropped
-# GUEST_TPM_BASE) and 0113 (glibc 2.43 defines struct sched_attr) -- are what make
-# qemu 7.0.0 compile at all, so the symptom would not look like a missing patch; it
-# would look like an unrelated compile error. A prefix test keeps working across
-# 7.x, and a hypothetical qemu 8.x would fail loudly at do_patch instead, which is
-# the better failure.
+# SRCREV-following recipe, an AUTOREV experiment) the exact match fails and all five
+# patches disappear SILENTLY. One of them -- 0112 (Xen 4.21 dropped
+# GUEST_TPM_BASE) -- is what makes qemu 7.0.0 compile at all, so the symptom would
+# not look like a missing patch; it would look like an unrelated compile error. A
+# prefix test keeps working across 7.x, and a hypothetical qemu 8.x would fail
+# loudly at do_patch instead, which is the better failure.
 SRC_URI:append:class-target = "${@d.getVar('QEMU_XT_7_0_0_PATCHES') if d.getVar('PV').startswith('7.') else ''}"
 # NOTE: a virtio-gpu EDID 60Hz patch was investigated for the AGL cluster (DomU)
 # free-run (~104fps) but ABANDONED: the EDID refresh_rate is advisory only, and
@@ -128,22 +117,24 @@ SRC_URI:append:class-target = "${@d.getVar('QEMU_XT_7_0_0_PATCHES') if d.getVar(
 # --- common-0001: fix the qemu-system-aarch64 package split ---
 # The pristine qemu-package-split.inc (required when vmsep is in DISTRO_FEATURES)
 # assigns BOTH qemu-aarch64 and qemu-system-aarch64 binaries to ${PN}-aarch64,
-# leaving the ${PN}-system-aarch64 package empty. Re-assign here: keep only
-# qemu-aarch64 in ${PN}-aarch64, and put qemu-system-aarch64 in
-# ${PN}-system-aarch64 so OE does not drop an empty package.
+# leaving the ${PN}-system-aarch64 package empty. Re-assign here: ${PN}-aarch64
+# keeps only qemu-aarch64 (which meta-xt-qemu's qemu_%.bbappend no longer builds --
+# the target list is aarch64-softmmu alone -- so the package is empty and OE drops
+# it), and qemu-system-aarch64 goes to ${PN}-system-aarch64.
 FILES:${PN}-aarch64:class-target = "${bindir}/qemu-aarch64"
 FILES:${PN}-system-aarch64:class-target = "${bindir}/qemu-system-aarch64"
 # The same upstream split also leaves an RPROVIDES alias behind: meta-virtualization
 # declares RPROVIDES:${PN}-aarch64:append:class-target = " ${PN}-system-aarch64"
 # because in ITS layout qemu-aarch64 ships both binaries. Here it does not (see the
-# two FILES lines above), and the alias makes the SBOM name the wrong package. poky's
+# two FILES lines above), and the alias made the SBOM name the wrong package. poky's
 # collect_package_providers() (meta/lib/oe/spdx_common.py) maps every RPROVIDES to a
-# provider in one flat dict while walking PACKAGES in order, so the alias carried by
-# qemu-aarch64 -- which comes after qemu-system-aarch64 in PACKAGES -- overwrites the
-# entry qemu-system-aarch64 registered for itself. The rootfs SPDX document then lists
-# qemu-aarch64, which is not installed, and omits qemu-system-aarch64, which is.
-# Dropping the alias costs nothing here: each package owns exactly one binary, and the
-# image asks for qemu-system-aarch64 by its real name. The :class-target override
+# provider in one flat dict while walking PACKAGES in order -- empty packages
+# included, since they are still in PACKAGES -- so the alias carried by
+# qemu-aarch64 -- which comes after qemu-system-aarch64 in PACKAGES -- overwrote the
+# entry qemu-system-aarch64 registered for itself, and the rootfs SPDX document
+# listed qemu-aarch64, which was not installed, and omitted qemu-system-aarch64,
+# which was. Dropping the alias costs nothing here: qemu-system-aarch64 is the only
+# binary packaged, and the image asks for it by its real name. The :class-target override
 # mirrors the one upstream uses, so this line is inert for nativesdk-qemu exactly as
 # the alias is. qemu-user-aarch64 is left alone -- that alias names no real package,
 # so it clobbers nothing.

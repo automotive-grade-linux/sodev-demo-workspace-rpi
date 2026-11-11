@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 07 Sep 2026 02:31:24 +0900
+Date: Wed, 11 Nov 2026 08:42:40 +0900
 Subject: [PATCH] virtio-media: add output-coherent and gpu-fence-fd
 
 A host-side QBUF cost 1.2 ms on RPi4 DomA (1080p60 HW decode, 2026-09-07).
@@ -29,6 +29,8 @@ syncs the whole sgt, not bytesused, and the host's H.264 OUTPUT sizeimage is
 The maintenance therefore covers 64x more memory than the copy touches. This
 asks for a coherent OUTPUT queue instead: ~12 us of Normal-NC copy against
 however much of the 500 us gap is the 512 KB sync.
+It is the OUTPUT queue alone that this makes coherent: with gpu-xfer=off
+the CPU reads the CAPTURE buffers, so they keep 0227's cacheable request.
 
 LEVER 2, gpu-fence-fd. virtio_media_gpu_wait costs 449 us wall / 435 us CPU
 per CAPTURE QBUF, and in 289,000 frames the fence never had to be waited for
@@ -45,6 +47,14 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-virgl-stub.c    |   4 +
+ hw/virtio/virtio-media-virgl.c         | 120 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media.c               |  24 +++++
+ include/hw/virtio/virtio-media-virgl.h |   6 ++
+ include/hw/virtio/virtio-media.h       |  17 ++++
+ 5 files changed, 170 insertions(+), 1 deletion(-)
+
 diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
 index b58febb597b..6494912ad09 100644
 --- a/hw/virtio/virtio-media-virgl-stub.c
@@ -248,14 +258,15 @@ index b7a8b49caa6..9bdc3f498dc 100644
          gpu_free_buf(b);
          gpu_leave(&sv);
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 75c8ddcab19..dc46cb7c508 100644
+index 2f7d84ad9a6..c4be54de2df 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -991,6 +991,26 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+@@ -991,6 +991,27 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
       */
      if (s->vm->gpu_xfer && virtio_media_queue_index(rb->type) == 1) {
          host_rb.flags = 0;
-+    } else if (s->vm->output_coherent) {
++    } else if (s->vm->output_coherent &&
++               virtio_media_queue_index(rb->type) == 0) {
 +        /*
 +         * NOTE: output-coherent: ask for a COHERENT (Normal-NC) OUTPUT buffer too.
 +         *
@@ -278,7 +289,7 @@ index 75c8ddcab19..dc46cb7c508 100644
      } else {
          host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
      }
-@@ -1802,6 +1822,7 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1803,6 +1824,7 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
      vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
      vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
@@ -286,7 +297,7 @@ index 75c8ddcab19..dc46cb7c508 100644
  
      info_report("virtio-media: proxying %s (device_caps 0x%08x)",
                  vm->v4l2_device, vm->device_caps);
-@@ -1841,6 +1862,8 @@ static const Property virtio_media_properties[] = {
+@@ -1842,6 +1864,8 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
      DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
@@ -313,10 +324,10 @@ index 6917d37de8f..07b2e0069f9 100644
  
  #endif
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 0731dacd2ba..78b14da9d8b 100644
+index 433e3029822..342ed17a00a 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -274,6 +274,23 @@ struct VirtIOMedia {
+@@ -276,6 +276,23 @@ struct VirtIOMedia {
       * cannot take the GPU path are converted on the CPU (slow, correct).
       */
      bool host_nv12;

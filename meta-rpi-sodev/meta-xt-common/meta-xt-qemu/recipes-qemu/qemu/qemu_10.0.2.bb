@@ -57,8 +57,8 @@
 #      sources and are version-gated off for this recipe. What this recipe carries
 #      instead: 0118 is 0111 rebased (virtio-tablet BTN_TOUCH, DomA touch) and 0120
 #      is 0110 rebased (virtio-pci ISR IOREQ range). Of the rest, 0112 is moot (no
-#      hw/arm/xen_arm.c and no GUEST_TPM_BASE anywhere in 10.0.2), 0113 is fixed in
-#      10.0.2 itself, and 0101/0103 come back squashed and forward-ported as
+#      hw/arm/xen_arm.c and no GUEST_TPM_BASE anywhere in 10.0.2), and 0101/0103
+#      come back squashed and forward-ported as
 #      0201, with the hardware-decode patches below: the pre-main-loop death
 #      they guard was not seen on 10.0.2, but the synchronous autostart path it
 #      comes from is still there. That bbappend states the evidence per patch.
@@ -68,10 +68,12 @@ require recipes-devtools/qemu/qemu_10.2.0.bb
 # against that tarball, and three data files that live in oe-core's own qemu/
 # directory (powerpc_rom.bin, qemu-guest-agent.init, qemu-guest-agent.udev) which
 # FILESPATH -- rooted at THIS recipe's directory -- cannot see. None of it applies
-# to a git fetch of the fork. run-ptest is kept because `inherit ptest` expects it
-# and this layer's own qemu/ directory provides it (the same copy qemu_7.0.0.bb
-# fetches). cross.patch is NOT carried over: it is a 5.2-era configure patch that
-# oe-core itself dropped, and it does not apply to qemu 10.
+# to a git fetch of the fork. run-ptest is this layer's copy of oe-core's runner
+# (the same copy qemu_7.0.0.bb fetches): `SRC_URI =` drops oe-core's, and a conf
+# with ptest in DISTRO_FEATURES would otherwise get the tests do_install_ptest
+# installs with no runner; the DomD confs leave ptest out, so nothing of it is
+# installed here. cross.patch is NOT carried over: it is a 5.2-era configure patch
+# that oe-core itself dropped, and it does not apply to qemu 10.
 # gitsm, not git: qemu carries submodules, as in qemu_7.0.0.bb's fetch.
 SRC_URI = "gitsm://github.com/xen-troops/qemu.git;branch=v10.0.2-xt;protocol=https;name=qemu \
            file://run-ptest \
@@ -234,7 +236,11 @@ SRC_URI:append:class-target = " file://0119-vhost-do-not-verify-vring-host-mappi
 # never reaches the 10.0.2 device model. 0120 is 0110 re-based onto
 # include/hw/xen/xen_native.h (xen_common.h was renamed in qemu 8.2); the code
 # is otherwise identical: check the DMOP rc, log it, and on -EEXIST unmap the
-# exact span and map it again as one clean range.
+# exact span and map it again as one clean range. 0232 below replaces that
+# self-heal (its unmap reopened the gap 0232 closes) and leaves of 0120 the rc
+# check and the report of a failed map. The two stay separate patches because the
+# 11.1.2 lane carries them one for one as q11-019 and q11-035, and the yaml's notes
+# name that pairing.
 SRC_URI:append:class-target = " file://0120-xen-do-not-silently-drop-IOREQ-MMIO-range-registrati.patch"
 
 # 0121: Venus rings/reply shmem are memfd-backed blobs that 0116 shared into the
@@ -298,6 +304,14 @@ SYSTEMD_SERVICE:${PN}-guest-agent = ""
 # `bb.utils.filter('DISTRO_FEATURES', 'alsa pulseaudio xen', d)` would otherwise
 # add a pulseaudio DEPENDS to the DomD build.
 PACKAGECONFIG:remove = "pulseaudio"
+
+# alsa is named here rather than left to DISTRO_FEATURES: the DomD confs take alsa
+# out of DISTRO_FEATURES, so the 10.2.0 recipe's filter() does not add it, and the
+# ALSA backend has only been built because alsa-lib reached the recipe sysroot
+# through libsdl2 -> pulseaudio. DomA's cfg plays through -audiodev alsa, so the
+# backend has to be built whatever the sysroot happens to hold. With the
+# PACKAGECONFIG set, alsa-lib is a DEPENDS of this recipe's own.
+PACKAGECONFIG:append:class-target = " alsa"
 
 # ---------------------------------------------------------------------------
 # virtio-media and the Xen/virgl work the hardware decoder needs.
@@ -499,6 +513,11 @@ SRC_URI:append:class-target = " file://0245-v10-hw-virtio-media-give-decoder-mod
 # same drain function. Off by default. On the board it is enabled by adding
 # tx-poll-us=10000 to virtio-snd in doma.cfg.
 SRC_URI:append:class-target = " file://0243-v10-virtio-snd-drain-tx-from-a-dedicated-thread.patch"
+# 0251-v10: q11-091 ported to this lane. Reset drops the buffers still queued on the
+# streams (they belong to the rings being reset), and 0243's TX thread registers with
+# RCU, under which virtqueue_push() reads the guest's memory map. After 0243, whose
+# thread it changes.
+SRC_URI:append:class-target = " file://0251-v10-virtio-snd-drop-the-buffers-of-the-rings-a-reset-resets-register-the-TX-thread-with-RCU.patch"
 # 0122: 0115 reads the virtio-pci layout from xenstore and 0215 can hand out one
 # INTX line per slot, but nothing passed the count between them -- the GPEX stayed
 # at four lines however many the guest DT declared, which pairs slots onto shared

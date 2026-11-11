@@ -1,5 +1,6 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 08 Sep 2026 00:23:38 +0900
+Date: Tue, 8 Sep 2026 00:23:38 +0900
 Subject: [PATCH] vhost: do not verify vring host mappings under Xen, it
  abort()s the device model
 
@@ -71,6 +72,11 @@ Upstream-Status: Pending [not yet submitted to qemu-devel; the check it skips
  Note that the vhost backends this unblocks get their Xen address translation
  from the fork's own guest-side vhost-Xen work, which upstream does not have]
 ---
+ hw/virtio/vhost.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index 6aa72fd434a..8ff0a3d8bab 100644
 --- a/hw/virtio/vhost.c
 +++ b/hw/virtio/vhost.c
 @@ -27,6 +27,7 @@
@@ -81,7 +87,7 @@ Upstream-Status: Pending [not yet submitted to qemu-devel; the check it skips
  #include "trace.h"
  
  /* enabled until disconnected backend stabilizes */
-@@ -520,6 +521,33 @@
+@@ -520,6 +521,33 @@ static int vhost_verify_ring_mappings(struct vhost_dev *dev,
          return 0;
      }
  

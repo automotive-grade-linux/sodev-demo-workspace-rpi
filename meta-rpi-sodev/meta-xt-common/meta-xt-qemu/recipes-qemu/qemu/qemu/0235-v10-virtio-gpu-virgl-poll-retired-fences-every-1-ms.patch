@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 19:22:39 +0900
+Date: Sat, 5 Sep 2026 19:22:39 +0900
 Subject: [PATCH] virtio-gpu-virgl: poll for retired fences every 1 ms instead
  of 10 ms
 
@@ -12,8 +12,12 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [tuning for Xen/Arm: a 1 ms fence-poll timer
  instead of 10 ms]
+---
+ hw/display/virtio-gpu-virgl.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index ecab00566ed..f39647dadbb 100644
+index d53d08239a2..6662b8acbd0 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
 @@ -1274,7 +1274,16 @@ static void virtio_gpu_fence_poll(void *opaque)

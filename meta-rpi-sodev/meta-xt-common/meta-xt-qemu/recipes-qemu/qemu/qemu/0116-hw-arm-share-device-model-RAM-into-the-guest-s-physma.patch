@@ -1,5 +1,6 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 06 Sep 2026 01:09:22 +0900
+Date: Sun, 6 Sep 2026 01:09:22 +0900
 Subject: [PATCH] hw/arm: share device-model RAM into the guest's physmap
 
 On Arm, arch_xen_set_memory() is an empty stub, so a RAM-backed region a device
@@ -122,11 +123,11 @@ Upstream-Status: Inappropriate [upstream wants the XSM question settled first,
  hw/arm/xen-stubs.c            | 512 ++++++++++++++++++++++++++++++++++
  hw/display/virtio-gpu-virgl.c | 122 ++++++++
  hw/i386/xen/xen-hvm.c         |  26 ++
- include/system/xen.h          |  47 +++
+ include/system/xen.h          |  47 ++++
  4 files changed, 707 insertions(+)
 
 diff --git a/hw/arm/xen-stubs.c b/hw/arm/xen-stubs.c
-index 5551584..21391d8 100644
+index 5551584dc20..7cf0c507af5 100644
 --- a/hw/arm/xen-stubs.c
 +++ b/hw/arm/xen-stubs.c
 @@ -6,20 +6,532 @@
@@ -663,7 +664,7 @@ index 5551584..21391d8 100644
  
  void xen_hvm_modified_memory(ram_addr_t start, ram_addr_t length)
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 145a0b3..86d654b 100644
+index 145a0b38795..dbd34d1acdf 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
 @@ -17,6 +17,7 @@
@@ -820,7 +821,7 @@ index 145a0b3..86d654b 100644
  }
  
 diff --git a/hw/i386/xen/xen-hvm.c b/hw/i386/xen/xen-hvm.c
-index d4516ac..0e0d154 100644
+index d4516acec69..0f122020437 100644
 --- a/hw/i386/xen/xen-hvm.c
 +++ b/hw/i386/xen/xen-hvm.c
 @@ -705,6 +705,32 @@ void qmp_xen_set_global_dirty_log(bool enable, Error **errp)
@@ -857,7 +858,7 @@ index d4516ac..0e0d154 100644
                                  bool add)
  {
 diff --git a/include/system/xen.h b/include/system/xen.h
-index 990c19a..2103173 100644
+index 990c19a8ef0..97e879ca033 100644
 --- a/include/system/xen.h
 +++ b/include/system/xen.h
 @@ -31,12 +31,59 @@ extern bool xen_allowed;

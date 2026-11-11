@@ -1,4 +1,4 @@
-From c66878f6a0b0237f927836f7747463db9c779fd7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Thu, 3 Sep 2026 22:49:34 +0900
 Subject: [PATCH] hw/xen/xen-pvh-common: allow one INTX line per virtio-pci

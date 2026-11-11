@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 09:12:58 +0900
-Subject: [PATCH] virtio-media: run the CAPTURE queue as NV12 on the host, convert on the GPU
+Date: Sat, 5 Sep 2026 09:12:58 +0900
+Subject: [PATCH] virtio-media: run the CAPTURE queue as NV12 on the host,
+ convert on the GPU
 
 An RGBA 720p capture buffer is 3.7 MB = order 10; the host cannot supply
 25 of them (5 of 25 at 720p60, 18 of 25 at 720p15), which is what caps the
@@ -24,6 +26,13 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media-virgl-stub.c    |  12 +
+ hw/virtio/virtio-media-virgl.c         | 310 +++++++++++++++++++++++--
+ hw/virtio/virtio-media.c               | 291 ++++++++++++++++++++++-
+ include/hw/virtio/virtio-media-virgl.h |  14 ++
+ include/hw/virtio/virtio-media.h       |  26 +++
+ 5 files changed, 623 insertions(+), 30 deletions(-)
+
 diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
 index 093593a968e..b58febb597b 100644
 --- a/hw/virtio/virtio-media-virgl-stub.c
@@ -404,7 +413,7 @@ index de09cb2889d..b7a8b49caa6 100644
      if (gl_err != GL_NO_ERROR) {
          qemu_log("virtio-media-diag: gpu_xfer: copy to res %u tex %u failed, "
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index c7ae782d20d..ad63a285a4c 100644
+index aec6b21841b..9dd8f36e9ac 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -170,6 +170,140 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
@@ -687,7 +696,7 @@ index c7ae782d20d..ad63a285a4c 100644
          }
      }
  
-@@ -1149,7 +1355,71 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1150,7 +1356,71 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
          }
      }
  
@@ -759,7 +768,7 @@ index c7ae782d20d..ad63a285a4c 100644
      virtio_media_unpoint(code, payload);
      if (ret) {
          return ret;
-@@ -1533,6 +1803,7 @@ static const Property virtio_media_properties[] = {
+@@ -1534,6 +1804,7 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
@@ -793,10 +802,10 @@ index 6193a4cfde0..6917d37de8f 100644
  int virtio_media_gpu_wait(void *handle);
  void virtio_media_gpu_release(void *handle);
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 2da0ed63daa..6b145becc04 100644
+index dd013b87fc7..6d84be73d07 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -199,6 +199,22 @@ typedef struct VirtIOMediaQueue {
+@@ -201,6 +201,22 @@ typedef struct VirtIOMediaQueue {
       */
      void *gpu_buf[VIRTIO_MEDIA_MAX_BUFFERS];
      bool gpu_failed;
@@ -819,7 +828,7 @@ index 2da0ed63daa..6b145becc04 100644
      uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
      /* Guest buffers by index, mirrored onto the host buffer of the same index. */
      VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
-@@ -242,6 +258,16 @@ struct VirtIOMedia {
+@@ -244,6 +260,16 @@ struct VirtIOMedia {
       */
      bool gpu_xfer;
      uint64_t gpu_xfer_fail;

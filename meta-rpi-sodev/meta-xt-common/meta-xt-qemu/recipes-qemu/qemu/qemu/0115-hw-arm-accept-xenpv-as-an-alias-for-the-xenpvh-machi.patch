@@ -1,5 +1,6 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 06 Sep 2026 01:09:22 +0900
+Date: Sun, 6 Sep 2026 01:09:22 +0900
 Subject: [PATCH] hw/arm: accept "xenpv" and its libxl-published PCI layout
 
 Two halves of one break: the interface between Xen's libxl and the ARM Xen
@@ -64,6 +65,9 @@ Upstream-Status: Inappropriate [restores an interface for a Xen toolstack that
  predates the property-based configuration; upstream expects libxl to pass the
  machine name and PCI properties itself]
 ---
+ hw/arm/xen-pvh.c | 103 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
+
 diff --git a/hw/arm/xen-pvh.c b/hw/arm/xen-pvh.c
 index 54fd1625376..a40a3cf0976 100644
 --- a/hw/arm/xen-pvh.c

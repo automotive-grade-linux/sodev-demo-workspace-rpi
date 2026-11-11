@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 14:07:44 +0900
+Date: Fri, 4 Sep 2026 14:07:44 +0900
 Subject: [PATCH] virtio-media: drain only what poll() actually reports
 
 virtio_media_host_readable() had no idea which condition woke it, because
@@ -61,8 +61,12 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c | 90 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 82 insertions(+), 8 deletions(-)
+
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index c4e2f1d2dba..b7d9ad88e01 100644
+index 674880e4751..23d4763d709 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -294,13 +294,9 @@ static void virtio_media_send_error_event(VirtIOMediaSession *s, int err)

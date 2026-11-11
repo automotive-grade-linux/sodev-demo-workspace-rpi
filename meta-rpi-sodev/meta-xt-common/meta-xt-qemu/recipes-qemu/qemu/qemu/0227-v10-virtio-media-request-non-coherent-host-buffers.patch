@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 16:51:23 +0900
+Date: Fri, 4 Sep 2026 16:51:23 +0900
 Subject: [PATCH] virtio-media: request non-coherent (cacheable) host MMAP
  buffers
 
@@ -22,8 +22,11 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 5d79cd3af62..05c07de67b0 100644
+index cb7b11695b8..1643f65452c 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -662,6 +662,16 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,

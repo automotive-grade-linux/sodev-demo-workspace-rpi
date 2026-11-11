@@ -113,6 +113,14 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/meson.build            |    6 +
+ hw/virtio/virtio-media-decoder.c | 1384 ++++++++++++++++++++++++++++++
+ hw/virtio/virtio-media.c         |  195 ++++-
+ include/hw/virtio/virtio-media.h |   72 ++
+ meson.build                      |   31 +
+ 5 files changed, 1667 insertions(+), 21 deletions(-)
+ create mode 100644 hw/virtio/virtio-media-decoder.c
+
 diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
 index 107cf64462b..53d8c0ce836 100644
 --- a/hw/virtio/meson.build
@@ -132,7 +140,7 @@ index 107cf64462b..53d8c0ce836 100644
  system_ss.add(when: 'CONFIG_VIRTIO', if_false: files('vhost-stub.c'))
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
 new file mode 100644
-index 00000000000..a32a7a48e43
+index 00000000000..4e724f1a53c
 --- /dev/null
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -0,0 +1,1384 @@
@@ -1521,7 +1529,7 @@ index 00000000000..a32a7a48e43
 +
 +#endif /* CONFIG_VIRTIO_MEDIA_DECODER */
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index dc46cb7c508..d1cbcc292ec 100644
+index c4be54de2df..b2ca1b46843 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -122,7 +122,7 @@ static VirtIOMediaSession *virtio_media_find_session(VirtIOMedia *vm, uint32_t i
@@ -1696,7 +1704,7 @@ index dc46cb7c508..d1cbcc292ec 100644
      *session_id = s->id;
      return 0;
  }
-@@ -1136,8 +1212,9 @@ fail:
+@@ -1137,8 +1213,9 @@ fail:
   * the only way to split them is to walk the entries accumulating lengths until
   * the plane's length is reached. That is what the loop below does.
   */
@@ -1708,7 +1716,7 @@ index dc46cb7c508..d1cbcc292ec 100644
  {
      struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
      struct v4l2_plane *guest_planes = NULL;
-@@ -1241,6 +1318,38 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -1243,6 +1320,38 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
          }
      }
  
@@ -1747,7 +1755,7 @@ index dc46cb7c508..d1cbcc292ec 100644
      /*
       * An output buffer carries the bitstream the guest just wrote, so it has to
       * be copied into the host buffer BEFORE the host is asked to consume it.
-@@ -1647,7 +1756,17 @@ static void virtio_media_command_bh(void *opaque)
+@@ -1649,7 +1758,17 @@ static void virtio_media_command_bh(void *opaque)
              }
              memset(payload + payload_len, 0, work_len - payload_len);
  
@@ -1766,7 +1774,7 @@ index dc46cb7c508..d1cbcc292ec 100644
                  if (payload_len < sizeof(struct v4l2_requestbuffers)) {
                      status = EINVAL;
                  } else {
-@@ -1768,8 +1887,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1770,8 +1889,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      struct v4l2_capability cap;
      int fd;
  
@@ -1789,7 +1797,7 @@ index dc46cb7c508..d1cbcc292ec 100644
          return;
      }
  
-@@ -1814,6 +1946,8 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1816,6 +1948,8 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
       * the kernel's numbering and not something reinvented here.
       */
      vm->device_type = 0;
@@ -1798,7 +1806,7 @@ index dc46cb7c508..d1cbcc292ec 100644
      vm->next_session_id = 1;
      QLIST_INIT(&vm->sessions);
      vm->cmd_buf = g_malloc0(VIRTIO_MEDIA_CMD_BUF_SIZE);
-@@ -1824,8 +1958,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1826,8 +1960,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
      virtio_media_gpu_set_fence_fd(vm->gpu_fence_fd);
  
@@ -1822,7 +1830,7 @@ index dc46cb7c508..d1cbcc292ec 100644
  }
  
  static void virtio_media_unrealize(DeviceState *dev)
-@@ -1859,6 +2006,12 @@ static const VMStateDescription vmstate_virtio_media = {
+@@ -1861,6 +2008,12 @@ static const VMStateDescription vmstate_virtio_media = {
  
  static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
@@ -1836,10 +1844,10 @@ index dc46cb7c508..d1cbcc292ec 100644
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
      DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 78b14da9d8b..12052fcac3b 100644
+index 342ed17a00a..d4d055a17c0 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -179,6 +179,15 @@ typedef struct VirtIOMediaBuffer {
+@@ -181,6 +181,15 @@ typedef struct VirtIOMediaBuffer {
  
  #define VIRTIO_MEDIA_MAX_BUFFERS 32
  
@@ -1855,7 +1863,7 @@ index 78b14da9d8b..12052fcac3b 100644
  typedef struct VirtIOMediaQueue {
      uint32_t type;                /* the v4l2_buf_type this state is for */
      bool mplane;
-@@ -220,10 +229,21 @@ typedef struct VirtIOMediaQueue {
+@@ -222,10 +231,21 @@ typedef struct VirtIOMediaQueue {
      VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
  } VirtIOMediaQueue;
  
@@ -1877,7 +1885,7 @@ index 78b14da9d8b..12052fcac3b 100644
      /*
       * The main-loop fd handler was detached because poll() reported only
       * POLLERR (a streaming queue with no buffer queued). Re-attached by the
-@@ -244,6 +264,18 @@ struct VirtIOMedia {
+@@ -246,6 +266,18 @@ struct VirtIOMedia {
  
      /* Properties. */
      char *v4l2_device;            /* host /dev/videoN to proxy */
@@ -1896,7 +1904,7 @@ index 78b14da9d8b..12052fcac3b 100644
      /*
       * host-xfer: when a CAPTURE buffer completes and the guest has given the
       * virgl resource id of the gralloc buffer behind it, write the decoded
-@@ -350,4 +382,44 @@ struct VirtIOMedia {
+@@ -352,4 +384,44 @@ struct VirtIOMedia {
      uint8_t *cmd_buf;
  };
  

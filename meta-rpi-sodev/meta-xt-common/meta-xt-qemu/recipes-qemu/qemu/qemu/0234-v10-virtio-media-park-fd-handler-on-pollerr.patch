@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 18:48:43 +0900
+Date: Sat, 5 Sep 2026 18:48:43 +0900
 Subject: [PATCH] virtio-media: park the host fd handler while poll() reports
  only POLLERR
 
@@ -14,8 +14,13 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media.c         | 37 ++++++++++++++++++++++++++++++++
+ include/hw/virtio/virtio-media.h |  6 ++++++
+ 2 files changed, 43 insertions(+)
+
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index ad63a285a4c..75c8ddcab19 100644
+index 9dd8f36e9ac..2f7d84ad9a6 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -510,6 +510,36 @@ static void virtio_media_host_readable(void *opaque)
@@ -63,7 +68,7 @@ index ad63a285a4c..75c8ddcab19 100644
      if (want) {
          /*
           * NOTE: BOTH CALLBACKS ARE THE SAME FUNCTION, AND THE WRITE ONE IS NOT
-@@ -1249,6 +1280,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -1250,6 +1281,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
      }
  
      gb->queued = true;
@@ -77,10 +82,10 @@ index ad63a285a4c..75c8ddcab19 100644
  }
  
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 6b145becc04..0731dacd2ba 100644
+index 6d84be73d07..433e3029822 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -224,6 +224,12 @@ typedef struct VirtIOMediaSession {
+@@ -226,6 +226,12 @@ typedef struct VirtIOMediaSession {
      struct VirtIOMedia *vm;
      uint32_t id;
      int fd;
