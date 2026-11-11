@@ -1,44 +1,193 @@
-From 1777479d8d1283746207c10493468581c57a1680 Mon Sep 17 00:00:00 2001
+From f152abaa9be3ef523e4c913bb232401e60b15c6f Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 21 Jul 2026 10:00:00 +0900
-Subject: [PATCH] vhost_xen: adversarial-review hardening (BV, MV1-MV4)
+Date: Wed, 11 Nov 2026 09:08:50 +0900
+Subject: [PATCH] vhost_xen: adversarial-review hardening (BV, MV1-MV5, review
+ fixes)
 
-Hardening from an adversarial review of the vhost_xen Xen-mapping paths.
-Applied as a trailing patch on top of the vhost_xen series so the existing
-0004-0013 quilt/git-am sequence stays byte-identical.
+Hardening from two adversarial reviews of the vhost_xen Xen-mapping
+paths. Applied as a trailing patch on top of the vhost_xen series so the
+EPAM and Renesas patches 0004-0011 stay byte-identical to their origin;
+the fixes to lines those patches added live here.
 
- - BV  (vhost.c translate_desc): the CONFIG_VHOST_XEN early path writes
-        iov[0] and returns 1 without consulting iov_size, so a guest
-        chaining >UIO_MAXIOV indirect descriptors drives an OOB write past
-        the fixed iov[] array. Reject when no iovec slot is left
-        (iov_size == 0).
- - MV2 (xen.c vhost_xen_map_desc): bound the guest-controlled size before
-        gnttab_alloc_pages(count), to avoid a ~4GB allocation attempt
-        (DomD OOM).
- - MV1 (xen.c): on the map-failure path free the map with
-        vhost_xen_put_map() (unmap-then-free) instead of free_map(), which
-        left partially-mapped grants mapped while returning their pages
-        (cross-domain leak).
- - MV3 (xen.c): READ_ONCE/WRITE_ONCE the global guest_domid (read from the
-        vhost worker, written from the xenwatch callback / sysfs param).
+Mapping lifetime (the review's two High findings):
+
+ - MV5 (vsock.c, net.c): translate_desc() maps every descriptor it
+        translates, but the device handlers only unmapped on their
+        success paths. Every error and discard path left the maps on
+        vq->desc_maps until QEMU closed the vhost fd: in vsock a vq_err
+        break in do_send_pkt (out != 0, short buffer, failed copy) and a
+        NULL from vhost_vsock_alloc_skb() in handle_tx_kick (which
+        `continue`s, so one map per forged descriptor); in vhost_net every
+        vhost_discard_vq_desc() -- get_rx_bufs() running out of guest
+        buffers (ordinary under load with mergeable RX), a short recvmsg,
+        a failed num_buffers write, vhost_net_build_xdp() failing, sendmsg
+        backpressure -- and get_tx_bufs() rejecting a chain; in vhost.c a
+        chain whose translation fails half-way and the six returns of
+        get_indirect() after its table was mapped. A discarded descriptor
+        is translated and mapped again on the next get, so the leak was
+        not bounded by the ring; a guest could drain DomD's maptrack or
+        unpopulated pages by posting bad descriptors.
+        Call vhost_xen_unmap_desc_all() at the head of every handler
+        iteration and once more before the handler drops vq->mutex
+        (do_send_pkt, handle_tx_kick, handle_rx, handle_tx_copy). This is
+        safe because every success path copies synchronously and unmaps
+        before its iteration ends, so nothing left on the list is in use.
+        handle_tx_zerocopy() hands guest pages to an skb asynchronously
+        and gets no such call; vhost_net never selects it here
+        (experimental_zcopytx defaults to 0 and is left at 0), which the
+        comment at vhost_xen_unmap_desc_all() records. The commented-out
+        unmap_desc_all calls EPAM left in the per-descriptor helpers are
+        removed.
+
+Translation (vhost.c translate_desc, CONFIG_VHOST_XEN path):
+
+ - BV:  the early path writes iov[0] and returns 1 without consulting
+        iov_size, so a guest chaining >UIO_MAXIOV indirect descriptors
+        drives an OOB write past the fixed iov[] array. Reject when no
+        iovec slot is left (iov_size == 0).
+ - A zero-length descriptor returns 0 iovecs, as the generic loop does.
+        It used to be mapped: count = 0, the allocators succeed with 0
+        pages, and map->pages[0] (ZERO_SIZE_PTR) was read -- an oops when
+        the unpopulated allocator falls back to ballooning (no extended
+        regions in the DT), a failed translation with a "Cannot allocate
+        new IOMEM resource" line otherwise.
+ - With an IOTLB the callers pass host virtual addresses; refuse with
+        -EOPNOTSUPP instead of mapping them as guest frames. QEMU on Xen
+        never negotiates one (no vIOMMU), so this is a guard.
+
+xen.c:
+
+ - MV2: bound the guest-controlled size of a descriptor before
+        gnttab_alloc_pages(count), to avoid a multi-GB allocation attempt
+        (DomD OOM). The bound is 1 MiB: the two vhost users here,
+        virtio-net and vsock, never post a descriptor above 64 KiB plus a
+        header. (The first review set 16 MiB.)
+ - MV1: on the map-failure path free the map with vhost_xen_put_map()
+        (unmap-then-free) instead of free_map(), which left
+        partially-mapped grants mapped while returning their pages.
+ - Unmap failures no longer recycle pages that may still be mapped:
+        vhost_xen_foreign_unmap_pages() removes every mapped frame and
+        reports the first error instead of stopping at it (the frames
+        behind it stayed in the physmap while their pages went back to
+        the pool), and vhost_xen_put_map() leaks a map whose unmap failed,
+        with a warning, instead of freeing it. For that to hold on the
+        MV1 path the foreign map records which frames Xen accepted (a
+        bitmap set from the per-frame errs[] of XENMEM_add_to_physmap_range)
+        and the unmap touches only those: removing a frame that never
+        mapped fails with -ENOENT, which would otherwise have leaked the
+        whole map for every descriptor with a bad gfn.
+ - vhost_xen_grant_unmap_pages() unmaps only the entries whose map op
+        succeeded; a handle left at INVALID_GRANT_HANDLE by a partial
+        failure made Xen answer GNTST_bad_handle.
+ - MV3: READ_ONCE/WRITE_ONCE the global guest_domid (read from the vhost
+        worker, written from the xenwatch callback / sysfs param); one
+        read per vhost_xen_map_desc() call, used for the check, the
+        message and map->domid.
+ - The guest-triggerable pr_err()s (bad address kind, map failure, vmap
+        failure) are rate-limited, as is the per-region "Skip pseudo
+        memory region" line in vhost.c, which is informational.
+ - VHOST_XEN is `bool`: VHOST selects it whenever XEN is set, so it is
+        always built in and never unloaded; the empty module_exit() that
+        did not undo the xenstore notifier or the watch is gone with it.
+ - The xenbus_watch is named after what it watches ("device-model");
+        the comment on the vmap() names both allocators and fixes its
+        typos.
  - MV4 (net.c): unmap the descriptors on the RX overrun-discard path
         before continuing (they were mapped by get_rx_bufs), matching the
-        success path.
+        success path. Kept; the handler-head unmap above covers it too.
+ - vsock.c: a space before the tab in the #else branch of the iov_iter
+        init in do_send_pkt.
+
+Compile-checked (drivers/vhost/{xen,vhost,net,vsock}.o, arm64, W=1,
+the RPi4 DomD .config) and checkpatch --strict clean except for the
+file's own two-tab continuation style. Not yet run on a board.
 
 Assisted-by: Claude Code:claude-opus-4-8
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [downstream fork; drivers/vhost/xen.c exists only in the xen-troops/linux fork, not in mainline]
 ---
- drivers/vhost/net.c   |  4 ++++
- drivers/vhost/vhost.c |  2 ++
- drivers/vhost/xen.c   | 16 +++++++++++-----
- 3 files changed, 17 insertions(+), 5 deletions(-)
+ drivers/vhost/Kconfig |   2 +-
+ drivers/vhost/net.c   |  35 ++++++---
+ drivers/vhost/vhost.c |  20 ++++-
+ drivers/vhost/vsock.c |  22 +++---
+ drivers/vhost/xen.c   | 174 ++++++++++++++++++++++++++++++++----------
+ 5 files changed, 191 insertions(+), 62 deletions(-)
 
+diff --git a/drivers/vhost/Kconfig b/drivers/vhost/Kconfig
+index e04b5c9f7d81c..3f3420634987c 100644
+--- a/drivers/vhost/Kconfig
++++ b/drivers/vhost/Kconfig
+@@ -7,7 +7,7 @@ config VHOST_IOTLB
+ 	  an IOMMU in software.
+ 
+ config VHOST_XEN
+-	tristate
++	bool
+ 	help
+ 	  Support of Xen specific mappings for accessing descriptors in virtio rings.
+ 
 diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
-index 2af217946abd..589137e30644 100644
+index 2af217946abdc..3aea81e4f87e1 100644
 --- a/drivers/vhost/net.c
 +++ b/drivers/vhost/net.c
-@@ -1254,6 +1254,10 @@ static void handle_rx(struct vhost_net *net)
+@@ -160,15 +160,6 @@ static void vhost_net_unmap_desc(struct vhost_virtqueue *vq, int count)
+ 		if (vq->iov[i].iov_base)
+ 			vhost_xen_unmap_desc(vq, vq->iov[i].iov_base, vq->iov[i].iov_len);
+ 	}
+-
+-	/*
+-	 * Alternatively we could unmap *all* mapped at this point descriptors
+-	 * (including indirect) in one go instead of unmapping one by one.
+-	 * But we must be sure that doing that we won't end up unmapping
+-	 * descriptors which are still in use. This depends on the place(s)
+-	 * from which current function gets called.
+-	 */
+-	/*vhost_xen_unmap_desc_all(vq);*/
+ }
+ #endif
+ 
+@@ -799,6 +790,14 @@ static void handle_tx_copy(struct vhost_net *net, struct socket *sock)
+ 	do {
+ 		bool busyloop_intr = false;
+ 
++#ifdef CONFIG_VHOST_XEN
++		/*
++		 * Maps an earlier iteration left on an error or discard path
++		 * (get_tx_bufs failure, vhost_net_build_xdp failure, sendmsg
++		 * backpressure); see xen.c. Not for handle_tx_zerocopy().
++		 */
++		vhost_xen_unmap_desc_all(vq);
++#endif
+ 		if (nvq->done_idx == VHOST_NET_BATCH)
+ 			vhost_tx_batch(net, nvq, sock, &msg);
+ 
+@@ -882,6 +881,9 @@ static void handle_tx_copy(struct vhost_net *net, struct socket *sock)
+ 	} while (likely(!vhost_exceeds_weight(vq, ++sent_pkts, total_len)));
+ 
+ 	vhost_tx_batch(net, nvq, sock, &msg);
++#ifdef CONFIG_VHOST_XEN
++	vhost_xen_unmap_desc_all(vq);
++#endif
+ }
+ 
+ static void handle_tx_zerocopy(struct vhost_net *net, struct socket *sock)
+@@ -1213,6 +1215,14 @@ static void handle_rx(struct vhost_net *net)
+ 			  vhost_has_feature(vq, VIRTIO_F_VERSION_1);
+ 
+ 	do {
++#ifdef CONFIG_VHOST_XEN
++		/*
++		 * Maps an earlier iteration left on an error or discard path
++		 * (get_rx_bufs running out of buffers, a short recvmsg, a
++		 * failed num_buffers write); see xen.c.
++		 */
++		vhost_xen_unmap_desc_all(vq);
++#endif
+ 		sock_len = vhost_net_rx_peek_head_len(net, sock->sk,
+ 						      &busyloop_intr, &count);
+ 		if (!sock_len)
+@@ -1254,6 +1264,10 @@ static void handle_rx(struct vhost_net *net)
  			err = sock->ops->recvmsg(sock, &msg,
  						 1, MSG_DONTWAIT | MSG_TRUNC);
  			pr_debug("Discarded rx packet: len %zd\n", sock_len);
@@ -49,55 +198,407 @@ index 2af217946abd..589137e30644 100644
  			continue;
  		}
  		/* We don't need to be notified again. */
+@@ -1325,6 +1339,9 @@ static void handle_rx(struct vhost_net *net)
+ 	else if (!sock_len)
+ 		vhost_net_enable_vq(net, vq);
+ out:
++#ifdef CONFIG_VHOST_XEN
++	vhost_xen_unmap_desc_all(vq);
++#endif
+ 	vhost_net_signal_used(nvq, count);
+ 	mutex_unlock(&vq->mutex);
+ }
 diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
-index 4d97b6c50518..7b90042bb5c9 100644
+index 4d97b6c50518a..eabef117ef1f5 100644
 --- a/drivers/vhost/vhost.c
 +++ b/drivers/vhost/vhost.c
-@@ -2665,6 +2665,8 @@ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+@@ -2012,7 +2012,8 @@ static long vhost_set_memory(struct vhost_dev *d, struct vhost_memory __user *m)
+ 
+ #ifdef CONFIG_VHOST_XEN
+ 		if (region->guest_phys_addr & XEN_GRANT_DMA_ADDR_OFF) {
+-			pr_err("%s: Skip pseudo memory region for Xen grant mappings\n", __func__);
++			pr_info_ratelimited("%s: Skip pseudo memory region for Xen grant mappings\n",
++					    __func__);
+ 			continue;
+ 		}
+ #endif
+@@ -2665,6 +2666,23 @@ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
  	int ret = 0;
  
  #ifdef CONFIG_VHOST_XEN
++	/*
++	 * A zero-length descriptor contributes no iovec, as in the generic
++	 * loop below (which does not run and returns 0). Mapping it would
++	 * ask the allocator for 0 pages and then read map->pages[0].
++	 */
++	if (!len)
++		return 0;
++	/*
++	 * With an IOTLB the callers pass host virtual addresses (the ring
++	 * accessors over dev->iotlb), which this path would take for guest
++	 * frames. QEMU on Xen never negotiates one (no vIOMMU); refuse rather
++	 * than map a host address as a foreign frame.
++	 */
++	if (dev->iotlb)
++		return -EOPNOTSUPP;
 +	if (!iov_size)
 +		return -ENOBUFS;
  	iov->iov_len = len;
  	iov->iov_base = vhost_xen_map_desc(vq, addr, len, access);
  	if (IS_ERR(iov->iov_base))
+diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
+index ba6dc94c53d1f..9de8565eda019 100644
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@ -96,15 +96,6 @@ static void vhost_vsock_unmap_desc(struct vhost_virtqueue *vq, int count)
+ 		if (vq->iov[i].iov_base)
+ 			vhost_xen_unmap_desc(vq, vq->iov[i].iov_base, vq->iov[i].iov_len);
+ 	}
+-
+-	/*
+-	 * Alternatively we could unmap *all* mapped at this point descriptors
+-	 * (including indirect) in one go instead of unmapping one by one.
+-	 * But we must be sure that doing that we won't end up unmapping
+-	 * descriptors which are still in use. This depends on the place(s)
+-	 * from which current function gets called.
+-	 */
+-	/*vhost_xen_unmap_desc_all(vq);*/
+ }
+ #endif
+ 
+@@ -139,6 +130,10 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
+ 		u32 offset;
+ 		int head;
+ 
++#ifdef CONFIG_VHOST_XEN
++		/* Maps an earlier iteration left on an error path (see xen.c). */
++		vhost_xen_unmap_desc_all(vq);
++#endif
+ 		skb = virtio_vsock_skb_dequeue(&vsock->send_pkt_queue);
+ 
+ 		if (!skb) {
+@@ -181,7 +176,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
+ #ifdef CONFIG_VHOST_XEN
+ 		iov_iter_kvec(&iov_iter, ITER_DEST, (struct kvec *)&vq->iov[out], in, iov_len);
+ #else
+- 		iov_iter_init(&iov_iter, ITER_DEST, &vq->iov[out], in, iov_len);
++		iov_iter_init(&iov_iter, ITER_DEST, &vq->iov[out], in, iov_len);
+ #endif
+ 		offset = VIRTIO_VSOCK_SKB_CB(skb)->offset;
+ 		payload_len = skb->len - offset;
+@@ -533,6 +528,10 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
+ 	do {
+ 		struct virtio_vsock_hdr *hdr;
+ 
++#ifdef CONFIG_VHOST_XEN
++		/* Maps an earlier iteration left on an error path (see xen.c). */
++		vhost_xen_unmap_desc_all(vq);
++#endif
+ 		if (!vhost_vsock_more_replies(vsock)) {
+ 			/* Stop tx until the device processes already
+ 			 * pending replies.  Leave tx virtqueue
+@@ -588,6 +587,9 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
+ 		vhost_signal(&vsock->dev, vq);
+ 
+ out:
++#ifdef CONFIG_VHOST_XEN
++	vhost_xen_unmap_desc_all(vq);
++#endif
+ 	mutex_unlock(&vq->mutex);
+ }
+ 
 diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
-index 8ccbb086e33e..fb54996604f7 100644
+index c60a283535cc6..b924c652f77b9 100644
 --- a/drivers/vhost/xen.c
 +++ b/drivers/vhost/xen.c
-@@ -328,7 +328,14 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/bitmap.h>
+ #include <linux/slab.h>
+ #include <linux/vhost.h>
+ #include <xen/grant_table.h>
+@@ -35,6 +36,8 @@ struct vhost_xen_map {
+ 	struct list_head next;
+ 	int count;
+ 	grant_handle_t *handles;
++	/* Foreign mappings: one bit per frame that is in the physmap. */
++	unsigned long *mapped;
+ 	domid_t domid;
+ 	struct page **pages;
+ 	unsigned long vaddr;
+@@ -108,7 +111,7 @@ static int vhost_xen_grant_map_pages(struct vhost_xen_map *map, u64 gpaddr,
+ 		grant_ref_t ref = XEN_PFN_DOWN(gpaddr & ~XEN_GRANT_DMA_ADDR_OFF) + i;
+ 
+ 		gnttab_set_map_op(&map_ops[i], vaddr, flags, ref, map->domid);
+-		map->handles[i] = -1;
++		map->handles[i] = INVALID_GRANT_HANDLE;
+ 	}
+ 
+ 	ret = gnttab_map_refs(map_ops, NULL, map->pages, map->count);
+@@ -127,32 +130,52 @@ static int vhost_xen_grant_map_pages(struct vhost_xen_map *map, u64 gpaddr,
+ static int vhost_xen_grant_unmap_pages(struct vhost_xen_map *map)
+ {
+ 	struct gnttab_unmap_grant_ref *unmap_ops;
+-	int i, ret;
++	struct page **pages;
++	int i, n = 0, ret = 0;
+ 
+ 	unmap_ops = kvcalloc(map->count, sizeof(unmap_ops[0]), GFP_KERNEL);
+-	if (!unmap_ops)
+-		return -ENOMEM;
++	pages = kvcalloc(map->count, sizeof(pages[0]), GFP_KERNEL);
++	if (!unmap_ops || !pages) {
++		ret = -ENOMEM;
++		goto out;
++	}
+ 
++	/*
++	 * Only the entries whose map op succeeded hold a handle. After a
++	 * partial failure in vhost_xen_grant_map_pages() the others are still
++	 * INVALID_GRANT_HANDLE, and passing one to the hypercall makes Xen
++	 * answer GNTST_bad_handle for it; pages[] must stay parallel to the
++	 * ops, so both are compacted.
++	 */
+ 	for (i = 0; i < map->count; i++) {
+-		unsigned long vaddr = (unsigned long)
+-			pfn_to_kaddr(page_to_xen_pfn(map->pages[i]));
++		unsigned long vaddr;
++
++		if (map->handles[i] == INVALID_GRANT_HANDLE)
++			continue;
+ 
+-		gnttab_set_unmap_op(&unmap_ops[i], vaddr, GNTMAP_host_map,
++		vaddr = (unsigned long)
++			pfn_to_kaddr(page_to_xen_pfn(map->pages[i]));
++		gnttab_set_unmap_op(&unmap_ops[n], vaddr, GNTMAP_host_map,
+ 				map->handles[i]);
++		pages[n] = map->pages[i];
++		n++;
+ 	}
+ 
+-	ret = gnttab_unmap_refs(unmap_ops, NULL, map->pages, map->count);
+-	if (ret) {
+-		kvfree(unmap_ops);
+-		return ret;
++	if (n) {
++		ret = gnttab_unmap_refs(unmap_ops, NULL, pages, n);
++		if (ret)
++			goto out;
+ 	}
+ 
+-	for (i = 0; i < map->count; i++) {
++	for (i = 0; i < n; i++) {
+ 		if (unmap_ops[i].status != GNTST_okay)
+ 			ret = -EINVAL;
+-		map->handles[i] = -1;
+ 	}
++	for (i = 0; i < map->count; i++)
++		map->handles[i] = INVALID_GRANT_HANDLE;
+ 
++out:
++	kvfree(pages);
+ 	kvfree(unmap_ops);
+ 
+ 	return ret;
+@@ -167,6 +190,7 @@ static void vhost_xen_foreign_free_map(struct vhost_xen_map *map)
+ 		xen_free_unpopulated_pages(map->count, map->pages);
+ 
+ 	kvfree(map->pages);
++	bitmap_free(map->mapped);
+ 	kfree(map);
+ }
+ 
+@@ -179,7 +203,8 @@ static struct vhost_xen_map *vhost_xen_foreign_alloc_map(int count)
+ 		return NULL;
+ 
+ 	map->pages = kvcalloc(count, sizeof(map->pages[0]), GFP_KERNEL);
+-	if (!map->pages)
++	map->mapped = bitmap_zalloc(count, GFP_KERNEL);
++	if (!map->pages || !map->mapped)
+ 		goto err;
+ 
+ 	if (xen_alloc_unpopulated_pages(count, map->pages))
+@@ -232,8 +257,19 @@ static int vhost_xen_foreign_map_pages(struct vhost_xen_map *map, u64 gpaddr,
+ 	set_xen_guest_handle(xatp.errs, errs);
+ 
+ 	ret = HYPERVISOR_memory_op(XENMEM_add_to_physmap_range, &xatp);
++	/*
++	 * Record which frames are in the physmap, so that the unmap touches
++	 * only those: a guest gfn Xen refuses leaves its errs[i] set and its
++	 * frame unmapped, and removing an unmapped frame fails with -ENOENT,
++	 * which would make vhost_xen_put_map() leak the whole map for every
++	 * bad descriptor. A frame whose errs[i] is clear counts as mapped even
++	 * when the hypercall itself failed: leaking on the unmap is the safe
++	 * side, recycling a mapped page is not.
++	 */
+ 	for (i = 0; i < map->count; i++) {
+-		if (errs[i] && !ret)
++		if (!errs[i])
++			__set_bit(i, map->mapped);
++		else if (!ret)
+ 			ret = errs[i];
+ 	}
+ 
+@@ -247,18 +283,32 @@ static int vhost_xen_foreign_map_pages(struct vhost_xen_map *map, u64 gpaddr,
+ 
+ static int vhost_xen_foreign_unmap_pages(struct vhost_xen_map *map)
+ {
+-	int i, ret = 0;
++	int i, err, ret = 0;
+ 	struct xen_remove_from_physmap xrp;
+ 
++	/*
++	 * Unmap every mapped frame even after one fails: stopping at the first
++	 * error left the frames behind it in the physmap while the caller
++	 * returned their pages to the unpopulated pool. Frames that never made
++	 * it into the physmap (map->mapped clear, see map_pages) are skipped.
++	 * The first error is reported.
++	 */
+ 	for (i = 0; i < map->count; i++) {
+ 		xen_pfn_t pfn = page_to_xen_pfn(map->pages[i / XEN_PFN_PER_PAGE]);
+ 
++		if (!test_bit(i, map->mapped))
++			continue;
++
+ 		xrp.domid = DOMID_SELF;
+ 		xrp.gpfn = pfn + (i % XEN_PFN_PER_PAGE);
+ 
+-		ret = HYPERVISOR_memory_op(XENMEM_remove_from_physmap, &xrp);
+-		if (ret)
+-			return ret;
++		err = HYPERVISOR_memory_op(XENMEM_remove_from_physmap, &xrp);
++		if (err) {
++			if (!ret)
++				ret = err;
++			continue;
++		}
++		__clear_bit(i, map->mapped);
+ 	}
+ 
+ 	return ret;
+@@ -279,9 +329,17 @@ static void vhost_xen_put_map(struct vhost_xen_map *map)
+ 		int ret;
+ 
+ 		ret = vhost_xen_ops->unmap_pages(map);
+-		if (ret)
+-			pr_err("%s: Failed to unmap pages from dom%d (ret=%d)\n",
+-					__func__, map->domid, ret);
++		if (ret) {
++			/*
++			 * Some frame may still be mapped from the guest. Giving
++			 * the pages back to their pool (gnttab or unpopulated)
++			 * would hand the next user a window onto guest memory,
++			 * so the map is leaked on purpose.
++			 */
++			pr_warn_ratelimited("%s: Failed to unmap pages from dom%d (ret=%d); leaking %d page(s)\n",
++					__func__, map->domid, ret, map->count);
++			return;
++		}
+ 	}
+ 	vhost_xen_ops->free_map(map);
+ }
+@@ -302,6 +360,28 @@ static struct vhost_xen_map *vhost_xen_find_map(struct vhost_virtqueue *vq,
+ 	return NULL;
+ }
+ 
++/*
++ * Unmap everything still mapped on this virtqueue.
++ *
++ * translate_desc() maps every descriptor it translates, so a handler that
++ * leaves an iteration before its own unmap -- a vq_err break, a NULL from
++ * vhost_vsock_alloc_skb(), vhost_discard_vq_desc() in vhost_net's RX and TX
++ * paths, or a chain whose translation failed half-way (including the
++ * indirect table in get_indirect()) -- leaves those maps on vq->desc_maps.
++ * A discarded descriptor is translated and mapped again on the next get, so
++ * the leftovers are not bounded by the ring. vhost_dev_cleanup() is the only
++ * other caller, so without this they live until QEMU closes the vhost fd.
++ *
++ * The device handlers therefore call this at the head of every iteration
++ * and once more before they drop vq->mutex. It is safe there because every
++ * success path copies the data synchronously (copy_to/from_iter,
++ * skb_copy_datagram_*, vhost_net_build_xdp into a page_frag) and unmaps
++ * before the iteration ends, so nothing still on the list is in use.
++ *
++ * handle_tx_zerocopy() is the one path that hands guest pages to an skb
++ * asynchronously; it has no such call and must not get one. vhost_net never
++ * selects it here: experimental_zcopytx defaults to 0 and is left at 0.
++ */
+ void vhost_xen_unmap_desc_all(struct vhost_virtqueue *vq)
+ {
+ 	struct vhost_xen_map *map;
+@@ -326,15 +406,31 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+ 	struct vhost_xen_map *map;
+ 	unsigned long offset = xen_offset_in_page(addr);
  	int count = XEN_PFN_UP(offset + size);
++	domid_t domid;
  	int ret;
  
 -	if (!xen_domain() || guest_domid == DOMID_INVALID)
 +	/*
-+	 * MV2: bound guest-controlled size; avoids an unbounded
-+	 * gnttab_alloc_pages(count) attempt (up to ~4GB) => DomD OOM.
++	 * MV2: bound the guest-controlled size of one descriptor, so that a
++	 * forged length cannot drive gnttab_alloc_pages()/
++	 * xen_alloc_unpopulated_pages() to a multi-GB attempt (DomD OOM). The
++	 * two vhost users here, virtio-net and vsock, never post a descriptor
++	 * above 64 KiB plus a header, so 1 MiB leaves a wide margin.
 +	 */
-+	if (size > (16u << 20))
++	if (size > (1u << 20))
 +		return ERR_PTR(-EINVAL);
 +
-+	if (!xen_domain() || READ_ONCE(guest_domid) == DOMID_INVALID)
++	/*
++	 * MV3: one read of the binding per call; it is written from the
++	 * xenwatch callback and the module parameter.
++	 */
++	domid = READ_ONCE(guest_domid);
++	if (!xen_domain() || domid == DOMID_INVALID)
  		return ERR_PTR(-ENODEV);
  
  	if ((nogrant && (addr & XEN_GRANT_DMA_ADDR_OFF)) ||
-@@ -342,12 +347,12 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
+ 			(!nogrant && !(addr & XEN_GRANT_DMA_ADDR_OFF))) {
+-		pr_err("%s: Descriptor from dom%d cannot be mapped via Xen %s mappings (addr 0x%llx)\n",
+-				__func__, guest_domid, nogrant ? "foreign" : "grant", addr);
++		pr_err_ratelimited("%s: Descriptor from dom%d cannot be mapped via Xen %s mappings (addr 0x%llx)\n",
++				__func__, domid, nogrant ? "foreign" : "grant", addr);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+@@ -342,25 +438,27 @@ void *vhost_xen_map_desc(struct vhost_virtqueue *vq, u64 addr, u32 size,
  	if (!map)
  		return ERR_PTR(-ENOMEM);
  
 -	map->domid = guest_domid;
-+	map->domid = READ_ONCE(guest_domid);
++	map->domid = domid;
  	ret = vhost_xen_ops->map_pages(map, addr, access == VHOST_ACCESS_RO);
  	if (ret) {
- 		pr_err("%s: Failed to map pages from dom%d (ret=%d)\n",
+-		pr_err("%s: Failed to map pages from dom%d (ret=%d)\n",
++		pr_err_ratelimited("%s: Failed to map pages from dom%d (ret=%d)\n",
  				__func__, map->domid, ret);
 -		vhost_xen_ops->free_map(map);
 +		vhost_xen_put_map(map);
  		return ERR_PTR(ret);
  	}
  
-@@ -527,7 +532,7 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 	/*
+-	 * Consider allocating xen_alloc_unpopulated_contiguous_pages() instead of
+-	 * xen_alloc_unpopulated_pages() to avoid maping as with the later
+-	 * map->pages are not guaranteed to be contiguous.
++	 * Neither allocator (gnttab_alloc_pages() for grant mappings,
++	 * xen_alloc_unpopulated_pages() for foreign ones) guarantees that
++	 * map->pages are contiguous, hence the vmap() for a multi-page
++	 * descriptor. Allocating contiguous pages instead (e.g.
++	 * xen_alloc_unpopulated_contiguous_pages()) would avoid this mapping.
+ 	 */
+ 	if (map->count > 1) {
+ 		map->vaddr = (unsigned long)vmap(map->pages, map->count, VM_MAP,
+ 				PAGE_KERNEL);
+ 		if (!map->vaddr) {
+-			pr_err("%s: Failed to create virtual mappings\n", __func__);
++			pr_err_ratelimited("%s: Failed to create virtual mappings\n", __func__);
+ 			vhost_xen_put_map(map);
+ 			return ERR_PTR(-ENOMEM);
+ 		}
+@@ -538,7 +636,7 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
  			pr_warn("%s: no qualifying device-model among %u entries; keeping dom%u\n",
  				__func__, n, guest_domid);
  	} else if (new_domid != guest_domid) {
@@ -106,6 +607,38 @@ index 8ccbb086e33e..fb54996604f7 100644
  		if (new_domid == DOMID_INVALID)
  			pr_info("%s: Reset current domid\n", __func__);
  		else
+@@ -548,7 +646,7 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 	kfree(dm_dir);
+ }
+ 
+-static struct xenbus_watch vhost_xen_qemu_args = {
++static struct xenbus_watch vhost_xen_device_model_watch = {
+ 	.node = "device-model",
+ 	.callback = vhost_xen_get_guest_domid,
+ };
+@@ -558,7 +656,7 @@ static int vhost_xen_watcher(struct notifier_block *notifier,
+ {
+ 	int ret;
+ 
+-	ret = register_xenbus_watch(&vhost_xen_qemu_args);
++	ret = register_xenbus_watch(&vhost_xen_device_model_watch);
+ 	if (ret)
+ 		pr_err("%s: Failed to set watcher (ret=%d)\n", __func__, ret);
+ 
+@@ -584,13 +682,7 @@ static int __init vhost_xen_init(void)
+ 	return 0;
+ }
+ 
+-static void __exit vhost_xen_exit(void)
+-{
+-
+-}
+-
+ module_init(vhost_xen_init);
+-module_exit(vhost_xen_exit);
+ 
+ MODULE_DESCRIPTION("Xen specific mappings for vhost");
+ MODULE_AUTHOR("Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>");
 -- 
-2.34.1
+2.43.0
 

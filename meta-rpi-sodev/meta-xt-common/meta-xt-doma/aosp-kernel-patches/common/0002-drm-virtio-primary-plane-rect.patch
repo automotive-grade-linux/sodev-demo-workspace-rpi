@@ -1,6 +1,8 @@
+From e06c518060c51a8b3352a805232c5e3af70c51d3 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 13 Oct 2026 07:52:29 +0900
-Subject: [PATCH] drm/virtio: optionally let the primary plane be positioned and scaled
+Date: Wed, 11 Nov 2026 08:35:16 +0900
+Subject: [PATCH] drm/virtio: optionally let the primary plane be positioned
+ and scaled
 
 The virtio-gpu primary plane is checked with DRM_PLANE_NO_SCALING and
 may not be positioned, so it has to cover the whole CRTC at 1:1. A
@@ -34,9 +36,34 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that is not in the virtio specification]
 ---
+ drivers/gpu/drm/virtio/virtgpu_drv.c   |  6 ++++
+ drivers/gpu/drm/virtio/virtgpu_drv.h   | 26 ++++++++++++++
+ drivers/gpu/drm/virtio/virtgpu_plane.c | 49 +++++++++++++++++++++++---
+ drivers/gpu/drm/virtio/virtgpu_vq.c    | 23 ++++++++++++
+ 4 files changed, 100 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index 7d9bf78c3..2aff06060 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -57,6 +57,12 @@ MODULE_PARM_DESC(overlay_planes,
+ 		 "(0..3, needs a device offering them, e.g. qemu overlay-planes=N)");
+ module_param_named(overlay_planes, virtio_gpu_overlay_planes, int, 0400);
+ 
++int virtio_gpu_plane_scaling;
++MODULE_PARM_DESC(plane_scaling,
++		 "Let the primary plane be positioned and scaled 1/8..8x, sent with "
++		 "SET_PRIMARY_RECT (needs a device that handles it); 0 = off");
++module_param_named(plane_scaling, virtio_gpu_plane_scaling, int, 0400);
++
+ static int virtio_gpu_pci_quirk(struct drm_device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 78e5a1bf6..bc09c4ea9 100644
 --- a/drivers/gpu/drm/virtio/virtgpu_drv.h
 +++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
-@@ -184,6 +184,9 @@
+@@ -184,6 +184,9 @@ struct virtio_gpu_output {
  	int cur_x;
  	int cur_y;
  	bool needs_modeset;
@@ -46,7 +73,7 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  };
  #define drm_crtc_to_virtio_gpu_output(x) \
  	container_of(x, struct virtio_gpu_output, crtc)
-@@ -371,7 +374,30 @@
+@@ -371,7 +374,30 @@ struct virtio_gpu_set_overlay_pos {
  	__le32 padding;
  };
  
@@ -77,56 +104,11 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
  				    uint32_t scanout_id, int32_t x, int32_t y);
  struct drm_plane *virtio_gpu_overlay_plane_init(struct virtio_gpu_device *vgdev,
---- a/drivers/gpu/drm/virtio/virtgpu_drv.c
-+++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
-@@ -57,6 +57,12 @@
- 		 "(0..3, needs a device offering them, e.g. qemu overlay-planes=N)");
- module_param_named(overlay_planes, virtio_gpu_overlay_planes, int, 0400);
- 
-+int virtio_gpu_plane_scaling;
-+MODULE_PARM_DESC(plane_scaling,
-+		 "Let the primary plane be positioned and scaled 1/8..8x, sent with "
-+		 "SET_PRIMARY_RECT (needs a device that handles it); 0 = off");
-+module_param_named(plane_scaling, virtio_gpu_plane_scaling, int, 0400);
-+
- static int virtio_gpu_pci_quirk(struct drm_device *dev)
- {
- 	struct pci_dev *pdev = to_pci_dev(dev->dev);
---- a/drivers/gpu/drm/virtio/virtgpu_vq.c
-+++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
-@@ -644,6 +644,29 @@
- 		virtio_gpu_cleanup_object(bo);
- }
- 
-+void virtio_gpu_cmd_set_primary_rect(struct virtio_gpu_device *vgdev,
-+					     uint32_t scanout_id, int32_t x, int32_t y,
-+					     uint32_t w, uint32_t h, uint32_t crtc_w,
-+					     uint32_t crtc_h)
-+{
-+	struct virtio_gpu_set_primary_rect *cmd_p;
-+	struct virtio_gpu_vbuffer *vbuf;
-+
-+	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
-+	memset(cmd_p, 0, sizeof(*cmd_p));
-+
-+	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_SET_PRIMARY_RECT);
-+	cmd_p->scanout_id = cpu_to_le32(scanout_id);
-+	cmd_p->x = cpu_to_le32(x);
-+	cmd_p->y = cpu_to_le32(y);
-+	cmd_p->w = cpu_to_le32(w);
-+	cmd_p->h = cpu_to_le32(h);
-+	cmd_p->crtc_w = cpu_to_le32(crtc_w);
-+	cmd_p->crtc_h = cpu_to_le32(crtc_h);
-+
-+	virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
-+}
-+
- void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
- 				    uint32_t scanout_id, int32_t x, int32_t y)
- {
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index cdc8362e1..24cd3da9f 100644
 --- a/drivers/gpu/drm/virtio/virtgpu_plane.c
 +++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
-@@ -150,6 +150,9 @@
+@@ -150,6 +150,9 @@ static int virtio_gpu_plane_atomic_check(struct drm_plane *plane,
  	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state,
  										 plane);
  	bool is_cursor = plane->type == DRM_PLANE_TYPE_CURSOR;
@@ -136,7 +118,7 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  	struct drm_crtc_state *crtc_state;
  	int ret;
  
-@@ -170,9 +173,11 @@
+@@ -170,9 +173,11 @@ static int virtio_gpu_plane_atomic_check(struct drm_plane *plane,
  		return PTR_ERR(crtc_state);
  
  	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
@@ -151,7 +133,7 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  	return ret;
  }
  
-@@ -285,6 +290,7 @@
+@@ -285,6 +290,7 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
  	struct virtio_gpu_output *output = NULL;
  	struct virtio_gpu_object *bo;
  	struct drm_rect rect;
@@ -159,7 +141,7 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  
  	if (plane->state->crtc)
  		output = drm_crtc_to_virtio_gpu_output(plane->state->crtc);
-@@ -295,6 +301,7 @@
+@@ -295,6 +301,7 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
  
  	if (!plane->state->fb || !output->crtc.state->active) {
  		DRM_DEBUG("nofb\n");
@@ -167,7 +149,7 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  		virtio_gpu_cmd_set_scanout(vgdev, output->index, 0,
  					   plane->state->src_w >> 16,
  					   plane->state->src_h >> 16,
-@@ -303,9 +310,34 @@
+@@ -303,9 +310,34 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
  		return;
  	}
  
@@ -203,7 +185,7 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  	bo = gem_to_virtio_gpu_obj(plane->state->fb->obj[0]);
  	if (bo->dumb)
  		virtio_gpu_update_dumb_bo(vgdev, plane->state, &rect);
-@@ -315,8 +347,17 @@
+@@ -315,8 +347,17 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
  	    plane->state->src_h != old_state->src_h ||
  	    plane->state->src_x != old_state->src_x ||
  	    plane->state->src_y != old_state->src_y ||
@@ -221,3 +203,40 @@ Upstream-Status: Inappropriate [uses a device-specific virtio-gpu command that i
  		DRM_DEBUG("handle 0x%x, crtc %dx%d+%d+%d, src %dx%d+%d+%d\n",
  			  bo->hw_res_handle,
  			  plane->state->crtc_w, plane->state->crtc_h,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+index 533e6e2e5..2aaae3e0c 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -644,6 +644,29 @@ void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
+ 		virtio_gpu_cleanup_object(bo);
+ }
+ 
++void virtio_gpu_cmd_set_primary_rect(struct virtio_gpu_device *vgdev,
++					     uint32_t scanout_id, int32_t x, int32_t y,
++					     uint32_t w, uint32_t h, uint32_t crtc_w,
++					     uint32_t crtc_h)
++{
++	struct virtio_gpu_set_primary_rect *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++
++	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
++	memset(cmd_p, 0, sizeof(*cmd_p));
++
++	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_SET_PRIMARY_RECT);
++	cmd_p->scanout_id = cpu_to_le32(scanout_id);
++	cmd_p->x = cpu_to_le32(x);
++	cmd_p->y = cpu_to_le32(y);
++	cmd_p->w = cpu_to_le32(w);
++	cmd_p->h = cpu_to_le32(h);
++	cmd_p->crtc_w = cpu_to_le32(crtc_w);
++	cmd_p->crtc_h = cpu_to_le32(crtc_h);
++
++	virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
++}
++
+ void virtio_gpu_cmd_set_overlay_pos(struct virtio_gpu_device *vgdev,
+ 				    uint32_t scanout_id, int32_t x, int32_t y)
+ {
+-- 
+2.43.0
+

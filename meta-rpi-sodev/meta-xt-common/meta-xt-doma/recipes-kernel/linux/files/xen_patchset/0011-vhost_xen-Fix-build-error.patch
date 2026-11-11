@@ -4,8 +4,8 @@ Date: Fri, 31 Oct 2025 00:16:02 +0900
 Subject: [PATCH] vhost_xen: Fix build error
 
 Signed-off-by: Yuya Hamamachi <yuya.hamamachi.sx@renesas.com>
-Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
-Origin: https://github.com/xen-troops/linux commit 78da67e5d603010602fb1af5ae496fe147d50e8c
+Upstream-Status: Inappropriate [downstream fork; drivers/vhost/xen.c exists only in the xen-troops/linux fork, not in mainline]
+Origin: carried over from the Renesas V4H (R-Car) reference workspace's DomD kernel patch set, where it follows the EPAM vhost_xen series; no xen-troops/linux commit is cited because neither this file's From id (e6829176) nor the id an earlier revision of this header named (78da67e5) is a commit of https://github.com/xen-troops/linux (GitHub: "No commit found" for both)
 ---
  drivers/vhost/xen.c | 1 +
  1 file changed, 1 insertion(+)

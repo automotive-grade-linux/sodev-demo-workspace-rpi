@@ -1,6 +1,6 @@
-From d51f76193caf01339fc0440a04266133c8bbbee5 Mon Sep 17 00:00:00 2001
+From 6d7e5788fe2818a51dc7c83c7c4d9fcff4cbc17f Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 12 Jun 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:37:55 +0900
 Subject: [PATCH] vhost_xen: Rebind guest domid on every device-model change
 
 The watch callback vhost_xen_get_guest_domid() only updates the global
@@ -25,12 +25,12 @@ destroyed domain (-ESRCH). The only recovery was a board reboot.
 Scan every "device-model/<domid>" entry instead, and bind to the LOWEST
 domid that both reports state "running" and still has a live
 /local/domain/<domid> tree. The liveness check is what actually discards
-the stale leftovers -- Xen removes a domain's Xenstore tree when the
-domain goes away, whereas a stale device-model entry can keep a last
-recorded state of "running", so no ordering of domids can distinguish
-them. Reset guest_domid when no live running instance exists (including
-the case where the whole directory disappears, which the old code also
-failed to handle).
+the stale leftovers -- libxl removes a domain's Xenstore tree when it
+destroys the domain (xs_rm of the domain path in devices_destroy_cb),
+whereas a stale device-model entry can keep a last recorded state of
+"running", so no ordering of domids can distinguish them. Reset
+guest_domid when the directory is empty; when the directory itself
+cannot be read, keep the binding (the second conservatism choice below).
 
 Lowest-first preserves the upstream selection semantics: with a single
 device-model the original code latched that one guest and never rebound,
@@ -38,12 +38,13 @@ so the first-created vhost guest kept the binding for the life of the
 boot. It also matches the only topology in which one DomD backs several
 guests here -- DomA is created before DomU and is the sole user of vhost
 (its AAOS VHAL rides vhost-vsock, while DomU's netdev is vhost=off and it
-has no vsock device). Selecting the highest domid instead would hand the
-binding to DomU, which uses no vhost device at all, and DomA's
-vhost-vsock and vhost-net would map the wrong domain -- observed on
-hardware as the AAOS guest getting no DHCP lease on either of its two
-interfaces and its VHAL never reaching the host, which in turn makes
-com.android.car crash-loop and leaves the AAOS panel black.
+has no vsock device). Selecting the highest domid instead -- which an
+earlier revision of this change did -- hands the binding to DomU, which
+uses no vhost device at all, and DomA's vhost-vsock and vhost-net then
+map the wrong domain: observed on hardware as the AAOS guest getting no
+DHCP lease on either of its two interfaces and its VHAL never reaching
+the host, which in turn makes com.android.car crash-loop and leaves the
+AAOS panel black.
 
 Two deliberate conservatism choices in the scan, both aimed at never making
 things worse than the code being replaced:
@@ -59,10 +60,8 @@ things worse than the code being replaced:
  - guest_domid is only reset to DOMID_INVALID when the device-model
    directory is genuinely empty. If it holds entries but none could be
    qualified, the last known good binding is kept and a warning is
-   logged. Clearing it would break
-   vhost_xen_map_desc() for every guest at once, which is worse than the
-   n >= 2
-   no-op it replaces.
+   logged. Clearing it would break vhost_xen_map_desc() for every guest
+   at once, which is worse than the n >= 2 no-op it replaces.
 
 Additionally expose guest_domid as a writable module parameter
 (/sys/module/vhost_xen/parameters/guest_domid) so that the binding can
@@ -74,14 +73,15 @@ the proper long-term solution remains passing the guest domid from Qemu
 through a VHOST ioctl and storing it per device.
 
 Assisted-by: Claude Code:claude-opus-4-8
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [downstream fork; drivers/vhost/xen.c exists only in the xen-troops/linux fork, not in mainline]
 ---
- drivers/vhost/xen.c | 124 +-
- 1 file changed, 99 insertions(+), 25 deletions(-)
+ drivers/vhost/xen.c | 136 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 116 insertions(+), 20 deletions(-)
 
 diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
-index 4d3927e73feb..8ccbb086e33e 100644
+index 4d3927e73feb3..c60a283535cc6 100644
 --- a/drivers/vhost/xen.c
 +++ b/drivers/vhost/xen.c
 @@ -23,6 +23,9 @@
@@ -94,7 +94,7 @@ index 4d3927e73feb..8ccbb086e33e 100644
  
  static bool nogrant;
  module_param(nogrant, bool, 0444);
-@@ -412,43 +415,133 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+@@ -412,43 +415,136 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
  		const char *path, const char *token)
  {
  	char **dm_dir;
@@ -112,6 +112,7 @@ index 4d3927e73feb..8ccbb086e33e 100644
 -			pr_info("%s: Reset current domid\n", __func__);
 -		}
 -	} else if (n == 1) {
+-		char *dm_str, *dm_path;
 +	/*
 +	 * Select the LOWEST domid whose device-model reports state "running"
 +	 * AND whose domain still exists.
@@ -131,19 +132,18 @@ index 4d3927e73feb..8ccbb086e33e 100644
 +	 * libxl__destroy_device_model() only cleans the path under
 +	 * LIBXL_TOOLSTACK_DOMID. Stale entries accumulate and can even keep a
 +	 * last recorded state of "running", so ranking by domid cannot tell them
-+	 * apart. Each candidate is therefore checked for liveness below: Xen
-+	 * removes /local/domain/<domid> when the domain goes away.
++	 * apart. Each candidate is therefore checked for liveness below: the
++	 * toolstack removes /local/domain/<domid> when it destroys the domain
++	 * (libxl's devices_destroy_cb() does xs_rm() on the domain path).
 +	 *
 +	 * NOTE. The proper solution would be to pass the guest domid from Qemu
 +	 * directly by extending some of VHOST ioctls and to keep it per device
 +	 * instead of in a single global variable.
 +	 */
 +	for (i = 0; i < n; i++) {
--		char *dm_str, *dm_path;
--		domid_t domid;
 +		char *dm_str, *dm_path, **dom_dir;
 +		unsigned int m = 0;
-+		domid_t domid;
+ 		domid_t domid;
  
 -		domid = simple_strtoul(dm_dir[0], NULL, 0);
 +		/*
@@ -172,28 +172,29 @@ index 4d3927e73feb..8ccbb086e33e 100644
 -		if (!strcmp(dm_str, "running")) {
 -			guest_domid = domid;
 -			pr_info("%s: Set new domid: %u\n", __func__, guest_domid);
--		}
 +		if (strcmp(dm_str, "running")) {
 +			kfree(dm_str);
 +			continue;
-+		}
+ 		}
 +		kfree(dm_str);
 +
 +		/*
-+		 * Liveness: Xen tears down /local/domain/<domid> when the
-+		 * domain is destroyed, so a stale device-model entry left
-+		 * behind by the toolstack fails this and is skipped.
++		 * Liveness: libxl removes /local/domain/<domid> (xs_rm in
++		 * devices_destroy_cb) when the domain is destroyed, so a
++		 * stale device-model entry left behind by the toolstack fails
++		 * this and is skipped.
 +		 */
 +		dm_path = kasprintf(GFP_KERNEL, "/local/domain/%u", domid);
 +		if (!dm_path)
 +			continue;
-+
+ 
 +		dom_dir = xenbus_directory(XBT_NIL, dm_path, "", &m);
-+		kfree(dm_path);
+ 		kfree(dm_path);
+-		kfree(dm_str);
 +		if (!IS_ERR(dom_dir)) {
 +			kfree(dom_dir);
 +		} else if (PTR_ERR(dom_dir) == -ENOENT) {
-+			/* Positively gone: Xen removed the tree. Skip. */
++			/* Positively gone: the toolstack removed the tree. Skip. */
 +			continue;
 +		}
 +		/*
@@ -210,8 +211,9 @@ index 4d3927e73feb..8ccbb086e33e 100644
 +		 * Lowest live domid wins. This encodes the boot order the
 +		 * platform guarantees: DomA (the only vhost-vsock guest) is
 +		 * created before DomU, so it always holds the lower domid, and
-+		 * DomU's later device-model entry can no longer steal the
-+		 * binding the way the previous highest-domid rule allowed.
++		 * DomU's later device-model entry cannot steal the binding the
++		 * way a highest-domid rule would (an earlier revision of this
++		 * change used one; the symptom was seen on hardware).
 +		 *
 +		 * Known limitation: if DomA were destroyed and re-created while
 +		 * DomU stayed up, DomA would come back with a HIGHER domid and
@@ -223,12 +225,9 @@ index 4d3927e73feb..8ccbb086e33e 100644
 +		 */
 +		if (new_domid == DOMID_INVALID || domid < new_domid)
 +			new_domid = domid;
- 
--		kfree(dm_path);
--		kfree(dm_str);
- 	}
- 
--out:
++
++	}
++
 +	/*
 +	 * Only tear the binding down when the directory is genuinely empty. If it
 +	 * has entries but none of them could be qualified (every xenbus read
@@ -246,8 +245,12 @@ index 4d3927e73feb..8ccbb086e33e 100644
 +			pr_info("%s: Reset current domid\n", __func__);
 +		else
 +			pr_info("%s: Set new domid: %u\n", __func__, guest_domid);
-+	}
-+
+ 	}
+ 
+-out:
  	kfree(dm_dir);
  }
  
+-- 
+2.43.0
+
