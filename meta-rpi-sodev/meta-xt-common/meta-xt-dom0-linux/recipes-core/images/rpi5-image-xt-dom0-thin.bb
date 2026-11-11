@@ -175,7 +175,6 @@ flatten_dom0_network() {
     rm -f ${IMAGE_ROOTFS}/etc/systemd/network/10-xenbr0.netdev
     rm -f ${IMAGE_ROOTFS}/etc/systemd/network/10-xenbr0.network
     rm -f ${IMAGE_ROOTFS}/etc/systemd/network/10-ether.network
-    rm -f ${IMAGE_ROOTFS}/etc/systemd/system/systemd-networkd.service.d/xenbr0-systemd-networkd.conf
     # Fail loudly rather than shipping a Dom0 that bridges its own vif: any file
     # left here is a network config this function does not know about.
     if [ -n "$(ls -A ${IMAGE_ROOTFS}/etc/systemd/network 2>/dev/null)" ]; then

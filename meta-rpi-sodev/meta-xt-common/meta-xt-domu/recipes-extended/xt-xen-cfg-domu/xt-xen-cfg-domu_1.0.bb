@@ -6,8 +6,8 @@ DESCRIPTION = "\
     xl-attach-disks chain is gone. \
     "
 
-LICENSE = "MIT"
-LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+LICENSE = "Apache-2.0"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
 
 # xl-attach-disks.service is dropped from the package:
 # the Dom0-blkback disk chain does not exist under the Zephyr Dom0; DomD
@@ -67,6 +67,12 @@ XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 # property, so it gets none whatever the value.
 XT_DOMU_OVERLAY_PLANES ??= "0"
 
+# [qemu monitor] LAB/DEMO ONLY. domu.cfg opens DomU's device-model HMP monitor on
+# loopback TCP (telnet:127.0.0.1:1235, unauthenticated; docs/VULKAN-VENUS.md uses it
+# for triage). "1" keeps the line; "0" drops it from the installed cfg. The same knob
+# gates doma.cfg's monitor in xt-xen-cfg-doma.
+XT_QEMU_MONITOR ??= "1"
+
 
 inherit systemd
 
@@ -78,6 +84,17 @@ SYSTEMD_AUTO_ENABLE = "enable"
 do_install() {
     install -d ${D}${sysconfdir}/xen
     install -m 0644 ${UNPACKDIR}/domu.cfg ${D}${sysconfdir}/xen/domu.cfg
+
+    # [qemu monitor] see XT_QEMU_MONITOR above.
+    case "${XT_QEMU_MONITOR}" in
+    1) ;;
+    0)  sed -i -e "/^    # LAB\/DEMO ONLY: the qemu monitor is unauthenticated\. It is bound to$/,/^    '-monitor', 'telnet:127\.0\.0\.1:1235,server,nowait',$/d" \
+            ${D}${sysconfdir}/xen/domu.cfg
+        if grep -q "'-monitor'," ${D}${sysconfdir}/xen/domu.cfg; then
+            bbfatal "domu.cfg: the -monitor line was not removed with XT_QEMU_MONITOR=0"
+        fi ;;
+    *)  bbfatal "XT_QEMU_MONITOR must be '1' or '0' (got '${XT_QEMU_MONITOR}')" ;;
+    esac
 
     # [Venus] Substitute the virtio-gpu-gl device-model options. XT_VENUS_GPU_OPTS
     # comes from the moulin GPU parameter through the domd component conf:
@@ -160,6 +177,7 @@ do_install[vardeps] += "XT_VENUS_GPU_OPTS"
 # Same reason for the device-model version that selects the argument fixups.
 do_install[vardeps] += "XT_DM_QEMU_VERSION"
 do_install[vardeps] += "XT_DOMU_OVERLAY_PLANES"
+do_install[vardeps] += "XT_QEMU_MONITOR"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/domu.cfg \
