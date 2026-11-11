@@ -81,9 +81,9 @@
 # BOARD RAM SIZE — 8 GiB (default) or 4 GiB SKU
 # =============================================================================
 # `setenv board_ram` below is SUBSTITUTED AT BUILD TIME by the xt-rpi-u-boot-scr
-# bbappend from ${BOARD_RAM} (moulin --BOARD_RAM 8g|4g, build.sh --ram=8g|4g). It is
-# a plain env var, so it can also be overridden at the U-Boot prompt for a one-off
-# test:  setenv board_ram 4g ; source ${scriptaddr}
+# bbappend from ${BOARD_RAM} (moulin --BOARD_RAM 8g|4g, build.sh --ram=8g|4g). The
+# assignment is unconditional, so presetting board_ram at the U-Boot prompt does
+# NOT work; a one-off test needs a boot.scr built with the other --ram value.
 #
 # WHY A SWITCH IS NEEDED AT ALL. The RPi4 firmware reports (gpu_mem=76):
 #     4 GiB SKU:  0x00000000-0x3b400000 (948 MiB) + 0x40000000-0xfc000000 (3008 MiB)
@@ -561,16 +561,6 @@ if fatload mmc 0 0xa4000000 Image ; then
 else
     fdt rm /chosen/domD
     echo "DomD kernel not on SD; Dom0-only boot (dom0less DomD disabled)"
-fi
-
-# -----------------------------------------------------------------------------
-# dom0less DomU — disabled; DomU and DomA are created by DomD's xl.
-# -----------------------------------------------------------------------------
-setenv domu_loaded 0
-if test "${domu_loaded}" = "1" ; then
-    echo "dom0less DomU is not implemented on rpi4 yet"
-else
-    fdt rm /chosen/domU
 fi
 
 # -----------------------------------------------------------------------------

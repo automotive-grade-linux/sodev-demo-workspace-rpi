@@ -47,11 +47,13 @@ do_deploy:append() {
 # the stub to the boot partition from classes/sdcard_image-rpi.bbclass, which
 # this workspace does not use.
 #
-# enable_gic defaults to 1 on the RPi4B, but state it explicitly: with 0 the
-# interrupts are routed through the legacy per-core controller instead of the
-# GIC-400, and TF-A's unconditional gicv2_driver_init() no longer matches the
-# hardware.
-RPI_EXTRA_CONFIG:append = "\n# --- EL3: TF-A BL31 (PSCI + GICv2) as the armstub ---\narm_64bit=1\nenable_gic=1\narmstub=bl31.bin\ndevice_tree=bcm2711-rpi-4-b.dtb\n"
+# enable_gic=1 is already in config.txt: meta-virtualization's
+# dynamic-layers/raspberrypi/conf/distro/include/xen-raspberrypi4-64.inc appends it
+# to RPI_EXTRA_CONFIG for every xen build of this MACHINE, so it is not repeated
+# here. It matters all the same (the RPi4B default is 1): with 0 the interrupts
+# are routed through the legacy per-core controller instead of the GIC-400, and
+# TF-A's unconditional gicv2_driver_init() no longer matches the hardware.
+RPI_EXTRA_CONFIG:append = "\n# --- EL3: TF-A BL31 (PSCI + GICv2) as the armstub ---\narm_64bit=1\narmstub=bl31.bin\ndevice_tree=bcm2711-rpi-4-b.dtb\n"
 
 # -----------------------------------------------------------------------------
 # UART assignment: pl011 -> Bluetooth, mini UART -> the Xen console.
@@ -89,7 +91,10 @@ RPI_EXTRA_CONFIG:append = "\n# --- EL3: TF-A BL31 (PSCI + GICv2) as the armstub 
 # max-speed = 3000000, and the controller answers with chip id 107,
 # BCM4345C0 build 0382.
 #
-# enable_uart=1: the mini UART is the primary UART, so this is what gives the
+# enable_uart=1 is written by meta-raspberrypi's rpi-config_git.bb from
+# ENABLE_UART = "1", which rpi4-sodev.yaml's DomD conf and meta-virtualization's
+# xen-raspberrypi4-64.inc both set, so it is not repeated here. The mini UART
+# is the primary UART, so that line is what gives the
 # firmware stage a console on the header at 115200. Xen's ns16550 driver supports
 # brcm,bcm2835-aux-uart directly (the compatible is in ns16550.c's DT match
 # table, and ns16550_uart_dt_init() sets reg_width=4/reg_shift=2 from it) and
@@ -147,7 +152,7 @@ RPI_EXTRA_CONFIG:append = "\n# --- EL3: TF-A BL31 (PSCI + GICv2) as the armstub 
 # Nothing references the file, and keeping it means reverting this UART assignment
 # costs one config.txt line plus boot.scr with no change to the FAT layout —
 # rewriting the SD card is the expensive step on this board.
-RPI_EXTRA_CONFIG:append = "\n# --- Xen console: mini UART on GPIO14/15; pl011 belongs to Bluetooth ---\nenable_uart=1\nforce_turbo=1\ngpio=30,33=a3,pu\ngpio=31,32=a3,pn\n"
+RPI_EXTRA_CONFIG:append = "\n# --- Xen console: mini UART on GPIO14/15; pl011 belongs to Bluetooth ---\nforce_turbo=1\ngpio=30,33=a3,pu\ngpio=31,32=a3,pn\n"
 
 # -----------------------------------------------------------------------------
 # Pin the A72 clock in firmware, for the same reason the Pi 5 layer pins the A76.
@@ -209,8 +214,9 @@ RPI_EXTRA_CONFIG:append = "\n# A72 clock pinned in firmware: Xen/Arm disables cp
 # complex to the control Dom0 — the exact opposite of this design, where DomD
 # declares those nodes itself and takes them by direct-map passthrough.
 #
-# On rpi5 it happened to be harmless because no overlays/ directory was shipped, so
-# the firmware could not find the file and skipped it. That is luck, not intent,
+# On rpi5 it was harmless by luck: p1's overlays/ holds only bcm2712d0.dtbo, so
+# the firmware could not find vc4-kms-v3d.dtbo and skipped the line (that layer
+# now cancels it the same way). Luck is not intent,
 # and it stops being true here: RPI_KERNEL_DEVICETREE_OVERLAYS is built and
 # deployed and overlays/disable-bt.dtbo is on the boot FAT as the rollback path
 # for the UART assignment above, so anyone widening the p1 overlay list would
@@ -272,5 +278,5 @@ RPI_EXTRA_CONFIG:append = "\n# --- fix the VideoCore carve-out: low DRAM bank en
 # REMOVED versus RPi5: usb_max_current_enable=1 — that knob is about the Pi 5's
 # 5 A USB-PD budget. RPi4's USB current limit is fixed in hardware and has no
 # equivalent config.txt setting, so the RP1 touch-panel force-enumerate rationale
-# does not carry over either (see the note in 72-touch-output.rules).
+# does not carry over either (see the note in 72-rp1-touch-output.rules).
 RPI_EXTRA_CONFIG:append = "\n# --- V3D 4.2 firmware DVFS bounds ---\nv3d_freq=500\nv3d_freq_min=250\n"

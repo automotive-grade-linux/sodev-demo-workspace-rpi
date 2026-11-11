@@ -96,9 +96,10 @@
 # bank[0] below 1 GiB also guarantees Dom0 a ZONE_DMA, which it needs because it
 # keeps the SD card in this flavour. Do not fill that hole with module loads.
 #
-# Nothing above 0xfc000000 is fatload-able: U-Boot's bcm2711_mem_map only maps
-# 0x0-0xfc000000 as normal memory unless the 8 GiB MMU patch in
-# recipes-bsp/u-boot/files/ is applied.
+# U-Boot's own bcm2711_mem_map stops at 0xfc000000; the 8 GiB MMU patch in
+# recipes-bsp/u-boot/files/, which the u-boot bbappend always applies on this
+# board, extends it so modules could be fatloaded above 4 GiB. This script still
+# keeps every load below 0xfc000000.
 # =============================================================================
 
 
@@ -106,9 +107,9 @@
 # BOARD RAM SIZE — 8 GiB (default) or 4 GiB SKU
 # =============================================================================
 # `setenv board_ram` below is SUBSTITUTED AT BUILD TIME by the xt-rpi-u-boot-scr
-# bbappend from ${BOARD_RAM} (moulin --BOARD_RAM 8g|4g, build.sh --ram=8g|4g). It is
-# a plain env var, so it can also be overridden at the U-Boot prompt for a one-off
-# test:  setenv board_ram 4g ; source ${scriptaddr}
+# bbappend from ${BOARD_RAM} (moulin --BOARD_RAM 8g|4g, build.sh --ram=8g|4g). The
+# assignment is unconditional, so presetting board_ram at the U-Boot prompt does
+# NOT work; a one-off test needs a boot.scr built with the other --ram value.
 #
 # WHY A SWITCH IS NEEDED AT ALL. The RPi4 firmware reports (gpu_mem=76):
 #     4 GiB SKU:  0x00000000-0x3b400000 (948 MiB) + 0x40000000-0xfc000000 (3008 MiB)
@@ -590,19 +591,15 @@ fdt rm /framebuffer@3f800000
 #       config.txt (overlays/disable-bt.dtbo is still on the boot FAT for exactly
 #       this), drop the &uart0 xen,passthrough marker from the Xen host overlay
 #       and set dtuart=/soc/serial@7e201000 — Bluetooth then stops working.
-#   dom0_mem=1024M
-#       Thin Dom0, but its xl/xenstored footprint grows with each guest (the RPi5
-#       bring-up OOM-killed xl at 512M with three domains). On a 4 GiB board
-#       lower this to 512M: the free sub-4 GiB space left by the map above is
-#       ~600 MiB there.
-#       This value is NOT best-effort — an unsatisfiable dom0_mem is FATAL:
+#   dom0_mem=${dom0mem}   (256M, set in the "Dom0 size" section above)
+#       Sized by emmc2's DMA reach, not by Dom0's footprint: every Dom0 bank has
+#       to sit below 0x40000000, and 256M is exactly what the two low windows
+#       supply, on both SKUs -- the derivation and the /proc/iomem readings are
+#       above. The value is NOT best-effort — an unsatisfiable dom0_mem is FATAL:
 #           xen/arch/arm/domain_build.c:390-393
 #           if ( kinfo->unassigned_mem )
 #               panic("Failed to allocate requested dom0 memory. %ldMB unallocated\n", ...)
-#       So dom0_mem must be sized for the SMALLEST SKU the image is written to,
-#       not for the 8 GiB board this map was measured on. Getting it wrong does
-#       not degrade gracefully; Xen stops before Dom0 exists, with only that one
-#       line on the console.
+#       Xen would stop before Dom0 exists, with only that one line on the console.
 #   NO dma_bits= : Xen's rpi4 platform already sets dma_bitsize = 30, which is
 #       what pushes Dom0's bank[0] below 1 GiB. Passing dma_bits would create a
 #       separate Xen-heap DMA zone, which is not what is wanted here.
@@ -637,8 +634,9 @@ fdt set /chosen/dom0 reg <0x0 0x2400000 0x0 0x${filesize}>
 #
 # First-boot graceful path: if the DomD payload is not on the boot partition yet,
 # fatload returns non-zero, the else branch removes /chosen/domD and the board
-# boots Dom0-only instead of panicking in Xen. The DomD binaries are deployed on
-# the following boot by install-domd-binaries-to-boot.sh.
+# boots Dom0-only instead of panicking in Xen. rpi4-sodev.yaml puts the DomD
+# kernel and DTB on p1 when full.img is assembled, so the branch only matters for
+# a card made by hand.
 # [v93] DomD no longer boots from a RAM initramfs. Its root is the ext4 on SD p2,
 # reached over PV block as /dev/xvda (Dom0 runs blkback), so nothing is fatloaded for
 # it beyond the kernel and its partial DT, and there is no module@2 ramdisk. The gate
@@ -737,12 +735,6 @@ fi
 # the cockpit creates DomU/DomA with `xl create` (proven on V4H). The load slot
 # 0xe0000000-0xfc000000 in the memory map above is reserved for restoring the
 # dom0less path later; nothing writes it today.
-setenv domu_loaded 0
-if test "${domu_loaded}" = "1" ; then
-    echo "dom0less DomU is not implemented on rpi4 yet"
-else
-    fdt rm /chosen/domU
-fi
 
 # -----------------------------------------------------------------------------
 # Dom0 Linux bootargs

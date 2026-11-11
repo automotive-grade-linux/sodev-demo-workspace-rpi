@@ -6,8 +6,8 @@ disassembled with `dtc -I dtb -O dts` and read off. Every address, size and inte
 number in this layer comes from here rather than from a datasheet or from the RPi5
 values — that is the point of the file.
 
-These values are the sole justification for the board DTS, the boot scripts, the
-`xen,reg` ranges and `domd.cfg`'s `iomem` list.
+These values are the sole justification for the board DTS, the boot scripts and the
+`xen,reg` ranges.
 
 ---
 

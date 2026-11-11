@@ -33,7 +33,9 @@
  *   - the V3D and HVS iomem ranges are the exact register sizes, not rounded up
  *   - all 9 HDMI reg blocks are present (metadata, csc, cec, hd, ...); a missing
  *     block leaves the driver bound but unable to drive that sub-function
- *   - the firmware node carries dma-ranges
+ *   - mailbox and firmware sit under mbox-bus, whose bounded dma-ranges keeps
+ *     their DMA in the VPU-reachable bank (an empty dma-ranges on the firmware
+ *     node itself did nothing)
  *   - disp_intr is SPI 97 (a plausible-looking 44 is wrong)
  */
 
@@ -1156,7 +1158,25 @@
 						phy-handle = <&eth_phy>;
 						phy-reset-gpios = <&gpiod0000 0x20 0x1>;
 						phy-reset-duration = <0x5>;
-						local-mac-address = [00 00 00 00 00 00];
+						/*
+						 * A locally-administered, DETERMINISTIC MAC.
+						 * All-zero is not a valid Ethernet address:
+						 * macb_main.c (macb_probe -> of_get_mac_address)
+						 * rejects it, there is no nvmem cell, and
+						 * macb falls back to "invalid hw address,
+						 * using random" -- a different MAC on every
+						 * boot. The board's real MAC cannot be put
+						 * here: the firmware patches it into the HOST
+						 * device tree, which DomD never sees. So: a
+						 * fixed value with the locally-administered
+						 * bit (0x02), no OUI, "DOMD" in the middle;
+						 * the last octet differs from the Pi 4
+						 * layer's (01) so the two boards never share
+						 * one. Fixed means two of these boards on one
+						 * L2 segment would collide -- change the last
+						 * octet per board if that ever happens.
+						 */
+						local-mac-address = [02 44 4f 4d 44 05];
 						clock-names = "pclk", "hclk", "tsu_clk";
 						clocks = <&macb_pclk>, <&macb_hclk>, <&clocks18000 0x1d>;
 						status = "okay";
@@ -1392,7 +1412,7 @@
 		 * SHARED WITH WI-FI. WL_ON is line 28 and BT_ON is line 29 on this same
 		 * controller, so this is ONE node with two users: the bluetooth child of
 		 * serial@107d50c000 above (shutdown-gpios, line 29) and wl_on_reg below
-		 * (line 28). bcm2712-raspberrypi5-wifi.dtso declared a second
+		 * (line 28). The former bcm2712-raspberrypi5-wifi.dtso declared a second
 		 * gpio@107d508500 of its own; that duplicate is NOT carried over -- the
 		 * dtso content was merged into this file instead of being applied as an
 		 * overlay (the partial DT is compiled without dtc -@, so it has no
@@ -1526,9 +1546,10 @@
 				 * each child. `pins` + `function` yields a mux map keyed by
 				 * the pin name, which resolves because TF-A exposes a 1:1
 				 * pin-to-group mapping with identical names (see the comment
-				 * in plat_scmi_pinctrl_group_permitted()). Upstream's
-				 * bcm2712-raspberrypi5-domd-scmi.dtso leaves these groups
-				 * EMPTY and relies on a Linux Dom0 having applied the host
+				 * in plat_scmi_pinctrl_group_permitted()). The former
+				 * bcm2712-raspberrypi5-domd-scmi.dtso (EPAM's, since removed)
+				 * left these groups EMPTY and relied on a Linux Dom0 having
+				 * applied the host
 				 * DT's copy; this board's Dom0 is Zephyr, so the settings
 				 * have to be here or nothing is muxed at all.
 				 *
@@ -1600,8 +1621,9 @@
 		};
 
 		/* ===== Wi-Fi: SDIO controller + WL_ON regulator -> DomD =====
-		 * Merged from meta-xt-driver-domain/recipes-kernel/linux/files/
-		 * bcm2712-raspberrypi5-wifi.dtso rather than applied as an overlay. Two
+		 * Merged from the former meta-xt-driver-domain/recipes-kernel/linux/files/
+		 * bcm2712-raspberrypi5-wifi.dtso (since removed) rather than applied as an
+		 * overlay. Two
 		 * reasons: the partial DT is compiled without `dtc -@` (on BOTH boards,
 		 * so this is not an rpi5 gap to fix) and therefore carries no
 		 * __symbols__ for &passthrough to bind to; and the dtso's own
@@ -1633,7 +1655,7 @@
 		 * "cfg" window (priv->cfg_regs), so dropping it would break probe.
 		 * boot.cmd releases the host side with
 		 *   fdt set /axi/mmc@1100000 xen,passthrough
-		 * (the gio half of wifi-passthrough.dtso is already done for BT).
+		 * (the gio half of the former wifi-passthrough.dtso is already done for BT).
 		 *
 		 * ===== DMA: ADMA2 IS ENABLED HERE, DELIBERATELY =====
 		 * This is the one DMA-capable passthrough path in the Wi-Fi/BT set, and

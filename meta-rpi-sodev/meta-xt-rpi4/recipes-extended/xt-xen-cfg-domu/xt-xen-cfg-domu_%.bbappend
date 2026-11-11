@@ -21,7 +21,7 @@
 #   frame rate (commit/paint)  20/17 -> 21/18
 # So this mainly cleans up DomD's steal and hands the slack to the GPU. DomU's
 # remaining ~33% "steal" is NOT pcpu contention -- it persists with DomU alone on
-# a core -- see review/FIX-STATUS.md. Do not expect this change to fix frame rate.
+# a core. Do not expect this change to fix frame rate.
 #
 # PCPU 2-3 (2026-10-24)
 # DomD's two vcpus are now pinned one per pcpu, 0 and 1 (domain-cpu-pin), so

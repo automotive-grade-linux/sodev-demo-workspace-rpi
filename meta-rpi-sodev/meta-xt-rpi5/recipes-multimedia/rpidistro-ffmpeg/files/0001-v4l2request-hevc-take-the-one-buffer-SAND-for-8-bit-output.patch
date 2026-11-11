@@ -1,8 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 3b7449d7ddaeacd74c85b19f330525a935833ab8 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 00:59:55 +0900
-Subject: [PATCH] v4l2request: hevc: take the one-buffer SAND for 8-bit
- output
+Date: Wed, 11 Nov 2026 08:37:55 +0900
+Subject: [PATCH] v4l2request: hevc: take the one-buffer SAND for 8-bit output
 
 rpi-hevc-dec lists NV12MT_COL128 (luma and chroma in two buffers) before
 NV12_COL128 (one buffer, the chroma of each 128-byte column after its
@@ -23,6 +22,11 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ libavcodec/v4l2_request_hevc.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/v4l2_request_hevc.c b/libavcodec/v4l2_request_hevc.c
+index 9f14192f..c263cff2 100644
 --- a/libavcodec/v4l2_request_hevc.c
 +++ b/libavcodec/v4l2_request_hevc.c
 @@ -151,10 +151,15 @@ static int dst_fmt_accept_cb(void * v, const struct v4l2_fmtdesc *fmtdesc)
@@ -43,3 +47,6 @@ Upstream-Status: Pending
      if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_10_COL128 ||
          fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_10_COL128M) {
          return bit_depth == 10;
+-- 
+2.43.0
+

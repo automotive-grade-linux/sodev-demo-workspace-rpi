@@ -1,34 +1,21 @@
-# Overlay on the PRISTINE meta-xt-rpi5
-# recipes-kernel/linux/linux-raspberrypi_6.12.bbappend.
+# BCM2712 / Raspberry Pi 5 kernel delta for the Xen Dom0/DomD split, on
+# meta-xt-driver-domain's linux-raspberrypi_6.18.bb.
 #
-# rpi5-0005 + rpi5-0006: Xen device-tree overlay (bcm2712-raspberrypi5-xen.dtso)
-# for the Dom0/DomD split:
-#   rpi5-0005  DomD GPU passthrough + Dom0 device ownership + 2 GB static-mem
-#              (Dom0 owns everything except the V3D/HVS/HDMI complex, which is
-#              direct-mapped (GPA==PA) into DomD because BCM2712 has no stage-2
-#              IOMMU for V3D).
-#   rpi5-0006  raise DomD static memory to 4 GB (16 GB SKU; two qemu
-#              device-models + weston + VHAL backend OOM-killed xl devd at 2 GB).
+# This file declares its own SRC_URI: the device-tree set in files/ (the Xen host
+# overlay bcm2712-raspberrypi5-xen.dtso -- DomD GPU passthrough, Dom0 device
+# ownership, 4 GB static-mem; the SCMI host overlay; the base DomD partial DT and
+# its feature overlays), the two EPAM kernel patches, and the Kconfig fragments.
+# The host overlay's history: a 2 GB static-mem map first, raised to 4 GB when two
+# qemu device-models + weston + the VHAL backend OOM-killed xl devd at 2 GB.
 #
-# Mechanism: the base meta-xt-rpi5 bbappend pulls the Xen DT overlay into the
-# kernel source tree with
-#     SRC_URI += " file://${XEN_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom"
-# where XEN_DT_NAME = "bcm2712-raspberrypi5-xen". A SRC_URI patch cannot modify a
-# WORKDIR-copied source file, so instead this layer SHADOWS the .dtso: its files/
-# holds the final (rpi5-0005 + rpi5-0006 applied) bcm2712-raspberrypi5-xen.dtso,
-# and FILESEXTRAPATHS:prepend puts this layer's files/ ahead of the base files/
-# in the bitbake file search path, so bitbake fetches our copy. The base
-# meta-xt-rpi5 .dtso stays pristine; we do not re-declare SRC_URI.
+# Of the device trees only bcm2712-raspberrypi5-xen.dtbo and the SCMI host overlay
+# reach p1 and are applied by boot.cmd; the DomD DT that boot.cmd loads is
+# recipes-guest/domd-vc4's. The base -domd.dts and the mmc/usb/pcie1/hdmi/can
+# overlays are the upstream single-overlay flow, kept building (and, for the
+# unconditional ones, deployed) so that path stays available.
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-# =============================================================================
-# re-host: meta-xt-rpi5 (pristine) linux-raspberrypi_6.12.bbappend body, verbatim.
-# Since the pristine _6.12 no longer attaches once we add a proper _6.18.bb, the body is
-# moved here (_%). It supplies the DT names / RPI_KERNEL_DEVICETREE / SRC_URI (sdhci+axi
-# patch, xen/scmi cfg, DT set) / KERNEL_IMAGETYPES / COMPATIBLE_MACHINE to the 6.18 recipe.
-# The shadow xen.dtso keeps the existing files/ via cp -n (the patched version wins via prepend).
-# =============================================================================
 COMPATIBLE_MACHINE:raspberrypi5 = "(raspberrypi5)"
 
 DOMD_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-domd"
@@ -40,10 +27,10 @@ CAN_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-can-${DOMD_CAN_TYPE}"
 HDMI_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-hdmi"
 HDMI_PASSTHROUGH_NAME = "hdmi-passthrough"
 # Host (hypervisor) DT overlay that publishes the TF-A SCMI server to Xen. This is
-# OURS, not the bcm2712-raspberrypi5-xen-scmi.dtso that meta-xt-driver-domain ships:
-# that one flips the ROOT node to #size-cells = <1> and writes the EPAM-downstream
-# property name xen,arm_sci, where upstream Xen reads xen,sci_type. The .dtso header
-# documents both in full.
+# OURS, not the bcm2712-raspberrypi5-xen-scmi.dtso meta-xt-driver-domain used to ship:
+# that one flipped the ROOT node to #size-cells = <1> and wrote the EPAM-downstream
+# property name xen,arm_sci, where upstream Xen reads xen,sci_type. The scmi-host
+# .dtso header documents both in full.
 SCMI_HOST_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-scmi-host"
 
 

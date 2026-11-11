@@ -36,8 +36,7 @@
  *     mapped. See ../../../BCM2711-DT-TRUTH.md §1.
  *
  * Addresses/SPIs: read from the shipped bcm2711-rpi-4-b.dtb, never translated
- * from the RPi5 values. Validate with
- *   The DomD passthrough cross-check <this file> --host <that dtb>
+ * from the RPi5 values.
  * ============================================================================
  */
 
@@ -88,16 +87,18 @@
 
 		/*
 		 * Legacy-peripheral bus: dma_addr = phys + 0xc0000000, bounded to
-		 * the DomD low static-mem bank (0x08000000 + 384 MiB) declared in
-		 * bcm2711-raspberrypi4-64-xen.dtso. Mirrors the host /soc
-		 * dma-ranges = <0xc0000000 0x0 0x0 0x40000000>.
+		 * DomD's low static-mem bank. The window is the 4 GiB map's bank
+		 * (0x06000000 + 416 MiB); the 8 GiB map's bank (0x08000000 +
+		 * 384 MiB, bcm2711-raspberrypi4-64-xen.dtso) is the top of it, so
+		 * one DTB serves both SKUs -- the same window domd-vc4.dts uses.
+		 * Mirrors the host /soc dma-ranges = <0xc0000000 0x0 0x0 0x40000000>.
 		 */
 		soc_bus: soc-bus {
 			compatible = "simple-bus";
 			#address-cells = <0x2>;
 			#size-cells = <0x2>;
 			ranges;
-			dma-ranges = <0x0 0xc8000000 0x0 0x08000000 0x0 0x18000000>;
+			dma-ranges = <0x0 0xc6000000 0x0 0x06000000 0x0 0x1a000000>;
 
 			mailbox: mailbox@fe00b880 {
 				compatible = "brcm,bcm2835-mbox";
@@ -196,7 +197,10 @@
 				interrupt-parent = <&gic>;
 				phy-mode = "rgmii-rxid";
 				phy-handle = <&phy1>;
-				local-mac-address = [00 00 00 00 00 00];
+				/* The fixed locally-administered MAC domd-vc4.dts
+				 * uses (all-zero makes bcmgenet pick a random one
+				 * per boot; the reasoning is in that file). */
+				local-mac-address = [02 44 4f 4d 44 01];
 				xen,path = "/scb/ethernet@7d580000";
 				xen,force-assign-without-iommu;
 				xen,reg = <0x0 0xfd580000 0x0 0x10000 0x0 0xfd580000>;

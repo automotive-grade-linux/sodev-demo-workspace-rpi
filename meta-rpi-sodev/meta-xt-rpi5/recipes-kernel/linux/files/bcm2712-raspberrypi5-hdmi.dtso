@@ -89,10 +89,12 @@
 			clock-names = "hdmi", "bvb", "audio", "cec";
 			xen,path = "/soc@107c000000/hdmi@7c701400";
 			xen,force-assign-without-iommu;
-			xen,reg = <0x10 0x7c700000 0x00 0x1000 0x10 0x7c700000>,
-				  <0x10 0x7c701000 0x00 0x4000 0x10 0x7c701000>,
-				  <0x10 0x7c720000 0x00 0x1000 0x10 0x7c720000>,
-				  <0x10 0x7d510000 0x00 0x1000 0x10 0x7d510000>;
+			/* One owner per 4 KiB page (a second xen,reg on the same
+			 * page is a double map). csc (0x7c700100) is in dvp's
+			 * 0x7c700000 page, cec (0x7d510800) in aon_intr's 0x7d510000
+			 * page; the shared hd page 0x7c720000 is mapped here only. */
+			xen,reg = <0x10 0x7c701000 0x00 0x4000 0x10 0x7c701000>,
+				  <0x10 0x7c720000 0x00 0x1000 0x10 0x7c720000>;
 			status = "okay";
 		};
 
@@ -129,9 +131,9 @@
 			clock-names = "hdmi", "bvb", "audio", "cec";
 			xen,path = "/soc@107c000000/hdmi@7c706400";
 			xen,force-assign-without-iommu;
-			xen,reg = <0x10 0x7c700000 0x00 0x1000 0x10 0x7c700000>,
-				  <0x10 0x7c706000 0x00 0x4000 0x10 0x7c706000>,
-				  <0x10 0x7c720000 0x00 0x1000 0x10 0x7c720000>,
+			/* csc (0x7c700180) is in dvp's page and hd (0x7c720000) is
+			 * mapped by hdmi0; cec1's page 0x7d511000 is this node's. */
+			xen,reg = <0x10 0x7c706000 0x00 0x4000 0x10 0x7c706000>,
 				  <0x10 0x7d511000 0x00 0x1000 0x10 0x7d511000>;
 			status = "okay";
 		};
@@ -155,7 +157,10 @@
 			#interrupt-cells = <1>;
 			xen,path = "/soc@107c000000/interrupt-controller@7d510600";
 			xen,force-assign-without-iommu;
-			xen,reg = <0x00 0x7d510000 0x00 0x4000 0x00 0x7d510000>;
+			/* Host PA is 0x10_7d510000: the upper cell must be 0x10, as
+			 * in every other xen,reg here (0x00_7d510000 is DRAM). The
+			 * one page also holds hdmi0's cec block. */
+			xen,reg = <0x10 0x7d510000 0x00 0x1000 0x10 0x7d510000>;
 			status = "okay";
 		};
 
@@ -190,9 +195,10 @@
 			clock-frequency = <97500>;
 			#address-cells = <1>;
 			#size-cells = <0>;
-			xen,path = "/soc@107c000000/i2c@7d508200";
-			xen,force-assign-without-iommu;
-			xen,reg = <0x10 0x7d508000 0x00 0x1000 0x10 0x7d508000>;
+			/* No xen,path / xen,reg: ddc0, ddc1 and bsc_irq share the
+			 * 0x7d508000 page, which bsc_irq maps (it is the one of the
+			 * three with a GIC interrupt to route). The node is still
+			 * copied to the guest DT, so hdmi0's ddc phandle resolves. */
 			status = "okay";
 		};
 
@@ -204,9 +210,7 @@
 			clock-frequency = <97500>;
 			#address-cells = <1>;
 			#size-cells = <0>;
-			xen,path = "/soc@107c000000/i2c@7d508280";
-			xen,force-assign-without-iommu;
-			xen,reg = <0x10 0x7d508000 0x00 0x1000 0x10 0x7d508000>;
+			/* As ddc0: the page is bsc_irq's. */
 			status = "okay";
 		};
 
@@ -218,6 +222,7 @@
 			#interrupt-cells = <1>;
 			xen,path = "/soc@107c000000/interrupt-controller@7d508380";
 			xen,force-assign-without-iommu;
+			/* Owner of the 0x7d508000 page, which also holds ddc0 and ddc1. */
 			xen,reg = <0x10 0x7d508000 0x00 0x1000 0x10 0x7d508000>;
 		};
 

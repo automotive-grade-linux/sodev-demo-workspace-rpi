@@ -21,10 +21,9 @@
 # =============================================================================
 # `setenv board_ram` below is SUBSTITUTED AT BUILD TIME by the xt-rpi-u-boot-scr
 # bbappend from ${BOARD_RAM} (moulin --BOARD_RAM 16g|8g, build.sh --ram=16g|8g). It
-# is a plain env var, so it can also be overridden at the U-Boot prompt for a
-# one-off test (no SD write): the assignment below is unconditional, so presetting
-# board_ram does NOT work -- load the other script instead:
-#     fatload mmc 0 ${scriptaddr} boot.scr.8g ; source ${scriptaddr}
+# is a plain env var, but the assignment below is unconditional, so presetting
+# board_ram at the U-Boot prompt does NOT work; a one-off test needs a boot.scr
+# built with the other --ram value.
 #
 # WHY A SWITCH IS NEEDED. The default domain map is sized for the 16 GiB board,
 # which the firmware reports as total_memory=16372 (see the comment block in
@@ -95,9 +94,10 @@ fdt apply 0x2200000
 # and /reserved-memory), but the ORDER MATTERS for the `fdt set` calls further
 # down that touch /chosen/domD: that node comes from xen.dtbo.
 #
-# This is meta-xt-rpi5's own bcm2712-raspberrypi5-scmi-host.dtbo, NOT the
-# bcm2712-raspberrypi5-xen-scmi.dtbo that meta-xt-driver-domain also deploys to
-# p1. The latter sets the ROOT node's #size-cells to 1 (so its 3-cell reg parses),
+# This is meta-xt-rpi5's own bcm2712-raspberrypi5-scmi-host.dtbo, not the
+# bcm2712-raspberrypi5-xen-scmi.dtbo meta-xt-driver-domain used to build (never
+# loaded; since removed). That one set the ROOT node's #size-cells to 1 (so its
+# 3-cell reg parsed),
 # which silently reinterprets the `ranges` of every root child on a 2/2 board, and
 # it writes the EPAM property name xen,arm_sci instead of upstream's xen,sci_type.
 # Do not swap one for the other.
@@ -175,17 +175,10 @@ echo "board_ram=${board_ram} dom0_mem=512M (placement-driven, board-independent)
 fdt rm /chosen/xenpolicy   # xenpolicy slot not needed (XSM dummy is used)
 
 # ------------------------------------------------------------------
-# Strip the 8 xen,passthrough markers the overlay added.
-#
-# The xen.dtbo was designed for the dom0less Hyperlaunch topology
-# where DomD (not Dom0) owns these devices. In traditional Dom0
-# mode the hardware domain (= Dom0) must own them, so the
-# passthrough markers must be removed or `handle_device()` will
-# set skip_mapping=true and Dom0 will never see the MMIO.
-#
-# these 8 devices are the
-# AON GPIO controller plus the entire RP1 chip + brcm-pcie host
-# bridge, all required for the SD card / LEDs / WiFi GPIO chain.
+# xen,passthrough markers on the SD path. The xen.dtbo marks the devices DomD owns
+# (the RP1 chip, the brcm-pcie bridges, ...); `handle_device()` then skips them for
+# Dom0 and DomD's partial DT claims them. The marker below is the one the overlay
+# does not carry.
 # ------------------------------------------------------------------
 # SD moves to DomD. Two independent devices on this path; only ONE
 # is host-DT-passthrough'd here:
@@ -332,8 +325,8 @@ fdt set /axi/codec@800000 xen,passthrough
 #
 # The WL_ON side needs nothing extra: it is gio line 28, and gio is already
 # marked above for BT_ON on line 29. That is the whole of what
-# meta-xt-driver-domain/recipes-kernel/linux/files/wifi-passthrough.dtso does
-# (`&sdio2` + `&gio`); that overlay is not applied, and these two `fdt set`
+# the former meta-xt-driver-domain/recipes-kernel/linux/files/wifi-passthrough.dtso did
+# (`&sdio2` + `&gio`); that overlay is gone, and these two `fdt set`
 # lines take its place.
 echo "passthrough: /axi/mmc@1100000 (Wi-Fi SDIO -> DomD, SPI 274)"
 fdt set /axi/mmc@1100000 xen,passthrough
@@ -634,9 +627,9 @@ fdt set /chosen/dom0 reg <0x0 0x4000000 0x0 0x${filesize}>
 # If the DomD kernel / DTB are not yet placed on the SD boot partition (mmcblk0p1
 # FAT32), fatload fails -> `setenv domd_loaded 1` does not run -> the
 # `if test "${domd_loaded}"` branch fdt-rm's /chosen/domD and falls back to
-# **Dom0-only boot**. This avoids a Xen panic on the auto-boot right after the first
-# SD card write, and the auto DomD bring-up happens on the 2nd boot after deploy via
-# install-domd-binaries-to-boot.sh.
+# **Dom0-only boot**. This avoids a Xen panic on a card that has no DomD payload
+# yet; rpi5-sodev.yaml puts the DomD kernel and DTB on p1 when full.img is
+# assembled, so the branch only matters for a card made by hand.
 #
 # U-Boot Hush syntax: `if cmd ; then ... fi` branches on cmd's exit status
 # (0=success; fatload returns non-zero when the file is absent).
@@ -647,11 +640,6 @@ fdt set /chosen/dom0 reg <0x0 0x4000000 0x0 0x${filesize}>
 # starts a 456 MB contiguous free region between optee_shm and optee_core
 # (0x1d000000).
 #
-# The sizes below are literals, substituted at build time. The recipe's
-# do_compile:append reads the actual DomD kernel and DTB sizes, seds them into the
-# placeholders and runs mkimage. Using U-Boot environment expansion (${filesize},
-# ${domd_kernel_size}) instead was a source of boot failures, because a value with a
-# 0x prefix does not survive the expansion path reliably.
 # Why DomD is dom0less and not created with `xl create`.
 #
 # `xl create` cannot give a domain a direct map -- libxl has no support for it. With
@@ -692,20 +680,13 @@ if fatload mmc 0 0xc000000 Image ; then
     # reliably disable domd.service later.
     fatload mmc 0 0xa000000 bcm2712-raspberrypi5-domd-vc4.dtb
     setenv domd_dtb_size ${filesize}
-    fdt set /chosen/domD xen,domain-id <1>
-    # step2 : grant DomD CDF_privileged via xen,privileged (patch 0056).
-    # -> DomD's libxl/xl devd can run privileged sysctls, so the qemu device-model
-    # (DomU virtio-gpu backend) can start. Without this, DomD's xl dies with
-    # libxl_cpu_bitmap_alloc failed (step1 = confirmed on HW). Empty bool prop.
-    fdt set /chosen/domD xen,privileged
-    # [4.21 fix] In Xen 4.21 the dom0less parsing moved to
-    # common/device-tree/dom0less-bindings.c, and the privileged spec changed from
-    # xen,privileged (0056, targets arch/arm/dom0less-build.c, disabled in M1) to
-    # capabilities=<DOMAIN_CAPS_CONTROL=0x1>. Without this DomD stays non-privileged,
-    # so the device-model qemu's dm_op (IOCTL_PRIVCMD_DM_OP) is EPERM ->
-    # xen_register_ioreq fails -> pcie.0 not created -> DomU/DomA black screen
-    # (confirmed via HW strace).
-    # Keep the xen,privileged above for 4.19 compatibility (a no-op ignored on 4.21).
+    # capabilities = DOMAIN_CAPS_CONTROL (0x1): since Xen 4.21 the dom0less
+    # privilege spec is this property (common/device-tree/dom0less-build.c);
+    # nothing in 4.22 reads xen,privileged or xen,domain-id. Without it DomD stays
+    # non-privileged, the device-model qemu's dm_op (IOCTL_PRIVCMD_DM_OP) is
+    # EPERM -> xen_register_ioreq fails -> pcie.0 not created -> DomU/DomA black
+    # screen (confirmed via HW strace). DomD gets domid 1 because it is the first
+    # /chosen domain child; anything that needs the id must look it up at runtime.
     fdt set /chosen/domD capabilities <0x1>
     # SCMI: make DomD the SCI domain. The property name is upstream Xen's (added
     # in 4.21; this tree builds 4.22)
