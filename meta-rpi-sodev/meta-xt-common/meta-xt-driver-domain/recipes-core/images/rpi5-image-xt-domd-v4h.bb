@@ -5,19 +5,14 @@ DESCRIPTION = "\
     weston GPU stack). \
 \
     Adds: glmark2, \
-          coreutils, xen-tools-xencommons \
+          coreutils \
     \
     Note: the core-image-weston base cannot be used directly (X11 fetch fails); \
     the vc4 base (core-image-minimal based) is reused and weston is pulled in \
     via GFX_PACKAGES instead."
 
-# Base: rpi5-image-xt-domd-vc4 (xen bits + xt-rpi5-domain etc.)
+# Base: rpi5-image-xt-domd-vc4 (xen bits + xt-rpi5-domain + xen-tools-xencommons etc.)
 require recipes-core/images/rpi5-image-xt-domd-vc4.bb
-
-# Additional driver-domain packages.
-IMAGE_INSTALL:append = " \
-    xen-tools-xencommons \
-    "
 
 # Install qemu when the enable_virtio DISTRO_FEATURE is set. This line is the
 # sole supplier of the thin qemu-system-aarch64 package (the full `qemu` was

@@ -1,6 +1,6 @@
 SUMMARY = "Internal virtual network"
 
-# Single source of truth for the DomD network topology (IPs / MACs / subnets).
+# Single source of truth for the DomD network topology (IPs / MACs / DHCP range).
 require recipes-connectivity/sodev-net.inc
 
 PV = "0.1"
@@ -22,7 +22,10 @@ LIC_FILES_CHKSUM = "file://${COREBASE}/meta/COPYING.MIT;md5=3da9cfbcb788c80a0384
 #   - systemd-networkd-wait-online.conf : --any --timeout=15 (no end0 block).
 #   - domd-sshd-fix.service  : /run/sshd + ssh-keygen -A + restart sshd.socket
 #                              (host keys generated on first boot; none committed).
-#   - domd-flatbridge-up/.service : LATE (post-graphical.target) flat L2 bridge:
+#   - domd-flatbridge-up/.service : LATE flat L2 bridge, After=xendriverdomain.service
+#                              (no target ordering; the unit header says why) with
+#                              the post-guest-creation timing enforced by the
+#                              script's own wait for the first vif-emu tap:
 #                              xenbr0=.10.10, enslave eth0 + DomU/DomA qemu taps,
 #                              serve DomA eth1 DHCP lease .10.13 (dnsmasq). Kept
 #                              off the xenstore-critical window (doing it at boot
@@ -37,7 +40,6 @@ SRC_URI = " \
     file://50-xenbr0.network \
     file://bridge.conf \
     file://domd-nat.conf \
-    file://xenbr0-systemd-networkd.conf \
     file://systemd-networkd-wait-online.conf \
     file://domd-sshd-fix.service \
     file://domd-flatbridge-up \
@@ -81,13 +83,11 @@ FILES:${PN}-flatbridge = " \
 FILES:${PN} = " \
     ${sysconfdir}/systemd/network/xenbr0.netdev \
     ${sysconfdir}/systemd/network/50-xenbr0.network \
-    ${sysconfdir}/systemd/system/systemd-networkd.service.d/xenbr0-systemd-networkd.conf \
     ${sysconfdir}/systemd/system/systemd-networkd-wait-online.service.d/systemd-networkd-wait-online.conf \
     ${systemd_system_unitdir}/bridge-up-notification.service \
 "
 
 RDEPENDS:${PN} = " \
-    ethtool \
     kernel-module-bridge \
     openssh-sshd \
     openssh-sftp-server \
@@ -123,9 +123,6 @@ do_install() {
     install -m 0644 ${S}/*.netdev ${D}${sysconfdir}/systemd/network
     # .link renames the RP1 cdns,macb NIC to eth0 (DomD-only pkg).
     install -m 0644 ${S}/*.link ${D}${sysconfdir}/systemd/network
-
-    install -d ${D}${sysconfdir}/systemd/system/systemd-networkd.service.d
-    install -m 0644 ${S}/xenbr0-systemd-networkd.conf ${D}${sysconfdir}/systemd/system/systemd-networkd.service.d
 
     install -d ${D}${sysconfdir}/systemd/system/systemd-networkd-wait-online.service.d
     install -m 0644 ${S}/systemd-networkd-wait-online.conf ${D}${sysconfdir}/systemd/system/systemd-networkd-wait-online.service.d
@@ -170,9 +167,7 @@ XT_DOMD_DROP_GUEST_QUIC ??= "0"
 # pinned to eth0 (00-rp1-eth0.link) so no "end0" ever appears on DomD, and the
 # thin Dom0 image already rm'd it (rpi5-image-xt-dom0-thin.bb flatten_dom0_network).
 do_install:append() {
-    sed -i \
-        -e 's|^Address=.*|Address=${XT_DOMD_ETH0_IP}/24|' \
-        -e 's|^Gateway=.*|Gateway=${XT_DOMD_XENBR0_IP}|' \
+    sed -i 's|^Address=.*|Address=${XT_DOMD_ETH0_IP}/24|' \
         ${D}${sysconfdir}/systemd/network/10-eth0.network
     sed -i 's|^Address=.*|Address=${XT_DOMD_VIF_IP}/24|' \
         ${D}${sysconfdir}/systemd/network/20-domd-vif.network

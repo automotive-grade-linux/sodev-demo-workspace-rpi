@@ -1,8 +1,7 @@
-# Overlay delta on the PRISTINE xen-troops xt-prod-devel-rpi5-domd
-# recipes-kernel/linux/linux-raspberrypi_6.12.bbappend. Second .bbappend (stacks
-# on the base, which already appends optee.cfg), adding the Dom0 pinctrl/vc4
-# workaround patches. Files live in this layer's files/; the xen-troops submodule
-# stays pristine.
+# This layer's own bbappend to its linux-raspberrypi_6.18.bb: the Dom0/DomD
+# kernel patches (pinctrl/vc4/v3d workarounds, brcmstb-l2, gntdev, bcm2835-codec,
+# swiotlb-xen, the V4H Xen patchset) and optee.cfg (at the end of this file). All
+# files live in this layer's files/.
 #
 # 0009 (pinctrl writel skip) avoids a BCM2712 pinctrl Async SError under Xen
 # Dom0; 0010 allocates dev->dma_mask before vc4_drm_bind calls dma_set_mask
@@ -136,49 +135,7 @@ SRC_URI:append = " \
     file://v4h-xen-patches/0009-Use-mhp_get_pluggable_range-in-balloon-as-well.patch \
 "
 
-# =============================================================================
-# re-host: meta-xt-prod-devel-rpi5 (pristine) linux-raspberrypi_6.12.bbappend body.
-# Bring optee.cfg + dt_config.inc (resolved via BBPATH) + the
-# SCMI/WiFi DT overlays forward to 6.18. dt_config.inc defines the SCMI/WiFi DT
-# names this bbappend's SRC_URI expands; it is provided here in
-# meta-xt-driver-domain/include/ (this layer is in BOTH the DomD and the thin
-# Linux Dom0 bblayers) so the require resolves in both — the thin Dom0 build
-# intentionally omits xt-prod-devel-rpi5-domd, which used to be the sole provider.
-require include/dt_config.inc
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
-
+# OP-TEE client side of the Dom0/DomD kernel (CONFIG_TEE, CONFIG_OPTEE).
 SRC_URI:append = " \
     file://optee.cfg \
-"
-
-# SCOPED TO raspberrypi5, and it has to be. All five names below are templated from
-# ${RPI_SOC_FAMILY}-${MACHINE} (or, for SCMI_XEN_DT_NAME, from the yaml's
-# XEN_DT_SCMI which is built the same way), and the files that satisfy them exist
-# only as bcm2712-raspberrypi5-* in this layer's files/. Left unscoped, another
-# board asks do_fetch for e.g. bcm2711-raspberrypi4-64-domd-scmi.dtso and the parse
-# dies with "Unable to get checksum ... file could not be found".
-#
-# Neither list is order-sensitive — they are device trees copied into the kernel
-# source tree and names added to the deploy list, not patches — so scoping them
-# leaves the expanded values for raspberrypi5 unchanged.
-#
-# What a board without these needs to be true instead: no SCMI (BCM2711 has no
-# SCMI firmware interface at all; clocks and power come from the VideoCore
-# mailbox) and no Wi-Fi overlay (on Raspberry Pi 4 the SDIO Wi-Fi shares GIC SPI
-# 126 with the SD controller, so it can only go to the domain that owns the SD
-# card).
-RPI_KERNEL_DEVICETREE:append:raspberrypi5 = " \
-    broadcom/${SCMI_XEN_DT_NAME}.dtbo \
-    broadcom/${SCMI_DOMD_DT_NAME}.dtbo \
-    broadcom/${SCMI_DOMD_PCIE1_DT_NAME}.dtbo \
-    broadcom/${DOMD_WIFI_DT_NAME}.dtbo \
-    broadcom/${XEN_WIFI_PASSTHROUGH_DT_NAME}.dtbo \
-"
-
-SRC_URI:append:raspberrypi5 = " \
-    file://${SCMI_XEN_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
-    file://${SCMI_DOMD_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
-    file://${SCMI_DOMD_PCIE1_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
-    file://${DOMD_WIFI_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
-    file://${XEN_WIFI_PASSTHROUGH_DT_NAME}.dtso;subdir=git/arch/${ARCH}/boot/dts/broadcom \
 "

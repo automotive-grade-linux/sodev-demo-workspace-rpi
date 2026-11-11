@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # udhcpc hook (run-parts after 50default): keep the Wi-Fi uplink usable when the
 # AP hands out a subnet that overlaps one of DomD's own networks (on xenbr0:
 # 192.168.10.10/24 and 192.168.97.1/30; any other interface is checked too).

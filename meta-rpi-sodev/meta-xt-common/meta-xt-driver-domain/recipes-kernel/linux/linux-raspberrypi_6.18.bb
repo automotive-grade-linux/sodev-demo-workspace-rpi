@@ -61,13 +61,28 @@ DEPLOYDEP = ""
 DEPLOYDEP:raspberrypi-armv7 = "${RASPBERRYPI_v7_KERNEL}:do_deploy"
 do_deploy[depends] += "${DEPLOYDEP}"
 
-# The kconfiglib.py bundled with scarthgap's kern-tools-native cannot parse the new
-# Kconfig syntax ('transitional') used by 6.18's arch/Kconfig, so do_kernel_configcheck
-# fails with an exception (it is only the Yocto-side config-audit tool that has not caught
-# up with the kernel version; the kernel's own Kconfig = do_configure succeeds). In this
-# setup, where only the kernel is bumped to 6.18 without upgrading Yocto, disable the audit
-# task and guarantee fragment application by inspecting .config directly.
+# do_kernel_configcheck is off. It was switched off on scarthgap, whose
+# kern-tools-native kconfiglib could not parse the 'transitional' Kconfig keyword
+# that 6.18's arch/Kconfig uses and died with an exception (only the Yocto-side
+# config audit; the kernel's own Kconfig = do_configure succeeds). wrynose's
+# kern-tools (a4a362d9) does parse it -- its kconfiglib.py tracks a transitional
+# context -- so the audit may run again on this release; that has not been tried
+# on a build here, and the switch stays until it is.
 do_kernel_configcheck[noexec] = "1"
+
+# With the audit off nothing would notice a fragment that stopped applying, so
+# check the symbols the Xen fragments set once olddefconfig has written the final
+# .config. DRM_VC4 and I2C_BRCMSTB are the two that the board layer's
+# xen-config-a4b-frontend.cfg demotes to =m against vc4graphics.cfg's =y (see
+# above: the override only holds while merge_config sees the Xen fragment after
+# the stock one); XEN_GNTDEV_DMABUF comes from venus-gntdev-dmabuf.cfg and is
+# expected only on the venus lane.
+do_configure:append() {
+    for s in CONFIG_DRM_VC4=m CONFIG_I2C_BRCMSTB=m \
+             ${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'CONFIG_XEN_GNTDEV_DMABUF=y', '', d)}; do
+        grep -qx "$s" ${B}/.config || bbfatal "kernel fragment not applied: $s is missing from ${B}/.config"
+    done
+}
 
 # DT staging fix.
 # On scarthgap, SRC_URI's `file://<dt>.dts;subdir=git/arch/${ARCH}/boot/dts/broadcom`
@@ -76,9 +91,11 @@ do_kernel_configcheck[noexec] = "1"
 # ${UNPACKDIR}/git/arch/${ARCH}/boot/dts/broadcom/ and does NOT reach the real
 # kernel-source (S=${STAGING_KERNEL_DIR}=work-shared/.../kernel-source) broadcom dir
 # → RPI_KERNEL_DEVICETREE's domd.dtb etc. fail with "No rule to make target".
-# Land every .dts/.dtso staged by both the meta-xt-rpi5 and meta-xt-driver-domain bbappends from the
-# post-unpack UNPACKDIR into the real kernel-source broadcom dir (since the source is
-# shared, overwrite-copy on every do_compile:prepend to reliably apply the patched version).
+# Land every .dts/.dtso the board layer's bbappend stages (meta-xt-rpi5 and
+# meta-xt-rpi4: the domd .dts and the xen / passthrough overlays, plus scmi-host on
+# the Pi 5) from the post-unpack UNPACKDIR into the real kernel-source broadcom dir
+# (since the source is shared, overwrite-copy on every do_compile:prepend to
+# reliably apply the patched version).
 do_compile:prepend() {
     src_bcm="${UNPACKDIR}/git/arch/${ARCH}/boot/dts/broadcom"
     dst_bcm="${S}/arch/${ARCH}/boot/dts/broadcom"
