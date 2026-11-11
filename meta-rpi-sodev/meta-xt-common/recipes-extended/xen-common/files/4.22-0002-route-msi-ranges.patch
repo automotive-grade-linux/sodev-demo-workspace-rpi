@@ -1,7 +1,8 @@
-From 621765d58cec21f38ffd81ed38a5d3468ab68598 Mon Sep 17 00:00:00 2001
+From 240712cb626e8c0aff9b24f0eae89db83167fa30 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 19 Jun 2026 08:49:29 +0900
-Subject: xen/arm: dom0less: route an MSI controller's msi-ranges SPIs to the domain
+Date: Wed, 11 Nov 2026 08:36:25 +0900
+Subject: [PATCH] xen/arm: dom0less: route an MSI controller's msi-ranges SPIs
+ to the domain
 
 dom0less passthrough (handle_passthrough_prop -> map_device_irqs_to_domain)
 only routes a node's interrupts.  An MSI controller such as the BCM2712 MIP
@@ -18,6 +19,12 @@ map_irq_to_domain() (-> the non-hwdom route_irq_to_guest relaxation already in
 this tree).  No-op for nodes without msi-ranges, so safe for every passthrough
 node.  dom0less-only; needs no toolstack (avoids the 4.19/4.21 xl ABI mismatch).
 
+An msi-ranges longer than the 20-cell buffer is reported and refused (-EINVAL)
+instead of being skipped: dt_property_read_variable_u32_array() returns
+-EOVERFLOW rather than truncating, which the first version of this patch took
+for "no msi-ranges", and its "truncated" warning could only fire for a property
+of exactly 20 cells, which is not truncated.  The BCM2712 MIP declares 5 cells.
+
 Builds clean (arm64). [4.22] Applies to stable-4.22 with zero fuzz and compiles in
 the Yocto build for both Dom0 flavours; the hunks moved by offsets only, no rebase.
 
@@ -27,14 +34,14 @@ Upstream-Status: Pending [rework needed before submission: relies on the
  non-hwdom route_irq_to_guest relaxation (XT_GUEST_MIN_NR_SPIS) that
  4.22-0001 adds, which is downstream-only]
 ---
- xen/arch/arm/dom0less-build.c | 83 +++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 82 insertions(+), 1 deletion(-)
+ xen/arch/arm/dom0less-build.c | 97 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 96 insertions(+), 1 deletion(-)
 
 diff --git a/xen/arch/arm/dom0less-build.c b/xen/arch/arm/dom0less-build.c
-index 4181c10538..c647a83099 100644
+index 3f48f74226..6a71cba3a2 100644
 --- a/xen/arch/arm/dom0less-build.c
 +++ b/xen/arch/arm/dom0less-build.c
-@@ -273,10 +273,91 @@ int __init init_vuart(struct domain *d, struct kernel_info *kinfo,
+@@ -259,10 +259,105 @@ int __init init_vuart(struct domain *d, struct kernel_info *kinfo,
      return rc;
  }
  
@@ -51,17 +58,31 @@ index 4181c10538..c647a83099 100644
 +static int __init route_msi_ranges_to_domain(struct domain *d,
 +                                              struct dt_device_node *node)
 +{
++    const struct dt_property *prop;
 +    uint32_t r[20];
 +    int n, pos = 0;
++
++    prop = dt_find_property(node, "msi-ranges", NULL);
++    if ( !prop )
++        return 0;   /* not an MSI controller declaring an SPI range */
++
++    /*
++     * dt_property_read_variable_u32_array() refuses an oversized property
++     * with -EOVERFLOW instead of truncating it, so check the length first and
++     * say so: skipping the node silently would surface much later, as the
++     * guest's PCIe endpoints never receiving an MSI.
++     */
++    if ( prop->length > sizeof(r) )
++    {
++        printk(XENLOG_ERR "%s: msi-ranges longer than %u cells, not routed\n",
++               dt_node_name(node), (unsigned int)ARRAY_SIZE(r));
++        return -EINVAL;
++    }
 +
 +    n = dt_property_read_variable_u32_array(node, "msi-ranges", r, 1,
 +                                            ARRAY_SIZE(r));
 +    if ( n <= 0 )
-+        return 0;   /* not an MSI controller declaring an SPI range */
-+
-+    if ( n >= (int)ARRAY_SIZE(r) )
-+        printk(XENLOG_WARNING "msi-ranges truncated (>%u cells)\n",
-+               (unsigned)ARRAY_SIZE(r));
++        return 0;   /* empty property: no SPI range declared */
 +
 +    while ( pos + 2 <= n )
 +    {
@@ -127,6 +148,3 @@ index 4181c10538..c647a83099 100644
  }
  
  static int __init domu_dt_sci_parse(struct dt_device_node *node,
--- 
-2.43.0
-

@@ -12,6 +12,10 @@ Signed-off-by: Dmytro Firsov <dmytro_firsov@epam.com>
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
 Origin: https://github.com/xen-troops/xen commit 5896fb9c309872b651e177b80fecdb7a4e9f45ec
+Local-Modifications: payload differs from Origin: the restored iomem_permit_access()
+ call keeps 4.22's paddr_to_pfn(addr + len - 1) where the fork's manual revert
+ re-introduced paddr_to_pfn(PAGE_ALIGN(addr + len - 1)), the form upstream removed
+ in 9568ceb287 (4.21.0); context regenerated against stable-4.22 (d45d5687f1)
 ---
  xen/arch/arm/device.c | 25 ++++++++-----------------
  1 file changed, 8 insertions(+), 17 deletions(-)

@@ -1,5 +1,6 @@
+From 99fd63e07474cac5a26137bf84b7b34898f6b94a Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 25 Aug 2026 11:56:39 +0900
+Date: Wed, 11 Nov 2026 08:36:25 +0900
 Subject: [PATCH] libxl/arm: one SPI per virtio-pci slot instead of INTA-D
 
 With four SPIs the interrupt-map wraps (irq = irq_first + ((pin + slot) %
@@ -23,9 +24,13 @@ lands on slot 1 -- virtio-blk, the rootfs. GUEST_VIRTIO_PCI_SPI_FIRST..LAST is
 32 SPIs, so at sixteen a guest can have two virtio-pci hosts: libxl allocates
 them per guest, one per backend domain, and every guest here has one, DomD. The
 SPI BUILD_BUG_ON becomes a bound rather than an equality, and a runtime guard
-rejects a third host instead of letting it overlap. The interrupt-map keeps an
-entry per slot for each of the four INTx pins rather than one per SPI, since a
-PCI function has no pin beyond INTD.
+rejects a third host instead of letting it overlap. GUEST_VIRTIO_PCI_SPI_LAST
+is an exclusive bound (NR_PCI_IRQS is LAST - FIRST, and the hypervisor's level
+bookkeeping in vgic.c and gic-vgic.c stops at LAST - 1), so the guard also
+rejects a host whose last SPI would be LAST itself; with sixteen SPIs per host
+from 44 the two hosts end at 59 and 75 and are unaffected. The interrupt-map
+keeps an entry per slot for each of the four INTx pins rather than one per
+SPI, since a PCI function has no pin beyond INTD.
 
 Requires the matching qemu change (one SPI per virtio-pci slot). An older qemu
 rejects num_irqs != GPEX_NUM_IRQS and the device model fails to spawn, so the
@@ -41,6 +46,11 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [downstream fork / BSP-layer delta]
 ---
+ tools/libs/light/libxl_arm.c | 68 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/tools/libs/light/libxl_arm.c b/tools/libs/light/libxl_arm.c
+index c3560b9062..1104fa6557 100644
 --- a/tools/libs/light/libxl_arm.c
 +++ b/tools/libs/light/libxl_arm.c
 @@ -43,7 +43,46 @@
@@ -110,8 +120,8 @@ Upstream-Status: Inappropriate [downstream fork / BSP-layer delta]
      hosts[i].irq_first = GUEST_VIRTIO_PCI_SPI_FIRST +
          i * VIRTIO_PCI_HOST_NUM_SPIS;
      hosts[i].num_irqs = VIRTIO_PCI_HOST_NUM_SPIS;
-+    if (hosts[i].irq_first + hosts[i].num_irqs - 1 > GUEST_VIRTIO_PCI_SPI_LAST) {
-+        LOG(ERROR, "virtio-pci host #%u SPI range %u..%u exceeds %u",
++    if (hosts[i].irq_first + hosts[i].num_irqs - 1 >= GUEST_VIRTIO_PCI_SPI_LAST) {
++        LOG(ERROR, "virtio-pci host #%u SPI range %u..%u does not fit below %u",
 +            i, hosts[i].irq_first,
 +            hosts[i].irq_first + hosts[i].num_irqs - 1,
 +            GUEST_VIRTIO_PCI_SPI_LAST);

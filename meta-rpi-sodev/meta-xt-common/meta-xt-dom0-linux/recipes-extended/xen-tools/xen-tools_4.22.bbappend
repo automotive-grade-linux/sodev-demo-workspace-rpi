@@ -72,11 +72,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # tests-vpci one from its own files/.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../recipes-extended/xen-common/files:"
 
-# --- the same patch series as the hypervisor, minus the two hypervisor-only
+# --- the same patch series as the hypervisor, minus the three hypervisor-only
 # --- patches (28 patches; order matters). 0025-dom0less-arm-xenstore-page-from-
-# --- domain-static-mem.patch and 4.22-0006-dom0less-seed-next-phandle-below-
-# --- reserved-range.patch both touch xen/ (arch) only, with no tools/ hunk, so
-# --- both are intentionally excluded from the toolstack series here. The
+# --- domain-static-mem.patch, 4.22-0006-dom0less-seed-next-phandle-below-
+# --- reserved-range.patch and 4.22-0013-xen-arm-Fix-evaluation-of-parameters-
+# --- for-SMCCC-calls.patch touch xen/ (arch) only, with no tools/ hunk, so all
+# --- three are intentionally excluded from the toolstack series here. The
 # --- toolstack-only patches (qemu_envs, 0059, 0061, 0062, 0063) follow below.
 
 SRC_URI:append = " \
@@ -188,12 +189,13 @@ FILES:${PN}-test += "\
 # with its own CAVEAT noting that a permanent demotion lets a silently
 # mis-applied patch (fuzz, or a hunk landing at the wrong offset after a context
 # shift) pass do_patch with only a warning. Both lines are REMOVED for 4.22:
-# every patch in this series applies to stable-4.22 with zero fuzz and zero
-# offset warnings (0008/0018 regenerated, 0022/4.22-0001 rebased), so there is
-# nothing left to tolerate, and a mis-apply on a future point update should fail
-# the build rather than warn. If a stable-4.22.x bump shifts context, refresh the
-# affected patch -- do not re-add the demotion. Kept in sync with the hypervisor
-# xen_4.22.bbappend.
+# every patch in this series applies to stable-4.22 with zero fuzz (0008/0018
+# regenerated, 0022/4.22-0001 rebased). Hunks do land at offsets, which the
+# patch-fuzz check does not look at (insane.bbclass reads only the "Patch fuzz"
+# block of the patch log), so there is nothing left to tolerate, and a mis-apply
+# on a future point update should fail the build rather than warn. If a
+# stable-4.22.x bump shifts context, refresh the affected patch -- do not re-add
+# the demotion. Kept in sync with the hypervisor xen_4.22.bbappend.
 # Upstream-Status is present on every patch, so the separate patch-status QA is
 # satisfied and is not touched here.
 
