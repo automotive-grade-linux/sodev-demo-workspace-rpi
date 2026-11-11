@@ -1,6 +1,6 @@
-From 3d63382929f6a0a3b691f59dc6ceb70c65eb240d Mon Sep 17 00:00:00 2001
+From 68ae53dc8f40901ccc24b263a966af2ac8c4e85a Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 22 Sep 2026 17:09:15 +0900
+Date: Wed, 11 Nov 2026 08:50:17 +0900
 Subject: [PATCH] car-audio: bridge the HFP far-end voice onto the call bus
 
 When the head unit is the hands-free (HFP client) side of a call, the far-end
@@ -8,25 +8,34 @@ voice arrives as an AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET input, and nothing
 in the platform routes an input to a speaker. CarAudioService now creates an
 audio patch from that input to the call bus -- USAGE_VOICE_COMMUNICATION,
 resolved through the car zone configuration -- when the device appears,
-releases it when the device goes away, and lets go of it when the service
-tears its callbacks down.
+forgets it when the device goes away (the audio policy manager has
+released it by then: cleanUpForDevice() runs before the port-list update
+that delivers the device callback), and releases it when the service
+tears its callbacks down while the audio server is up.
+
+The bridge takes the first TYPE_BLUETOOTH_SCO input it sees. A product
+that enables the AG role next to the HF one (bluetooth.profile.hfp.ag.enabled
+with hf.enabled) is not supported by this change: a headset the AG role
+connects would present the same input type and be bridged onto the call
+bus as well.
 
 The SCO input's runtime port carries no gain controller, so
 AudioManagerHelper.createAudioPatch() accepts a source without one when the
 requested gain is 0 and patches it at unity; a non-zero gain on such a source
-stays an error. releaseAudioPatch() also returns after a successful release
-instead of falling through to its "found no match" error.
+stays an error. releaseAudioPatchLocked() also returns after a successful
+release instead of falling through to its "found no match" error.
 
 Assisted-by: Claude Code:claude-opus-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
  .../car/builtin/media/AudioManagerHelper.java |  43 ++++--
- .../android/car/audio/CarAudioService.java    | 128 ++++++++++++++++++
- 2 files changed, 163 insertions(+), 8 deletions(-)
+ .../android/car/audio/CarAudioService.java    | 134 ++++++++++++++++++
+ 2 files changed, 169 insertions(+), 8 deletions(-)
 
 diff --git a/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java b/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java
-index aa4bc2671b..9c2e3323f1 100644
+index aa4bc26..9c2e332 100644
 --- a/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java
 +++ b/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java
 @@ -185,17 +185,44 @@ public final class AudioManagerHelper {
@@ -83,7 +92,7 @@ index aa4bc2671b..9c2e3323f1 100644
  
          // Create an audioPatch to connect the two ports
 diff --git a/service/src/com/android/car/audio/CarAudioService.java b/service/src/com/android/car/audio/CarAudioService.java
-index 2704eb1646..d365be0afa 100644
+index 2704eb1..e9061ee 100644
 --- a/service/src/com/android/car/audio/CarAudioService.java
 +++ b/service/src/com/android/car/audio/CarAudioService.java
 @@ -240,6 +240,10 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
@@ -109,9 +118,9 @@ index 2704eb1646..d365be0afa 100644
  
          if (mAudioManagerWrapper.releaseAudioPatch(getAudioPatchInfo(carPatch))) {
              Slogf.d(TAG, "releaseAudioPatch %s successfully", carPatch);
-+            // Without this return the error below also prints after
-+            // every successful release, and handleHfpScoInputRemoved()
-+            // releases a patch at the end of every HFP call.
++            // Without this return the error below also prints after every
++            // successful release (releaseHfpScoPatchLocked() makes one while the
++            // audio server is up).
 +            return;
          }
          // If we didn't find a match, then something went awry, but it's probably not fatal...
@@ -137,7 +146,7 @@ index 2704eb1646..d365be0afa 100644
          List<AudioDeviceInfo> devices = filterBusDevices(removedDevices);
  
          if (devices.isEmpty()) {
-@@ -4492,6 +4508,118 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+@@ -4492,6 +4508,124 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
          mConfigsCallbacks.finishBroadcast();
      }
  
@@ -195,7 +204,17 @@ index 2704eb1646..d365be0afa 100644
 +        }
 +    }
 +
-+    /** Undo {@link #handleHfpScoInputAdded}; leaving the patch would double up on the next call. */
++    /**
++     * Undo {@link #handleHfpScoInputAdded}: forget the bridge once its input is gone, so that
++     * the next call gets a new one instead of "already bridged, leaving alone".
++     *
++     * The patch itself is not released here, because it no longer exists by the time this
++     * callback runs: on the SCO input's disconnection AudioPolicyManager's
++     * setDeviceConnectionStateInt() calls cleanUpForDevice(), which releases every patch whose
++     * source is that device, and only then onAudioPortListUpdate(), which is what delivers
++     * this callback. Releasing here found no match and logged an error at the end of every
++     * call.
++     */
 +    private void handleHfpScoInputRemoved(AudioDeviceInfo[] removedDevices) {
 +        if (findHfpScoInput(removedDevices) == null) {
 +            return;
@@ -204,12 +223,8 @@ index 2704eb1646..d365be0afa 100644
 +            if (mHfpScoPatch == null) {
 +                return;
 +            }
-+            try {
-+                releaseAudioPatchLocked(mHfpScoPatch);
-+                Slogf.i(TAG, "Released the HFP SCO bridge");
-+            } catch (RuntimeException e) {
-+                Slogf.e(TAG, e, "Could not release the HFP SCO bridge");
-+            }
++            Slogf.i(TAG, "HFP SCO input gone; the audio policy released the bridge %s",
++                    mHfpScoPatch);
 +            mHfpScoPatch = null;
 +        }
 +    }
@@ -256,3 +271,6 @@ index 2704eb1646..d365be0afa 100644
      private static List<AudioDeviceInfo> filterBusDevices(AudioDeviceInfo[] infos) {
          List<AudioDeviceInfo> devices = new ArrayList<>();
          for (int c = 0; c < infos.length; c++) {
+-- 
+2.43.0
+

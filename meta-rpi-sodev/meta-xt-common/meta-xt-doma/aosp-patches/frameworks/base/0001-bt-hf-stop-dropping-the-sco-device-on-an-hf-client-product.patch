@@ -1,6 +1,6 @@
-From 4ffa3997508101cdc9cfa30756639a8d50d4895f Mon Sep 17 00:00:00 2001
+From 09afe21f0cb0302c669fb26da4002a728cf16179 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Tue, 22 Sep 2026 17:09:15 +0900
+Date: Wed, 11 Nov 2026 08:49:51 +0900
 Subject: [PATCH] audio: stop dropping the SCO device on an HF-client product
 
 On a product that runs only the HFP client role
@@ -11,17 +11,23 @@ drops the SCO active-device message that HeadsetClientStateMachine sends
 input device then never reaches AudioPolicy, the car audio service has
 nothing to bridge onto the call bus, and the call is silent.
 isProfileProxyConnected() now also answers true for HEADSET on such a
-product.
+product: hf.enabled set and ag.enabled not set. A product that enables
+both roles keeps the upstream check alone -- its AG proxy does bind --
+and is not supported by the HF-client changes this accompanies
+(packages/modules/Bluetooth "bt-hf: open the SCO path for the hands-free
+client role", packages/services/Car "car-audio: bridge the HFP far-end
+voice onto the call bus").
 
 Assisted-by: Claude Code:claude-opus-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
- .../java/com/android/server/audio/BtHelper.java  | 16 +++++++++++++++-
- 1 file changed, 15 insertions(+), 1 deletion(-)
+ .../com/android/server/audio/BtHelper.java    | 21 ++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
 
 diff --git a/services/core/java/com/android/server/audio/BtHelper.java b/services/core/java/com/android/server/audio/BtHelper.java
-index b104fc01ce985..8dbae27435f21 100644
+index b104fc01c..6eb05ad96 100644
 --- a/services/core/java/com/android/server/audio/BtHelper.java
 +++ b/services/core/java/com/android/server/audio/BtHelper.java
 @@ -58,6 +58,7 @@ import android.media.BluetoothProfileConnectionInfo;
@@ -32,13 +38,18 @@ index b104fc01ce985..8dbae27435f21 100644
  import android.os.UserHandle;
  import android.text.TextUtils;
  import android.util.IntArray;
-@@ -1275,10 +1276,23 @@ public class BtHelper {
+@@ -1275,10 +1276,28 @@ public class BtHelper {
          mDeviceBroker.postBluetoothActiveDevice(info, 0 /* delay */);
      }
  
-+    /** True on HFP client-role (HF) products, where the AG HEADSET proxy is never bound. */
++    /**
++     * True on HFP client-role (HF) products, where the AG HEADSET proxy is never bound. A
++     * product that enables both roles is not one: there the AG proxy does bind, and the
++     * upstream check below stays the only gate.
++     */
 +    private static final boolean sHfClientRole =
-+            SystemProperties.getBoolean("bluetooth.profile.hfp.hf.enabled", false);
++            SystemProperties.getBoolean("bluetooth.profile.hfp.hf.enabled", false)
++                    && !SystemProperties.getBoolean("bluetooth.profile.hfp.ag.enabled", false);
 +
      /*package*/ synchronized boolean isProfileProxyConnected(int profile) {
          switch (profile) {
@@ -57,3 +68,6 @@ index b104fc01ce985..8dbae27435f21 100644
              case BluetoothProfile.A2DP:
                  return mA2dp != null;
              case BluetoothProfile.HEARING_AID:
+-- 
+2.43.0
+

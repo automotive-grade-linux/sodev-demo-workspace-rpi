@@ -61,10 +61,15 @@
      1920x1088 in 16x16 blocks is 120 x 68 = 8160, times 60 = 489600 (avc);
      3840x2176 is 240 x 136 = 32640, times 60 = 1958400 (hevc).
 
-     performance-point-1920x1080 is 30. Measured on the board (2026-09-24)
-     with AOSP's codec tool on a 1080p stream, the decode alone ran at 57 fps
-     and at 45 fps with the display, so 30 describes the decoder; playback in
-     an app (VideoView) showed 15-19 frames a second on the same day.
+     performance-point-1920x1080 is 30, the value of 2026-09-24: measured on
+     the board with AOSP's codec tool on a 1080p stream, the decode alone ran
+     at 57 fps and at 45 fps with the display, so 30 describes the decoder;
+     playback in an app (VideoView) showed 15-19 frames a second on the same
+     day. The 4K60 figure above is a separate, later measurement (2026-10-16,
+     after the virtio-media and device model changes in between); by pixel
+     rate it covers 1080p60, so 30 is the older, conservative value (a
+     performance point is an upper bound, MediaCodecInfo.java:2495-2498). It
+     goes to 60 once 1080p HEVC has been measured again with the display.
 
      NEITHER NUMBER REACHES WEBVIEW (measured 2026-08-30 on the RPi4, which
      ships the same WebView). The shipped WebView 145.0.7632.218 references

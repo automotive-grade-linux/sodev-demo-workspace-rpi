@@ -42,10 +42,11 @@
 # WHY THIS ONLY MATTERS FROM ANDROID 17
 # -------------------------------------
 # The disabled trigger is not new -- trout has set the property since the 15 era --
-# and neither is the hard-coded interface name: cuttlefish's own reference-ril
-# hard-codes it too (guest/hals/ril/reference-ril/reference-ril.c:62
-# `#define PPP_TTY_PATH_ETH0 "buried_eth0"`). What changed is that until 17 no radio
-# HAL on this product ever asked for the interface:
+# and neither is the hard-coded interface name: Android 15's cuttlefish reference-ril
+# hard-coded it too (guest/hals/ril/reference-ril/reference-ril.c:62 at
+# android-15.0.0_r1, `#define PPP_TTY_PATH_ETH0 "buried_eth0"`; the 17 tree no longer
+# has that file). What changed is that until 17 no radio HAL on this product ever
+# asked for the interface:
 #
 #   Android 15  hardware/interfaces/radio/aidl/minradio does not exist, and
 #               device/google/cuttlefish/shared/auto/device_vendor.mk mentions

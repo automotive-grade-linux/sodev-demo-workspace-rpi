@@ -1,6 +1,6 @@
-From 3cda9587c2529e0631a3bb13ef60fcb925e00285 Mon Sep 17 00:00:00 2001
+From 5180f650fdda8778369ca06b18ff3fe9070bcdf4 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 28 Oct 2026 10:46:59 +0900
+Date: Wed, 11 Nov 2026 08:42:28 +0900
 Subject: [PATCH] wifi: more kinds of AP, DomD's link state, and SELinux
  enforcing
 
@@ -74,6 +74,15 @@ writes DomD's reports into req/relay.state, and the app enables such a
 network again while DomD has it, once per report. DomaWifiOverlay, a
 product RRO, makes the disable last 10 minutes instead of for good.
 
+Review of 2026-11-11: ssid_hostapd_safe() refuses an SSID that starts
+with # (a comment row in aps.conf, which the generators skip: such an
+AP had a row but no BSS and no entry on the screen), psk_valid()
+refuses a passphrase with a control character (DomD's agent refuses
+one, and a TAB would shift the request line's fields),
+doma-shadow-ap.sh's virt_wifi check names $UPLINK_IF instead of eth1,
+and the comment on init.xenvm-hwsim.rc's chown lines says they also
+cover a file edited over adb root. Not run on a board.
+
 Tested on a PC: the relay under mksh (186 checks in five suites), the
 app against the system stubs, and the AOSP build of selinux_policy (with
 the neverallow check), DomaWifiRelay, DomaWifiOverlay and iw_vendor for
@@ -109,15 +118,15 @@ Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
  .../xt/domawifirelay/RelayService.java        |  352 ++++-
  README.md                                     |   21 +-
  aosp_xenvm_trout_rpi4_arm64.mk                |   55 +-
- sepolicy/doma_shadow_ap.te                    |  246 +---
+ sepolicy/doma_shadow_ap.te                    |  246 +--
  sepolicy/file_contexts                        |    4 +
  sepolicy/system_app.te                        |   14 +
  xenvm_trout_rpi4_arm64/BoardConfig.mk         |   15 +-
- xenvm_trout_rpi4_arm64/doma-shadow-ap.sh      |  236 +--
+ xenvm_trout_rpi4_arm64/doma-shadow-ap.sh      |  241 +--
  xenvm_trout_rpi4_arm64/doma-shadow-aps.conf   |   38 +-
- xenvm_trout_rpi4_arm64/doma-wifi-relay.sh     | 1310 +++++++++++++----
- xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc    |  111 +-
- 17 files changed, 1793 insertions(+), 671 deletions(-)
+ xenvm_trout_rpi4_arm64/doma-wifi-relay.sh     | 1325 +++++++++++++----
+ xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc    |  115 +-
+ 17 files changed, 1812 insertions(+), 676 deletions(-)
  create mode 100644 DomaWifiOverlay/Android.bp
  create mode 100644 DomaWifiOverlay/AndroidManifest.xml
  create mode 100644 DomaWifiOverlay/res/values/config.xml
@@ -1206,7 +1215,7 @@ index dacd2f4..caffa51 100644
  
  # ---------------------------------------------------------------------------
 diff --git a/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh b/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh
-index 2e3e1a2..070b5d4 100755
+index 2e3e1a2..8660ac4 100755
 --- a/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh
 +++ b/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh
 @@ -1,4 +1,4 @@
@@ -1300,22 +1309,24 @@ index 2e3e1a2..070b5d4 100755
  # doma-wifi-relay.sh, which writes hostapd.conf at runtime by the same rules;
  # the comments there say why each rule exists.
  ssid_hostapd_safe() {
-     case "$1" in ''|*\\*) return 1;; esac
+-    case "$1" in ''|*\\*) return 1;; esac
 -    [ "$(printf '%s' "$1" | wc -c)" -le 32 ]
++    case "$1" in ''|'#'*|*\\*) return 1;; esac
 +    byte_len "$1"; [ "$_bl" -le 32 ]
  }
  psk_is_hex() {
      case "$1" in ''|*[!0-9A-Fa-f]*) return 1;; esac
-@@ -85,7 +110,7 @@ psk_is_hex() {
+@@ -85,7 +110,8 @@ psk_is_hex() {
  }
  psk_valid() {
      psk_is_hex "$1" && return 0
 -    _n=$(printf '%s' "$1" | wc -c)
++    case "$1" in *[[:cntrl:]]*) return 1;; esac
 +    byte_len "$1"; _n=$_bl
      [ "$_n" -ge 8 ] && [ "$_n" -le 63 ]
  }
  
-@@ -113,9 +138,11 @@ psk_valid() {
+@@ -113,9 +139,11 @@ psk_valid() {
  if [ "$(getprop persist.vendor.doma.shadow_ap true)" != "true" ]; then
      log "persist.vendor.doma.shadow_ap is not true -- handing wlan0 to virt_wifi"
      # exec, not a background start: this service is `oneshot`, so init waits for it, and
@@ -1330,7 +1341,7 @@ index 2e3e1a2..070b5d4 100755
      #
      # TIMING: setup_wifi renames eth1 with SIOCSIFNAME, which needs the
      # interface administratively down. This runs at sys.boot_completed, and
-@@ -126,52 +153,51 @@ fi
+@@ -126,52 +154,51 @@ fi
  
  # --- preconditions -----------------------------------------------------------------
  # The modules are in vendor_ramdisk/lib/modules/modules.load, so first-stage init has
@@ -1362,14 +1373,15 @@ index 2e3e1a2..070b5d4 100755
  # setup_wifi (the fallback above) creates a virt_wifi wlan0 on top of a buried
 -# ethernet link. Both providers want the name, and whoever created it first
 -# holds it, so the old one has to go before the radios are made.
+-if [ -e /sys/class/net/wlan0 ] && [ -e /sys/class/net/wlan0/lower_buried_eth1 ]; then
+-    log "removing virt_wifi wlan0 (was stacked on buried_eth1)"
+-    ip link set wlan0 down 2>/dev/null
+-    ip link del wlan0 2>/dev/null || log "could not delete virt_wifi wlan0; continuing"
 +# ethernet link. Both providers want the name, and whoever created it first holds it.
 +# Nothing in /vendor can delete a link, so a boot where the fallback ran first (the
 +# property switched back to true without a reboot) stops here; a reboot hands wlan0 to
 +# the shadow AP.
- if [ -e /sys/class/net/wlan0 ] && [ -e /sys/class/net/wlan0/lower_buried_eth1 ]; then
--    log "removing virt_wifi wlan0 (was stacked on buried_eth1)"
--    ip link set wlan0 down 2>/dev/null
--    ip link del wlan0 2>/dev/null || log "could not delete virt_wifi wlan0; continuing"
++if [ -e /sys/class/net/wlan0 ] && [ -e "/sys/class/net/wlan0/lower_buried_$UPLINK_IF" ]; then
 +    die "virt_wifi owns wlan0 this boot (setup_wifi ran); reboot to give it to the shadow AP"
  fi
 -# AND RENAME THE LOWER INTERFACE BACK. Deleting the upper link does NOT undo
@@ -1413,7 +1425,7 @@ index 2e3e1a2..070b5d4 100755
  fi
  for i in 0 1 2 3 4 5 6 7 8 9; do
      [ -e "/sys/class/net/$AP_IF" ] && break
-@@ -183,12 +209,16 @@ done
+@@ -183,12 +210,16 @@ done
  mkdir -p "$CONF_DIR" "$CONF_DIR/sockets" 2>/dev/null
  # CONF_DIR must be 0771. The sys.boot_completed block of init.xenvm-hwsim.rc
  #   sets 0771 on /data/vendor/wifi{,/shadow} right before
@@ -1431,7 +1443,7 @@ index 2e3e1a2..070b5d4 100755
  # Seed $APS on first run, then MERGE the seed on every later run: add only the
  # seed SSIDs $APS does not have and leave every existing row alone, so a PSK the
  # user typed on screen is never reverted to the seed's value. $APS is where
-@@ -196,8 +226,8 @@ chmod 0770 "$CONF_DIR/sockets" 2>/dev/null
+@@ -196,8 +227,8 @@ chmod 0770 "$CONF_DIR/sockets" 2>/dev/null
  # lost, and doma-wifi-relay's seed_psk_of() keeps a publication from writing a
  # placeholder over a seeded SSID. The merge skips `#` lines, so $APS carries
  # data rows only (psk_of() and the two hostapd.conf generators ignore `#` lines
@@ -1442,7 +1454,7 @@ index 2e3e1a2..070b5d4 100755
  if [ -s "$SEED" ]; then
      _seeded=0
      # DO NOT PRE-CREATE $APS. `:` is a POSIX special builtin in mksh
-@@ -247,16 +277,25 @@ if [ -s "$SEED" ]; then
+@@ -247,16 +278,25 @@ if [ -s "$SEED" ]; then
      # GNU's \| is not portable to it. An empty line has no character to
      # match [^#], so blanks are excluded for free.
      # DO NOT WRITE `A && log ... || log ...`. log() ends with `:` today, but
@@ -1471,7 +1483,7 @@ index 2e3e1a2..070b5d4 100755
  
  CONF=$CONF_DIR/hostapd.conf
  {
-@@ -291,7 +330,9 @@ CONF=$CONF_DIR/hostapd.conf
+@@ -291,7 +331,9 @@ CONF=$CONF_DIR/hostapd.conf
      #   => Emit bridge explicitly in each BSS so nothing depends on the ordering.
      first=1
      idx=0
@@ -1482,7 +1494,7 @@ index 2e3e1a2..070b5d4 100755
          case "$ssid" in ''|'#'*) continue;; esac
          # Skip what hostapd would reject, by the same rules doma-wifi-relay.sh
          # applies when it writes this file at runtime: ONE bad row makes hostapd
-@@ -326,23 +367,22 @@ CONF=$CONF_DIR/hostapd.conf
+@@ -326,23 +368,22 @@ CONF=$CONF_DIR/hostapd.conf
              echo "wpa=0"
          fi
      done < "$APS"
@@ -1519,7 +1531,7 @@ index 2e3e1a2..070b5d4 100755
  chmod 0660 "$CONF" 2>/dev/null || log "WARNING: chmod $CONF failed"
  
  # --- 4. uplink bridge ----------------------------------------------------------------
-@@ -352,13 +392,13 @@ chmod 0660 "$CONF" 2>/dev/null || log "WARNING: chmod $CONF failed"
+@@ -352,13 +393,13 @@ chmod 0660 "$CONF" 2>/dev/null || log "WARNING: chmod $CONF failed"
  # network when it becomes a bridge port -- that is intended, the whole point is that
  # connectivity now arrives over Wi-Fi.
  if [ ! -e "/sys/class/net/$BR" ]; then
@@ -1536,7 +1548,7 @@ index 2e3e1a2..070b5d4 100755
  # A vif that shows up late, or one still called buried_eth1 (see step 1), must not end
  # as a one-line "WARNING: eth1 absent; not enslaving": that state has no DHCP for the
  # station and nothing in the UI says why. Poll up to UPLINK_WAIT_S, then say so loudly.
-@@ -367,10 +407,7 @@ _w=0
+@@ -367,10 +408,7 @@ _w=0
  while [ ! -e "/sys/class/net/$UPLINK_IF" ] && [ "$_w" -lt "$UPLINK_WAIT_S" ]; do
      if [ -e "/sys/class/net/buried_$UPLINK_IF" ]; then
          log "renaming buried_$UPLINK_IF back to $UPLINK_IF (late)"
@@ -1548,7 +1560,7 @@ index 2e3e1a2..070b5d4 100755
          break
      fi
      [ "$_w" = 0 ] && log "$UPLINK_IF not present yet; waiting up to ${UPLINK_WAIT_S}s"
-@@ -378,13 +415,13 @@ while [ ! -e "/sys/class/net/$UPLINK_IF" ] && [ "$_w" -lt "$UPLINK_WAIT_S" ]; do
+@@ -378,13 +416,13 @@ while [ ! -e "/sys/class/net/$UPLINK_IF" ] && [ "$_w" -lt "$UPLINK_WAIT_S" ]; do
      _w=$((_w+1))
  done
  [ -e "/sys/class/net/$UPLINK_IF" ] \
@@ -1566,7 +1578,7 @@ index 2e3e1a2..070b5d4 100755
  done
  # Say plainly whether the uplink made it; this is the line to look for in
  # `logcat -s doma-shadow-ap` when wlan0 associates but never gets an address.
-@@ -410,23 +447,29 @@ fi
+@@ -410,23 +448,29 @@ fi
  #
  # vendor.doma_shadow_hostapd is defined in init.xenvm-hwsim.rc and is NOT oneshot.
  HOSTAPD_SVC=${HOSTAPD_SVC:-vendor.doma_shadow_hostapd}
@@ -1600,7 +1612,7 @@ index 2e3e1a2..070b5d4 100755
  else
      die "hostapd did not come up; check that the apex path in the service line exists and see logcat -s doma-shadow-ap, $CONF"
  fi
-@@ -448,20 +491,15 @@ fi
+@@ -448,20 +492,15 @@ fi
  # enumerates them. Cycling regardless would save Wi-Fi ON at every boot and override the
  # Settings toggle. wifi_on is 1 when saved ON and 2 when ON in airplane mode
  # (WifiSettingsStore.java:50-58).
@@ -1682,7 +1694,7 @@ index fd96acf..63002d3 100644
 +# this source tree, as a row or in a comment: the file is published inside the
 +# vendor image.
 diff --git a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
-index 401eb6a..dcb80d0 100755
+index 401eb6a..e7ac474 100755
 --- a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
 +++ b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
 @@ -1,4 +1,4 @@
@@ -2340,10 +2352,11 @@ index 401eb6a..dcb80d0 100755
                  log "hostapd restarted via init ($(grep -c '^ssid=' "$CONF") SSID(s))"
                  return 0
              fi
-@@ -544,6 +769,15 @@ restart_hostapd() {
+@@ -544,7 +769,21 @@ restart_hostapd() {
  
  # --- handlers ------------------------------------------------------------------------
  
+-# ssid_hostapd_safe <ssid> -- false for a name hostapd.conf cannot carry.
 +# byte_len <s> -- sets _bl to the BYTE count of <s> without a fork. mksh's ${#s}
 +# counts characters only in its UTF-8 mode (set -U) and bytes otherwise, so the
 +# mode is turned off for the count and back on if it was on. A fork per row
@@ -2353,14 +2366,22 @@ index 401eb6a..dcb80d0 100755
 +    case $- in *U*) set +U; _bl=${#1}; set -U;; *) _bl=${#1};; esac
 +}
 +
- # ssid_hostapd_safe <ssid> -- false for a name hostapd.conf cannot carry.
++# ssid_hostapd_safe <ssid> -- false for a name hostapd.conf or $APS cannot carry.
++#
++# A leading # marks a comment row in $APS: handle_aps keeps such a row as it is,
++# psk_of and both generators skip it. An SSID starting with # could be written
++# as a row but would never be beaconed or listed, so it is refused here, where
++# the skip is logged like every other refused name.
  #
  # ONE bad SSID makes hostapd reject the WHOLE config, and with it the shadow AP
-@@ -557,7 +791,10 @@ restart_hostapd() {
+ # and all of DomA's Wi-Fi: measured 2026-09-17, an AP beaconing 20 NUL bytes
+@@ -556,8 +795,11 @@ restart_hostapd() {
+ # well. Count BYTES: mksh's ${#s} counts characters under UTF-8.
  # doma-shadow-ap.sh carries the same function.
  ssid_hostapd_safe() {
-     case "$1" in ''|*\\*) return 1;; esac
+-    case "$1" in ''|*\\*) return 1;; esac
 -    [ "$(printf '%s' "$1" | wc -c)" -le 32 ]
++    case "$1" in ''|'#'*|*\\*) return 1;; esac
 +    # Printable ASCII: one byte per character, so ${#1} is the byte count without
 +    #   running wc (an SSID is checked on every publication).
 +    case "$1" in *[!\ -~]*) ;; *) [ "${#1}" -le 32 ]; return;; esac
@@ -2368,16 +2389,29 @@ index 401eb6a..dcb80d0 100755
  }
  
  # psk_is_hex <psk> -- a raw PSK: exactly 64 hex digits. hostapd.conf carries it
-@@ -588,7 +825,7 @@ psk_is_hex() {
+@@ -570,7 +812,10 @@ psk_is_hex() {
+ # psk_valid <psk> -- is this a PSK both hostapd and DomD's wpa_supplicant
+ # accept?
+ #
+-# Two forms exist. A passphrase is 8..63 BYTES (count bytes, as above). A raw
++# Two forms exist. A passphrase is 8..63 BYTES (count bytes, as above) with no
++# control character: hostapd checks only the length, but DomD's agent refuses one
++# with a control character, and a TAB or CR would split or shift the fields of
++# the request line and of a row in $APS. A raw
+ # PSK is 64 hex digits (psk_is_hex): AAOS's Wi-Fi dialog LEGITIMATELY ACCEPTS
+ # ONE and stores it unquoted
+ # (packages/apps/Car/Settings/.../WifiUtil.java:285-288 puts it into
+@@ -588,7 +833,8 @@ psk_is_hex() {
  # GUARD IN THE APP ALONE IS NOT THE LAST LINE OF DEFENCE.
  psk_valid() {
      psk_is_hex "$1" && return 0
 -    _n=$(printf '%s' "$1" | wc -c)
++    case "$1" in *[[:cntrl:]]*) return 1;; esac
 +    byte_len "$1"; _n=$_bl
      [ "$_n" -ge 8 ] && [ "$_n" -le 63 ]
  }
  
-@@ -632,30 +869,118 @@ sta_link_ssid() {
+@@ -632,30 +878,118 @@ sta_link_ssid() {
      iw_ssid "$_raw" || printf '%s' "$_raw"
  }
  
@@ -2515,7 +2549,7 @@ index 401eb6a..dcb80d0 100755
  # handle_aps <json-line> -- make $APS mirror the SSIDs DomD can currently hear.
  #
  # Each publication REPLACES the list, so the picker shows what is actually in
-@@ -667,76 +992,199 @@ EOF
+@@ -667,76 +1001,199 @@ EOF
  #     over;
  #   * seeded rows (/vendor/etc/doma-shadow-aps.conf), which must be joinable
  #     even before the first scan arrives.
@@ -2759,7 +2793,7 @@ index 401eb6a..dcb80d0 100755
      chmod 0660 "$_tmp" 2>/dev/null
      if ! mv -f "$_tmp" "$APS"; then
          log "WARNING: aps: could not update $APS"
-@@ -744,14 +1192,60 @@ EOF
+@@ -744,14 +1201,60 @@ EOF
          return 0
      fi
      log "aps: synced to the current scan (+$_added -$_dropped, now $(grep -c . "$APS") row(s))"
@@ -2824,7 +2858,7 @@ index 401eb6a..dcb80d0 100755
          log "aps: a station is associated -- deferring the hostapd restart (the conf is already updated; it will be applied once the station leaves)"
      else
          restart_hostapd
-@@ -762,22 +1256,292 @@ EOF
+@@ -762,22 +1265,292 @@ EOF
  #
  # WITHOUT THIS A DEFERRAL CAN LAST FOREVER. A publication that arrives while the
  # user is connected defers the restart, and the next one finds nothing new:
@@ -3121,7 +3155,7 @@ index 401eb6a..dcb80d0 100755
  }
  
  # handle_psk <ssid> <psk> -- the user typed a passphrase; make it work.
-@@ -788,30 +1552,25 @@ flush_pending_restart() {
+@@ -788,30 +1561,25 @@ flush_pending_restart() {
  handle_psk() {
      _s=$1; _p=$2
      # A PSK psk_valid refuses goes nowhere, neither into $APS nor to DomD, and
@@ -3165,7 +3199,7 @@ index 401eb6a..dcb80d0 100755
          # If generating the conf failed, do not touch hostapd. `ctl.restart` is a
          #   SIGKILL, so dropping it while the old conf is still in place gains nothing
          #   and merely loses DomA's only way in.
-@@ -824,7 +1583,10 @@ handle_psk() {
+@@ -824,7 +1592,10 @@ handle_psk() {
          fi
      fi
      # Do not write `A && log ... || log ...` (see log() at the top).
@@ -3177,7 +3211,7 @@ index 401eb6a..dcb80d0 100755
          log "psk: forwarded connect($_s) to DomD"
          mirror_mark_write "$_s" "$_p"      # the mirror must not send this connect again
      else
-@@ -834,8 +1596,11 @@ handle_psk() {
+@@ -834,8 +1605,11 @@ handle_psk() {
  
  # --- boot-time mirror ------------------------------------------------------------------
  # See the MIRROR_MARK block near the top for why this exists.
@@ -3190,7 +3224,7 @@ index 401eb6a..dcb80d0 100755
          && mv "$MIRROR_MARK.new" "$MIRROR_MARK" 2>/dev/null; then
          chmod 0600 "$MIRROR_MARK" 2>/dev/null
      else
-@@ -843,28 +1608,46 @@ mirror_mark_write() {
+@@ -843,28 +1617,46 @@ mirror_mark_write() {
      fi
  }
  
@@ -3246,7 +3280,7 @@ index 401eb6a..dcb80d0 100755
      _ss=$(sta_link_ssid)
      if [ -z "$_ss" ]; then
          # Not associated: re-arm so the NEXT association is a fresh event (roaming to
-@@ -872,29 +1655,53 @@ mirror_station() {
+@@ -872,29 +1664,53 @@ mirror_station() {
          STA_LAST_SSID=""
          return 0
      fi
@@ -3314,7 +3348,7 @@ index 401eb6a..dcb80d0 100755
      else
          log "WARNING: mirror: could not write connect($_ss) to $CHAN"
      fi
-@@ -969,6 +1776,7 @@ fi
+@@ -969,6 +1785,7 @@ fi
  printf '\n' >&3 2>/dev/null || log "WARNING: chan: could not write the flushing newline to $CHAN"
  
  log "started (chan=$CHAN aps=$APS req=$REQ)"
@@ -3322,7 +3356,7 @@ index 401eb6a..dcb80d0 100755
  
  # Buffer that carries an incomplete line over. Details in the else branch below.
  LINEBUF=""
-@@ -981,14 +1789,18 @@ while :; do
+@@ -981,14 +1798,18 @@ while :; do
      if read -t 2 -r line <&3 2>/dev/null; then
          # Re-attach the incomplete part from the previous pass at the front
          line=$LINEBUF$line; LINEBUF=""
@@ -3343,7 +3377,7 @@ index 401eb6a..dcb80d0 100755
          case "$_t" in
              # NOT WHILE doma_shadow_ap IS STILL RUNNING. init starts this daemon right
              # after it, and the publications DomD queued while nothing read $CHAN arrive
-@@ -996,12 +1808,17 @@ while :; do
+@@ -996,12 +1817,17 @@ while :; do
              # oneshot's seed merge, and its restart would race the oneshot's ctl.start
              # (the flush below defers for the same reason). The next publication
              # is at most 20 s away.
@@ -3363,7 +3397,7 @@ index 401eb6a..dcb80d0 100755
              '')    [ -z "$line" ] || log "ignoring: $(printf '%s' "$line" | cut -c1-120)";;
              *)     log "ignoring type $_t";;
          esac
-@@ -1009,16 +1826,16 @@ while :; do
+@@ -1009,16 +1835,16 @@ while :; do
          # EVEN ON TIMEOUT, `read` LEAVES WHAT IT MANAGED TO READ IN THE VARIABLE (both
          #   bash and mksh do). Discarding it here would LOSE A WHOLE PUBLICATION, with
          #   the remainder surfacing on the next pass as `ignoring: <fragment>`. DomD on
@@ -3384,7 +3418,7 @@ index 401eb6a..dcb80d0 100755
                  LINEBUF=""
              fi
          fi
-@@ -1038,7 +1855,7 @@ while :; do
+@@ -1038,7 +1864,7 @@ while :; do
      # boot waits for doma_shadow_ap to finish, as the publications above do: until then
      # wlan0 may not exist, so sta_is_up cannot tell, and handle_psk's restart would race
      # the oneshot's.
@@ -3393,14 +3427,14 @@ index 401eb6a..dcb80d0 100755
          # Move before reading so a request cannot be handled twice if hostapd's
          # restart takes longer than the poll interval.
          mv "$REQ" "$REQ.busy" 2>/dev/null || continue
-@@ -1054,4 +1871,5 @@ while :; do
+@@ -1054,4 +1880,5 @@ while :; do
  
      mirror_station
      flush_pending_restart
 +    [ "$STATE_RESTART" = 1 ] && state_restart
  done
 diff --git a/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc b/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
-index 91a1160..5f2427e 100644
+index 91a1160..8751465 100644
 --- a/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
 +++ b/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
 @@ -36,58 +36,66 @@
@@ -3558,7 +3592,7 @@ index 91a1160..5f2427e 100644
  # starts, and the relay skips DomD's publications until the oneshot has exited. `=`
  # matches the property unset (action.cpp:199-206), which is the default. Both wait for
  # boot_completed because before it init counts every crash of a process with updatable
-@@ -219,11 +222,21 @@ on post-fs-data
+@@ -219,11 +222,25 @@ on post-fs-data
      mkdir /data/vendor/wifi 0771 wifi wifi
      mkdir /data/vendor/wifi/shadow 0771 wifi wifi
      mkdir /data/vendor/wifi/shadow/sockets 0770 wifi wifi
@@ -3577,10 +3611,17 @@ index 91a1160..5f2427e 100644
 +    # Its label (doma_wifi_req_file) is newer than the directory on a /data that already
 +    # has it, and mkdir does not relabel an existing directory.
 +    restorecon_recursive /data/vendor/wifi/shadow/req
-+    # The files the services wrote while they ran as root (before they ran as uid wifi),
-+    # which uid wifi could otherwise not read. A missing file is only logged.
++    # Files under shadow/ that root owns: written by an image from before the services
++    # ran as uid wifi, or pushed or edited over `adb root` (the seed's header invites
++    # editing aps.conf on the device). uid wifi could not read a 0600 one (the relay
++    # would then rewrite aps.conf from the scan and lose the edit), and doma-shadow-ap
++    # writes aps.conf and hostapd.conf in place. Kept for the adb root case, so not tied
++    # to the old images. A missing file is only logged.
 +    chown wifi wifi /data/vendor/wifi/shadow/aps.conf
 +    chown wifi wifi /data/vendor/wifi/shadow/learned.conf
 +    chown wifi wifi /data/vendor/wifi/shadow/mirror.mark
 +    chown wifi wifi /data/vendor/wifi/shadow/hostapd.conf.live
 +    chown wifi wifi /data/vendor/wifi/shadow/hostapd.conf
+-- 
+2.43.0
+

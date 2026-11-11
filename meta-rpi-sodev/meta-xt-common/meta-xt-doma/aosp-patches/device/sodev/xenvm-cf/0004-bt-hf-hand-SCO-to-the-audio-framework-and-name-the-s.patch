@@ -1,6 +1,6 @@
-From 261048fca55b3597cb4b643be81eb899b61bef15 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 25 Sep 2026 09:34:40 +0900
+Date: Wed, 11 Nov 2026 09:40:51 +0900
 Subject: [PATCH] bt-hf: hand SCO to the audio framework and name the shipped
  dialer
 
@@ -59,7 +59,12 @@ framework-res overlay, and the root is a DEVICE_PACKAGE_OVERLAYS one:
     cmd role get-role-holders --user 10 android.app.role.DIALER
 has to answer com.android.car.dialer.
 
+Running both HFP roles at once (bluetooth.profile.hfp.ag.enabled=true
+next to hf.enabled=true) is not supported by this product's HF-client
+changes.
+
 Assisted-by: Claude Code:claude-opus-5-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
 ---

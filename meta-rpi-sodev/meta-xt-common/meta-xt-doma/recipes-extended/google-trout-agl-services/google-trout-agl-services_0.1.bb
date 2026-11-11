@@ -8,7 +8,7 @@ DESCRIPTION = "\
 
 # clang: the trout sources are written against Android's toolchain and do not build
 # clean with gcc (the -Wno-error list below is clang diagnostic names). meta-clang
-# is added to this build's layers by rpi5-sodev.yaml.
+# is added to this build's layers by the board yaml (rpi5-sodev.yaml, rpi4-sodev.yaml).
 TOOLCHAIN = "clang"
 
 # Each of these corresponds to a diagnostic that a newer clang promoted to an error

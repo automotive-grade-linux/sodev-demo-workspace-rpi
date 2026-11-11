@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # DomA: no incoming-call screen and no ringtone over Bluetooth HFP
 
 Root cause, measured on the RPi5 board on 2026-09-21 with a phone paired over
