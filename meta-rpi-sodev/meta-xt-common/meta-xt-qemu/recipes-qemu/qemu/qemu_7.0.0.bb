@@ -27,5 +27,12 @@ PACKAGECONFIG ??= " \
 PACKAGECONFIG:class-nativesdk ??= "fdt sdl kvm pie slirp \
     ${@bb.utils.contains('DISTRO_FEATURES', 'opengl', 'virglrenderer epoxy', '', d)} \
 "
+# alsa is named here rather than left to DISTRO_FEATURES: the DomD confs take alsa
+# out of DISTRO_FEATURES, so the filter() above does not add it, and the ALSA
+# backend has only been built because alsa-lib reached the recipe sysroot through
+# libsdl2 -> pulseaudio. DomA's cfg plays through -audiodev alsa, so the backend has
+# to be built whatever the sysroot happens to hold. With the PACKAGECONFIG set,
+# alsa-lib is a DEPENDS of this recipe's own.
+PACKAGECONFIG:append:class-target = " alsa"
 # ppc32 hosts are no longer supported in qemu
 COMPATIBLE_HOST:powerpc = "null"

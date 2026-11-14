@@ -1,27 +1,25 @@
-SUMMARY = "AAOS host-side backend daemons (VHAL / dumpstate / GNSS) for DomA on RPi5"
+SUMMARY = "AAOS host-side glue (VHAL / dumpstate / GNSS units, config and data) for DomA"
 DESCRIPTION = "\
-    AAOS host backend extracted from the V4H reference DomD image \
-    and reused as prebuilt binaries, deployed into the RPi5 DomD rootfs. \
-    No source build is required (the same aarch64 binaries are installed). \
+    The DomD side of the AAOS guest's host services: the systemd units that run \
+    the two gRPC backends google-trout-agl-services builds from source, the mock \
+    GNSS host agent, and their configuration and data. Built for both boards \
+    (raspberrypi5 here; raspberrypi4-64 through meta-xt-rpi4's bbappend). \
 \
-    Components (from V4H /usr/bin + /etc + /usr/share): \
-      /usr/bin/vehicle_hal_grpc_server   (AAOS VehicleHAL + power-state forward) \
-      /usr/bin/dumpstate_grpc_server     (AAOS dumpstate backend) \
+    Installs: \
       /usr/bin/gnss_replay.py            (mock GNSS host agent) \
       /etc/aaos.dumpstate.xml            (dumpstate config) \
       /usr/share/gnss/test.csv           (GNSS replay data) \
       /usr/lib/systemd/system/{vehicle_hal_grpc_server,dumpstate_grpc_server,gnss_replay}.service \
+    vehicle_hal_grpc_server and dumpstate_grpc_server themselves come from \
+    google-trout-agl-services (RDEPENDS). \
 \
     Runtime paths (matching doma.cfg): \
       vehicle_hal = vsock cid2:9210 (DomA qemu vhost-vsock-pci guest-cid=3) \
       dumpstate   = vsock cid2:9310 \
       gnss        = /run/gnss-uart (doma.cfg qemu virtconsole server=on,wait=off) \
-    The DomD kernel has VSOCK=y / VHOST_VSOCK=y / VHOST=y (no kernel change needed). \
-\
-    Dependencies (verified with readelf): \
-      vehicle_hal_grpc_server = base libs only (grpc/protobuf static link) \
-      dumpstate_grpc_server   = + libxml2.so.2 -> RDEPENDS libxml2 \
-      gnss_replay.py          = python3 -> RDEPENDS python3 \
+    The DomD kernel gets VSOCKETS / VHOST / VHOST_VSOCK from this layer's \
+    recipes-kernel/linux/files/vsock.cfg, and the Xen mappings for the vhost \
+    rings from the vhost_xen series next to it (linux-raspberrypi_6.18.bbappend). \
 \
     The services have no ordering dependency on a vsock unit: the V4H-era \
     Wants/After=coqos-virtio-vsock.service soft refs were dropped (no such unit \
@@ -30,10 +28,11 @@ DESCRIPTION = "\
 #   - our own glue: gnss_replay.py, aaos.dumpstate.xml, test.csv and the three systemd
 #     units. MIT, matching the sibling glue recipes in this layer (xt-xen-cfg-doma,
 #     xt-xen-cfg-domu).
-#   - the AOSP NOTICE, redistributed under Apache-2.0 section 4(d) alongside the gRPC
-#     backends. Those backends are NOT in this package: google-trout-agl-services builds
-#     and installs them, and declares the licences of the 14 sources they are built from
-#     (see the LICENSE note in its sources.inc). This recipe only RDEPENDS on it.
+#   - the AOSP NOTICE for the two AOSP-derived files above, gnss_replay.py and
+#     aaos.dumpstate.xml (Apache-2.0 section 4(d)). The gRPC backends are NOT in this
+#     package: google-trout-agl-services builds and installs them, and declares the
+#     licences of the 14 sources they are built from (see the LICENSE note in its
+#     sources.inc). This recipe only RDEPENDS on it.
 #
 # LICENSE was "CLOSED" while the backends were staged prebuilt binaries whose aggregate
 # nobody here could state. They are built from source now and this package no longer
@@ -72,13 +71,10 @@ inherit systemd
 SYSTEMD_SERVICE:${PN} = "vehicle_hal_grpc_server.service dumpstate_grpc_server.service gnss_replay.service"
 SYSTEMD_AUTO_ENABLE = "enable"
 
-# The backends themselves come from google-trout-agl-services; gnss_replay.py needs
-# python3. libxml2 is pulled in by that package's own shlib dependency now, but is
-# kept explicit because gnss_replay/dumpstate config handling relies on it.
-RDEPENDS:${PN} = "google-trout-agl-services libxml2 python3"
-
-# (The prebuilt-binary libxml2.so.2 / SKIP_FILEDEPS workaround is gone: the
-#  backends are built against this build's libxml2.)
+# The backends themselves come from google-trout-agl-services, whose shlib dependency
+# brings libxml2 for dumpstate_grpc_server. gnss_replay.py imports argparse, sys, socket
+# and time: python3-core, plus python3-io for socket.py and _socket.
+RDEPENDS:${PN} = "google-trout-agl-services python3-core python3-io"
 
 do_install() {
     # gnss_replay.py -> /usr/bin (the two gRPC backends come from
@@ -94,7 +90,7 @@ do_install() {
     install -d ${D}${datadir}/gnss
     install -m 0644 ${UNPACKDIR}/test.csv ${D}${datadir}/gnss/test.csv
 
-    # AOSP NOTICE (Apache-2.0 sec 4d) -> ships with the redistributed binaries
+    # AOSP NOTICE (Apache-2.0 sec 4d) for gnss_replay.py and aaos.dumpstate.xml
     install -d ${D}${datadir}/licenses/${PN}
     install -m 0644 ${UNPACKDIR}/NOTICE ${D}${datadir}/licenses/${PN}/NOTICE
 

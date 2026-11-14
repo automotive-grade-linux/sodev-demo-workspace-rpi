@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:31 +0900
+Date: Wed, 11 Nov 2026 08:38:33 +0900
 Subject: [PATCH] virtio-media: drain only what poll() actually reports
 
 qemu 11.1.2 port of
@@ -9,16 +9,16 @@ that patch's description has the reasoning and the measurements.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media.c | 90 ++++++++++++++++++++++++++++++++++++----
  1 file changed, 82 insertions(+), 8 deletions(-)
 
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 7d02c5430..85a3e5018 100644
+index c427cdbe5..fb12c0ba2 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -294,13 +294,9 @@ static void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
+@@ -297,13 +297,9 @@ static void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
   * before allocating capture buffers. A decoder with no event path stalls at the
   * first frame with nothing in the log to say why.
   */
@@ -34,7 +34,7 @@ index 7d02c5430..85a3e5018 100644
      for (;;) {
          struct virtio_media_event_event evt = {
              .hdr = { .event = VIRTIO_MEDIA_EVT_EVENT, .session_id = s->id },
-@@ -309,16 +305,94 @@ static void virtio_media_host_readable(void *opaque)
+@@ -312,16 +308,94 @@ static void virtio_media_host_readable(void *opaque)
          if (ioctl(s->fd, VIDIOC_DQEVENT, &evt.event) < 0) {
              break;
          }
@@ -57,7 +57,7 @@ index 7d02c5430..85a3e5018 100644
 +     * the ioctls that correspond to it.
 +     *
 +     * qemu_set_fd_handler() does not tell the callback which event woke it
-+     * (util/aio-posix.c:158 only arms G_IO_IN|G_IO_HUP|G_IO_ERR for read and
++     * (util/aio-posix.c:151 in 11.1.2 only arms G_IO_IN|G_IO_HUP|G_IO_ERR for read and
 +     * G_IO_OUT|G_IO_ERR for write). A blind drain -- DQEVENT until EAGAIN plus
 +     * DQBUF until EAGAIN on both queues, every time -- is not justified by the
 +     * argument that "vb2 only raises POLLOUT while done_list is non-empty, so

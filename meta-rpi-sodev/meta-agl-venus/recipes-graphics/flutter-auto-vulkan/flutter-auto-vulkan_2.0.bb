@@ -23,10 +23,6 @@
 
 require recipes-graphics/toyota/flutter-auto_2.0.bb
 
-# The patch below lives beside this recipe, not beside the required one, so FILESPATH has
-# to be told: `require` restores THISDIR to this file's directory once it returns.
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
-
 # The Vulkan backend is the least-travelled path in this tree and does not compile against
 # the Vulkan-Headers AGL scarthgap ships (1.3.275). See the patch header for the full
 # reasoning; in short, resultCheck and defaultDispatchLoaderDynamic moved into vk::detail

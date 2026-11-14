@@ -1,9 +1,10 @@
 SUMMARY = "Xen runtime cfg for the DomA (AAOS) guest (xl create)"
 DESCRIPTION = "\
-    /etc/xen/doma.cfg + doma.dtb + xl-create-doma.service, plus the \
-    DomA-augmented /etc/xen/domd.cfg (adds xvdc=p4 = the AAOS super.img to the \
-    DomD config). DomA is created before DomU so the DomD vhost_xen module \
-    latches the correct guest domid. Boot order is encoded in the unit files. \
+    /etc/xen/doma.cfg + doma.dtb + xl-create-doma.service, plus, on the \
+    Raspberry Pi 5 only, the reference /etc/xen/domd.cfg (DomA-augmented: xvdc=p4 \
+    = the AAOS super.img; BCM2712 iomem/irqs; not in the dom0less boot path). \
+    DomA is created before DomU so the DomD vhost_xen backend latches the \
+    correct guest domid. Boot order is encoded in the unit files. \
     "
 
 LICENSE = "MIT"
@@ -109,6 +110,12 @@ XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 # every device model in this tree can run. moulin always sets the value explicitly.
 XT_DOMA_HWDEC ??= "false"
 
+# [qemu monitor] LAB/DEMO ONLY. doma.cfg opens DomA's device-model HMP monitor on
+# loopback TCP (telnet:127.0.0.1:1234, unauthenticated; README.md and
+# docs/VULKAN-VENUS.md use it for triage). "1" keeps the line; "0" drops it from the
+# installed cfg. The same knob gates domu.cfg's monitor in xt-xen-cfg-domu.
+XT_QEMU_MONITOR ??= "1"
+
 # [hardware decode] What the virtio-media device is pointed at. Per board, because
 # the two boards' decode hardware has nothing in common beyond the words "hardware
 # decode":
@@ -204,7 +211,17 @@ do_compile() {
 do_install() {
     install -d ${D}${sysconfdir}/xen
     install -m 0644 ${UNPACKDIR}/doma.cfg ${D}${sysconfdir}/xen/doma.cfg
-    install -m 0644 ${UNPACKDIR}/domd.cfg ${D}${sysconfdir}/xen/domd.cfg
+
+    # [qemu monitor] see XT_QEMU_MONITOR above.
+    case "${XT_QEMU_MONITOR}" in
+    1) ;;
+    0)  sed -i -e "/^    # LAB\/DEMO ONLY: the qemu monitor is unauthenticated\. It is bound to$/,/^    '-monitor', 'telnet:127\.0\.0\.1:1234,server,nowait',$/d" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        if grep -q "'-monitor'," ${D}${sysconfdir}/xen/doma.cfg; then
+            bbfatal "doma.cfg: the -monitor line was not removed with XT_QEMU_MONITOR=0"
+        fi ;;
+    *)  bbfatal "XT_QEMU_MONITOR must be '1' or '0' (got '${XT_QEMU_MONITOR}')" ;;
+    esac
 
     # DomA's size is board-dependent. On the 8 GB SKU the four domains have to fit
     # 7680 MiB, and DomD cannot absorb the whole reduction alone: DomD 2048 was
@@ -577,10 +594,17 @@ do_install[vardeps] += "XT_DM_QEMU_VERSION"
 do_install[vardeps] += "XT_DOMA_HWDEC XT_DOMA_HWDEC_DEVARG"
 do_install[vardeps] += "XT_DOMA_GPU_PROPS"
 do_install[vardeps] += "XT_DOMA_OVERLAY_PLANES XT_DOMA_PLANE_SCALING"
+do_install[vardeps] += "XT_QEMU_MONITOR"
+
+# domd.cfg is a reference copy for the Raspberry Pi 5 (BCM2712 iomem/irqs, bcm2712
+# dtb) and in no board's boot path (DomD is dom0less), so it goes to that board only.
+do_install:append:raspberrypi5() {
+    install -m 0644 ${UNPACKDIR}/domd.cfg ${D}${sysconfdir}/xen/domd.cfg
+}
+FILES:${PN}:append:raspberrypi5 = " ${sysconfdir}/xen/domd.cfg"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \
-    ${sysconfdir}/xen/domd.cfg \
     /usr/lib/xen/boot/doma.dtb \
     ${systemd_system_unitdir}/xl-create-doma.service \
     ${libexecdir}/doma-devmodel-sweep \

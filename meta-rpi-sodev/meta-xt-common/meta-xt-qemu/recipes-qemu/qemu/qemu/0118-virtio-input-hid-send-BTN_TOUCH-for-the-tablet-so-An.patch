@@ -1,5 +1,6 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 06 Sep 2026 23:16:13 +0900
+Date: Sun, 6 Sep 2026 23:16:13 +0900
 Subject: [PATCH] virtio-input-hid: send BTN_TOUCH for the tablet, so Android
  sees a touchscreen
 
@@ -57,7 +58,7 @@ Upstream-Status: Inappropriate [same downstream policy as the 7.0.0 original;
  1 file changed, 29 insertions(+), 1 deletion(-)
 
 diff --git a/hw/input/virtio-input-hid.c b/hw/input/virtio-input-hid.c
-index 812faae..c5f35e1 100644
+index 812faaef8fe..1b050a5cad0 100644
 --- a/hw/input/virtio-input-hid.c
 +++ b/hw/input/virtio-input-hid.c
 @@ -89,6 +89,30 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,

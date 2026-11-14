@@ -43,7 +43,6 @@ __pycache__/
 .aaos-ref-shim/
 # local scratch / per-site overrides (not part of the PR)
 *.bak-*
-/rpi5-sodev.build.yaml
 # SSH host keys — generated on first boot by ssh-keygen -A, never committed
 **/recipes-core/images/files/ssh_host_*
 # DomA boot artifacts. Normally DERIVED from the AAOS build outputs, so nothing is
@@ -56,8 +55,8 @@ __pycache__/
 **/recipes-bsp/aaos-guest-binaries/files/aaos-vendor-boot-ramdisk-xenbuilt-*
 
 # Build outputs: SD images. build.sh names each one after the configuration it
-# holds -- <board>-<SKU>-Dom0<flavour>[-DomU][-DomA][-DomZ]-<date>-<time>.img -- and
-# points full.img at the newest, so both shapes have to be ignored. The pattern is
+# holds -- <board>-<SKU>-Dom0<flavour>[-DomU]-<Venus|GL>[-DomA][-DomZ]-<date>-<time>.img
+# -- and points full.img at the newest, so both shapes have to be ignored. The pattern is
 # written out rather than a bare *.img so that an image someone deliberately adds
 # to the tree is still noticed.
 /rpi[45]-*GB-Dom0*.img

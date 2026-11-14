@@ -1,5 +1,6 @@
+From 9fcfa40e5c1707e02afd00beef1f45cbbc04f6a4 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 21 Sep 2026 00:34:27 +0900
+Date: Wed, 11 Nov 2026 08:37:12 +0900
 Subject: [PATCH] plat: rpi5: pinctrl: add BCM2712 D0 stepping tables
 
 plat/rpi/rpi5/bcm2712_pinctrl.c only carries the C0 register map, but the pin
@@ -61,6 +62,12 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ plat/rpi/rpi5/bcm2712_pinctrl.c | 245 +++++++++++++++++++++++++++++---
+ plat/rpi/rpi5/platform.mk       |  14 ++
+ 2 files changed, 241 insertions(+), 18 deletions(-)
+
+diff --git a/plat/rpi/rpi5/bcm2712_pinctrl.c b/plat/rpi/rpi5/bcm2712_pinctrl.c
+index fc6d88df3..87a7c236f 100644
 --- a/plat/rpi/rpi5/bcm2712_pinctrl.c
 +++ b/plat/rpi/rpi5/bcm2712_pinctrl.c
 @@ -38,6 +38,18 @@
@@ -82,7 +89,7 @@ Upstream-Status: Pending
  static spinlock_t bcm2712_pfc_lock;
  
  struct bcm2712_pin_regs {
-@@ -443,6 +455,203 @@
+@@ -443,6 +455,203 @@ static const struct bcm2712_pin_funcs bcm2712_c0_gpio_pin_funcs[] = {
  	PIN(53, sc0, enet0_rgmii, ext_sc_clk, _, _, _, _, _),
  };
  
@@ -286,7 +293,7 @@ Upstream-Status: Pending
  static inline uint32_t bcm2712_pfc_reg_rd(unsigned int reg)
  {
  	return mmio_read_32(RPI_PINCTRL_BASE + reg);
-@@ -455,7 +664,7 @@
+@@ -455,7 +664,7 @@ static inline void bcm2712_pfc_reg_wr(unsigned int reg, uint32_t val)
  
  static enum bcm2712_pfc_funcs bcm2712_pfc_fsel_get(unsigned int pin)
  {
@@ -295,7 +302,7 @@ Upstream-Status: Pending
  	enum bcm2712_pfc_funcs func;
  	uint32_t val;
  	uint32_t fsel;
-@@ -468,7 +677,7 @@
+@@ -468,7 +677,7 @@ static enum bcm2712_pfc_funcs bcm2712_pfc_fsel_get(unsigned int pin)
  
  	val = bcm2712_pfc_reg_rd(BIT_TO_REG(bit));
  	fsel = (val >> BIT_TO_SHIFT(bit)) & BCM2712_FSEL_MASK;
@@ -304,7 +311,7 @@ Upstream-Status: Pending
  	if (func >= func_count) {
  		func = (enum bcm2712_pfc_funcs)fsel;
  	}
-@@ -482,7 +691,7 @@
+@@ -482,7 +691,7 @@ static enum bcm2712_pfc_funcs bcm2712_pfc_fsel_get(unsigned int pin)
  static void bcm2712_pinctrl_fsel_set(unsigned int pin,
  				     enum bcm2712_pfc_funcs func)
  {
@@ -313,7 +320,7 @@ Upstream-Status: Pending
  	const uint8_t *pin_funcs;
  	uint32_t val;
  	uint32_t fsel;
-@@ -498,7 +707,7 @@
+@@ -498,7 +707,7 @@ static void bcm2712_pinctrl_fsel_set(unsigned int pin,
  
  	if (func >= BCM2712_FSEL_COUNT) {
  		/* Convert to an fsel number */
@@ -322,7 +329,7 @@ Upstream-Status: Pending
  		for (i = 1; i < BCM2712_FSEL_COUNT; i++) {
  			if (pin_funcs[i - 1] == func) {
  				fsel = i;
-@@ -530,7 +739,7 @@
+@@ -530,7 +739,7 @@ static void bcm2712_pinctrl_fsel_set(unsigned int pin,
  
  static unsigned int bcm2712_pfc_pull_config_get(unsigned int pin)
  {
@@ -331,7 +338,7 @@ Upstream-Status: Pending
  	uint32_t val;
  
  	if (bit == REG_BIT_INVALID) {
-@@ -543,7 +752,7 @@
+@@ -543,7 +752,7 @@ static unsigned int bcm2712_pfc_pull_config_get(unsigned int pin)
  
  static void bcm2712_pfc_pull_config_set(unsigned int pin, unsigned int arg)
  {
@@ -340,7 +347,7 @@ Upstream-Status: Pending
  	uint32_t val;
  
  	if (bit == REG_BIT_INVALID) {
-@@ -562,15 +771,15 @@
+@@ -562,15 +771,15 @@ static void bcm2712_pfc_pull_config_set(unsigned int pin, unsigned int arg)
  uint32_t pinctrl_get_groups_count(void)
  {
  	VERBOSE("%s: %lu\n", __func__,
@@ -359,7 +366,7 @@ Upstream-Status: Pending
  }
  
  int pinctrl_get_group_pins(uint32_t group_id, const unsigned int **pins,
-@@ -578,27 +787,27 @@
+@@ -578,27 +787,27 @@ int pinctrl_get_group_pins(uint32_t group_id, const unsigned int **pins,
  {
  	VERBOSE("%s: %u\n", __func__, group_id);
  	*num_pins = 1;
@@ -394,7 +401,7 @@ Upstream-Status: Pending
  
  	return 0;
  }
-@@ -622,8 +831,8 @@
+@@ -622,8 +831,8 @@ int pinctrl_get_function_groups(uint32_t func_id, const uint32_t **groups,
  {
  	VERBOSE("%s: %u\n", __func__, func_id);
  
@@ -405,9 +412,11 @@ Upstream-Status: Pending
  
  	return 0;
  }
+diff --git a/plat/rpi/rpi5/platform.mk b/plat/rpi/rpi5/platform.mk
+index 84db94bc5..5043ba3ae 100644
 --- a/plat/rpi/rpi5/platform.mk
 +++ b/plat/rpi/rpi5/platform.mk
-@@ -116,6 +116,20 @@
+@@ -116,6 +116,20 @@ RPI_SCMI_NUM_AGENTS ?= 8
  $(eval $(call add_define,RPI_SCMI_SHMEM_BASE))
  $(eval $(call add_define,RPI_SCMI_SHMEM_SIZE))
  $(eval $(call add_define_val,SCMI_NUM_AGENTS,${RPI_SCMI_NUM_AGENTS}))
@@ -428,3 +437,6 @@ Upstream-Status: Pending
  endif
  
  $(eval $(call add_define,RPI3_BL33_IN_AARCH32))
+-- 
+2.43.0
+

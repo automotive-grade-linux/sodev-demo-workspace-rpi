@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:57:54 +0900
 Subject: [PATCH] hw/virtio-media: return the OUTPUT buffer timestamp on
  completion
 
@@ -8,18 +8,23 @@ qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0244-v10-hw-virtio-media-return-the-OUTPUT-buffer-timestamp-on-completion.patch;
 that patch's description has the reasoning and the measurements.
 
+Changed in the q11 series (review 2026-11-11): DEC_IN_PTS() bounds the
+guest's tv_sec before the multiplication (a value past 9.2e12 seconds
+was signed overflow), and the packet pts set in dec_qbuf() uses it too
+instead of repeating the expression.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
- hw/virtio/virtio-media-decoder.c | 31 +++++++++++++++++++++++++++++--
- 1 file changed, 29 insertions(+), 2 deletions(-)
+ hw/virtio/virtio-media-decoder.c | 41 ++++++++++++++++++++++++++++----
+ 1 file changed, 37 insertions(+), 4 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 7ac6fcb92..1e61c3deb 100644
+index 97d2af9c5..20f094d95 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -109,6 +109,33 @@
+@@ -109,6 +109,40 @@
  /* Frames one dec_pump() call may deliver; see the loop for why it is bounded. */
  #define DEC_PUMP_MAX_FRAMES 4
  
@@ -47,13 +52,20 @@ index 7ac6fcb92..1e61c3deb 100644
 + * OUTPUT buffer to the CAPTURE buffer decoded from it), so echoing it is not a
 + * workaround for this one client.
 + */
-+#define DEC_IN_PTS(b) \
-+    ((int64_t)(b)->timestamp.tv_sec * 1000000 + (b)->timestamp.tv_usec)
++static inline int64_t dec_in_pts(const struct v4l2_buffer *b)
++{
++    /* The guest fills the v4l2_buffer: bound tv_sec so the product cannot overflow. */
++    const int64_t max_sec = INT64_MAX / 1000000 - 1;
++    int64_t sec = MIN(MAX((int64_t)b->timestamp.tv_sec, -max_sec), max_sec);
++
++    return sec * 1000000 + b->timestamp.tv_usec;
++}
++#define DEC_IN_PTS(b) dec_in_pts(b)
 +
  /*
   * What the input backlog may hold. Bounded for the reason DEC_MAX_OUT_SIZE is:
   * the guest decides how much it queues, so a guest that feeds input while never
-@@ -1253,7 +1280,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -1252,7 +1286,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
                  d->drain_done = false;
                  avcodec_send_packet(d->avctx, NULL);
              }
@@ -62,7 +74,17 @@ index 7ac6fcb92..1e61c3deb 100644
              dec_pump(s);
              return 0;
          }
-@@ -1357,7 +1384,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -1283,8 +1317,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+         }
+         memcpy(d->pkt->data, buf, used);
+         g_free(buf);
+-        d->pkt->pts = (int64_t)b->timestamp.tv_sec * 1000000 +
+-                      b->timestamp.tv_usec;
++        d->pkt->pts = DEC_IN_PTS(b);
+ 
+         /*
+          * ORDER IS NOT NEGOTIABLE. A packet may go straight to libavcodec only
+@@ -1356,7 +1389,7 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
           * is reported before any decoded frame, which is the order a stateful
           * decoder gives: input completion does not wait for output.
           */

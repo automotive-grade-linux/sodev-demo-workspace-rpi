@@ -3,8 +3,9 @@ DESCRIPTION = "\
     For the thin-Linux control Dom0 flavour ONLY (ships in rpi5-image-xt-dom0-thin, \
     never in the DomD rootfs image). DomD is dom0less in both flavours; in the linux \
     flavour Dom0 owns the SD, so it must block-attach the guest partitions \
-    (p3 -> xvdb, p4 -> xvdc) to the dom0less DomD, whose `xl devd` then spawns the \
-    guest device-models against them. Provides: \
+    (p2 -> xvda, the DomD root, mandatory; p3 -> xvdb and p4 -> xvdc when present) \
+    to the dom0less DomD, whose `xl devd` then spawns the guest device-models \
+    against them. Provides: \
       - xl-attach-disks.service : the Dom0 -> DomD block-attach (existence-guarded). \
       - xl-create-{domu,doma,domz}.service.d/10-linux-dom0.conf : drop-ins that replace \
         the DomD-only Requires=domd-toolstack-prep.service (a Zephyr-xenstore seeder \

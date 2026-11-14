@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 14:53:17 +0900
-Subject: [PATCH] virtio-media: decoder mode: decode H.264 on two frame
- threads
+Date: Wed, 11 Nov 2026 08:33:52 +0900
+Subject: [PATCH] virtio-media: decoder mode: decode H.264 on two frame threads
 
 A 1080p60 H.264 stream played in a WebView (High profile, one slice a
 picture) takes about 1.35 times the CPU of the local test clip: DomD's
@@ -28,16 +27,16 @@ for the one thread at 47 frames a second.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
 ---
  hw/virtio/virtio-media-decoder.c | 19 +++++++++++++++----
  1 file changed, 15 insertions(+), 4 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 3aee470..e59e4d8 100644
+index 2d306a816..05405efa3 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -2586,12 +2586,23 @@ static int dec_codec_open(VirtIOMediaSession *s)
+@@ -2600,12 +2600,23 @@ static int dec_codec_open(VirtIOMediaSession *s)
          return ENOMEM;
      }
      /*

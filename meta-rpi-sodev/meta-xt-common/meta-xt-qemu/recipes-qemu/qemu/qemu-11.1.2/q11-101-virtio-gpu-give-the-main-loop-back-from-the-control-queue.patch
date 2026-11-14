@@ -30,7 +30,7 @@ Upstream-Status: Pending
  3 files changed, 70 insertions(+)
 
 diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
-index eb5e1252a..d2f562c06 100644
+index 0e3234790..648f94e81 100644
 --- a/hw/display/virtio-gpu-gl.c
 +++ b/hw/display/virtio-gpu-gl.c
 @@ -89,6 +89,9 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
@@ -151,10 +151,10 @@ index 31a1b453a..354feab47 100644
      g->reset_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_reset_bh, g);
      qemu_cond_init(&g->reset_cond);
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index 4cb84c9cd..0229a6275 100644
+index b98c0abcc..b4b17860c 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -250,6 +250,12 @@ struct VirtIOGPU {
+@@ -249,6 +249,12 @@ struct VirtIOGPU {
      VirtQueue *cursor_vq;
  
      QEMUBH *ctrl_bh;

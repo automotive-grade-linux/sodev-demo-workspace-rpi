@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 09:22:29 +0900
+Date: Fri, 4 Sep 2026 09:22:29 +0900
 Subject: [PATCH] audio/alsa: report the generic buffer as free, as 7.0 did
 
 DomA -> HDMI audio does not play on RPi4 under qemu 10.0.2. The guest side is

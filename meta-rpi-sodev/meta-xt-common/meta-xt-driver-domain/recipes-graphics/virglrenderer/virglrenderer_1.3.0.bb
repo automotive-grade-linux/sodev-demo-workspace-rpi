@@ -37,7 +37,8 @@ BBCLASSEXTEND = ""
 
 REQUIRED_DISTRO_FEATURES = "opengl"
 
-# The yamls' vulkan lane appends PACKAGECONFIG "render-server" (a 1.2.0 option). 1.3.0 removed the
-# option and always builds the render server together with Venus (meson.build: with_render_server = with_venus),
+# The yamls' vulkan lane appends PACKAGECONFIG "render-server" (deprecated and ignored already in 1.2.0:
+# with_render_server = with_venus there too). 1.3.0 removed the option and always builds the render
+# server together with Venus (meson.build: with_render_server = with_venus),
 # so accept the name as a no-op instead of failing the invalid-packageconfig QA check.
 PACKAGECONFIG[render-server] = ",,"

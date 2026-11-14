@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 16:51:23 +0900
+Date: Fri, 4 Sep 2026 16:51:23 +0900
 Subject: [PATCH] xen/mapcache: find reverse entries by hash, not by list walk
 
 Every dma_memory_unmap() ends in xen-mapcache twice: address_space_unmap()
@@ -31,8 +31,11 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ hw/xen/xen-mapcache.c | 46 ++++++++++++++++++++++++++++++-------------
+ 1 file changed, 32 insertions(+), 14 deletions(-)
+
 diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
-index 33ca168699f..cd9374389b7 100644
+index dccf33045f8..714e0f7a6f7 100644
 --- a/hw/xen/xen-mapcache.c
 +++ b/hw/xen/xen-mapcache.c
 @@ -55,6 +55,8 @@ typedef struct MapCacheRev {

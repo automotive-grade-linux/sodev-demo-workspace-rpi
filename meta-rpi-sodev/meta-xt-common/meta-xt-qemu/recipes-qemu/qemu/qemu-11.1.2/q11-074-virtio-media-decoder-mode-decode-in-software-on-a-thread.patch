@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 00:46:03 +0900
-Subject: [PATCH] virtio-media: decoder mode: decode in software on a
- thread
+Date: Wed, 11 Nov 2026 08:39:45 +0900
+Subject: [PATCH] virtio-media: decoder mode: decode in software on a thread
 
 Software decoding ran on the main loop, inside the QBUF that carried
 the packet: 96 to 98% of a core at H.264 1080p60 on the Raspberry Pi
@@ -35,13 +34,13 @@ aborted playbacks and H.264 720p60 next to HEVC 1080p60 (60.3 and
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media decoder mode (q11-041), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-decoder.c | 317 +++++++++++++++++++++++++++++--
  1 file changed, 298 insertions(+), 19 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 053cea7..ed6a98a 100644
+index e11088e64..7648287ce 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -48,8 +48,9 @@
@@ -91,7 +90,7 @@ index 053cea7..ed6a98a 100644
  /* A blitted hardware frame and the import whose GPU work reads it. */
  typedef struct DecGpuHeld {
      AVFrame *frame;
-@@ -299,6 +321,8 @@ typedef struct DecGpuHeld {
+@@ -306,6 +328,8 @@ static inline int64_t dec_in_pts(const struct v4l2_buffer *b)
   */
  #define DEC_MAX_BACKLOG_PKTS 32
  #define DEC_MAX_BACKLOG_BYTES (16 * 1024 * 1024)
@@ -100,7 +99,7 @@ index 053cea7..ed6a98a 100644
  
  struct VirtIOMediaDec {
      const DecCodec *codec;          /* the OUTPUT format (S_FMT picks it) */
-@@ -405,8 +429,20 @@ struct VirtIOMediaDec {
+@@ -412,8 +436,20 @@ struct VirtIOMediaDec {
      bool sw_off;      /* the GPU path failed for this stream: CPU from now on */
      bool sw_logged;
      struct SwsContext *sws_nv12;
@@ -121,7 +120,7 @@ index 053cea7..ed6a98a 100644
  /* ------------------------------------------------------------------------- */
  /* helpers                                                                   */
  /* ------------------------------------------------------------------------- */
-@@ -1254,6 +1290,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1259,6 +1295,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      }
  
      /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
@@ -129,7 +128,7 @@ index 053cea7..ed6a98a 100644
      tex = virtio_media_gpu_res_tex(gb->virgl_res);
      show = tex && dec_ds_on() && direct_scanout_sand_usable() && dec_ds_wanted(d);
      if (show && e->show_fd < 0) {
-@@ -1738,6 +1775,182 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+@@ -1743,6 +1780,182 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
      return true;
  }
  
@@ -312,7 +311,7 @@ index 053cea7..ed6a98a 100644
  /*
   * q11-dec-h264: libavcodec's send, receive and flush. avctx is NULL only when
   * dec_codec_switch could not open a decoder again.
-@@ -1745,28 +1958,83 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+@@ -1750,28 +1963,83 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
  /* avcodec_send_packet; pkt NULL starts a drain. */
  static int dec_av_send(VirtIOMediaDec *d, const AVPacket *pkt)
  {
@@ -401,7 +400,7 @@ index 053cea7..ed6a98a 100644
  }
  
  /*
-@@ -1786,7 +2054,8 @@ static void dec_av_flush(VirtIOMediaDec *d)
+@@ -1791,7 +2059,8 @@ static void dec_av_flush(VirtIOMediaDec *d)
   * So take the bytes and hold them. A real driver does the same -- the OUTPUT
   * buffer completes once its data has been copied out, long before any frame
   * comes back -- and the backlog is drained from dec_pump(), i.e. from the next
@@ -411,7 +410,7 @@ index 053cea7..ed6a98a 100644
   *
   * ORDER IS THE WHOLE POINT. Everything that feeds libavcodec has to go through
   * the queue once the queue is non-empty; see dec_qbuf.
-@@ -1855,8 +2124,8 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+@@ -1860,8 +2129,8 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
   *
   * Called from every path that can change either side of that condition: an
   * OUTPUT QBUF (new input), a CAPTURE QBUF (new space) and DECODER_CMD(STOP)
@@ -422,7 +421,7 @@ index 053cea7..ed6a98a 100644
   */
  static void dec_pump(VirtIOMediaSession *s)
  {
-@@ -1890,7 +2159,8 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -1895,7 +2164,8 @@ static void dec_pump(VirtIOMediaSession *s)
       * SG copies before the main loop turned again -- at 4K that is hundreds of
       * megabytes of memory traffic, during which DomA's virtio-blk (served by
       * this same QEMU) is stopped. Bounding it per call costs nothing in
@@ -432,7 +431,7 @@ index 053cea7..ed6a98a 100644
       */
      for (n = 0; n < DEC_PUMP_MAX_FRAMES; n++) {
          int r;
-@@ -2177,8 +2447,9 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+@@ -2186,8 +2456,9 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
   * again when S_FMT(OUTPUT) picks another one (before any OUTPUT buffer, so
   * nothing of the old stream is in flight).
   */
@@ -443,7 +442,7 @@ index 053cea7..ed6a98a 100644
      const AVCodec *codec = avcodec_find_decoder_by_name(d->codec->av_name);
  
      if (!codec) {
-@@ -2189,10 +2460,10 @@ static int dec_codec_open(VirtIOMediaDec *d)
+@@ -2198,10 +2469,10 @@ static int dec_codec_open(VirtIOMediaDec *d)
          return ENOMEM;
      }
      /*
@@ -458,7 +457,7 @@ index 053cea7..ed6a98a 100644
       */
      d->avctx->thread_count = 1;
  
-@@ -2223,6 +2494,10 @@ static int dec_codec_open(VirtIOMediaDec *d)
+@@ -2232,6 +2503,10 @@ static int dec_codec_open(VirtIOMediaDec *d)
          avcodec_free_context(&d->avctx);
          return ENOMEM;
      }
@@ -469,7 +468,7 @@ index 053cea7..ed6a98a 100644
      return 0;
  }
  
-@@ -2239,6 +2514,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+@@ -2248,6 +2523,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
          s->queues[1].streaming) {
          return EBUSY;
      }
@@ -477,7 +476,7 @@ index 053cea7..ed6a98a 100644
      dec_gpu_reset(d);
      dec_sw_clear(d);
      dec_backlog_clear(d);
-@@ -2251,12 +2527,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+@@ -2260,12 +2536,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
      d->hw_logged = false;
      d->gpu_logged = false;
      d->codec = c;
@@ -492,7 +491,7 @@ index 053cea7..ed6a98a 100644
  }
  
  int virtio_media_dec_open(VirtIOMediaSession *s)
-@@ -2281,8 +2557,10 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -2290,8 +2566,10 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
      d->pkt = av_packet_alloc();
      d->frame = av_frame_alloc();
      d->swframe = av_frame_alloc();
@@ -504,7 +503,7 @@ index 053cea7..ed6a98a 100644
          goto fail;
      }
  
-@@ -2311,6 +2589,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -2320,6 +2598,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
      if (!d) {
          return;
      }

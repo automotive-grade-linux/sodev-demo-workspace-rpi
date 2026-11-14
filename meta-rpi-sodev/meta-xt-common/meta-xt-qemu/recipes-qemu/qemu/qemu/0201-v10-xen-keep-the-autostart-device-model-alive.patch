@@ -1,4 +1,4 @@
-From b0b73b72153f2841e31a3728bc4fb65d03b7f7a1 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Thu, 3 Sep 2026 22:42:16 +0900
 Subject: [PATCH] xen: keep the autostart device model alive without a QMP

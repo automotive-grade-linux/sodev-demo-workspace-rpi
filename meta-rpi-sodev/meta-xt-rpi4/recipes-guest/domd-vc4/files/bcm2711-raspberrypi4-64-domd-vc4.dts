@@ -130,7 +130,8 @@
 	 *
 	 * The phandle is hard-coded to GUEST_PHANDLE_GIC (65000 = 0xfde8) from
 	 * xen/include/public/device_tree_defs.h because THIS FRAGMENT IS ALSO
-	 * USED BY libxl: domd.cfg names it in `device_tree =`, and libxl gives
+	 * MEANT FOR libxl: a domd.cfg names it in `device_tree =` (this board
+	 * installs none; README "No domd.cfg on this board"), and libxl gives
 	 * the GIC node it generates a hard-coded GUEST_PHANDLE_GIC
 	 * (libxl_arm.c make_gicv{2,3}_node()). A lower value would leave every
 	 * interrupt-parent inside /passthrough pointing at a non-existent node

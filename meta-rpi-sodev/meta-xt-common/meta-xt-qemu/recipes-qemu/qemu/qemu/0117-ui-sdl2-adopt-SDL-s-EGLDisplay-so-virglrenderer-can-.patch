@@ -1,5 +1,6 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 06 Sep 2026 01:09:22 +0900
+Date: Sun, 6 Sep 2026 01:09:22 +0900
 Subject: [PATCH] ui/sdl2: adopt SDL's EGLDisplay so virglrenderer can import
  dma-bufs
 
@@ -42,7 +43,7 @@ Upstream-Status: Pending [not yet submitted to qemu-devel]
  1 file changed, 46 insertions(+)
 
 diff --git a/ui/sdl2.c b/ui/sdl2.c
-index cda4293..cf45657 100644
+index cda4293a53e..a98474bdf55 100644
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
 @@ -33,6 +33,7 @@

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:31 +0900
+Date: Wed, 11 Nov 2026 08:38:25 +0900
 Subject: [PATCH] virtio-gpu/xen: pin shmem-backed blobs through udmabuf before
  sharing them into the guest
 
@@ -10,17 +10,17 @@ that patch's description has the reasoning and the measurements.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [extends 0116, which is itself Inappropriate]
+Upstream-Status: Inappropriate [extends q11-015 (the port of 0116), which is itself Inappropriate]
 ---
- hw/arm/xen-stubs.c            |  6 ++-
+ hw/arm/xen-stubs.c            |  7 ++-
  hw/display/virtio-gpu-virgl.c | 84 +++++++++++++++++++++++++++++++++++
- 2 files changed, 88 insertions(+), 2 deletions(-)
+ 2 files changed, 89 insertions(+), 2 deletions(-)
 
 diff --git a/hw/arm/xen-stubs.c b/hw/arm/xen-stubs.c
-index e526a6f97..3d2932d52 100644
+index e526a6f97..aeaf4a443 100644
 --- a/hw/arm/xen-stubs.c
 +++ b/hw/arm/xen-stubs.c
-@@ -74,8 +74,10 @@ void arch_handle_ioreq(XenIOState *state, ioreq_t *req)
+@@ -74,8 +74,11 @@ void arch_handle_ioreq(XenIOState *state, ioreq_t *req)
   *    process to be privileged enough to read the PFNs -- true for a device
   *    model;
   *  - mlock() keeps them resident but does not stop the kernel from migrating
@@ -28,13 +28,14 @@ index e526a6f97..3d2932d52 100644
 - *    which means kernel help;
 + *    them (compaction, khugepaged), so this route is only safe for memory the
 + *    caller has pinned some other way: a dma-buf by the gntdev import above,
-+ *    a shmem blob by a udmabuf (0121, which vetoes the share when it cannot).
++ *    a shmem blob by a udmabuf (q11-020, the port of 0121, which vetoes the
++ *    share when it cannot).
 + *    A failed export or XT_XEN_NO_BLOB_EXPORT still sends a shmem blob here;
   *  - the hypervisor has to permit the direction at all. Without the matching
   *    change (4.22-0007) the batch below fails -- with -ESRCH on Xen 4.22, whose
   *    rcu_lock_remote_domain_by_id() cannot resolve DOMID_SELF, and with -EPERM
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 614f2a8f0..e81d9b159 100644
+index 614f2a8f0..cda4cc602 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
 @@ -18,6 +18,10 @@
@@ -129,8 +130,8 @@ index 614f2a8f0..e81d9b159 100644
 +                    xen_dm_set_blob_dmabuf(dmabuf);
 +                } else {
 +                    /*
-+                     * No pin, so no share. The pagemap route 0116 keeps for
-+                     * this case IS the unpinned sharing measured above to
++                     * No pin, so no share. The pagemap route q11-015 (the port
++                     * of 0116) keeps for this case IS the unpinned sharing measured above to
 +                     * corrupt the guest's command ring, so falling back to it
 +                     * would reintroduce the bug this patch exists to fix.
 +                     * Refusing gives the guest VK_ERROR_MEMORY_MAP_FAILED,

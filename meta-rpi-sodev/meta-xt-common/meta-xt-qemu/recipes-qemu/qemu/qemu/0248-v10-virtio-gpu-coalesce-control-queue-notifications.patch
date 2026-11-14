@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Fri, 2 Oct 2026 10:56:12 +0900
 Subject: [PATCH] virtio-gpu: raise the control-queue interrupt once per batch
@@ -28,30 +29,32 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
---- a/include/hw/virtio/virtio-gpu.h
-+++ b/include/hw/virtio/virtio-gpu.h
-@@ -206,6 +206,9 @@
-     uint64_t hostmem;
+ hw/display/virtio-gpu-virgl.c  |  3 +++
+ hw/display/virtio-gpu.c        | 38 +++++++++++++++++++++++++++++++++-
+ include/hw/virtio/virtio-gpu.h |  5 +++++
+ 3 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 6662b8acbd0..13dbf8eda87 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1271,8 +1271,11 @@ static void virtio_gpu_fence_poll(void *opaque)
+     VirtIOGPU *g = opaque;
+     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
  
-     bool processing_cmdq;
-+    /* virtio_gpu_notify_defer_begin/end(): batched control-queue interrupt */
-+    unsigned int notify_defer;
-+    bool notify_pending;
- 
-     uint32_t inflight;
-     struct {
-@@ -318,6 +321,8 @@
-                               struct virtio_gpu_ctrl_command *cmd,
-                               struct virtio_gpu_ctrl_hdr *resp,
-                               size_t resp_len);
-+void virtio_gpu_notify_defer_begin(VirtIOGPU *g);
-+void virtio_gpu_notify_defer_end(VirtIOGPU *g);
- void virtio_gpu_ctrl_response_nodata(VirtIOGPU *g,
-                                      struct virtio_gpu_ctrl_command *cmd,
-                                      enum virtio_gpu_ctrl_type type);
++    /* fences retired by the poll and the commands they unblock: one interrupt */
++    virtio_gpu_notify_defer_begin(g);
+     virgl_renderer_poll();
+     virtio_gpu_process_cmdq(g);
++    virtio_gpu_notify_defer_end(g);
+     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
+         /*
+          * FENCE RETIREMENT IS DISCOVERED ONLY HERE (and at the end of the
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 11a7a857502..f747a62a3cf 100644
 --- a/hw/display/virtio-gpu.c
 +++ b/hw/display/virtio-gpu.c
-@@ -177,10 +177,42 @@
+@@ -177,10 +177,42 @@ void virtio_gpu_ctrl_response(VirtIOGPU *g,
                        __func__, s, resp_len);
      }
      virtqueue_push(cmd->vq, &cmd->elem, s);
@@ -95,7 +98,7 @@ Upstream-Status: Pending
  void virtio_gpu_ctrl_response_nodata(VirtIOGPU *g,
                                       struct virtio_gpu_ctrl_command *cmd,
                                       enum virtio_gpu_ctrl_type type)
-@@ -1037,6 +1069,7 @@
+@@ -1037,6 +1069,7 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
          return;
      }
      g->processing_cmdq = true;
@@ -103,7 +106,7 @@ Upstream-Status: Pending
      while (!QTAILQ_EMPTY(&g->cmdq)) {
          cmd = QTAILQ_FIRST(&g->cmdq);
  
-@@ -1072,6 +1105,7 @@
+@@ -1072,6 +1105,7 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
          }
      }
      g->processing_cmdq = false;
@@ -111,7 +114,7 @@ Upstream-Status: Pending
  }
  
  static void virtio_gpu_process_fenceq(VirtIOGPU *g)
-@@ -1094,8 +1128,10 @@
+@@ -1094,8 +1128,10 @@ static void virtio_gpu_handle_gl_flushed(VirtIOGPUBase *b)
  {
      VirtIOGPU *g = container_of(b, VirtIOGPU, parent_obj);
  
@@ -122,17 +125,26 @@ Upstream-Status: Pending
  }
  
  static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
---- a/hw/display/virtio-gpu-virgl.c
-+++ b/hw/display/virtio-gpu-virgl.c
-@@ -1271,8 +1271,11 @@
-     VirtIOGPU *g = opaque;
-     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 8d109a16ee6..4aedbf20248 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -206,6 +206,9 @@ struct VirtIOGPU {
+     uint64_t hostmem;
  
-+    /* fences retired by the poll and the commands they unblock: one interrupt */
-+    virtio_gpu_notify_defer_begin(g);
-     virgl_renderer_poll();
-     virtio_gpu_process_cmdq(g);
-+    virtio_gpu_notify_defer_end(g);
-     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
-         /*
-          * FENCE RETIREMENT IS DISCOVERED ONLY HERE (and at the end of the
+     bool processing_cmdq;
++    /* virtio_gpu_notify_defer_begin/end(): batched control-queue interrupt */
++    unsigned int notify_defer;
++    bool notify_pending;
+ 
+     uint32_t inflight;
+     struct {
+@@ -318,6 +321,8 @@ void virtio_gpu_ctrl_response(VirtIOGPU *g,
+                               struct virtio_gpu_ctrl_command *cmd,
+                               struct virtio_gpu_ctrl_hdr *resp,
+                               size_t resp_len);
++void virtio_gpu_notify_defer_begin(VirtIOGPU *g);
++void virtio_gpu_notify_defer_end(VirtIOGPU *g);
+ void virtio_gpu_ctrl_response_nodata(VirtIOGPU *g,
+                                      struct virtio_gpu_ctrl_command *cmd,
+                                      enum virtio_gpu_ctrl_type type);

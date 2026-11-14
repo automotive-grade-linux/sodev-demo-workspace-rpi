@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 17 Oct 2026 13:15:43 +0900
+Date: Wed, 11 Nov 2026 09:36:33 +0900
 Subject: [PATCH] virtio-media: decoder mode: decode H.264 straight into
  dma-bufs
 
@@ -34,17 +34,22 @@ from a pool of 4-7 buffers. DomD stays busy (idle 11-20 of 200): the
 decode threads take the time freed. The cluster in DomU, HEVC (-T
 60.5/61.1) and VP9 (decoded in DomA) are unchanged.
 
+The imported I420 buffer records neither its stride nor its length:
+VirtIOMediaGpuBuf lost those fields in q11-032, and nothing here reads
+them (the caller keeps the geometry it imported with).
+
 Assisted-by: Claude Code:claude-opus-5-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
 ---
  hw/virtio/virtio-media-decoder.c       | 530 ++++++++++++++++++++++++-
- hw/virtio/virtio-media-virgl.c         | 162 ++++++++
+ hw/virtio/virtio-media-virgl.c         | 160 ++++++++
  include/hw/virtio/virtio-media-virgl.h |  12 +
- 3 files changed, 703 insertions(+), 1 deletion(-)
+ 3 files changed, 701 insertions(+), 1 deletion(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index e59e4d8..673b7cd 100644
+index 05405efa3..c660aa4ca 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -64,6 +64,7 @@
@@ -107,7 +112,7 @@ index e59e4d8..673b7cd 100644
  /*
   * q11-dec-thread: a codec without the hwaccel (H.264) is decoded on a thread
   * of its own; HEVC stays on the main loop, also when it falls back to
-@@ -444,6 +490,19 @@ struct VirtIOMediaDec {
+@@ -451,6 +497,19 @@ struct VirtIOMediaDec {
      bool sw_logged;
      struct SwsContext *sws_nv12;
  
@@ -127,7 +132,7 @@ index e59e4d8..673b7cd 100644
      /* q11-dec-thread (dec_thr_run) */
      bool thr_on;
      QemuThread thr;
-@@ -707,6 +766,8 @@ static void dec_gpu_clear(VirtIOMediaDec *d)
+@@ -712,6 +771,8 @@ static void dec_gpu_clear(VirtIOMediaDec *d)
   * old buffers, so they do not pin the old pool's CMA while the new one is
   * allocated, and give the GPU path another try.
   */
@@ -136,7 +141,7 @@ index e59e4d8..673b7cd 100644
  static void dec_gpu_reset(VirtIOMediaDec *d)
  {
      dec_gpu_clear(d);
-@@ -715,6 +776,13 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+@@ -720,6 +781,13 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
      d->gpu_off = false;
      d->sw_off = false;
      d->gpu_again = 0;
@@ -150,7 +155,7 @@ index e59e4d8..673b7cd 100644
  }
  
  /*
-@@ -1481,6 +1549,308 @@ static void dec_sw_sync(int fd, uint64_t flags)
+@@ -1486,6 +1554,308 @@ static void dec_sw_sync(int fd, uint64_t flags)
      }
  }
  
@@ -459,7 +464,7 @@ index e59e4d8..673b7cd 100644
  /*
   * q11-dec-sw-gpu: a software frame (YUV420P) to the guest's RGBA resource on
   * the GPU. The CPU path converted it to RGBA with swscale -- no NEON path for
-@@ -1598,6 +1968,125 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1603,6 +1973,125 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      return 0;
  }
  
@@ -585,7 +590,7 @@ index e59e4d8..673b7cd 100644
  /*
   * Write one decoded frame into the guest's pages as RGBA.
   *
-@@ -1685,7 +2174,24 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -1690,7 +2179,24 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
      /* q11-dec-sw-gpu: a software frame to the GPU, as dec_gpu_write does */
      if ((fr->format == AV_PIX_FMT_YUV420P || fr->format == AV_PIX_FMT_YUVJ420P) &&
          s->vm->gpu_xfer && !d->sw_off) {
@@ -611,7 +616,7 @@ index e59e4d8..673b7cd 100644
  
          if (r == 0) {
              *bytesused = need;
-@@ -1928,6 +2434,9 @@ static void *dec_thr_run(void *opaque)
+@@ -1933,6 +2439,9 @@ static void *dec_thr_run(void *opaque)
              }
              qemu_mutex_unlock(&d->thr_lock);
              r = avcodec_receive_frame(d->avctx, f);
@@ -621,7 +626,7 @@ index e59e4d8..673b7cd 100644
              qemu_mutex_lock(&d->thr_lock);
              if (d->thr_flush || d->thr_quit) {
                  av_frame_unref(f);
-@@ -2602,6 +3111,11 @@ static int dec_codec_open(VirtIOMediaSession *s)
+@@ -2616,6 +3125,11 @@ static int dec_codec_open(VirtIOMediaSession *s)
      if (!d->codec->hwaccel) {
          d->avctx->thread_count = 2;
          d->avctx->thread_type = FF_THREAD_FRAME;
@@ -633,7 +638,7 @@ index e59e4d8..673b7cd 100644
      }
  
      /*
-@@ -2654,9 +3168,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+@@ -2668,9 +3182,12 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
      dec_thr_stop(d);
      dec_gpu_reset(d);
      dec_sw_clear(d);
@@ -646,7 +651,7 @@ index e59e4d8..673b7cd 100644
      d->stream_fmt_known = false;
      d->awaiting_reconfig = false;
      d->draining = false;
-@@ -2683,6 +3200,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -2697,6 +3214,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
      for (unsigned i = 0; i < DEC_SW_RING; i++) {
          d->sw[i].fd = -1;
      }
@@ -654,7 +659,7 @@ index e59e4d8..673b7cd 100644
      d->backlog = g_queue_new();
      d->coded_w = DEC_MIN_W;
      d->coded_h = DEC_MIN_H;
-@@ -2717,6 +3235,10 @@ fail:
+@@ -2731,6 +3249,10 @@ fail:
      av_buffer_unref(&d->hwdev);
      dec_backlog_clear(d);
      g_queue_free(d->backlog);
@@ -665,7 +670,7 @@ index e59e4d8..673b7cd 100644
      g_free(d);
      return ENOMEM;
  }
-@@ -2731,6 +3253,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -2745,6 +3267,7 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
      dec_thr_stop(d);
      dec_gpu_clear(d);
      dec_sw_clear(d);
@@ -673,7 +678,7 @@ index e59e4d8..673b7cd 100644
      sws_freeContext(d->sws_nv12);
      av_buffer_unref(&d->gpu_fctx);
      if (d->avctx) {
-@@ -2744,6 +3267,11 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -2758,6 +3281,11 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
      dec_backlog_clear(d);
      g_queue_free(d->backlog);
      sws_freeContext(d->sws);
@@ -686,10 +691,10 @@ index e59e4d8..673b7cd 100644
      s->dec = NULL;
  }
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index fa90965..3fe379c 100644
+index 16db48e86..66048897b 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -78,6 +78,9 @@ typedef struct VirtIOMediaGpuBuf {
+@@ -79,6 +79,9 @@ typedef struct VirtIOMediaGpuBuf {
      float scale_x, scale_y;   /* source pixels per destination pixel */
      GLuint tex_uv;
      int matrix;
@@ -699,7 +704,7 @@ index fa90965..3fe379c 100644
      bool sand;                /* planes are SAND128 external textures (host-sand) */
      bool sand_linear;         /* host-sand=2: tex is the whole buffer as linear RGBA8 */
      uint32_t col_height;      /* host-sand=2: lines per 128-byte column */
-@@ -124,6 +127,10 @@ static struct {
+@@ -125,6 +128,10 @@ static struct {
      GLuint prog_sl;
      GLint s_t, s_geom, s_scale, s_yoff, s_yscale, s_coef;
      bool prog_sl_failed;
@@ -710,7 +715,7 @@ index fa90965..3fe379c 100644
  } gpu;
  
  typedef struct GpuSaved {
-@@ -154,6 +161,9 @@ static void gpu_free_buf(VirtIOMediaGpuBuf *b)
+@@ -155,6 +162,9 @@ static void gpu_free_buf(VirtIOMediaGpuBuf *b)
      if (b->tex_uv) {
          glDeleteTextures(1, &b->tex_uv);
      }
@@ -720,7 +725,7 @@ index fa90965..3fe379c 100644
      glDeleteTextures(1, &b->tex);
      g_free(b);
  }
-@@ -405,6 +415,31 @@ static const char *nv12_fs_ext =
+@@ -421,6 +431,31 @@ static const char *nv12_fs_ext =
      "  o = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
      "}\n";
  
@@ -752,7 +757,7 @@ index fa90965..3fe379c 100644
  /*
   * host-sand=2. The buffer is NV12_COL128: 128-byte-wide columns of u_geom.y lines, each luma
   * rows of Y (u_geom.z) then luma/2 rows of interleaved CbCr. It is bound as a linear RGBA8
-@@ -530,6 +565,33 @@ static bool gpu_build_sand_program(void)
+@@ -546,6 +581,33 @@ static bool gpu_build_sand_program(void)
      return true;
  }
  
@@ -786,7 +791,7 @@ index fa90965..3fe379c 100644
  static bool gpu_build_nv12_program(bool ext)
  {
      GLuint p;
-@@ -643,6 +705,75 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+@@ -657,6 +719,73 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
      return b;
  }
  
@@ -828,8 +833,6 @@ index fa90965..3fe379c 100644
 +    b->src_height = src_height;
 +    b->scale_x = scale;
 +    b->scale_y = scale;
-+    b->stride = y_stride;
-+    b->len = len;
 +    b->matrix = matrix;
 +    b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, src_width,
 +                              src_height, y_stride, offset[0], scaled,
@@ -862,7 +865,7 @@ index fa90965..3fe379c 100644
  void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
                                            uint32_t luma_rows, uint32_t col_height,
                                            uint32_t dst_width, uint32_t dst_height,
-@@ -775,6 +906,37 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+@@ -787,6 +916,37 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
          glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
          return 0;
      }
@@ -901,7 +904,7 @@ index fa90965..3fe379c 100644
          glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
          return -EIO;
 diff --git a/include/hw/virtio/virtio-media-virgl.h b/include/hw/virtio/virtio-media-virgl.h
-index 701595d..4776cd0 100644
+index 701595d1e..4776cd0ab 100644
 --- a/include/hw/virtio/virtio-media-virgl.h
 +++ b/include/hw/virtio/virtio-media-virgl.h
 @@ -77,6 +77,18 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,

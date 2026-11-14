@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:57:25 +0900
 Subject: [PATCH] hw/virtio-media: add a stateful decoder mode backed by
  libavcodec
 
@@ -8,16 +8,26 @@ qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0217-v10-hw-virtio-media-add-a-stateful-decoder-mode.patch;
 that patch's description has the reasoning and the measurements.
 
+Changed in the q11 series (review 2026-11-11): the mid-stream
+resolution test in dec_pump() compares the frame with visible_w/h, the
+frame's own size, not with stream_w/h, which dec_norm_dims() has made
+even and clamped to 128..4096; a stream the clamp changed (a 96x96
+thumbnail, say) differed on every frame and announced a SOURCE_CHANGE
+each time. virtio_media_dec_available(), which nothing called, is gone.
+The comments say what is so: the session limit and the once-only open
+log apply to the proxy mode too, five functions lost their static, and
+the forward-port note is in 0217's message.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/meson.build            |    6 +
- hw/virtio/virtio-media-decoder.c | 1384 ++++++++++++++++++++++++++++++
+ hw/virtio/virtio-media-decoder.c | 1378 ++++++++++++++++++++++++++++++
  hw/virtio/virtio-media.c         |  195 ++++-
- include/hw/virtio/virtio-media.h |   72 ++
- meson.build                      |   31 +
- 5 files changed, 1667 insertions(+), 21 deletions(-)
+ include/hw/virtio/virtio-media.h |   73 ++
+ meson.build                      |   32 +
+ 5 files changed, 1663 insertions(+), 21 deletions(-)
  create mode 100644 hw/virtio/virtio-media-decoder.c
 
 diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
@@ -39,10 +49,10 @@ index a9d1cfb2b..0ecc6d4d9 100644
  stub_ss.add(files('vhost-stub.c'))
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
 new file mode 100644
-index 000000000..4e724f1a5
+index 000000000..8e04c1092
 --- /dev/null
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1378 @@
 +/*
 + * VIRTIO-MEDIA decoder mode -- a STATEFUL decoder for the guest, driven by
 + * libavcodec on the host.
@@ -198,11 +208,6 @@ index 000000000..4e724f1a5
 +/* ------------------------------------------------------------------------- */
 +/* helpers                                                                   */
 +/* ------------------------------------------------------------------------- */
-+
-+bool virtio_media_dec_available(void)
-+{
-+    return true;
-+}
 +
 +/*
 + * NORMALISE A RESOLUTION BEFORE IT IS EVER STORED.
@@ -578,8 +583,8 @@ index 000000000..4e724f1a5
 +         * it would lose the IDR the guest needs to start from.
 +         */
 +        if (!d->stream_fmt_known ||
-+            (uint32_t)d->frame->width != d->stream_w ||
-+            (uint32_t)d->frame->height != d->stream_h) {
++            (uint32_t)d->frame->width != d->visible_w ||
++            (uint32_t)d->frame->height != d->visible_h) {
 +            uint32_t sw = d->frame->width, sh = d->frame->height;
 +
 +            /*
@@ -588,7 +593,11 @@ index 000000000..4e724f1a5
 +             * straight into coded_w/h and from there into the allocation size.
 +             * visible_* keeps the frame's real (cropped) size, which is what
 +             * G_SELECTION should report -- the two differ by up to one pixel
-+             * and that is the whole point of a compose rectangle.
++             * and that is the whole point of a compose rectangle. The change
++             * test above compares with visible_*, not with the normalised
++             * stream_*: a stream the clamp changes (below 128 or above 4096
++             * on a side) would otherwise differ on every frame and announce a
++             * SOURCE_CHANGE each time.
 +             */
 +            d->visible_w = sw;
 +            d->visible_h = sh;
@@ -1395,11 +1404,6 @@ index 000000000..4e724f1a5
 + * that answers every ioctl with ENODEV.
 + */
 +
-+bool virtio_media_dec_available(void)
-+{
-+    return false;
-+}
-+
 +bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
 +{
 +    if (!vm->decoder) {
@@ -1428,10 +1432,10 @@ index 000000000..4e724f1a5
 +
 +#endif /* CONFIG_VIRTIO_MEDIA_DECODER */
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index faac3cdc5..554664800 100644
+index e77c7dff3..bd29db098 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -122,7 +122,7 @@ static VirtIOMediaSession *virtio_media_find_session(VirtIOMedia *vm, uint32_t i
+@@ -120,7 +120,7 @@ static VirtIOMediaSession *virtio_media_find_session(VirtIOMedia *vm, uint32_t i
   * that is not an output queue is treated as capture, which matches the driver's
   * own two-queue model.
   */
@@ -1440,7 +1444,7 @@ index faac3cdc5..554664800 100644
  {
      switch (type) {
      case V4L2_BUF_TYPE_VIDEO_OUTPUT:
-@@ -133,7 +133,7 @@ static int virtio_media_queue_index(uint32_t type)
+@@ -131,7 +131,7 @@ static int virtio_media_queue_index(uint32_t type)
      }
  }
  
@@ -1449,7 +1453,7 @@ index faac3cdc5..554664800 100644
  {
      int p;
  
-@@ -313,6 +313,8 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
+@@ -311,6 +311,8 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
      for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
          virtio_media_queue_release(s, &s->queues[i]);
      }
@@ -1458,7 +1462,7 @@ index faac3cdc5..554664800 100644
      if (s->fd >= 0) {
          qemu_set_fd_handler(s->fd, NULL, NULL, NULL);
          close(s->fd);
-@@ -339,8 +341,8 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
+@@ -337,8 +339,8 @@ static void virtio_media_session_free(VirtIOMediaSession *s)
   * because one QEMU serves every DomA virtio device, would take the guest's
   * rootfs disk down with it.
   */
@@ -1469,7 +1473,7 @@ index faac3cdc5..554664800 100644
  {
      size_t done = 0;
      uint32_t i;
-@@ -395,7 +397,7 @@ static bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
+@@ -398,7 +400,7 @@ static bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
   * (virtio_media_send_event_buffer is called for each one at probe and again
   * after each event), so an empty queue means the guest has stopped consuming.
   */
@@ -1478,7 +1482,7 @@ index faac3cdc5..554664800 100644
  {
      VirtIODevice *vdev = VIRTIO_DEVICE(vm);
      VirtQueueElement *elem;
-@@ -412,7 +414,7 @@ static void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len
+@@ -415,7 +417,7 @@ static void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len
      g_free(elem);
  }
  
@@ -1487,7 +1491,7 @@ index faac3cdc5..554664800 100644
  {
      struct virtio_media_event_error evt = {
          .hdr = { .event = VIRTIO_MEDIA_EVT_ERROR, .session_id = s->id },
-@@ -826,6 +828,15 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
+@@ -846,6 +848,15 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
      bool want = false;
      int i;
  
@@ -1503,7 +1507,7 @@ index faac3cdc5..554664800 100644
      for (i = 0; i < ARRAY_SIZE(s->queues); i++) {
          if (s->queues[i].streaming) {
              want = true;
-@@ -883,16 +894,53 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
+@@ -903,16 +914,53 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
  static int virtio_media_do_open(VirtIOMedia *vm, uint32_t *session_id)
  {
      VirtIOMediaSession *s;
@@ -1564,7 +1568,7 @@ index faac3cdc5..554664800 100644
      }
  
      s = g_new0(VirtIOMediaSession, 1);
-@@ -924,8 +972,36 @@ static int virtio_media_do_open(VirtIOMedia *vm, uint32_t *session_id)
+@@ -944,8 +992,36 @@ static int virtio_media_do_open(VirtIOMedia *vm, uint32_t *session_id)
       * (see virtio_media_update_fd_handler), which is also the only time there is
       * anything to drain.
       */
@@ -1603,7 +1607,7 @@ index faac3cdc5..554664800 100644
      *session_id = s->id;
      return 0;
  }
-@@ -1136,8 +1212,9 @@ fail:
+@@ -1159,8 +1235,9 @@ fail:
   * the only way to split them is to walk the entries accumulating lengths until
   * the plane's length is reached. That is what the loop below does.
   */
@@ -1615,7 +1619,7 @@ index faac3cdc5..554664800 100644
  {
      struct v4l2_buffer *b = (struct v4l2_buffer *)payload;
      struct v4l2_plane *guest_planes = NULL;
-@@ -1241,6 +1318,38 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -1268,6 +1345,38 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
          }
      }
  
@@ -1654,7 +1658,7 @@ index faac3cdc5..554664800 100644
      /*
       * An output buffer carries the bitstream the guest just wrote, so it has to
       * be copied into the host buffer BEFORE the host is asked to consume it.
-@@ -1647,7 +1756,17 @@ static void virtio_media_command_bh(void *opaque)
+@@ -1677,7 +1786,17 @@ static void virtio_media_command_bh(void *opaque)
              }
              memset(payload + payload_len, 0, work_len - payload_len);
  
@@ -1673,7 +1677,7 @@ index faac3cdc5..554664800 100644
                  if (payload_len < sizeof(struct v4l2_requestbuffers)) {
                      status = EINVAL;
                  } else {
-@@ -1768,8 +1887,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1798,8 +1917,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      struct v4l2_capability cap;
      int fd;
  
@@ -1696,7 +1700,7 @@ index faac3cdc5..554664800 100644
          return;
      }
  
-@@ -1814,6 +1946,8 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1844,6 +1976,8 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
       * the kernel's numbering and not something reinvented here.
       */
      vm->device_type = 0;
@@ -1705,7 +1709,7 @@ index faac3cdc5..554664800 100644
      vm->next_session_id = 1;
      QLIST_INIT(&vm->sessions);
      vm->cmd_buf = g_malloc0(VIRTIO_MEDIA_CMD_BUF_SIZE);
-@@ -1824,8 +1958,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1854,8 +1988,21 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
      virtio_media_gpu_set_fence_fd(vm->gpu_fence_fd);
  
@@ -1729,7 +1733,7 @@ index faac3cdc5..554664800 100644
  }
  
  static void virtio_media_unrealize(DeviceState *dev)
-@@ -1859,6 +2006,12 @@ static const VMStateDescription vmstate_virtio_media = {
+@@ -1889,6 +2036,12 @@ static const VMStateDescription vmstate_virtio_media = {
  
  static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
@@ -1743,10 +1747,10 @@ index faac3cdc5..554664800 100644
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
      DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 78b14da9d..12052fcac 100644
+index 32dc04a3c..737bc9ef8 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -179,6 +179,15 @@ typedef struct VirtIOMediaBuffer {
+@@ -181,6 +181,15 @@ typedef struct VirtIOMediaBuffer {
  
  #define VIRTIO_MEDIA_MAX_BUFFERS 32
  
@@ -1762,7 +1766,7 @@ index 78b14da9d..12052fcac 100644
  typedef struct VirtIOMediaQueue {
      uint32_t type;                /* the v4l2_buf_type this state is for */
      bool mplane;
-@@ -220,10 +229,21 @@ typedef struct VirtIOMediaQueue {
+@@ -222,10 +231,21 @@ typedef struct VirtIOMediaQueue {
      VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
  } VirtIOMediaQueue;
  
@@ -1784,14 +1788,16 @@ index 78b14da9d..12052fcac 100644
      /*
       * The main-loop fd handler was detached because poll() reported only
       * POLLERR (a streaming queue with no buffer queued). Re-attached by the
-@@ -244,6 +264,18 @@ struct VirtIOMedia {
+@@ -246,6 +266,20 @@ struct VirtIOMedia {
  
      /* Properties. */
      char *v4l2_device;            /* host /dev/videoN to proxy */
 +    /*
 +     * "hevc" selects decoder mode: no host V4L2 device is opened and the guest
 +     * is offered a STATEFUL HEVC decoder backed by libavcodec. Unset (the
-+     * default) keeps the original proxy behaviour byte for byte.
++     * default) keeps the proxy behaviour, except for what this patch adds to
++     * both modes: the limit of VIRTIO_MEDIA_MAX_SESSIONS sessions, and a log
++     * line for the first open only.
 +     *
 +     * WHY A SECOND MODE RATHER THAN A SECOND DEVICE. The protocol handling --
 +     * sessions, the SG serialisation, the event queue, the ioctl table -- is
@@ -1803,7 +1809,7 @@ index 78b14da9d..12052fcac 100644
      /*
       * host-xfer: when a CAPTURE buffer completes and the guest has given the
       * virgl resource id of the gralloc buffer behind it, write the decoded
-@@ -350,4 +382,44 @@ struct VirtIOMedia {
+@@ -352,4 +386,43 @@ struct VirtIOMedia {
      uint8_t *cmd_buf;
  };
  
@@ -1811,7 +1817,7 @@ index 78b14da9d..12052fcac 100644
 +/* shared with virtio-media-decoder.c                                        */
 +/* ------------------------------------------------------------------------- */
 +/*
-+ * These four were static until decoder mode needed them. Nothing about them
++ * These five were static until decoder mode needed them. Nothing about them
 + * changed; only the linkage. Keeping them in virtio-media.c rather than moving
 + * them means the proxy path is textually untouched.
 + */
@@ -1834,10 +1840,9 @@ index 78b14da9d..12052fcac 100644
 +/* decoder mode (virtio-media-decoder.c)                                     */
 +/* ------------------------------------------------------------------------- */
 +/*
-+ * All five are no-ops or hard failures when the device was built without
++ * All four are no-ops or hard failures when the device was built without
 + * libavcodec, so virtio-media.c needs no #ifdef of its own.
 + */
-+bool virtio_media_dec_available(void);
 +/* Validate the `decoder` property at realize time. Returns false and sets errp. */
 +bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp);
 +int virtio_media_dec_open(VirtIOMediaSession *s);
@@ -1849,10 +1854,10 @@ index 78b14da9d..12052fcac 100644
 +
  #endif /* QEMU_VIRTIO_MEDIA_H */
 diff --git a/meson.build b/meson.build
-index 40e3f4ec4..85ced3251 100644
+index 40e3f4ec4..c887f3f30 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -1333,6 +1333,34 @@ if not get_option('alsa').auto() or (host_os == 'linux' and have_system)
+@@ -1333,6 +1333,35 @@ if not get_option('alsa').auto() or (host_os == 'linux' and have_system)
    alsa = dependency('alsa', required: get_option('alsa'),
                      method: 'pkg-config')
  endif
@@ -1866,7 +1871,8 @@ index 40e3f4ec4..85ced3251 100644
 +# colour conversion) and a partial set would fail at link time instead of here.
 +#
 +# host_os, not targetos, and no kwargs: static_kwargs -- qemu removed both before
-+# 10.0.2. See the forward-port note in the commit message.
++# 10.0.2. See the forward-port note in the message of 0217, the 10.0.2 patch
++# this one ports.
 +libavcodec = not_found
 +libavutil = not_found
 +libswscale = not_found
@@ -1887,7 +1893,7 @@ index 40e3f4ec4..85ced3251 100644
  jack = not_found
  if not get_option('jack').auto() or have_system
    jack = dependency('jack', required: get_option('jack'),
-@@ -2271,6 +2299,9 @@ endif
+@@ -2271,6 +2300,9 @@ endif
  config_host_data = configuration_data()
  
  config_host_data.set('CONFIG_HAVE_RUST', have_rust)

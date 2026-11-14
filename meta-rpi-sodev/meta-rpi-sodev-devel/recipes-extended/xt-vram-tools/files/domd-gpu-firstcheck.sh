@@ -30,7 +30,7 @@ fi
 # depends on the attached panel, so probe them rather than hardcoding a value from
 # one particular board+cable setup. CONN_MODE overrides the probe.
 if [ -z "${CONN_MODE:-}" ]; then
-    _c=$(modetest -M vc4 -c 2>/dev/null | awk '$2=="connected"{print $1; exit}')
+    _c=$(modetest -M vc4 -c 2>/dev/null | awk '$3=="connected"{print $1; exit}')
     _r=$(modetest -M vc4 -p 2>/dev/null | awk '/^[0-9]+/{print $1; exit}')
     _m=$(modetest -M vc4 -c 2>/dev/null | awk '/#0/{print $2; exit}')
     [ -n "$_c" ] && [ -n "$_r" ] && [ -n "$_m" ] && CONN_MODE="${_c}@${_r}:${_m}"
@@ -124,9 +124,9 @@ else
     echo "  kmscube not present (skip)"
 fi
 
-# ---- Step 4: weston pixman (CPU render = current default) ----------------
+# ---- Step 4: weston pixman (CPU render = diagnostic fallback) ------------
 echo ""
-echo "===== Step 4: weston pixman renderer (CPU render = clean fallback) ====="
+echo "===== Step 4: weston pixman renderer (CPU render = diagnostic fallback) ====="
 if [ -f /etc/xdg/weston/weston.ini.pixman ]; then
     cp /etc/xdg/weston/weston.ini.pixman /etc/xdg/weston/weston.ini
 fi

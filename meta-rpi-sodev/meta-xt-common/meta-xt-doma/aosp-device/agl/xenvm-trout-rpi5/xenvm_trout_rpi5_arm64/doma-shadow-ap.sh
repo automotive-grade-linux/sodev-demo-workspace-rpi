@@ -101,7 +101,7 @@ byte_len() {
 # doma-wifi-relay.sh, which writes hostapd.conf at runtime by the same rules;
 # the comments there say why each rule exists.
 ssid_hostapd_safe() {
-    case "$1" in ''|*\\*) return 1;; esac
+    case "$1" in ''|'#'*|*\\*) return 1;; esac
     byte_len "$1"; [ "$_bl" -le 32 ]
 }
 psk_is_hex() {
@@ -110,6 +110,7 @@ psk_is_hex() {
 }
 psk_valid() {
     psk_is_hex "$1" && return 0
+    case "$1" in *[[:cntrl:]]*) return 1;; esac
     byte_len "$1"; _n=$_bl
     [ "$_n" -ge 8 ] && [ "$_n" -le 63 ]
 }
@@ -173,7 +174,7 @@ rename_back() {
 # Nothing in /vendor can delete a link, so a boot where the fallback ran first (the
 # property switched back to true without a reboot) stops here; a reboot hands wlan0 to
 # the shadow AP.
-if [ -e /sys/class/net/wlan0 ] && [ -e /sys/class/net/wlan0/lower_buried_eth1 ]; then
+if [ -e /sys/class/net/wlan0 ] && [ -e "/sys/class/net/wlan0/lower_buried_$UPLINK_IF" ]; then
     die "virt_wifi owns wlan0 this boot (setup_wifi ran); reboot to give it to the shadow AP"
 fi
 # AND RENAME THE LOWER INTERFACE BACK if a setup_wifi that ran first renamed eth1 to

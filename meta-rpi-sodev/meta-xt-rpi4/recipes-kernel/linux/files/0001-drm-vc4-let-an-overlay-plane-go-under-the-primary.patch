@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 55d8ae58b88c93bd8b8b0989a7a2fda5c7a1eaf8 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 23 Oct 2026 00:47:54 +0900
+Date: Wed, 11 Nov 2026 08:37:55 +0900
 Subject: [PATCH] drm/vc4: let an overlay plane go under the primary plane
 
 The primary plane had an immutable zpos of 0 and the overlays a range of
@@ -19,9 +19,14 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ drivers/gpu/drm/vc4/vc4_plane.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/vc4/vc4_plane.c b/drivers/gpu/drm/vc4/vc4_plane.c
+index 2c4826ede21b8..53c0fa6ebf15f 100644
 --- a/drivers/gpu/drm/vc4/vc4_plane.c
 +++ b/drivers/gpu/drm/vc4/vc4_plane.c
-@@ -2803,8 +2803,15 @@
+@@ -2803,8 +2803,15 @@ struct drm_plane *vc4_plane_init(struct drm_device *dev,
  
  	drm_plane_create_chroma_siting_properties(plane, 0, 0);
  
@@ -38,7 +43,7 @@ Upstream-Status: Pending
  
  	return plane;
  }
-@@ -2852,7 +2859,7 @@
+@@ -2852,7 +2859,7 @@ int vc4_plane_create_additional_planes(struct drm_device *drm)
  		/* Create zpos property. Max of all the overlays + 1 primary +
  		 * 1 cursor plane on a crtc.
  		 */
@@ -47,7 +52,7 @@ Upstream-Status: Pending
  					       VC4_NUM_OVERLAY_PLANES + 1);
  	}
  
-@@ -2867,7 +2874,7 @@
+@@ -2867,7 +2874,7 @@ int vc4_plane_create_additional_planes(struct drm_device *drm)
  		/* Create zpos property. Max of all the overlays + 1 primary +
  		 * 1 cursor plane on a crtc.
  		 */
@@ -56,3 +61,6 @@ Upstream-Status: Pending
  					       VC4_NUM_OVERLAY_PLANES + 1);
  	}
  
+-- 
+2.43.0
+

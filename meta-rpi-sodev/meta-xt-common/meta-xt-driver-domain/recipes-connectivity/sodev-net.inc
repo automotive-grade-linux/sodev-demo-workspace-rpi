@@ -28,7 +28,6 @@
 # is a parse error ("unparsed line"), so every annotation below is on its own line.
 
 # --- flat L2 management subnet (192.168.10.0/24) ---
-XT_NET_FLAT_SUBNET  ??= "192.168.10.0/24"
 # DomD xenbr0 (assigned LATE by flatbridge; also DomD eth0 gateway)
 XT_DOMD_XENBR0_IP   ??= "192.168.10.10"
 # DomD RP1 eth0 (boot-time, NOT bridged)
@@ -61,7 +60,6 @@ XT_DHCP_RANGE_START ??= "192.168.10.100"
 XT_DHCP_RANGE_END   ??= "192.168.10.200"
 
 # --- Dom0<->DomD point-to-point vif subnet (192.168.0.0/24) ---
-XT_NET_P2P_SUBNET ??= "192.168.0.0/24"
 # Dom0 end of the vif
 XT_DOM0_VIF_IP    ??= "192.168.0.1"
 # DomD xen-netfront end of the vif

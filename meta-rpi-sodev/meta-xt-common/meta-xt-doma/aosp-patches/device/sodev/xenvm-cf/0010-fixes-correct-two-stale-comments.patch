@@ -1,7 +1,7 @@
-From d3f30754daad67c770df937267f75be6c775b169 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 19 Oct 2026 01:20:41 +0900
-Subject: [PATCH] fixes: correct two stale comments
+Date: Wed, 11 Nov 2026 09:41:06 +0900
+Subject: [PATCH] fixes: correct three stale comments
 
 - init.xenvm-buried-eth0.rc said eth1 keeps .13, the address adb
   connects to; eth1 becomes a port of the shadow AP's bridge, so DomA
@@ -9,22 +9,45 @@ Subject: [PATCH] fixes: correct two stale comments
   no wlan0 to protect" meant virtwifi's; say so, since the shadow AP's
   station is a wlan0.
 - sepolicy/file_contexts said the two scripts' denials can be told
-  apart by domain; both run as doma_shadow_ap, so by pid.
+  apart by the time they run; they overlap at boot (the relay watches
+  init.svc.vendor.doma_shadow_ap while the oneshot runs), and both run
+  as doma_shadow_ap, so by pid.
+- init.xenvm-buried-eth0.rc cited cuttlefish's reference-ril as if it
+  were in the 17 tree; it is Android 15's (android-15.0.0_r1), and 17
+  has no such file.
 The Raspberry Pi 5's copies in the AGL layer get the same text.
 
 Assisted-by: Claude Code:claude-opus-5-5
+Assisted-by: Claude Code:claude-fable-5-1
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
 ---
- init.xenvm-buried-eth0.rc | 7 ++++---
- sepolicy/file_contexts    | 5 +++--
- 2 files changed, 7 insertions(+), 5 deletions(-)
+ init.xenvm-buried-eth0.rc | 16 +++++++++-------
+ sepolicy/file_contexts    |  5 +++--
+ 2 files changed, 12 insertions(+), 9 deletions(-)
 
 diff --git a/init.xenvm-buried-eth0.rc b/init.xenvm-buried-eth0.rc
-index 3830385..67c4eb2 100644
+index 3830385..cbfe842 100644
 --- a/init.xenvm-buried-eth0.rc
 +++ b/init.xenvm-buried-eth0.rc
-@@ -89,13 +89,14 @@
+@@ -42,10 +42,11 @@
+ # WHY THIS ONLY MATTERS FROM ANDROID 17
+ # -------------------------------------
+ # The disabled trigger is not new -- trout has set the property since the 15 era --
+-# and neither is the hard-coded interface name: cuttlefish's own reference-ril
+-# hard-codes it too (guest/hals/ril/reference-ril/reference-ril.c:62
+-# `#define PPP_TTY_PATH_ETH0 "buried_eth0"`). What changed is that until 17 no radio
+-# HAL on this product ever asked for the interface:
++# and neither is the hard-coded interface name: Android 15's cuttlefish reference-ril
++# hard-coded it too (guest/hals/ril/reference-ril/reference-ril.c:62 at
++# android-15.0.0_r1, `#define PPP_TTY_PATH_ETH0 "buried_eth0"`; the 17 tree no longer
++# has that file). What changed is that until 17 no radio HAL on this product ever
++# asked for the interface:
+ #
+ #   Android 15  hardware/interfaces/radio/aidl/minradio does not exist, and
+ #               device/google/cuttlefish/shared/auto/device_vendor.mk mentions
+@@ -89,13 +90,14 @@
  #     service only runs `cmd wifi set-wifi-enabled` / `connect-network VirtWifi`
  #     (the product installs an empty virtwifi.rc over it), and cuttlefish's
  #     setup_wifi, which is what creates the interface, is gated on

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 19 Oct 2026 21:24:05 +0900
+Date: Wed, 11 Nov 2026 08:33:54 +0900
 Subject: [PATCH] virtio-media: decoder mode: offer scaled frames, keep more of
  them
 
@@ -47,13 +47,13 @@ weston's GPU time 38% -> under 2%, the whole picture on the panel
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
 ---
  hw/virtio/virtio-media-decoder.c | 61 ++++++++++++++++++++++++--------
  1 file changed, 46 insertions(+), 15 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 673b7cd..986311b 100644
+index c660aa4ca..d98a92cb9 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -198,16 +198,23 @@ typedef struct DecGpuEntry {
@@ -85,7 +85,7 @@ index 673b7cd..986311b 100644
   *
   * The limits of that probe: the pool keeps every buffer it allocated until the
   * stream stops (v4l2request never frees one), so a probe that grew it leaves
-@@ -826,8 +833,9 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
+@@ -831,8 +838,9 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
   * guest buffer it was converted into, so that weston puts a full-screen frame
   * on an HVS plane; this is the same for the decoder's (v4l2request) buffers.
   * The display (ui/sdl2-gl.c, sdl2-wl-scanout.c) takes the buffer instead of the
@@ -97,7 +97,7 @@ index 673b7cd..986311b 100644
   *
   * Unlike the proxy's, the pixels live in libavcodec's pool, not in a buffer the
   * guest queues: a frame stays showable while a reference to it is kept, and the
-@@ -864,6 +872,20 @@ static bool dec_ds_skip_on(void)
+@@ -869,6 +877,20 @@ static bool dec_ds_skip_on(void)
      return dec_ds_file_on("/run/qemu-sand-skip-isp", &checked, &on);
  }
  
@@ -118,7 +118,7 @@ index 673b7cd..986311b 100644
  static uint64_t dec_ds_epochs;
  
  static bool dec_ds_current(void *owner, uint32_t slot, uint64_t seq)
-@@ -1146,13 +1168,21 @@ static void dec_ds_drop(VirtIOMediaDec *d)
+@@ -1151,13 +1173,21 @@ static void dec_ds_drop(VirtIOMediaDec *d)
          direct_scanout_forget(d);
          d->ds_epoch = 0;
      }
@@ -144,7 +144,7 @@ index 673b7cd..986311b 100644
                      d->ds_evict_release_n, d->ds_evict_held_n, d->ds_starved_n);
          d->ds_pub_n = d->ds_skip_n = d->ds_catch_n = d->ds_lost_n = 0;
          d->ds_evict_held_n = d->ds_starved_n = d->ds_evict_release_n = 0;
-@@ -1411,9 +1441,9 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1416,9 +1446,9 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
      assert(!d->thr_on);   /* avctx below: a hwaccel codec has no decode thread */
      tex = virtio_media_gpu_res_tex(gb->virgl_res);
@@ -157,7 +157,7 @@ index 673b7cd..986311b 100644
      if (show && e->show_fd < 0) {
          e->show_fd = fcntl(desc->objects[0].fd, F_DUPFD_CLOEXEC, 0);
      }
-@@ -1442,7 +1472,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1447,7 +1477,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      if (show) {
          DirectScanout ds = {
              .owner = d, .epoch = d->ds_epoch ? d->ds_epoch : ++dec_ds_epochs,

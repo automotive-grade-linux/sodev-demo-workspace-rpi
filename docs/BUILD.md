@@ -769,6 +769,10 @@ yet, `do_compile` then aborts with the paths it could not find.
 `build.sh` handles this: in `source` mode it runs
 
     ninja fetch-doma_kernel fetch-doma
+      && meta-rpi-sodev/meta-xt-common/meta-xt-doma/apply-aosp-patches.sh "$PWD/<aosp>" aosp-patches \
+             "$PWD/<aosp>/out/target/product/<product>/boot.img"
+      && meta-rpi-sodev/meta-xt-common/meta-xt-doma/apply-aosp-patches.sh "$PWD/<kernel>" aosp-kernel-patches \
+             "$PWD/<kernel>/<deploy dir>/Image"
       && meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-aosp-device.sh "$PWD/<aosp>" <board>
       && ninja doma_kernel
       && meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-doma-kernel.sh \
@@ -776,6 +780,10 @@ yet, `do_compile` then aborts with the paths it could not find.
       && ninja doma
       && ninja image-full
 
+The two apply-aosp-patches.sh steps come right after the fetch because `repo sync`
+hard-resets every project and moulin has no hook to apply a patch after it; the AOSP
+patch set and the guest-kernel patch set are this workspace's deltas to repo-owned
+projects (the device tree is copied, not patched, by stage-aosp-device.sh).
 The two staging steps are why this is not a plain `ninja doma_kernel doma`: moulin has no
 hook between `repo sync` and the AOSP build, so the board's AAOS product variant
 (a no-op on rpi5) and the guest kernel copy Soong insists on have to be inserted between
@@ -787,7 +795,9 @@ declares ninja's `console` pool, whose depth is 1, so the components are seriali
 either way — this only fixes *which* order.
 
 If you drive ninja by hand, run that whole sequence, not just the two goals: skipping
-`stage-doma-kernel.sh` builds the AOSP images against a stale kernel copy. See
+the two apply-aosp-patches.sh steps leaves the AOSP and guest-kernel patch sets
+unapplied, and skipping `stage-doma-kernel.sh` builds the AOSP images against a stale
+kernel copy. See
 *Keep the guest kernel and the p4 images coherent*. This also applies to
 `--domains-only`: it still builds DomD, and moulin's default ninja target does *not*
 include `doma`/`doma_kernel`.
@@ -839,7 +849,7 @@ AOSP checkout to derive from and so takes those two artifacts out of the bundle.
 |---|---|---|---|
 | **Nothing at all** | `./build.sh -u --aaos=source` | yes | moulin runs its own `repo init` + `repo sync`. See *Case A* below |
 | **A `.repo` object mirror** | `./build.sh -u --aaos=source --aaos-ref=<mirror> --aaos-kernel-ref=<mirror>` | yes | objects come from the mirror instead of the network. See *Case B* below |
-| **An AOSP checkout** | `./build.sh -u --aaos=source --aaos-src=<dir>` | yes | skips the sync; `<dir>` is symlinked in as `<workspace>/android` |
+| **An AOSP checkout** | `./build.sh -u --aaos=source --aaos-src=<dir>` | yes | `<dir>` is symlinked in as the board's `DOMA_DIR` (`<workspace>/android`, `android-rpi4` on the RPi4) instead of cloned; moulin still runs an incremental `repo sync` on it while the workspace has no sync stamp for it, or when `<dir>/.repo` is newer than the stamp |
 | **A prebuilt bundle** | `./build.sh -u --aaos=prebuilt --aaos-prebuilt=<dir>` | **no** | minutes instead of hours. Bundle contract below |
 
 `-a` is `--aaos=auto` and resolves to `prebuilt` if a bundle is found, else `source` if a

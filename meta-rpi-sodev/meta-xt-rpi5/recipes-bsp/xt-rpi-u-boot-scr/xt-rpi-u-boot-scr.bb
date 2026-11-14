@@ -46,8 +46,11 @@ UBOOT_BOOT_SCRIPT_SOURCE ?= "boot.cmd"
 # pass dom0_mem=512M and xsm=dummy. Keeping a stale, unread copy of the hypervisor
 # command line next to the real one is worse than not having it. The live values are
 # in meta-xt-rpi5/recipes-bsp/xt-rpi-u-boot-scr/files/boot.cmd.xen.*-dom0.in.
-# The DOM0_/DOMD_/XEN_ IMAGE and *_ADDR variables above are kept: they still document
-# the upstream load-address budget the static scripts were checked against.
+# The DOM0_/DOMD_/XEN_ IMAGE and *_ADDR variables above are kept: they are upstream
+# meta-xt-rpi5's load-address budget, which the static scripts were checked against.
+# They are NOT what this board loads -- boot.cmd.xen.*-dom0.in fatload xen at
+# 0x2000000, zephyr.bin at 0x4000000 (Linux Dom0: Image at 0x4000000), the DomD
+# Image at 0xc000000 and bcm2712-raspberrypi5-domd-vc4.dtb at 0xa000000.
 
 # XEN_OVERLAYS is likewise not consumed by any task here. It is kept because the
 # vendored xt-prod-devel-rpi5-domd bbappend appends to it, and that layer is carried

@@ -1,8 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 70fddacb2322a8910d17fa00f48dc552d2b6ef3e Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 09:40:19 +0900
-Subject: [PATCH] virtio-media: keep a session the device reported an error
- for
+Date: Wed, 11 Nov 2026 08:35:16 +0900
+Subject: [PATCH] virtio-media: keep a session the device reported an error for
 
 On VIRTIO_MEDIA_EVT_ERROR the driver closed and freed the session at
 once, while user space still had the node open. The next ioctl on that
@@ -31,6 +30,13 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ driver/session.h             |  4 ++++
+ driver/virtio_media_driver.c | 31 ++++++++++++++++++++++++++++++-
+ driver/virtio_media_ioctls.c | 23 ++++++++++++++++++++++-
+ 3 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/driver/session.h b/driver/session.h
+index 440a3ad..a166c27 100644
 --- a/driver/session.h
 +++ b/driver/session.h
 @@ -133,6 +133,9 @@ struct virtio_media_queue_state {
@@ -51,6 +57,8 @@ Upstream-Status: Pending
  
  	struct list_head list;
  };
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index a2099b6..02d8936 100644
 --- a/driver/virtio_media_driver.c
 +++ b/driver/virtio_media_driver.c
 @@ -661,7 +661,17 @@ process_bufs:
@@ -98,6 +106,8 @@ Upstream-Status: Pending
  	mutex_lock(&session->queues_lock);
  	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
  		/*
+diff --git a/driver/virtio_media_ioctls.c b/driver/virtio_media_ioctls.c
+index 75b08a7..2d57a2d 100644
 --- a/driver/virtio_media_ioctls.c
 +++ b/driver/virtio_media_ioctls.c
 @@ -1181,10 +1181,13 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
@@ -140,3 +150,6 @@ Upstream-Status: Pending
  	/*
  	 * We need to handle a few ioctls manually because their result
  	 * rely on vfd->tvnorms, which is normally updated by the driver
+-- 
+2.43.0
+

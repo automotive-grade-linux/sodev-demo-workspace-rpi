@@ -47,7 +47,7 @@ Upstream-Status: Inappropriate [this layer's q11 plane handoff and decoder mode]
  4 files changed, 173 insertions(+), 8 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 1c85db061..4dfb4054d 100644
+index 784ab84f0..933c6bda6 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -65,6 +65,7 @@
@@ -71,7 +71,7 @@ index 1c85db061..4dfb4054d 100644
  /* -EAGAIN (no GL context) this many frames in a row is reported once. */
  #define DEC_GPU_AGAIN_WARN 120
  
-@@ -542,6 +549,15 @@ struct VirtIOMediaDec {
+@@ -549,6 +556,15 @@ struct VirtIOMediaDec {
      GQueue *thr_out;        /* DecThrOut * */
      bool thr_quit, thr_flush, thr_eof;
      QEMUBH *thr_bh;
@@ -87,7 +87,7 @@ index 1c85db061..4dfb4054d 100644
      int thr_reorder;        /* avctx->has_b_frames after the last frame (thr_lock) */
      unsigned thr_out_max;   /* decoded ahead at most (2 with the hwaccel's device) */
  };
-@@ -757,6 +773,93 @@ static int dec_next_cap_buffer(VirtIOMediaSession *s)
+@@ -762,6 +778,93 @@ static int dec_next_cap_buffer(VirtIOMediaSession *s)
      return -1;
  }
  
@@ -181,7 +181,7 @@ index 1c85db061..4dfb4054d 100644
  /* ------------------------------------------------------------------------- */
  /* host-sand: hardware frames on the GPU                                     */
  /* ------------------------------------------------------------------------- */
-@@ -2188,9 +2291,10 @@ static void dec_zc_report(VirtIOMediaDec *d)
+@@ -2193,9 +2296,10 @@ static void dec_zc_report(VirtIOMediaDec *d)
                  "decoder's buffers, %" PRIu64 " staged (%" PRIu64 " not in "
                  "the pool, %" PRIu64 " layout or guest buffer, %" PRIu64
                  " no GL, %" PRIu64 " off); pool %u buffers, %" PRIu64
@@ -194,7 +194,7 @@ index 1c85db061..4dfb4054d 100644
  }
  
  /*
-@@ -2553,7 +2657,7 @@ static void dec_fail(VirtIOMediaSession *s, int err)
+@@ -2558,7 +2662,7 @@ static void dec_fail(VirtIOMediaSession *s, int err)
  static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
  {
      uint32_t bytesused = 0;
@@ -203,7 +203,7 @@ index 1c85db061..4dfb4054d 100644
  
      if (index < 0) {
          return false;
-@@ -2691,8 +2795,6 @@ static void *dec_thr_run(void *opaque)
+@@ -2696,8 +2800,6 @@ static void *dec_thr_run(void *opaque)
      return NULL;
  }
  
@@ -212,7 +212,7 @@ index 1c85db061..4dfb4054d 100644
  /* Frames came out of the thread: deliver them, as a QBUF would. */
  static void dec_thr_bh(void *opaque)
  {
-@@ -2708,7 +2810,7 @@ static void dec_thr_bh(void *opaque)
+@@ -2713,7 +2815,7 @@ static void dec_thr_bh(void *opaque)
      more = o && o->err != AVERROR_EOF;
      qemu_mutex_unlock(&d->thr_lock);
      /* dec_pump delivers DEC_PUMP_MAX_FRAMES a call; the rest on the next turn */
@@ -221,7 +221,7 @@ index 1c85db061..4dfb4054d 100644
          !d->awaiting_reconfig) {
          qemu_bh_schedule(d->thr_bh);
      }
-@@ -3144,7 +3246,9 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -3158,7 +3260,9 @@ static void dec_pump(VirtIOMediaSession *s)
  
          if (!dec_deliver(s, d->frame)) {
              /*
@@ -232,7 +232,7 @@ index 1c85db061..4dfb4054d 100644
               * av_frame_free first: d->held should be NULL by the reasoning at
               * the top of this function, but an assignment over a non-NULL held
               * frame is a silent leak and the guard costs nothing.
-@@ -3362,6 +3466,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+@@ -3376,6 +3480,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
          return EBUSY;
      }
      dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
@@ -240,7 +240,7 @@ index 1c85db061..4dfb4054d 100644
      dec_thr_stop(d);
      dec_gpu_reset(d);
      dec_sw_clear(d);
-@@ -3447,6 +3552,10 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -3461,6 +3566,10 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
          return;
      }
      dec_let_go(d);   /* a decode waiting for a pool buffer gets one */
@@ -252,12 +252,12 @@ index 1c85db061..4dfb4054d 100644
      dec_gpu_clear(d);
      dec_sw_clear(d);
 diff --git a/include/ui/console.h b/include/ui/console.h
-index 6afeefaec..d89cf1a57 100644
+index 9b8ffd61e..634df73d4 100644
 --- a/include/ui/console.h
 +++ b/include/ui/console.h
-@@ -325,6 +325,8 @@ void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
+@@ -327,6 +327,8 @@ void qemu_console_gl_overlay(QemuConsole *con, unsigned int idx, bool on,
  extern uint32_t q11_scanout0_resource_id;
- extern uint32_t q11_overlay_resource_id[3];        /* the same for the overlay planes */
+ extern uint32_t q11_overlay_resource_id[QEMU_CONSOLE_MAX_OVERLAYS]; /* the same for the overlays */
  extern void (*q11_resource_gone_cb)(uint32_t res); /* the guest unref'd res */
 +/* q11-plane-held: weston still holds a plane buffer of res (ui/sdl2-wl-scanout.c) */
 +extern bool (*q11_plane_res_held_cb)(uint32_t res);
@@ -265,22 +265,22 @@ index 6afeefaec..d89cf1a57 100644
                                    uint32_t w, uint32_t h, uint32_t crtc_w,
                                    uint32_t crtc_h); /* q11-primary-rect */
 diff --git a/ui/console.c b/ui/console.c
-index 86a07ce86..ffde46866 100644
+index c1eb52d3c..6f45d5ab9 100644
 --- a/ui/console.c
 +++ b/ui/console.c
-@@ -1023,6 +1023,7 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+@@ -1026,6 +1026,7 @@ void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
  uint32_t q11_scanout0_resource_id; /* q11-plane-handoff */
- uint32_t q11_overlay_resource_id[3];
+ uint32_t q11_overlay_resource_id[QEMU_CONSOLE_MAX_OVERLAYS];
  void (*q11_resource_gone_cb)(uint32_t res);
 +bool (*q11_plane_res_held_cb)(uint32_t res); /* q11-plane-held */
  
  void qemu_console_gl_primary_rect(QemuConsole *con, int32_t x, int32_t y,
                                    uint32_t w, uint32_t h, uint32_t crtc_w,
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
-index e459f7e1d..249029e67 100644
+index 097573cdc..5649af21c 100644
 --- a/ui/sdl2-wl-scanout.c
 +++ b/ui/sdl2-wl-scanout.c
-@@ -608,6 +608,11 @@ typedef struct WlPlaneBuf {
+@@ -606,6 +606,11 @@ typedef struct WlPlaneBuf {
      ino_t ino;
      uint32_t fourcc, stride;
      bool ready, failed, pending;
@@ -292,7 +292,7 @@ index e459f7e1d..249029e67 100644
  } WlPlaneBuf;
  
  static struct {
-@@ -712,6 +717,47 @@ static bool plane_in_use(WlPlaneBuf *b)
+@@ -710,6 +715,47 @@ static bool plane_in_use(WlPlaneBuf *b)
  
  static void pl_cache_add(WlPlaneBuf *b);
  
@@ -340,7 +340,7 @@ index e459f7e1d..249029e67 100644
  static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
  {
      int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-@@ -763,6 +809,10 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
+@@ -761,6 +807,10 @@ static WlPlaneBuf *plane_buf(uint32_t tex, uint32_t w, uint32_t h, uint32_t res)
      b->used = now;
      b->wb = zwp_linux_buffer_params_v1_create_immed(params, w, h, fourcc, 0);
      zwp_linux_buffer_params_v1_destroy(params);
@@ -351,7 +351,7 @@ index e459f7e1d..249029e67 100644
      for (int i = 0; i < np; i++) {
          close(fd[i]);
      }
-@@ -788,7 +838,7 @@ static void pl_cache_add(WlPlaneBuf *b)
+@@ -800,7 +850,7 @@ static void pl_cache_add(WlPlaneBuf *b)
               * So the cache can grow past WL_PLANE_CACHE while every entry is on screen or
               * waiting for weston; it shrinks again as they are answered.
               */
@@ -360,15 +360,15 @@ index e459f7e1d..249029e67 100644
                  t = o->used;
                  lru = i;
              }
-@@ -955,6 +1005,7 @@ static void pl_resource_gone(uint32_t res)
+@@ -991,6 +1041,7 @@ static void pl_resource_gone(uint32_t res)
          }
-         b->tex = 0; /* the LRU frees it once it is off screen */
+         b->tex = 0; /* on screen or unanswered: freed when the plane moves on / weston answers */
          b->ino = 0;
 +        b->res = 0; /* q11-plane-held: the id may come back as another resource */
      }
  }
  
-@@ -1078,6 +1129,7 @@ static bool planes_create(void)
+@@ -1114,6 +1165,7 @@ static bool planes_create(void)
          wl_subsurface_set_sync(pl.ss[i]);
      }
      q11_resource_gone_cb = pl_resource_gone;
@@ -376,7 +376,7 @@ index e459f7e1d..249029e67 100644
      info_report("sdl2: plane-handoff: %d subsurfaces on the window", WL_PLANES);
      return true;
  }
-@@ -1162,6 +1214,7 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
+@@ -1198,6 +1250,7 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
      wl_surface_attach(pl.s[i], b->wb, 0, 0);
      wl_surface_damage_buffer(pl.s[i], 0, 0, INT32_MAX, INT32_MAX);
      wl_surface_commit(pl.s[i]);
@@ -384,6 +384,3 @@ index e459f7e1d..249029e67 100644
      pl.cur[i] = b;
  }
  
--- 
-2.43.0
-

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:38:58 +0900
 Subject: [PATCH] virtio-media: park the host fd handler while poll() reports
  only POLLERR
 
@@ -10,17 +10,17 @@ that patch's description has the reasoning and the measurements.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media.c         | 37 ++++++++++++++++++++++++++++++++
  include/hw/virtio/virtio-media.h |  6 ++++++
  2 files changed, 43 insertions(+)
 
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 0e1040c2c..4de592d4c 100644
+index 07cdb3001..487bbe430 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -510,6 +510,36 @@ static void virtio_media_host_readable(void *opaque)
+@@ -513,6 +513,36 @@ static void virtio_media_host_readable(void *opaque)
      }
      revents = pfd.revents;
  
@@ -57,7 +57,7 @@ index 0e1040c2c..4de592d4c 100644
      /* V4L2 events first: a SOURCE_CHANGE tells the guest to re-negotiate. */
      if (revents & POLLPRI) {
          virtio_media_drain_events(s);
-@@ -801,6 +831,7 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
+@@ -821,6 +851,7 @@ static void virtio_media_update_fd_handler(VirtIOMediaSession *s)
              want = true;
          }
      }
@@ -65,7 +65,7 @@ index 0e1040c2c..4de592d4c 100644
      if (want) {
          /*
           * NOTE: BOTH CALLBACKS ARE THE SAME FUNCTION, AND THE WRITE ONE IS NOT
-@@ -1249,6 +1280,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -1275,6 +1306,12 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
      }
  
      gb->queued = true;
@@ -79,10 +79,10 @@ index 0e1040c2c..4de592d4c 100644
  }
  
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 6b145becc..0731dacd2 100644
+index f28bff618..ea459eba3 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -224,6 +224,12 @@ typedef struct VirtIOMediaSession {
+@@ -226,6 +226,12 @@ typedef struct VirtIOMediaSession {
      struct VirtIOMedia *vm;
      uint32_t id;
      int fd;

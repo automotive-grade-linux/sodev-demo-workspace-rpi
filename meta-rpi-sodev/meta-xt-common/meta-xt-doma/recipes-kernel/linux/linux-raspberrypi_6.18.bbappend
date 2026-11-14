@@ -1,6 +1,7 @@
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-# vhost_xen module + vsock.cfg (driver-domain virtio backend support for AAOS).
+# vhost_xen backend (built in, VHOST_XEN=y) + vsock.cfg (driver-domain virtio
+# backend support for AAOS).
 # The DomA (AAOS) virtio rings carry grant/foreign addresses, so the DomD-side
 # vhost must map guest pages via Xen grant/foreign mappings; stock 6.18 vhost
 # cannot, so vsock over virtio fails and the VHAL never reaches the guest.
@@ -11,7 +12,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # Upstream attribution (Signed-off-by preserved verbatim inside each .patch):
 #   0004-0008 = Oleksandr Tyshchenko / Dmytro Firsov (EPAM), Acked-by V. Babchuk
 #   0011      = Yuya Hamamachi (Renesas)
-#   0012/0013 = Yuichi Kusakabe (RPi5-specific EXPORT_SYMBOL_GPL + domid-rebind fix)
+#   0012-0014 = Yuichi Kusakabe (EXPORT_SYMBOL_GPL for VHOST_XEN=y with
+#               VHOST_NET=m, which both boards' configs produce; the domid
+#               rebind; the review hardening, which also carries the fixes to
+#               lines the EPAM patches added so that 0004-0011 stay as fetched)
+# 0007's message describes the fork's defconfig (VHOST_NET=y, TAP=y, MACVLAN=y,
+# MACVTAP=y); in this build those four are =m, see vsock.cfg.
 # inline-python in SRC_URI breaks wrynose's
 # fetcher_hashes_dummyfunc[vardepvalue] (raw ${@...} survives unexpanded ->
 # NoMethodError). Moved out of SRC_URI into anonymous python. Effective SRC_URI

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 16:49:05 +0900
+Date: Wed, 11 Nov 2026 08:34:25 +0900
 Subject: [PATCH] xen-mapcache: let QEMU_XEN_MAPCACHE_MAX_MB cap the foreign
  mapcache
 
@@ -25,18 +25,31 @@ unset (the default) keeps the built-in cap. The grant mapcache is not
 affected: its entries are unmapped when their lock count drops to zero
 anyway.
 
+The value is parsed with qemu_strtoul() and must be the whole string
+("64abc" is ignored with a warning, as is any other non-number), and the
+comparison with the built-in cap is made in MB, so that a huge value
+cannot wrap the shift to megabytes and come out as a tiny cap.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [this layer's Xen device model; switched by an environment variable]
 ---
- hw/xen/xen-mapcache.c | 32 +++++++++++++++++++++++++++++---
- 1 file changed, 29 insertions(+), 3 deletions(-)
+ hw/xen/xen-mapcache.c | 41 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 38 insertions(+), 3 deletions(-)
 
 diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
-index def688817..c617c92ef 100644
+index def688817..e889010be 100644
 --- a/hw/xen/xen-mapcache.c
 +++ b/hw/xen/xen-mapcache.c
-@@ -184,9 +184,35 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
+@@ -11,6 +11,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/units.h"
+ #include "qemu/error-report.h"
++#include "qemu/cutils.h"
+ 
+ #include <sys/resource.h>
+ 
+@@ -184,9 +185,43 @@ void xen_map_cache_init(phys_offset_to_gaddr_t f, void *opaque)
          }
      }
  
@@ -48,7 +61,8 @@ index def688817..c617c92ef 100644
 +     *
 +     * WHY. A 64-bit host gets a 32 GB cap, i.e. one bucket per 64 KiB of any
 +     * guest, so nothing ever collides, and with bucket heads kept mapped once
-+     * unlocked (0224) every page the guest has ever DMAed through stays mapped.
++     * unlocked (q11-027, the port of 0224) every page the guest has ever DMAed
++     * through stays mapped.
 +     * On Arm each foreign mapping lives in the kernel's unpopulated "Xen
 +     * scratch" space, which is sized from the hypervisor's extended regions:
 +     * 17 x 128 MB on RPi4 DomD, for a 2 GB DomA plus blobs and grants. Once the
@@ -61,9 +75,16 @@ index def688817..c617c92ef 100644
 +     */
 +    {
 +        const char *cap = getenv("QEMU_XEN_MAPCACHE_MAX_MB");
-+        unsigned long mb = cap ? strtoul(cap, NULL, 10) : 0;
++        const char *end = NULL;
++        unsigned long mb = 0;
 +
-+        if (mb >= 64 && (mb << 20) < max_mcache_size) {
++        if (cap && (qemu_strtoul(cap, &end, 10, &mb) || *end)) {
++            warn_report("xen mapcache: QEMU_XEN_MAPCACHE_MAX_MB '%s' is not a"
++                        " number; ignored", cap);
++            mb = 0;
++        }
++        /* mb < max >> 20 rather than mb << 20 < max: the shift must not wrap. */
++        if (mb >= 64 && mb < (max_mcache_size >> 20)) {
 +            info_report("xen mapcache: foreign cache capped at %lu MB", mb);
 +            mapcache = xen_map_cache_init_single(f, opaque, bucket_shift,
 +                                                 mb << 20);

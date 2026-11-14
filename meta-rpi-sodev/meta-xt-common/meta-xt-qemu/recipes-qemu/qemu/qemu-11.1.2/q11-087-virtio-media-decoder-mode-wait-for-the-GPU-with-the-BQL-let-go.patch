@@ -43,10 +43,10 @@ Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
  3 files changed, 67 insertions(+), 6 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 4dc8431c8..1c85db061 100644
+index d91bdcff9..784ab84f0 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -778,6 +778,44 @@ static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
+@@ -783,6 +783,44 @@ static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
      dec_gpu_drop_oldest(d);
  }
  
@@ -91,7 +91,7 @@ index 4dc8431c8..1c85db061 100644
  /*
   * q11-dec-gpu-poll: let go of the held frames whose GPU copies are done,
   * without waiting. Each frame is tested on its own buffer's fence, so none goes
-@@ -888,8 +926,13 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+@@ -893,8 +931,13 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
   * hardware codec (HEVC), and a copy without a fence fd (GLsync), still waits
   * for the oldest one at DEC_GPU_HOLD: HEVC's buffers come from v4l2request's
   * pool, in CMA.
@@ -106,7 +106,7 @@ index 4dc8431c8..1c85db061 100644
  {
      AVFrame *ref = av_frame_alloc();
  
-@@ -905,7 +948,11 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
+@@ -910,7 +953,11 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
      }
      if (dec_gpu_reap(d) && !d->codec->hwaccel) {
          if (d->gpu_held_n >= DEC_GPU_HOLD_MAX) {
@@ -119,7 +119,7 @@ index 4dc8431c8..1c85db061 100644
          }
      } else if (d->gpu_held_n >= DEC_GPU_HOLD) {
          dec_gpu_unhold_oldest(d);
-@@ -1026,7 +1073,7 @@ static void dec_ds_settle_slot(VirtIOMediaDec *d, unsigned slot)
+@@ -1031,7 +1078,7 @@ static void dec_ds_settle_slot(VirtIOMediaDec *d, unsigned slot)
          if (dec_ds_current(d, slot, p->seq) &&
              virtio_media_gpu_blit(d->gpu[slot].handle, p->res) == 0) {
              /* the decoder must not write the buffer before the GPU read it */
@@ -128,7 +128,7 @@ index 4dc8431c8..1c85db061 100644
              d->ds_catch_n++;
          } else {
              d->ds_lost_n++;
-@@ -1582,7 +1629,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1587,7 +1634,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
              }
              return r;
          }
@@ -137,7 +137,7 @@ index 4dc8431c8..1c85db061 100644
          dec_ds_unpend(d, gb->virgl_res);
      }
      if (show) {
-@@ -2221,7 +2268,7 @@ static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -2226,7 +2273,7 @@ static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          return r;
      }
      /* the decoder may write the slot again once the frame is let go */
@@ -199,6 +199,3 @@ index c713c0356..f3524dbde 100644
  
      Notifier exit;
  } XenIOState;
--- 
-2.43.0
-

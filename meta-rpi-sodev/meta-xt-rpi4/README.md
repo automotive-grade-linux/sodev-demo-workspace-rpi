@@ -14,7 +14,7 @@ belongs in a build: `rpi4-sodev.yaml` lists this layer where `rpi5-sodev.yaml` l
 Every address, size and interrupt number here is measured from the shipped
 `bcm2711-rpi-4-b.dtb` and recorded in **`BCM2711-DT-TRUTH.md`**. Read that file before
 changing any of them; it is the only justification for the values in the DTS, the boot
-scripts, `xen,reg` and `domd.cfg`'s `iomem`.
+scripts and `xen,reg`.
 
 ## What is verified, and where
 
@@ -329,11 +329,11 @@ with it:
   BCM2712's, and the RPi5 DVFS pair (960/500 MHz) does not apply — `v3d_freq=500` is
   this board's stock maximum. The load figures above are for one screen with DomU
   absent.
-* **`domd.cfg` still carries BCM2712 `iomem`/`irqs`.** It is off the boot path (DomD is
-  dom0less, `domd.service` is masked, and `xl create` cannot direct-map), and the file
-  says so in its header. It has to be regenerated before anyone tries the libxl route on
-  this board — which is also where the missing interrupt-type information in
-  `irqs=[...]` would bite.
+* **No `domd.cfg` on this board.** The reference `/etc/xen/domd.cfg` is installed on the
+  Raspberry Pi 5 only, and carries BCM2712 `iomem`/`irqs`. Nothing on this board's boot path
+  would read one (DomD is dom0less, `domd.service` is masked, and `xl create` cannot
+  direct-map). Trying the libxl route here means writing a BCM2711 one first — which is
+  also where the missing interrupt-type information in `irqs=[...]` would bite.
 * **DomA's 1280x720 needs a panel whose EDID lists 1280x720@60.** weston
   drives HDMI-A-1 with CEA-861 VIC 4 (74.25 MHz), which the bench panel, an
   Onlap1102I, lists, and the panel scales it up. On a panel that does not
@@ -349,6 +349,19 @@ with it:
   agreeing, the Venus override touching only `bank@0x40000000`, and the domain budget
   for both SKUs. Neither tool models Xen's `allocate_memory_11()`, so Dom0's bank[0]
   address remains an observation read off the console.
+
+## Licenses in this layer
+
+`LICENSE` is Apache-2.0, and that is the license of every file here that carries no
+SPDX tag or is tagged `SPDX-License-Identifier: Apache-2.0` (the device trees and
+overlays, the kernel and Xen `.cfg` fragments, the boot scripts, ...), with these
+exceptions:
+
+| files | license | why |
+|---|---|---|
+| `conf/layer.conf`, `recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb`, `recipes-bsp/xt-rpi-u-boot-scr/xt-rpi-u-boot-scr.bb` and `.bbappend`, `recipes-core/images/rpi5-image-minimal-domd.bb` and `rpi5-image-xt-domd-v4h.bbappend`, `recipes-extended/rp1-touch-forward/rp1-touch-bridge.bbappend`, `recipes-extended/xt-aaos-host-services/xt-aaos-host-services.bbappend`, `recipes-extended/xt-xen-cfg-doma/xt-xen-cfg-doma_%.bbappend`, `recipes-graphics/wayland/weston-init.bbappend`, `recipes-kernel/linux/linux-raspberrypi_6.18.bbappend` | MIT (`SPDX-License-Identifier: MIT`) | recipe metadata, tagged as the meta-xt-common recipes they extend are |
+| `recipes-bsp/trusted-firmware-a/trusted-firmware-a.inc` | MIT, no SPDX tag | derived from meta-arm's `recipes-bsp/trusted-firmware-a/trusted-firmware-a.inc` (meta-arm is MIT, its `COPYING.MIT`) with local changes; the same file is in `meta-xt-rpi5` |
+| `recipes-extended/xen/files/*.patch`, `recipes-kernel/linux/files/*.patch`, `recipes-bsp/u-boot/files/*.patch` | the license of the project each one modifies: Xen (GPL-2.0-only; `0025-*.patch` adds a file with that SPDX tag), the Raspberry Pi kernel (GPL-2.0), U-Boot (GPL-2.0+) | a patch is a change to that project, not to this layer |
 
 ## Layout
 

@@ -1,5 +1,5 @@
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 13 Sep 2026 17:36:40 +0900
+Date: Tue, 22 Sep 2026 15:07:01 +0900
 Subject: [PATCH] arm/ioreq: make the paths that inject a guest abort loud on a
  release hypervisor
 

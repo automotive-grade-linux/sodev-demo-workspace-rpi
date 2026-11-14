@@ -55,7 +55,7 @@ echo "===== Pre-modetest state ====="
 # values and the mode depends on the attached panel, so both are probed here
 # unless CONN_MODE is set in the environment.
 if [ -z "${CONN_MODE:-}" ]; then
-    conn=$(modetest -M vc4 -c 2>/dev/null | awk '$2=="connected"{print $1; exit}')
+    conn=$(modetest -M vc4 -c 2>/dev/null | awk '$3=="connected"{print $1; exit}')
     crtc=$(modetest -M vc4 -p 2>/dev/null | awk '/^[0-9]+/{print $1; exit}')
     mode=$(modetest -M vc4 -c 2>/dev/null | awk '/#0/{print $2; exit}')
     if [ -n "$conn" ] && [ -n "$crtc" ] && [ -n "$mode" ]; then

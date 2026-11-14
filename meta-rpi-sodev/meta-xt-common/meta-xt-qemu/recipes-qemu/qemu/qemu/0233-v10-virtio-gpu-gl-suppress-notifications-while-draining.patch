@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 17:19:48 +0900
+Date: Sat, 5 Sep 2026 17:19:48 +0900
 Subject: [PATCH] virtio-gpu-gl: suppress guest notifications while draining
  the control queue
 
@@ -13,6 +13,10 @@ as virtio-blk does.
 Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-gl.c | 36 ++++++++++++++++++++++++++++--------
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
 diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
 index 683fad3bf8a..8677b8006ae 100644
 --- a/hw/display/virtio-gpu-gl.c

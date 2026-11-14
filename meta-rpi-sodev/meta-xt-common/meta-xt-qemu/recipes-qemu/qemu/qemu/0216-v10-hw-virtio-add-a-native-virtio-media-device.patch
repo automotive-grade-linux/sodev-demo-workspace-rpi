@@ -1,6 +1,6 @@
-From c72a512582b6a381d43cfdc73402af8df3d79413 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 3 Sep 2026 22:40:16 +0900
+Date: Wed, 11 Nov 2026 08:42:39 +0900
 Subject: [PATCH] hw/virtio: add a native virtio-media device
 
 Forward-port of the three qemu 7.0.0 virtio-media patches of the decode
@@ -83,6 +83,9 @@ guest restores both pointers from its own copies anyway.
 class_init's data argument is still `void *` on this base, so it was left
 alone.
 
+The header, include/hw/virtio/virtio-media.h, carries the same SPDX
+identifier as the .c files of the device (GPL-2.0-or-later).
+
 Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [native virtio-media device model for Xen;
@@ -94,9 +97,9 @@ Upstream-Status: Inappropriate [native virtio-media device model for Xen;
  hw/virtio/virtio-media-pci.c                |   92 ++
  hw/virtio/virtio-media.c                    | 1301 +++++++++++++++++++
  hw/virtio/virtio.c                          |    3 +-
- include/hw/virtio/virtio-media.h            |  233 ++++
+ include/hw/virtio/virtio-media.h            |  235 ++++
  include/standard-headers/linux/virtio_ids.h |    8 +
- 7 files changed, 1646 insertions(+), 1 deletion(-)
+ 7 files changed, 1648 insertions(+), 1 deletion(-)
  create mode 100644 hw/virtio/virtio-media-pci.c
  create mode 100644 hw/virtio/virtio-media.c
  create mode 100644 include/hw/virtio/virtio-media.h
@@ -1555,11 +1558,13 @@ index 755260981ef..5d44378a50e 100644
  static const char *virtio_id_to_name(uint16_t device_id)
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
 new file mode 100644
-index 00000000000..c990d788fbb
+index 00000000000..db854f9d3cc
 --- /dev/null
 +++ b/include/hw/virtio/virtio-media.h
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,235 @@
 +/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
 + * VIRTIO-MEDIA device -- proxies a host V4L2 device into the guest.
 + *
 + * On this platform the device model runs in DomD, which owns the only real

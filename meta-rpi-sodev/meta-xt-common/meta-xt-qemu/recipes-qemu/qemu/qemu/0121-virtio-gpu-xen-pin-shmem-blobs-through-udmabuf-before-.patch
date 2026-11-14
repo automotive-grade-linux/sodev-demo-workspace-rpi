@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Sat, 12 Sep 2026 02:07:19 +0900
 Subject: [PATCH] virtio-gpu/xen: pin shmem-backed blobs through udmabuf before
@@ -49,6 +50,12 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [extends 0116, which is itself Inappropriate]
 ---
+ hw/arm/xen-stubs.c            |  6 ++-
+ hw/display/virtio-gpu-virgl.c | 85 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/xen-stubs.c b/hw/arm/xen-stubs.c
+index 7cf0c507af5..971fd773f7c 100644
 --- a/hw/arm/xen-stubs.c
 +++ b/hw/arm/xen-stubs.c
 @@ -75,8 +75,10 @@ void arch_handle_ioreq(XenIOState *state, ioreq_t *req)
@@ -64,6 +71,8 @@ Upstream-Status: Inappropriate [extends 0116, which is itself Inappropriate]
   *  - the hypervisor has to permit the direction at all. Without the matching
   *    change (4.22-0007) the batch below fails -- with -ESRCH on Xen 4.22, whose
   *    rcu_lock_remote_domain_by_id() cannot resolve DOMID_SELF, and with -EPERM
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index dbd34d1acdf..7bbeadb2e91 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
 @@ -18,6 +18,10 @@

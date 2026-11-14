@@ -36,7 +36,7 @@ Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
  3 files changed, 66 insertions(+), 1 deletion(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 8204d1d3e..a129190ca 100644
+index 065d68938..917e793ce 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -78,6 +78,7 @@
@@ -47,7 +47,7 @@ index 8204d1d3e..a129190ca 100644
  #include <linux/dma-buf.h>
  #include <linux/dma-heap.h>
  
-@@ -3478,6 +3479,54 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
+@@ -3492,6 +3493,54 @@ static enum AVPixelFormat dec_get_format(AVCodecContext *avctx,
      return fmts[0];
  }
  
@@ -102,7 +102,7 @@ index 8204d1d3e..a129190ca 100644
  /*
   * Set up libavcodec for d->codec. At open with the device's first codec, and
   * again when S_FMT(OUTPUT) picks another one (before any OUTPUT buffer, so
-@@ -3541,7 +3590,7 @@ static int dec_codec_open(VirtIOMediaSession *s)
+@@ -3555,7 +3604,7 @@ static int dec_codec_open(VirtIOMediaSession *s)
          d->avctx->hw_device_ctx = av_buffer_ref(d->hwdev);
          d->avctx->get_format = dec_get_format;
      }
@@ -112,10 +112,10 @@ index 8204d1d3e..a129190ca 100644
          return ENOMEM;
      }
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 4726b93c0..460b0a3a8 100644
+index 296a835a8..19b367fb2 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -3372,6 +3372,12 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -3443,6 +3443,12 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
          error_setg(errp, "virtio-media: host-sand must be 0, 1 or 2");
          return;
      }
@@ -128,7 +128,7 @@ index 4726b93c0..460b0a3a8 100644
      if (vm->host_sand && (!vm->host_nv12 || !vm->gpu_xfer)) {
          warn_report("virtio-media: host-sand has no effect without "
                      "host-nv12=on and gpu-xfer=on");
-@@ -3531,6 +3537,8 @@ static const Property virtio_media_properties[] = {
+@@ -3602,6 +3608,8 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_UINT32("host-max-width", VirtIOMedia, host_max_width, 0),
      DEFINE_PROP_BOOL("output-coherent", VirtIOMedia, output_coherent, false),
      DEFINE_PROP_BOOL("gpu-fence-fd", VirtIOMedia, gpu_fence_fd, false),
@@ -138,10 +138,10 @@ index 4726b93c0..460b0a3a8 100644
  
  static void virtio_media_class_init(ObjectClass *klass, const void *data)
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index e7ef9ac3a..f06aa146e 100644
+index 26a714b14..426c2459d 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -434,6 +434,14 @@ struct VirtIOMedia {
+@@ -439,6 +439,14 @@ struct VirtIOMedia {
       * DomD's Mesa advertises the extension (checked 2026-09-07).
       */
      bool gpu_fence_fd;
@@ -156,6 +156,3 @@ index e7ef9ac3a..f06aa146e 100644
  
      VirtQueue *command_vq;
      VirtQueue *event_vq;
--- 
-2.43.0
-

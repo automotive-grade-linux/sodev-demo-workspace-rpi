@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 08:07:07 +0900
+Date: Wed, 11 Nov 2026 08:33:49 +0900
 Subject: [PATCH] virtio-media: decoder mode: scale wide streams down to
  host-max-width
 
@@ -37,7 +37,7 @@ whole core.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
 ---
  hw/virtio/virtio-media-decoder.c | 126 ++++++++++++++++++++++++-------
  hw/virtio/virtio-media.c         |  30 +-------
@@ -45,7 +45,7 @@ Upstream-Status: Pending
  3 files changed, 137 insertions(+), 60 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 3fbac888f..e92f54067 100644
+index 9a64f5b6f..ffef77909 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -178,6 +178,7 @@ typedef struct DecGpuEntry {
@@ -56,7 +56,7 @@ index 3fbac888f..e92f54067 100644
      int matrix;
      void *handle;
      /* q11-dec-sand-scanout: the buffer as the display sees it (dec_ds_*) */
-@@ -338,6 +339,12 @@ struct VirtIOMediaDec {
+@@ -345,6 +346,12 @@ struct VirtIOMediaDec {
       */
      bool stream_fmt_known;
      uint32_t stream_w, stream_h;
@@ -69,7 +69,7 @@ index 3fbac888f..e92f54067 100644
  
      /* Event subscriptions. Unsubscribed events must not be sent. */
      bool sub_source_change;
-@@ -426,6 +433,7 @@ struct VirtIOMediaDec {
+@@ -433,6 +440,7 @@ struct VirtIOMediaDec {
      DecSwSlot sw[DEC_SW_RING];
      unsigned sw_next;
      uint32_t sw_w, sw_h, sw_stride, sw_uv_offset;
@@ -77,7 +77,7 @@ index 3fbac888f..e92f54067 100644
      int sw_matrix;
      bool sw_off;      /* the GPU path failed for this stream: CPU from now on */
      bool sw_logged;
-@@ -501,6 +509,31 @@ static void dec_norm_dims(uint32_t *w, uint32_t *h)
+@@ -503,6 +511,31 @@ static void dec_norm_dims(uint32_t *w, uint32_t *h)
      *h = (hh + 1) & ~1u;
  }
  
@@ -109,7 +109,7 @@ index 3fbac888f..e92f54067 100644
  static uint32_t dec_cap_sizeimage(uint32_t w, uint32_t h)
  {
      /*
-@@ -1203,12 +1236,18 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1208,12 +1241,18 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      unsigned i;
      int err = 0, r;
      bool show, skip;
@@ -130,7 +130,7 @@ index 3fbac888f..e92f54067 100644
          return -ENOTSUP;
      }
      l = &desc->layers[0];
-@@ -1222,7 +1261,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1227,7 +1266,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      col = (uint32_t)DEC_MOD_PARAM(mod);
      uv_offset = (uint32_t)l->planes[1].offset;
      /* luma_rows (uv_offset / 128) lines of Y, then the CbCr lines, per column */
@@ -140,7 +140,7 @@ index 3fbac888f..e92f54067 100644
          return -ENOTSUP;
      }
      if (fstat(desc->objects[0].fd, &st) < 0) {
-@@ -1245,7 +1285,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1250,7 +1290,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          DecGpuEntry *c = &d->gpu[i];
  
          if (c->dev == st.st_dev && c->ino == st.st_ino &&
@@ -150,7 +150,7 @@ index 3fbac888f..e92f54067 100644
              e = c;
              break;
          }
-@@ -1254,7 +1295,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1259,7 +1300,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          int fd;
  
          /* Another size: the old imports are of no further use. */
@@ -160,7 +160,7 @@ index 3fbac888f..e92f54067 100644
              dec_gpu_clear(d);
          }
          if (d->gpu_n == DEC_GPU_CACHE) {
-@@ -1267,11 +1309,12 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1272,11 +1314,12 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          }
          e = &d->gpu[d->gpu_n];
          e->handle = s->vm->host_sand == 2
@@ -176,7 +176,7 @@ index 3fbac888f..e92f54067 100644
                                             (uint32_t)desc->objects[0].size,
                                             matrix, col, &err);
          if (!e->handle) {
-@@ -1281,6 +1324,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1286,6 +1329,8 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          e->ino = st.st_ino;
          e->w = w;
          e->h = h;
@@ -185,7 +185,7 @@ index 3fbac888f..e92f54067 100644
          e->matrix = matrix;
          e->show_fd = -1;
          e->seq = 0;
-@@ -1293,7 +1338,9 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1298,7 +1343,9 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      /* q11-dec-sand-scanout: offer the decoder's buffer to the display */
      assert(!d->thr_on);   /* avctx below: a hwaccel codec has no decode thread */
      tex = virtio_media_gpu_res_tex(gb->virgl_res);
@@ -196,7 +196,7 @@ index 3fbac888f..e92f54067 100644
      if (show && e->show_fd < 0) {
          e->show_fd = fcntl(desc->objects[0].fd, F_DUPFD_CLOEXEC, 0);
      }
-@@ -1388,7 +1435,7 @@ static void dec_sw_clear(VirtIOMediaDec *d)
+@@ -1393,7 +1440,7 @@ static void dec_sw_clear(VirtIOMediaDec *d)
          sl->fd = -1;
      }
      d->sw_next = 0;
@@ -205,7 +205,7 @@ index 3fbac888f..e92f54067 100644
  }
  
  /* A dma-buf of len bytes from the system heap, mapped. */
-@@ -1449,9 +1496,13 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1454,9 +1501,13 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
  {
      VirtIOMediaDec *d = s->dec;
      int matrix = dec_gpu_matrix(fr);
@@ -222,7 +222,7 @@ index 3fbac888f..e92f54067 100644
      DecSwSlot *sl;
      uint8_t *dst[4];
      int dst_ls[4] = { 0 };
-@@ -1459,19 +1510,22 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1464,19 +1515,22 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      uint32_t tex;
  
      if (!gb->virgl_res || gb->num_planes != 1 ||
@@ -250,7 +250,7 @@ index 3fbac888f..e92f54067 100644
                                       AV_PIX_FMT_NV12, SWS_POINT,
                                       NULL, NULL, NULL);
          if (!d->sws_nv12) {
-@@ -1491,9 +1545,10 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1496,9 +1550,10 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          if (fd < 0) {
              return -errno;
          }
@@ -264,7 +264,7 @@ index 3fbac888f..e92f54067 100644
          if (!sl->handle) {
              return err ? err : -EINVAL;
          }
-@@ -1533,7 +1588,7 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1538,7 +1593,7 @@ static int dec_sw_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          d->sw_logged = true;
          info_report("virtio-media/dec: sw-gpu: %s frames reach the guest on "
                      "the GPU (linear NV12 %ux%u, stride %u, matrix %d)",
@@ -273,7 +273,7 @@ index 3fbac888f..e92f54067 100644
      }
      return 0;
  }
-@@ -2314,8 +2369,7 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -2323,8 +2378,7 @@ static void dec_pump(VirtIOMediaSession *s)
                   * no renegotiation coming, so its chosen format must stay put and
                   * dec_write_frame() scales into it.
                   */
@@ -283,7 +283,7 @@ index 3fbac888f..e92f54067 100644
                  /*
                   * Hold this frame across the renegotiation rather than dropping
                   * it: it is the IDR the guest has to start decoding from.
-@@ -2430,6 +2484,12 @@ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
+@@ -2439,6 +2493,12 @@ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
                     vm->decoder);
          return false;
      }
@@ -296,7 +296,7 @@ index 3fbac888f..e92f54067 100644
      /*
       * device_caps is what the guest reads out of config space, and
       * v4l2_codec2 refuses to start without M2M_MPLANE (V4L2Decoder::start()).
-@@ -2568,6 +2628,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -2577,6 +2637,7 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
  
      d = g_new0(VirtIOMediaDec, 1);
      d->codec = dec_codec_nth(s->vm, 0);
@@ -304,7 +304,7 @@ index 3fbac888f..e92f54067 100644
      for (unsigned i = 0; i < DEC_SW_RING; i++) {
          d->sw[i].fd = -1;
      }
-@@ -2699,8 +2760,7 @@ static int dec_s_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+@@ -2708,8 +2769,7 @@ static int dec_s_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
          uint32_t w = pix->width, h = pix->height;
  
          if (d->stream_fmt_known) {
@@ -314,7 +314,7 @@ index 3fbac888f..e92f54067 100644
          }
          /*
           * ALWAYS, not only in the else branch. Without it the stream-known path
-@@ -2764,6 +2824,20 @@ static int dec_g_selection(VirtIOMediaDec *d, struct v4l2_selection *sel)
+@@ -2773,6 +2833,20 @@ static int dec_g_selection(VirtIOMediaDec *d, struct v4l2_selection *sel)
          sel->r.top = 0;
          sel->r.width = d->visible_w ? d->visible_w : d->coded_w;
          sel->r.height = d->visible_h ? d->visible_h : d->coded_h;
@@ -336,10 +336,10 @@ index 3fbac888f..e92f54067 100644
      default:
          return EINVAL;
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index e7acc7bed..40caf7455 100644
+index 5c60ea029..cbc2b4e8a 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -197,30 +197,6 @@ static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
+@@ -195,30 +195,6 @@ static inline uint32_t virtio_media_rgba_bpl(uint32_t width)
      return QEMU_ALIGN_UP(width * 4, 64);
  }
  
@@ -370,7 +370,7 @@ index e7acc7bed..40caf7455 100644
  /* Does this v4l2_format describe the CAPTURE side of a decoder? */
  static bool virtio_media_fmt_is_capture(const struct v4l2_format *f)
  {
-@@ -3159,10 +3135,10 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -3230,10 +3206,10 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
                     "least 16");
          return;
      }
@@ -385,10 +385,10 @@ index e7acc7bed..40caf7455 100644
      /* host-sand: 0 = NV12, 1 = SAND detiled by Mesa, 2 = SAND detiled in the shader */
      if (vm->host_sand > 2) {
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 1495874c5..c4a78ce14 100644
+index 5c107e04d..16bee6cd6 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -397,13 +397,14 @@ struct VirtIOMedia {
+@@ -402,13 +402,14 @@ struct VirtIOMedia {
       */
      uint32_t host_sand;
      /*
@@ -410,7 +410,7 @@ index 1495874c5..c4a78ce14 100644
       */
      uint32_t host_max_width;
      /*
-@@ -522,4 +523,30 @@ int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
+@@ -526,4 +527,30 @@ int virtio_media_dec_ioctl(VirtIOMediaSession *s, unsigned long code,
                             uint8_t *payload, size_t payload_len,
                             size_t work_len);
  

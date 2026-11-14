@@ -3,7 +3,7 @@
  * HOST (hypervisor) DT overlay that publishes the TF-A SCMI server to Xen.
  *
  * Why this file exists instead of the upstream bcm2712-raspberrypi5-xen-scmi.dtso
- * that meta-xt-driver-domain ships:
+ * that meta-xt-driver-domain used to ship (removed as never loaded):
  *
  *  1. The upstream overlay sets `#size-cells = <0x01>` on the ROOT node so that its
  *     `reg = <0x0 0x3ff00000 0x10000>` parses. bcm2712-rpi-5-b.dtb is 2/2, and every

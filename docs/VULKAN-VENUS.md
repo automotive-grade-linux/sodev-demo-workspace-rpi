@@ -16,16 +16,16 @@ This is the authoritative list of what that means:
 
 | | `--gpu=vulkan` (default) | `--gpu=gl` |
 |---|---|---|
-| DomD device model | qemu 11.1.2 on both boards (section 4); the fork's 10.0.2-xt (`meta-xt-qemu`, built with `gtk+` and `pixman`) remains selectable | qemu 7.0.0-xt, with its six 7.0.0-only device-model patches |
+| DomD device model | qemu 11.1.2 on both boards (section 4); the fork's 10.0.2-xt (`meta-xt-qemu`) remains selectable; whichever version, this lane's qemu is built with `gtk+` and `pixman` (`qemu_%.bbappend`, gated on the `venus` distro feature) | qemu 7.0.0-xt, with its five 7.0.0-only device-model patches |
 | DomD rootfs | `mesa-vulkan-drivers`, `vulkan-loader` and `vulkan-tools` installed explicitly | no `vulkan-tools`; the V3DV ICD and the loader arrive only through weston's Vulkan renderer |
-| DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 9 product patches on 1.3.0 on both boards (0009 is upstream there, 0017 is replaced by its 1.3.0 port, and 0024 is 1.3.0's only); 9 on 1.2.0 when 10.0.2 is selected; DomD's weston is 16.0.0 instead of poky's 15.0.0 | oe-core's stock build, no venus, no patches |
+| DomD virglrenderer | venus + `minigbm_allocation` (the render server is built with venus; the `render-server` PACKAGECONFIG the yamls append is a no-op), 9 product patches on 1.3.0 on both boards (0009 is upstream there, 0017 is replaced by its 1.3.0 port, and 0024 is 1.3.0's only); 9 on 1.2.0 when 10.0.2 is selected; DomD's weston is 16.0.0 instead of poky's 15.0.0 | oe-core's stock build, no venus, no patches |
 | guest cfg (`domu.cfg`/`doma.cfg`) | `hostmem=256M,blob=true,venus=true` on `virtio-gpu-gl-pci`; in `doma.cfg` the Venus `qemu_envs` (`VIRGL_EXTERNAL_GBM`, `V3DV_MAX_BO_CACHE_SIZE`, `VKR_DEVICE_HEAP_MIB`, `VKR_RING_IDLE_WAIT_MS`, `VKR_RING_RELAX`), `VKR_RING_IDLE_WAIT_MS` and `VKR_RING_RELAX` in `domu.cfg`, and `VIRGL_EXTERNAL_GBM` there with DomU overlay planes; the options and renames only the qemu 10 and 11 device models take | `VKR_RING_IDLE_WAIT_MS` and `VKR_RING_RELAX` in `domu.cfg` (unused without venus); none of the others |
 | Xen + libxl | `4.22-0007/0008/0009/0010` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices, one SPI per virtio-pci slot); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
 | rpi4 4 GiB SKU memory | DomD 1440 MiB / DomA 2048 MiB | DomD 1056 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
 | DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in the qemu 10.0.2 and 11.1.2 device models |
 | DomA overlay planes | `XT_DOMA_OVERLAY_PLANES` in `xt-xen-cfg-doma`: `0` (the default) to `3`, and a board may set its own; both boards set `3`. It sets both halves in `doma.cfg`, the device model's `overlay-planes=N` (qemu 10.0.2 patch `0250`, qemu 11.1.2 patch `q11-051`) and DomA's `virtio_gpu.overlay_planes=N` (DomA kernel patch `aosp-kernel-patches/common/0001`); drm_hwcomposer then puts the system bars on the overlays instead of SurfaceFlinger compositing them on the GPU | `0` whatever the variable says: qemu 7.0.0 has no `overlay-planes` |
-| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`; the Raspberry Pi 5 sets `1`. The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`), plus `VIRGL_EXTERNAL_GBM=1`, the gbm device a linear scanout buffer needs on the host to be a linear gbm bo (virglrenderer 1.3.0). With it, xdg-cluster-receiver's window goes on the overlay (section 7f, 2026-10-15) | none: the qemu 7 device model has no overlay planes |
+| DomU overlay planes | `XT_DOMU_OVERLAY_PLANES` in `xt-xen-cfg-domu`: `0` (the default) to `3`; the Raspberry Pi 5 sets `1`, the Raspberry Pi 4 leaves `0` (and its 4 GiB SKU cannot carry DomU and DomA together: `build.sh` refuses `-u -a` there). The same two halves as DomA's (`overlay-planes=N`, and DomU's `virtio_gpu.overlay_planes=N` from `linux-virtio-armv8`'s `0002`), plus `VIRGL_EXTERNAL_GBM=1`, the gbm device a linear scanout buffer needs on the host to be a linear gbm bo (virglrenderer 1.3.0). With it, xdg-cluster-receiver's window goes on the overlay (section 7f, 2026-10-15) | none: the qemu 7 device model has no overlay planes |
 
 Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.4 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from
@@ -43,7 +43,7 @@ hypervisor patch numbered `4.22-0009` that makes Xen's injected-abort paths
 print on a release build. It is not the libxl `4.22-0009` of section 7a; the two
 series are numbered independently.
 
-**Current state (2026-09-24).** This file is a working record kept in the order the
+**Current state (2026-10-23).** This file is a working record kept in the order the
 work happened, so several sections state a conclusion that a later section
 overturns. Those are marked *Superseded* where they sit. The standing summary:
 
@@ -51,8 +51,10 @@ overturns. Those are marked *Superseded* where they sit. The standing summary:
    guest memory, no trapping, the AGL Flutter cluster at 60 fps.
 2. Venus works in **DomA**: full-Vulkan AAOS on the RPi4, 2026-09-12.
 3. **Defect A** (venus suballocation) is fixed by `meta-agl-venus`' mesa `0002`.
-4. **Defect B** (no EGLDisplay for virglrenderer) is fixed by qemu `0117` plus
-   virglrenderer `0002`; `MESA_VK_WSI_DEBUG=sw` is no longer needed and is not
+4. **Defect B** (no EGLDisplay for virglrenderer) is fixed by virglrenderer `0002`
+   plus, on the qemu 10.0.2 lane, qemu `0117`; qemu 11.1.2 (the default) already
+   adopts SDL's EGLDisplay upstream, so it carries no port of `0117` (`q11-016` is
+   left free). `MESA_VK_WSI_DEBUG=sw` is no longer needed and is not
    shipped. The defect-B subsection in section 7a opens with the pre-fix reading
    and carries the correction in a box at its top.
 5. The host GEM growth that made 0117 look unusable was **Impeller**
@@ -103,7 +105,7 @@ and one was a hard blocker; the table is written from that starting point, and t
 |---|---|---|---|
 | mesa | 26.0.5 in oe-core; **this series pins DomD's to 26.2.4** (ungated, so both lanes) -- section 7e | **V3DV already built AND already installed** | meta-raspberrypi `mesa.bbappend` appends `vulkan broadcom` for `rpi`, so `VULKAN_DRIVERS` gains `broadcom` → `libvulkan_broadcom.so` in `mesa-vulkan-drivers`. And it is already in the shipping rootfs: weston's `vulkan-renderer.so` links `libvulkan.so.1`, so weston RDEPENDS on vulkan-loader, whose `RRECOMMENDS virtual-vulkan-icd` resolves to `mesa-vulkan-drivers` |
 | weston | 15.0.0 (oe-core); a 16.0.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_weston` selects it (both board yamls pin `15.%`, and both boards' `vulkan` lanes select `16.%`) | **Vulkan renderer already built** | `PACKAGECONFIG` filters `vulkan` from `DISTRO_FEATURES` → `-Drenderer-vulkan=true` |
-| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also turns on the `render-server` PACKAGECONFIG: qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and oe-core defaults that option off. On 1.3.0 a guest resource gets a GBM dma-buf only with `VIRGL_GBM_LAYOUT_ENABLE`, which a Venus-compositing DomA needs and which costs the GL path; the DomD qemu wrapper exports it for DomA's device model when `/etc/qemu-gbm-layout` exists, and the image does not create that file. (`0024` adds one exception: a linear scanout buffer gets a linear GBM bo whenever the device model has a gbm device, `VIRGL_EXTERNAL_GBM=1`.) |
+| virglrenderer | 1.2.0 (oe-core); a 1.3.0 recipe in `meta-xt-driver-domain` is used only if `PREFERRED_VERSION_virglrenderer` selects it (both board yamls pin `1.2.%`, and both boards' `vulkan` lanes select `1.3.%`) | **venus and the render server on in the default lane** | oe-core's `PACKAGECONFIG` enables venus from `vulkan`. The tree used to cancel that (`PACKAGECONFIG:remove:pn-virglrenderer = "venus"`) to match the pure-GL known-working image, and a bitbake `:remove` cannot be undone by a later `:append` or by a hard assignment — so the removal is variable-gated (`XT_VIRGL_VENUS_REMOVE`), empty by default and set to `venus` only by `--gpu=gl`. The default lane also appends the `render-server` PACKAGECONFIG, which does nothing: virglrenderer builds the render server whenever venus is on (`with_render_server = with_venus` in both 1.2.0's and 1.3.0's `meson.build`; 1.2.0's `meson_options.txt` lists the option as deprecated, 1.3.0 dropped it and the local recipe accepts the name as a no-op). qemu >= 9.2 passes `VIRGL_RENDERER_RENDER_SERVER` unconditionally with venus, and the venus build satisfies it. On 1.3.0 a guest resource gets a GBM dma-buf only with `VIRGL_GBM_LAYOUT_ENABLE`, which a Venus-compositing DomA needs and which costs the GL path; the DomD qemu wrapper exports it for DomA's device model when `/etc/qemu-gbm-layout` exists, and the image does not create that file. (`0024` adds one exception: a linear scanout buffer gets a linear GBM bo whenever the device model has a gbm device, `VIRGL_EXTERNAL_GBM=1`.) |
 | qemu | **11.1.2** (`qemu_11.1.2.bb`) on both boards, **10.0.2** (xen-troops fork, `meta-xt-qemu`) selectable; **7.0.0** with `--gpu=gl` | was the blocker | `virtio-gpu-gl` grew `venus=` in QEMU **9.2.0**, so the 7.0.0 the tree used to ship has no such property. Raising the device model is what this work turned into the default |
 
 So the host-side work was: raise QEMU, keep virglrenderer's venus backend, install
@@ -197,7 +199,8 @@ property → virglrenderer with venus → the Vulkan loader → V3DV.
 
 **And on the Raspberry Pi 4** (`rpi4-sodev.yaml`, `MACHINE=raspberrypi4-64`, in a
 separate workspace — see the board note in that file for why it has to be
-separate): the same ten checks pass. 3357 recipes parse with 0 errors, qemu
+separate): the same ten checks pass (2026-09, when qemu 10.0.2 was the lane's
+device model). 3357 recipes parse with 0 errors, qemu
 10.0.2-xt configures, compiles and packages for `cortexa72-nocrypto`, `domu.cfg`
 installs with the venus options, and `rpi5-image-xt-domd-v4h` assembles carrying
 `libvulkan_broadcom.so` + its ICD manifest, `vulkaninfo`, `weston-simple-vulkan`,
@@ -205,8 +208,8 @@ a virglrenderer with `venus_protocol`, and a qemu binary with the `venus`, `blob
 and `hostmem` properties. So the lane is not Pi 5-only in practice, and the Pi 4
 configuration meets the "verified by build" bar the product yaml sets for it.
 
-Re-checked at the current head of the series, since everything from the p2m work
-onwards landed after that build: the Pi 4 Venus lane's conf still generates as
+Re-checked (2026-09, still with 10.0.2) at the then head of the series, since
+everything from the p2m work onwards landed after that build: the Pi 4 Venus lane's conf still generates as
 intended (`XT_VENUS_GPU_OPTS`, `DISTRO_FEATURES:append = " venus"`, and
 `PREFERRED_VERSION_qemu` appended last so 10.0.2 wins over the lane default), 3357
 recipes parse with 0 errors on `raspberrypi4-64`, `xen`, `xen-tools` and `qemu` all
@@ -216,6 +219,11 @@ bbappends list, including the hypervisor half of the p2m fix -- and a dry run of
 hardware; what it rules out is the failure mode that matters for a second board,
 which is a file or a variable that only ever existed for the Pi 5.
 
+Since then both boards' Venus lanes have moved to qemu 11.1.2 (2026-10-28), and
+their current workspaces configure, compile and package `qemu-11.1.2` for
+`cortexa72` and `cortexa76`; the "verified by build" statement above now rests on
+those builds. The 10.0.2 figures stay as the record of the first one.
+
 **Beyond the build, on a PC:** the Venus path was also run — an emulated arm64
 guest on an x86 host with an Intel iGPU. That guest enumerates the host GPU through
 Venus, a Vulkan client draws on it for 35 s with the compositor surviving, and a
@@ -223,9 +231,10 @@ frame captured mid-draw shows the triangle correctly composited. Section 5a carr
 the fps/CPU/GPU numbers with the reasons **no performance figure there transfers to
 the board** — emulated guest, Intel host driver rather than V3DV, no Xen. The
 rendering-correctness result is the part that stands on its own. Two bugs in this
-series were found that way rather than on the board: the missing `render-server`
-PACKAGECONFIG, and the gate script's use of a headless backend this tree's weston
-does not build.
+series were found that way rather than on the board: the missing render server
+(section 5; the `render-server` PACKAGECONFIG it was credited to is a no-op, venus
+itself builds the server), and the gate script's use of a headless backend this
+tree's weston does not build.
 
 > **Superseded (sections 7a and 7g).** Both of the questions below were answered on
 > hardware afterwards: V3DV does serve Venus, and the Xen path works with this
@@ -316,7 +325,8 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
 - `RPI5_DOMA_HOST_SAND` (`meta-xt-rpi5`'s `xt-xen-cfg-doma` append; `1` with qemu
   11.1.2, `0` otherwise): `host-sand=N` on DomA's virtio-media device, so the decoder
   mode's HEVC frames reach the guest on the GPU (`q11-069`); the append refuses a
-  non-zero value with any other qemu.
+  non-zero value with any other qemu. The Raspberry Pi 4's `RPI4_DOMA_HOST_SAND`
+  (`meta-xt-rpi4`'s append) is the same switch under the same condition.
 - `RPI5_DOMA_H264` (the same append; `1` with qemu 11.1.2, `0` otherwise):
   `decoder=hevc+h264`, so DomA's H.264 is decoded by libavcodec in software in DomD
   (`q11-072` to `q11-074`) instead of by DomA's own software decoder, on two frame
@@ -328,7 +338,9 @@ qemu 11.1.2 no longer has. What only qemu 11.1.2 acts on:
   `RPI5_DOMA_GPU_RES` with qemu 11.1.2, `0` otherwise): `host-max-width=N`, so a
   stream wider than the display, such as 4K HEVC, reaches DomA scaled down to it by
   the decoder mode's GPU conversion (`q11-076`); the append refuses a non-zero value
-  with any other qemu.
+  with any other qemu. The Raspberry Pi 4's `RPI4_DOMA_HWDEC_MAX_W` is its display
+  width from `RPI4_DOMA_GPU_RES` (1280) with either device model, since the 10.0.2
+  one carries the property too (`0246`).
 - `RPI5_DOMA_H264_NICE` (the same append; `-19` with `RPI5_DOMA_H264=1`, empty
   otherwise): `dec-sw-nice=N`, the nice value of the H.264 decoder's two frame threads
   (`q11-094`), the device model's own -19 by decision; the threads DomA waits for are kept
@@ -382,16 +394,16 @@ larger jump than the 7.0 -> 8.2 move a virtio-snd update alone would need, and
 it makes that move unnecessary.
 
 What the move costs, and what it no longer costs — this is the shipping
-configuration now, and the six 7.0.0-only patches are why it was not:
+configuration now, and the five 7.0.0-only patches are why it was not:
 
-- The six device-model patches in
+- The five device-model patches in
   `meta-xt-driver-domain/recipes-qemu/qemu/qemu_%.bbappend` are all written
-  against 7.0.0 sources and are version-gated off for 10.0.2. All six are now
+  against 7.0.0 sources and are version-gated off for 10.0.2. All five are now
   accounted for, which is what allowed the default to move:
   - `0111` (virtio-tablet `BTN_TOUCH`) was the one with a user-visible consequence
     -- Android classifies an ABS_X/ABS_Y device as a touchscreen only when it also
     reports `BTN_TOUCH`, so without it DomA got no touch input at all -- and it is
-    **rebased as `meta-xt-qemu`'s `0118`**. The 10.0.2 form is much smaller than the
+    **rebased as `meta-xt-qemu`'s `0118`** (`q11-017` on 11.1.2). The 10.0.2 form is much smaller than the
     7.0.0 one: upstream already has `touch` in the `InputButton` enum and
     `[INPUT_BUTTON_TOUCH] = BTN_TOUCH` in `keymap_button`, and because the tablet
     synthesises its advertised `EV_KEY` bitmap from that whole array
@@ -399,14 +411,11 @@ configuration now, and the six 7.0.0-only patches are why it was not:
     `virtio_tablet_config_v1/v2` declare no `EV_KEY` at all) the device **already
     advertises** `BTN_TOUCH` -- only the send side was missing, where a left press
     goes out as `BTN_LEFT`.
-  - `0110` (virtio-pci ISR IOREQ range) is **rebased as `0120`**, against the fork's
+  - `0110` (virtio-pci ISR IOREQ range) is **rebased as `0120`** (`q11-019` on 11.1.2), against the fork's
     reworked Xen ioreq code.
   - `0112` (vTPM `GUEST_TPM_BASE` guard) is **moot**: 10.0.2 has no
     `hw/arm/xen_arm.c` at all -- the Arm Xen machine is `hw/arm/xen-pvh.c` on the
     `xen-pvh-common` code -- and `GUEST_TPM_BASE` appears nowhere in the tree.
-  - `0113` (`struct sched_attr` redefinition) is **fixed upstream**: 10.0.2's own
-    `linux-user/syscall.c` already wraps the local definition in
-    `#ifndef SCHED_ATTR_SIZE_VER0`.
   - `0101` (RESUME emitted with no QMP monitor) and `0103` (deferred autostart
     `vm_start`) guard a pre-main-loop death in 7.0.0's `softmmu/vl.c`. The code moved
     to `system/vl.c`; both are forward-ported, as `meta-xt-qemu`'s `0201` for 10.0.2
@@ -440,14 +449,17 @@ That gates on `venus` in `DISTRO_FEATURES` and turns on:
 - qemu 11.1.2 (with weston 16.0.0 and virglrenderer 1.3.0) instead of 7.0.0-xt;
 - virglrenderer's venus backend, by making the domd conf's
   `PACKAGECONFIG:remove:pn-virglrenderer` empty (`XT_VIRGL_VENUS_REMOVE`);
-- virglrenderer's **render server** (`PACKAGECONFIG:append:pn-virglrenderer =
-  " render-server"`), which is not optional: qemu passes
+- virglrenderer's **render server**, which is not optional: qemu passes
   `VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER` together
   (`hw/display/virtio-gpu-virgl.c`), and without `/usr/libexec/virgl_render_server`
   the venus context is never created -- the guest's first blob allocation comes back
   `VIRTIO_GPU_RESP_ERR_UNSPEC` and `vkCreateInstance` fails with
   `ERROR_OUT_OF_HOST_MEMORY`. This was found on a PC, not on the board (see the
-  three-stage plan below);
+  three-stage plan below). The venus build supplies it: `with_render_server =
+  with_venus` in 1.2.0 and 1.3.0 alike, so the lane's
+  `PACKAGECONFIG:append:pn-virglrenderer = " render-server"` is a no-op (the option
+  is deprecated in 1.2.0 and gone in 1.3.0, where the local recipe accepts the
+  name so the QA check passes);
 - `mesa-vulkan-drivers vulkan-loader vulkan-tools` in the DomD rootfs (the V3DV
   ICD, the loader, `vulkaninfo`) and in `rpi5-image-domu-gfx` (the guest's Venus
   ICD, `libvulkan_virtio.so`);
@@ -762,7 +774,12 @@ three corrections, and **one of them was a bug in this series**:
    `render-server` PACKAGECONFIG off; the Venus lane now turns it on, and the board
    image was rebuilt to confirm `/usr/libexec/virgl_render_server` ships (1.5 MB in
    the `virglrenderer` package). **Without this the board run would have failed the
-   same way and cost a hardware session to find.**
+   same way and cost a hardware session to find.** (Correction, 2026-11-11: that
+   PACKAGECONFIG is a no-op -- virglrenderer builds the render server whenever venus
+   is on, `with_render_server = with_venus` in 1.2.0's and 1.3.0's `meson.build`, and
+   1.2.0's `meson_options.txt` marks the option deprecated. The server was missing
+   for as long as venus itself was removed from the build, and the rebuilt image
+   ships it because venus is built; the append is still carried but does nothing.)
 3. `-object memory-backend-memfd` + `-machine memory-backend=` is **not** needed --
    tested both ways, and Venus enumerates identically without it. It is worth
    recording because it is the usual advice for virtio-gpu blob resources: it
@@ -973,10 +990,10 @@ device model happens to hold.
 
 ## 5b. The host build option a Vulkan-compositing guest needs
 
-Two virglrenderer PACKAGECONFIGs are off by default in oe-core and both are required
-for this lane. The first, `render-server`, is covered in section 5's stage-0 findings.
-This is the second, and it was found the same way — by running a guest, not by reading
-recipes.
+One virglrenderer PACKAGECONFIG that is off by default in oe-core is required for
+this lane (the `render-server` one that section 5's stage-0 findings credit is a
+no-op: the render server is built with venus). This is it, and it was found by
+running a guest, not by reading recipes.
 
 ### The symptom
 
@@ -1065,7 +1082,8 @@ succeeded).
   log level. `VIRGL_LOG_LEVEL=debug` is what turned three rounds of "the compositor just
   aborts" into one line naming the cause.
 - `venus` alone is not a sufficient PACKAGECONFIG for a guest that composites with
-  Vulkan. It needs `render-server` (without it no venus context is created at all) and
+  Vulkan. It needs the render server (without it no venus context is created at all;
+  virglrenderer builds it with venus, the `render-server` PACKAGECONFIG is a no-op) and
   `minigbm_allocation` (without it no external buffer can enter one).
 
 ## 5c. The tuning surface, and which half of it transfers
@@ -1083,12 +1101,12 @@ transfer in neither direction. Two classes, and only one is a product input.
 | `debug.renderengine.graphite` (+ the `graphite_preview*_optin` R/W aconfig flags) | **Skia Graphite**, the Vulkan-first successor to Ganesh, compiled into this AAOS build. Measured — section 6. |
 | `debug.renderengine.blur_algorithm` | blur cost/quality; the default (`KawaseDualFilterV2`) is already the cheap one |
 | mesa venus ring relax profile | `base_sleep_us=160` plus busy-wait/warn/abort orders — a real latency-vs-CPU tradeoff, but **hard-coded constants** in 26.0.5's `vn_common.c`. 24.0.7 had `VN_RELAX_BASE_SLEEP_US` / `VN_DRAW_CMD_BATCH_LIMIT` as env vars; 26.0.5 replaced them with per-reason profiles, so changing it now needs a patch, not a variable. |
-| `XT_XEN_NO_BLOB_EXPORT` | **diagnostic, in `qemu_envs`** — a non-empty value other than `0` makes the device model skip the blob export, so a dma-buf blob falls to the `/proc/self/pagemap` path and is withdrawn. Use it to attribute a withdrawal to the export half or to the p2m insert half; the log says which path ran (`(dma-buf)` vs `(pagemap)` -- and since `0121` a memfd-backed blob is wrapped in a udmabuf, so it reports `(dma-buf)` too). Not a tuning knob — leaving it set disables guest Vulkan on dma-buf backed blobs, and it also skips `0121`'s udmabuf pin, so a memfd-backed blob is shared through pagemap under `mlock()` alone, which is the page-migration corruption `0121` fixes; a failed blob export does the same. (qemu `0116`.) |
+| `XT_XEN_NO_BLOB_EXPORT` | **diagnostic, in `qemu_envs`** — a non-empty value other than `0` makes the device model skip the blob export, so a dma-buf blob falls to the `/proc/self/pagemap` path and is withdrawn. Use it to attribute a withdrawal to the export half or to the p2m insert half; the log says which path ran (`(dma-buf)` vs `(pagemap)` -- and since `0121` (`q11-020`) a memfd-backed blob is wrapped in a udmabuf, so it reports `(dma-buf)` too). Not a tuning knob — leaving it set disables guest Vulkan on dma-buf backed blobs, and it also skips `0121`'s udmabuf pin, so a memfd-backed blob is shared through pagemap under `mlock()` alone, which is the page-migration corruption `0121` fixes; a failed blob export does the same. (qemu `0116`, `q11-015` on 11.1.2.) |
 | `VKR_DEVICE_HEAP_MIB` | **product, in `qemu_envs`** — forces the device-local heap size vkr advertises to the guest (virglrenderer `0021`). `1088` ships in `doma.cfg`: v3dv reports a share of DomD's system RAM (645 MiB on a 1408 MiB DomD) and the guest's Skia/VMA then sizes its block pool as heap/8 for any heap of 1 GiB or less, so HWUI took heap/8 blocks by the handful (96 MiB each on a 1664 MiB DomD) and DomD fell into a memory-reclaim livelock. Above 1 GiB VMA uses the 4 MiB block size Skia asks for. Expected reading with it set: **zero** guest allocations of 64 MiB or more (the `0019` diagnostic in `meta-rpi-sodev-devel` is what prints them) and DomD `MemAvailable` never below ~460 MiB. |
 | `VKR_RING_IDLE_WAIT_MS` | **product, in `qemu_envs`** (DomA's Venus lane and DomU) — how long an idle Venus ring thread waits before it looks again for a missed notification (virglrenderer `0022` bounds the wait, `0023` makes the bound this variable; default 10). `1000` ships: on the RPi4 idle wake-ups went from 975 to about 10 a second, with one rescue in 15 minutes and no stall. |
 | `VKR_RING_RELAX` | **product, in `qemu_envs`** (DomA's Venus lane and DomU) — the ring thread's busy-wait between commands, `<order>,<first sleep in us>` (virglrenderer `0025`; unset = upstream's 15 yields, then sleeps from 10 us; a value that does not parse is logged and ignored). `0,100` ships: on the Raspberry Pi 5 the cluster's ring thread made about 24,000 yields and 9,000 sleeps a second, about 3,000 and 1,500 with `0,100` (the yields left are V3DV's), and H.264 1080p60 playback in a WebView showed 55.0 frames a second against 52.7 (two alternating sessions, full screen and HMI each; single runs spread 50 to 57). The cost is latency: Mesa's guest asks for a 1 ms idle timeout, so the ring goes idle about 1.3 ms after its last command and the guest's notify wakes it from then on, and a command that arrives in that window waits up to 0.4 ms instead of 40 us; the cluster drew 25.1 frames a second against 26.3. On the Raspberry Pi 4 (2026-10-21) a WebView's 720p60 H.264 in DomA showed the same frame rates with it and without it; the ring's calls were not counted there, and that board runs no cluster. |
 | `V3DV_MAX_BO_CACHE_SIZE` | **product, in `qemu_envs`** — MiB of freed GEM BOs each render server keeps for reuse (Mesa v3dv, default 64). Nine Venus render servers retained ~0.5 GiB of DomD memory that way; `8` ships. |
-| `hostmem=<size>` | a **capacity** knob whose floor is a rendering constraint, not a free dial: venus takes ~25 MiB of it and a 1920x1080 swapchain needs most of the rest — at 32M that swapchain failed with `VK_ERROR_OUT_OF_DEVICE_MEMORY`, and 128M ran out in DomA once a full-Vulkan AAOS had its resident apps up (every process rendering with HWUI on Venus maps its own blocks: 103 MiB of 128 in use by SurfaceFlinger and five apps on the rpi4, after which a WebView failed to allocate). **256M ships, as ONE value substituted into both guest configs** (it is not per-SKU; the 4 GiB rpi4 adjustment is DomD/DomA RAM, not this). The value becomes the virtio-gpu BAR as it is, so it must be a power of two no larger than libxl's per-host slice (256 MiB, `4.22-0009`). Raising it does not change how a dma-buf blob is shared: that is the DomD kernel's `0014` and qemu `0116` (§7a). |
+| `hostmem=<size>` | a **capacity** knob whose floor is a rendering constraint, not a free dial: venus takes ~25 MiB of it and a 1920x1080 swapchain needs most of the rest — at 32M that swapchain failed with `VK_ERROR_OUT_OF_DEVICE_MEMORY`, and 128M ran out in DomA once a full-Vulkan AAOS had its resident apps up (every process rendering with HWUI on Venus maps its own blocks: 103 MiB of 128 in use by SurfaceFlinger and five apps on the rpi4, after which a WebView failed to allocate). **256M ships, as ONE value substituted into both guest configs** (it is not per-SKU; the 4 GiB rpi4 adjustment is DomD/DomA RAM, not this). The value becomes the virtio-gpu BAR as it is, so it must be a power of two no larger than libxl's per-host slice (256 MiB, `4.22-0009`). Raising it does not change how a dma-buf blob is shared: that is the DomD kernel's `0014` and qemu `0116` / `q11-015` (§7a). |
 
 **Rig-relevant only (deliberately not measured, and not to be applied from PC data):**
 `ioeventfd=on` (eventfd/KVM notify plumbing — the board is Xen/IOREQ);
@@ -1646,7 +1664,8 @@ order they were reached.
 
 `xl create` succeeded, the guest ran, and then stopped forever with 0.3 s of CPU
 consumed. Diagnosis order that worked, and is worth reusing, because the guest
-console is silent in this lane (see the note at the end of this section):
+console was silent in this lane when this was written (2026-09-25, qemu 10.0.2; see
+the note at the end of this section):
 
 ```sh
 xenctx <domid>                     # PC/LR/TTBR1 of the stuck vcpu
@@ -1689,7 +1708,8 @@ watcher registers. The practical consequences are that `xl shutdown` fails
 (`guest didn't acknowledge control request: -9` after 60 s; `xl destroy` is needed,
 and a lingering guest makes the next `xl create` fail on the duplicate name) and
 that no PV frontend — including the PV console, hence the truncated boot logs above
-— works in DomU. Everything the guest actually uses is virtio-pci with
+— works in DomU (as observed with the 10.0.2 device model, 2026-09-25). Everything
+the guest actually uses is virtio-pci with
 `XEN_VIRTIO_FORCE_GRANT`, which needs no xenstore lookup, which is why the guest is
 otherwise fully functional.
 
@@ -1793,16 +1813,17 @@ the hypervisor layer. Three ways out, in increasing order of value:
 
 The two below are the core of it. Four more, each added when the next failure was
 reached, complete it -- so a reader looking for "the p2m fix" should expect six
-patches, not two:
+patches, not two (the qemu numbers are the 10.0.2 series'; the 11.1.2 ports are
+named beside them, see `qemu_11.1.2.bb`):
 
 | patch | what it adds |
 |---|---|
-| qemu `0116` | implements `arch_xen_set_memory()` for Arm: learn the frames, insert them, withdraw the window if that fails |
+| qemu `0116` (11.1.2: `q11-015`) | implements `arch_xen_set_memory()` for Arm: learn the frames, insert them, withdraw the window if that fails |
 | Xen `4.22-0007` | permits the direction, and resolves `DOMID_SELF` (see below) |
 | Xen `4.22-0008` | moves the guest's prefetchable PCI window to 0xc0000000 and grows it to 768 MiB |
 | Xen `4.22-0009` (libxl) | hands that window out in 256 MiB slices, so one BAR can hold a swapchain and the resident apps' blocks with room for a WebView |
 | DomD kernel `0014` | `IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS`, for the dma-buf case pagemap cannot answer |
-| qemu `0121` | pins a shmem-backed blob through udmabuf first, because `mlock()` does not stop page migration |
+| qemu `0121` (11.1.2: `q11-020`) | pins a shmem-backed blob through udmabuf first, because `mlock()` does not stop page migration |
 
 **Why it needs both.** On Arm `arch_xen_set_memory()` is an empty stub
 (`hw/arm/xen-stubs.c`), so device-model RAM in the guest's address space is only
@@ -2060,7 +2081,9 @@ same options" does not mean "same code path".
 > and its opening reading -- "root-caused, belongs upstream, nothing in this series
 > touches it" -- is wrong as of 2026-09-04. The fix is qemu `0117` (adopt SDL's
 > EGLDisplay) plus virglrenderer `0002` (do not initialise the global gbm while
-> doing so). The guest's Vulkan images reach the compositor as dma-bufs,
+> doing so). `0117` is a 10.0.2 patch: qemu 11.1.2, the default device model,
+> takes SDL's EGLDisplay upstream, so it carries no port of it (`q11-016` is left
+> free) and virglrenderer `0002` is this tree's whole share of the fix there. The guest's Vulkan images reach the compositor as dma-bufs,
 > `MESA_VK_WSI_DEBUG=sw` is not needed and is not shipped, and the OpenGL lane keeps
 > its 60 fps. The two "must not ship yet" notes below were both about the Impeller
 > memory growth, which `meta-agl-venus`' flutter-engine `0001` fixes.
@@ -2207,8 +2230,9 @@ asked for both venus and an EGL GL winsys the way these flags are structured. Cl
 needs a virglrenderer change, or `GL_EXT_memory_object` in V3D's GL driver. Both are
 upstream.
 
-`MESA_VK_WSI_DEBUG=sw` remains the working way to run a Vulkan client under a GL
-compositor here. It is a guest-side environment variable rather than a patch.
+`MESA_VK_WSI_DEBUG=sw` remained, as of 2026-09-03 and until the defect-B fix recorded
+in the box above, the working way to run a Vulkan client under a GL compositor here.
+It is a guest-side environment variable rather than a patch, and it is not shipped.
 
 **What it actually does**, traced in mesa 24.0.7 (the AGL rootfs' own version) and confirmed
 against the `WAYLAND_DEBUG` logs of both lanes:
@@ -2254,8 +2278,9 @@ Where that leaves the lane:
   pools and full-size swapchain images, all on real guest memory with no trapping, and a
   correct picture on screen.
 * **Both defects are fixed in this series.** Defect A by a one-line mesa backport in
-  `meta-agl-venus` (`0002`); defect B by qemu `0117` plus virglrenderer `0002`, which is
-  what the box at the top of the defect-B subsection records. Neither needs an
+  `meta-agl-venus` (`0002`); defect B by virglrenderer `0002` plus, on the qemu 10.0.2
+  lane, qemu `0117` (qemu 11.1.2 takes SDL's EGLDisplay upstream and carries no port),
+  which is what the box at the top of the defect-B subsection records. Neither needs an
   environment workaround, and `MESA_VK_WSI_DEBUG=sw` is not in the shipped drop-in.
 * The fallback that was sketched here -- a Vulkan-rendered compositor in DomU, or an
   offscreen workload with no WSI -- is therefore not needed. `weston --renderer=vulkan`
@@ -2272,21 +2297,25 @@ on the RPi4 -- so the "DomD-native Vulkan is the only working Vulkan on this boa
 conclusion that used to close this section is superseded, and so is the fallback in
 section 8.
 
-### Note: the qemu 10.0.2 lane hides the guest console
+### Note: the 10.0.2 device model hid the guest console
 
-`/var/log/xen/qdisk-<domid>.log` carries
+With qemu 10.0.2 (2026-09-25) xenconsoled served nothing for DomU — `xl console` and
+`/var/log/xen/console/guest-*.log` both stayed empty, which is why the boot log had to
+come out of RAM. `/var/log/xen/qdisk-<domid>.log` carried
 
 ```
 failed to create 'console' device '0': declining to handle console type 'xenconsoled'
 ```
 
-and after that xenconsoled serves nothing for that guest — `xl console` and
-`/var/log/xen/console/guest-*.log` both stay empty, which is why the boot log had
-to come out of RAM. qemu's xen-bus backend enumeration only started running once
-the 0115 patch called `setup_xen_backend_ops()`; it then claims console 0, declines
-it because the toolstack assigned it to xenconsoled, and leaves it unusable. The
-default 7.0.0 lane is unaffected (its console works). Diagnosis is cheap with the
-pmemsave recipe above, so this is filed rather than fixed.
+— qemu's xen-bus backend enumeration, which only started running once the 0115 patch
+called `setup_xen_backend_ops()`, claims console 0 and declines it because the
+toolstack assigned it to xenconsoled — and that was taken for the cause. The default
+11.1.2 device model is not affected, measured on an RPi5 8GB on 2026-11-11: its port,
+`q11-014`, makes the same call and `qdisk-3.log` carries the same decline line, yet
+`xl console 3` reaches `domu login:`, `/var/log/xen/console/guest-DomU.log` fills
+(40 KB at boot), and `control/feature-poweroff` reads `1`. So the decline line by
+itself is harmless, and what left 10.0.2's console unusable was not determined. The
+`--gpu=gl` 7.0.0 lane is unaffected as well (its console works, 2026-08-03).
 
 ## 7b. The AGL instrument cluster on Venus, measured (2026-09-03)
 
@@ -2851,17 +2880,17 @@ this series. Three are in the p2m path:
   memory-topology commits, the per-FlatRange map/unmap churn makes a partial-overlap
   `map` return `-EEXIST`, and qemu discarded the return code -- so three PCI
   functions' ISR/notify pages stopped being covered and the guest took Xen's
-  synthesised abort (ESR 0x96000000, ISS=0). Twelve panics. Fixed by qemu `0120`,
-  which is the 7.0.0 lane's `0110` rebased.
+  synthesised abort (ESR 0x96000000, ISS=0). Twelve panics. Fixed by qemu `0120`
+  (`q11-019`), which is the 7.0.0 lane's `0110` rebased.
 - **Page migration corrupted the Venus ring.** `mlock()` keeps pages resident but
   not in place, and DomD compacts constantly under Venus load, so a shared frame
   moved and the render server decoded an all-zero command. Fixed by qemu `0121`
-  (udmabuf as a real pin).
+  (`q11-020`; udmabuf as a real pin).
 
 The fourth is outside that path: **adding the blob's MemoryRegion drove the vhost
 MemoryListener**, and `vhost_commit()` re-verified every vring against addresses
 that are pseudo-hvas under Xen, so the device model `abort()`ed the instant Mesa
-created its first Venus context. Fixed by qemu `0119`.
+created its first Venus context. Fixed by qemu `0119` (`q11-018`).
 
 Also from this run: the memory redistribution the 4 GiB SKU needs (in that
 run DomD 1408 MiB / DomA 2176 MiB in the Vulkan lane; this tree's map is
@@ -2873,9 +2902,9 @@ The Pi 5, which shares all of this code, was verified afterwards: DomA
 compositing with Vulkan (SkiaVk) on the 8 GB SKU, 2026-09-24 (the Pi 5
 product now composites with GL). The two boards
 differ in the memory map and in their board-specific Xen patches and config
-fragments (`4.22-0002` for RP1 MSI routing, `xen-scmi.cfg`, and `CONFIG_TEE`/
+fragments (`4.22-0002` for RP1 MSI routing, and `CONFIG_TEE`/
 `CONFIG_OPTEE` in `xen-hyp-config.cfg`, which the Pi 4 drops, on the Pi 5;
-`4.22-0011`/`4.22-0012` on the Pi 4; and each board's passthrough config), none
+`4.22-0011`/`4.22-0012`/`4.22-0014` on the Pi 4; and each board's passthrough config), none
 of which is in the Venus path.
 
 ## 8. Phase 5 — the fallback, and why it is not needed

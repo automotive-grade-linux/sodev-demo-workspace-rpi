@@ -2,13 +2,21 @@
 #
 # What this adds and why:
 #   kernel=u-boot + UART at the bootloader stage  -- U-Boot loads Xen.
-#   CMA via the vc4-kms-v3d overlay parameter     -- a cmdline `cma=` kills the
-#     RPi5 firmware mailbox (raspberrypi/linux#7230), so CMA has to be attached
-#     to the dtoverlay line instead.
 #   disable_fw_kms_setup=1                        -- DomD's vc4-drm owns HDMI.
 #   usb_max_current_enable=1                      -- the RP1 USB touch panel
 #     over-currents without it (needs a 5 A PSU).
 #   V3D firmware DVFS bounds                      -- busy ceiling / idle floor.
+#   arm_freq pinned in firmware                   -- see the long note below.
+#
+# No dtoverlay=vc4-kms-v3d. meta-raspberrypi's rpi-config_git.bb writes that line
+# whenever MACHINE_FEATURES has vc4graphics (its `if VC4GRAPHICS = 1` emits the
+# comment and the dtoverlay line, nothing else); VC4GRAPHICS = "0" below cancels
+# it. The overlay has never been on p1 -- rpi5-sodev.yaml ships only
+# overlays/bcm2712d0.dtbo -- so the firmware could not find vc4-kms-v3d.dtbo and
+# skipped the line, and the `,cma-256` this file used to sed onto it set nothing.
+# DomD's CMA comes from its own bootargs in boot.cmd.xen.{zephyr,linux}-dom0.in
+# (cma=640M@0x68000000 with the Zephyr Dom0, cma=128M with the Linux one); the
+# host DT's /reserved-memory/linux,cma stays at the firmware's 64 MiB.
 
 do_deploy:append() {
     install -d ${DEPLOYDIR}/${BOOTFILES_DIR_NAME}
@@ -24,11 +32,13 @@ do_deploy:append() {
     elif [ -n "${UART_BOOTLOADER}" ]; then
         bbfatal "Invalid value for UART_BOOTLOADER [${UART_BOOTLOADER}]. The value for UART_BOOTLOADER can be 0 or 1."
     fi
-
-    # Rewrite the vc4-kms-v3d overlay line to carry
-    # cma-256 (runs after the dtoverlay=vc4-kms-v3d line already exists).
-    sed -i 's|^dtoverlay=vc4-kms-v3d$|dtoverlay=vc4-kms-v3d,cma-256|' $CONFIG
 }
+
+# VC4GRAPHICS is a recipe-local variable used at exactly one place (the `if` that
+# writes dtoverlay=vc4-kms-v3d), so clearing it removes that line and nothing else.
+# MACHINE_FEATURES is left alone: DomD's mesa / vc4-drm packaging and the
+# vc4graphics.cfg kernel fragment depend on it.
+VC4GRAPHICS = "0"
 
 # Bake disable_fw_kms_setup=1. DomD's vc4-drm owns the
 # HDMI mode set and framebuffer; suppress the firmware-side KMS auto-attach so no
@@ -42,7 +52,7 @@ RPI_EXTRA_CONFIG:append = "\n# allow >600mA USB (needs 5A PSU) so the RP1 touch 
 
 # V3D GPU clock bounds for the VideoCore firmware DVFS:
 # busy ceiling 960MHz / idle floor 500MHz (native .maximize via firmware_clocks).
-RPI_EXTRA_CONFIG:append = "\n# V3D firmware DVFS bounds: busy max 960MHz / idle floor 500MHz (native .maximize via firmware_clocks)\nv3d_freq=960\nv3d_freq_min=500\n"
+RPI_EXTRA_CONFIG:append = "\n# V3D firmware DVFS bounds: busy max 960MHz / idle floor 500MHz\n# (native .maximize via firmware_clocks)\nv3d_freq=960\nv3d_freq_min=500\n"
 
 # Pin the A76 clock to the turbo frequency, in the firmware.
 #
@@ -93,4 +103,4 @@ RPI_EXTRA_CONFIG:append = "\n# V3D firmware DVFS bounds: busy max 960MHz / idle 
 # 50/60/67.5/75 C "active" (fan steps) and 110 C "critical" (shutdown). The
 # firmware's own temp_limit (default 85 C) is the effective thermal guard, so
 # sustained full-load runs should record temperature.
-RPI_EXTRA_CONFIG:append = "\n# A76 clock pinned in firmware: Xen/Arm disables cpufreq in every guest\n# (arch/arm/xen/enlighten.c disable_cpufreq()), so no governor can raise it from\n# the 1.5 GHz idle floor. min == max also removes DVFS jitter for RT measurement.\narm_freq=2400\narm_freq_min=2400\n"
+RPI_EXTRA_CONFIG:append = "\n# A76 clock pinned in firmware: Xen/Arm disables cpufreq in every guest\n# (arch/arm/xen/enlighten.c disable_cpufreq()), so no governor can raise it from\n# the 1.5 GHz idle floor. min == max also removes DVFS jitter for RT\n# measurement.\narm_freq=2400\narm_freq_min=2400\n"

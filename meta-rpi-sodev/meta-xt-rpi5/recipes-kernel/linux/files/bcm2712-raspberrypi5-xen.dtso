@@ -10,7 +10,7 @@
 	#address-cells = <0x2>;
 	#size-cells = <0x2>;
 	xenpolicy {
-		compatible = "xen,xsm-policy", "multiboot-module";
+		compatible = "xen,xsm-policy", "multiboot,module";
 	};
 	dom0 {
 		compatible = "multiboot,kernel", "multiboot,module";
@@ -54,10 +54,10 @@
 		 * xl devd OOM above was measured at -- and reproduced that
 		 * failure on hardware: AAOS crash-looped in binder and never
 		 * set sys.boot_completed, while DomD itself still had 1.3 GiB
-		 * free and was never OOM-killed. The remaining banks stay
-		 * place_modules() puts the DomD kernel/DTB, and
-		 * 0x68000000 holds DomD's CMA (cma=640M@0x68000000 with the
-		 * Zephyr Dom0). Keeping the 16 GB values here means
+		 * free and was never OOM-killed. The remaining banks stay as
+		 * they are: place_modules() puts the DomD kernel/DTB in them,
+		 * and 0x68000000 holds DomD's CMA (cma=640M@0x68000000 with
+		 * the Zephyr Dom0). Keeping the 16 GB values here means
 		 * a hand-built DTB (no boot script) still gets the 16 GB map;
 		 * the map with the 0x68000000 bank (2026-10-19) was booted
 		 * only as the 8 GB override, not as a 16 GB image. Do NOT
@@ -106,7 +106,7 @@
  * Root is targeted via &{/} (a path reference) rather than a label so it never
  * depends on a symbol being present in the base DTB __symbols__ (see the GPU
  * note below); reserved-memory then merges into the base host node at fdt apply.
- * This is the same idiom the sibling bcm2712-raspberrypi5-xen-scmi.dtso uses to
+ * This is the same idiom the former bcm2712-raspberrypi5-xen-scmi.dtso used to
  * add its scmi_shm reserved-memory entry. Cells are 2/2 to match the base
  * bcm2712.dtsi root and its rmem node; declaring them on &{/} keeps the empty
  * "ranges" consistent (the merge into the 2/2 root writes identical values).

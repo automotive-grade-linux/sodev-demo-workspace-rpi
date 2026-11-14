@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Sat, 12 Sep 2026 01:02:25 +0900
 Subject: [PATCH] xen: do not silently drop IOREQ MMIO range (un)registration
@@ -48,6 +49,11 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ include/hw/xen/xen_native.h | 65 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/include/hw/xen/xen_native.h b/include/hw/xen/xen_native.h
+index 5caf91a6162..2df563a575c 100644
 --- a/include/hw/xen/xen_native.h
 +++ b/include/hw/xen/xen_native.h
 @@ -20,6 +20,9 @@
@@ -60,7 +66,7 @@ Upstream-Status: Pending
  
  extern xc_interface *xen_xc;
  
-@@ -370,14 +373,59 @@
+@@ -370,14 +373,59 @@ static inline void xen_map_memory_section(domid_t dom,
      hwaddr start_addr = section->offset_within_address_space;
      ram_addr_t size = int128_get64(section->size);
      hwaddr end_addr = start_addr + size - 1;
@@ -122,7 +128,7 @@ Upstream-Status: Pending
  }
  
  static inline void xen_unmap_memory_section(domid_t dom,
-@@ -387,14 +435,23 @@
+@@ -387,14 +435,23 @@ static inline void xen_unmap_memory_section(domid_t dom,
      hwaddr start_addr = section->offset_within_address_space;
      ram_addr_t size = int128_get64(section->size);
      hwaddr end_addr = start_addr + size - 1;

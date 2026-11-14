@@ -23,8 +23,7 @@ inherit pkgconfig systemd
 EXTRA_OEMAKE = "WAYLAND_SCANNER=${STAGING_BINDIR_NATIVE}/wayland-scanner WPROTODIR=${STAGING_DATADIR}/wayland-protocols"
 
 do_compile() {
-    oe_runmake -f ${S}/Makefile WAYLAND_SCANNER=${STAGING_BINDIR_NATIVE}/wayland-scanner \
-        WPROTODIR=${STAGING_DATADIR}/wayland-protocols
+    oe_runmake -f ${S}/Makefile
 }
 
 do_install() {

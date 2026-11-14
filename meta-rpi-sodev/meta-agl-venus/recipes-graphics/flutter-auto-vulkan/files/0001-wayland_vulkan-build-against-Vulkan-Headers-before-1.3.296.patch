@@ -1,5 +1,5 @@
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 06 Sep 2026 01:20:01 +0900
+Date: Tue, 22 Sep 2026 15:07:01 +0900
 Subject: [PATCH] wayland_vulkan: build against Vulkan-Headers before 1.3.296
 
 Vulkan-Headers 1.3.296 moved resultCheck and defaultDispatchLoaderDynamic from

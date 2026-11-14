@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Follow V4H (AGL SoDeV) pins from the external/sodev-demo-workspace submodule.
 # moulin has no cross-file include, so the pins are duplicated into our build.sh /
-# rpi5-sodev.yaml; this script reports the upstream values so drift stays visible.
+# rpi5-sodev.yaml / rpi4-sodev.yaml; this script reports the upstream values so drift
+# stays visible.
 #
 # The DomA manifest pins are NO LONGER derived from V4H and --apply refuses to touch
 # them, for two reasons. V4H is on Android 15 (yhamamachi/android_manifest @ aff3224d,
@@ -31,7 +32,6 @@ here="$(cd "$(dirname "$0")/../.." && pwd)"
 SDW="$here/external/sodev-demo-workspace"
 RCAR_YAML="$SDW/external/meta-rcar-demo/prod-devel-rcar4_new.yaml"
 SDW_BUILD="$SDW/build.sh"
-OUR_YAML="$here/rpi5-sodev.yaml"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 [ -f "$SDW_BUILD" ] || die "submodule not initialized: $SDW (run: git submodule update --init --recursive)"
@@ -54,7 +54,7 @@ android_kernel_rev() { rev_for "android_kernel_manifest"; }
 case "${1:-}" in
   --print)
     case "${2:-}" in
-      agl-branch)          b="$(agl_branch)"; echo "${b:-trout-sodev}" ;;
+      agl-branch)          b="$(agl_branch)"; [ -n "$b" ] || die "agl_branch= not found in $SDW_BUILD"; echo "$b" ;;
       android-rev)         android_rev ;;
       android-kernel-rev)  android_kernel_rev ;;
       *) die "usage: --print {agl-branch|android-rev|android-kernel-rev}" ;;
@@ -64,11 +64,13 @@ case "${1:-}" in
     echo "  agl-branch         : $(agl_branch)"
     echo "  android rev        : $(android_rev)"
     echo "  android-kernel rev : $(android_kernel_rev)"
-    echo "[our rpi5-sodev.yaml]"
     # Key on the `manifest:` line: both repo components have one, and their names are
     # what distinguishes the AOSP tree from the pinned kernel manifest.
-    grep -nE '^ +manifest: [-a-z0-9.]+\.xml' -B2 "$OUR_YAML" 2>/dev/null \
-      | grep -E 'rev:|manifest:' || echo "  (no doma pins found yet)" ;;
+    for y in rpi5-sodev.yaml rpi4-sodev.yaml; do
+      echo "[our $y]"
+      grep -nE '^ +manifest: [-a-z0-9.]+\.xml' -B2 "$here/$y" 2>/dev/null \
+        | grep -E 'rev:|manifest:' || echo "  (no doma pins found yet)"
+    done ;;
   --apply)
     cat >&2 <<'EOT'
 ERROR: --apply is disabled for the DomA manifest pins.

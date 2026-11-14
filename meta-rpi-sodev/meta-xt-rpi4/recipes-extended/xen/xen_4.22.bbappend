@@ -6,9 +6,11 @@
 # down). The rpi5 bbappend takes that one and not the rpi4-only 4.22-0011/0012/0014,
 # which only a mini-UART console needs.
 # ============================================================================
-# This bbappend attaches to the STOCK meta-virtualization recipe
-# xen_4.22.bb (PV "4.22.0+stable", SRCREV d45d5687f1, branch stable-4.22) instead
-# of the xen-troops fork _git recipe. It is selected by
+# This bbappend attaches to the interim xen_4.22.bb in
+# meta-xt-common/meta-xt-domx/recipes-extended/xen/ (PV "4.22.0+stable", SRCREV
+# d45d5687f1, branch stable-4.22; meta-virtualization stops at xen_4.21.bb, so that
+# recipe is carried here until it is accepted upstream) instead of the xen-troops
+# fork _git recipe. It is selected by
 #   PREFERRED_VERSION_xen = "4.22.0+stable"
 # (set in the DomD build's local.conf / rpi4-sodev.yaml linux_domain_conf).
 #
@@ -142,8 +144,8 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # lane adds 4.22-0008 to both from there as well, and keeps the hypervisor-only
 # 4.22-0007 there too so the two boards carry one copy rather than two;
 # 4.22-0006 and 4.22-0013, also hypervisor-only, live there for the same reason.
-# Only the hypervisor-only 0025, the rpi4-only 4.22-0011/0012 and the Kconfig .cfg
-# fragments remain in ./files here.
+# Only the hypervisor-only 0025, the rpi4-only 4.22-0011/0012/0014 and the Kconfig
+# .cfg fragments remain in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series ---
@@ -214,21 +216,26 @@ SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 #   symbols govern the `xl create` path that DomA uses).
 SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://xen-config-rpi4-passthrough.cfg"
 
-# --- hypervisor Kconfig fragment: SCMI/SCI (conditional on the scmi MACHINE_FEATURE,
-#     mirrors the fork's xt-prod-devel-rpi5-domd xen_git.bbappend anonymous-python) ---
-# REMOVED(rpi4): the scmi MACHINE_FEATURE hook that appended xen-scmi.cfg.
-# BCM2711 has no SCMI at all — clocks and power come from the VideoCore firmware
-# mailbox (raspberrypi,firmware) — so CONFIG_SCMI_SMC has nothing to talk to and
-# xen-scmi.cfg was deleted along with the rest of the SCMI plumbing (TF-A's
-# SCMI_SERVER_SUPPORT, the *-scmi.dtso overlays and the SCMI dtbo deploy list).
+# --- SCMI/SCI: no fragment, on either board ---
+# stable-4.22's xen/arch/arm/firmware/Kconfig makes SCMI_SMC the default of the
+# "ARM SCI driver type" choice (it selects ARM_SCI), so this board's .config has
+# CONFIG_ARM_SCI=y and CONFIG_SCMI_SMC=y with nothing added here. The mediator is
+# built in but idle: BCM2711 has no SCMI -- clocks and power come from the
+# VideoCore firmware mailbox (raspberrypi,firmware) -- and the host DT has no
+# arm,scmi-smc node for it to bind. Switching the choice to ARM_SCI_NONE here is a
+# board measurement that has not been made, so the default stays. The rest of the
+# rpi5 SCMI plumbing (TF-A's SCMI_SERVER_SUPPORT, the *-scmi.dtso overlays, the
+# SCMI dtbo deploy list) is absent from this layer.
 
 # --- patch-fuzz QA: left at ERROR (the OE default) ---------------------------
 # [4.22] The 4.21 revision of this bbappend demoted patch-fuzz to a warning here
 # (WARN_QA:append / ERROR_QA:remove) with its own CAVEAT noting that a permanent
 # demotion lets a silently mis-applied patch pass do_patch with only a warning.
 # Both lines are REMOVED for 4.22: the series applies to stable-4.22 with zero
-# fuzz and zero offset warnings (0008/0018 regenerated, 0022/4.22-0001 rebased),
-# so there is nothing left to tolerate and a mis-apply should fail the build. If a
+# fuzz (0008/0018 regenerated, 0022/4.22-0001 rebased). Hunks do land at
+# offsets, which the patch-fuzz check does not look at (insane.bbclass reads
+# only the "Patch fuzz" block of the patch log), so there is nothing left to
+# tolerate and a mis-apply should fail the build. If a
 # stable-4.22.x bump shifts context, refresh the affected patch -- do not re-add
 # the demotion. Kept in sync with the rpi5 bbappend.
 # Upstream-Status is present on every patch, so the separate patch-status QA is
@@ -269,7 +276,7 @@ SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://
 #     firmware prebuilt, so those two currently disagree for SPI 96 -- tracked as
 #     an open item; the partial DT is the one that governs what DomD's probe sees,
 #     which is why fixing it was what stopped the panic.
-#     The override still only triggers on the libxl path (domd.cfg `irqs=[...]`),
+#     The override still only triggers on the libxl path (a domd.cfg's `irqs=[...]`),
 #     which carries no type information at all.
 #     (GIC SPI n maps to Xen/libxl irq n+32: msi SPI 148 -> 180, pcie SPI 147 ->
 #     179, INTA-D SPI 143..146 -> 175..178, HDMI L2 SPI 96 -> 128.)

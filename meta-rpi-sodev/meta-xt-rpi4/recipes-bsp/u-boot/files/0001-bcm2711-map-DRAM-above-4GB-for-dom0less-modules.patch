@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 8464db7703f30b75b0175671dc245c2c7496e94b Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 25 Jul 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:38:21 +0900
 Subject: [PATCH] bcm283x: map DRAM above 4 GiB on BCM2711
 
 bcm2711_mem_map only describes DRAM up to 0xfc000000 (the MMIO window base), so on
@@ -28,22 +28,26 @@ banks, so nothing dereferences the unbacked range.
 
 Generated against xen-troops/u-boot branch rpi5-2024.04-xt
 (arch/arm/mach-bcm283x/init.c), which is what recipes-bsp/u-boot/u-boot-src.inc
-pins, so the hunk offsets match the tree bitbake unpacks.
+pins, so the hunk offsets match the tree bitbake unpacks. It stays local to
+this workspace: the map it extends is the fork's BCM2711 table and it has been
+tested only there, for the module placement of this Xen dom0less boot.
 
 Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [configuration]
+Upstream-Status: Inappropriate [embedded specific]
 ---
  arch/arm/mach-bcm283x/init.c | 10 ++++++++++
  1 file changed, 10 insertions(+)
 
 diff --git a/arch/arm/mach-bcm283x/init.c b/arch/arm/mach-bcm283x/init.c
+index 284324c78d7..6da610c250b 100644
 --- a/arch/arm/mach-bcm283x/init.c
 +++ b/arch/arm/mach-bcm283x/init.c
-@@ -63,6 +63,16 @@
+@@ -62,6 +62,16 @@ static struct mm_region bcm2711_mem_map[MEM_MAP_MAX_ENTRIES] = {
+ 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
  			 PTE_BLOCK_NON_SHARE |
  			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
- 	}, {
++	}, {
 +		/*
 +		 * DRAM above the 4 GiB MMIO hole (8 GiB SKU). Needed so Xen
 +		 * dom0less boot modules can be fatload'ed there.
@@ -53,9 +57,9 @@ diff --git a/arch/arm/mach-bcm283x/init.c b/arch/arm/mach-bcm283x/init.c
 +		.size = 0x100000000UL,
 +		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
 +			 PTE_BLOCK_INNER_SHARE
-+	}, {
+ 	}, {
  		/* List terminator */
  		0,
- 	}
---
+-- 
 2.43.0
+

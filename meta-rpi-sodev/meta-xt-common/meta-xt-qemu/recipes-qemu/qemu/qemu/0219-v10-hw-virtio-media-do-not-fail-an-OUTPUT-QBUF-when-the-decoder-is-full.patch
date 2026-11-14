@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Tue, 22 Sep 2026 01:50:07 +0900
-Subject: [PATCH] hw/virtio-media: do not fail an OUTPUT QBUF when the decoder is full
+Subject: [PATCH] hw/virtio-media: do not fail an OUTPUT QBUF when the decoder
+ is full
 
 0217/0218 got hardware decode working on the board -- DomD logs
 
@@ -70,8 +72,11 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media-decoder.c | 150 +++++++++++++++++++++++++++++--
+ 1 file changed, 145 insertions(+), 5 deletions(-)
+
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 09fe9c3a8dc..85f5e990b11 100644
+index 322f56cfd57..7ac6fcb92cd 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -109,6 +109,15 @@

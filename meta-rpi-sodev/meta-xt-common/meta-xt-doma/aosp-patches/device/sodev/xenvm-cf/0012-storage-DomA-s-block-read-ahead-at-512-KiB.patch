@@ -1,6 +1,6 @@
-From a95809ff6927217f30579c883e89b36cc83c1337 Mon Sep 17 00:00:00 2001
+From 3f3764d2bacc9245e74d43736c0eb5c8b251584f Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 28 Oct 2026 11:38:08 +0900
+Date: Wed, 11 Nov 2026 08:51:04 +0900
 Subject: [PATCH] storage: DomA's block read-ahead at 512 KiB
 
 init.xenvm-readahead.rc writes 512 to read_ahead_kb of vda and of the dm
@@ -19,28 +19,33 @@ a single request. Measured on this board with the value set at run time
 (2026-10-25): the virtio-blk holds over the frame time went away under a
 cold read of the disk, and in the 580 s runs of a WebView's 720p60
 H.264 the main loop held the BQL for a vsync or more only with single
-GPU commands. That init writes it from this rc has not been run on the
-board yet. The Raspberry Pi 5 product keeps the kernel's default.
+GPU commands. Run on the board (2026-11-02) with this rc as merged in
+PR #6 of the AGL workspace: after boot the dm devices read back 512 KiB,
+but vda and the dm device under /data (userdata) read back 8192 KiB, so
+for those two the rc does not yet achieve the figure above; what sets
+them back is not yet known. The Raspberry Pi 5 product keeps the
+kernel's default.
 
 Assisted-by: Claude Code:claude-opus-5-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
 ---
  README.md                                     |  1 +
  aosp_xenvm_trout_rpi4_arm64.mk                |  5 +++
- .../init.xenvm-readahead.rc                   | 36 +++++++++++++++++++
- 3 files changed, 42 insertions(+)
+ .../init.xenvm-readahead.rc                   | 41 +++++++++++++++++++
+ 3 files changed, 47 insertions(+)
  create mode 100644 xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc
 
 diff --git a/README.md b/README.md
-index c798cf3..42e9dad 100644
+index c798cf3..13a2b30 100644
 --- a/README.md
 +++ b/README.md
 @@ -46,6 +46,7 @@ reuse object files built for the other CPU.
  | `DomaWifiRelay/` | The framework half of that relay: a platform app that, while the Settings Wi-Fi toggle is on, reads the passphrase the user typed and asks the vendor half to use it. It also cycles Wi-Fi once the bring-up has made the radios, and enables again a network AAOS disabled for no internet while DomD has it |
  | `DomaWifiOverlay/` | A product RRO on the Wi-Fi resources: a network disabled for no internet is tried again after 10 minutes instead of never |
  | `xenvm_trout_rpi4_arm64/init.xenvm-webview.rc` | Writes the WebView's command line (its video as a layer of its own); works only while the product boots permissive |
-+| `xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc` | Sets DomA's block read-ahead to 512 KiB (vda and the dm devices), so that one virtio-blk request does not hold DomD's device-model main loop for longer than a frame |
++| `xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc` | Sets DomA's block read-ahead to 512 KiB (vda and the dm devices), so that one virtio-blk request does not hold DomD's device-model main loop for longer than a frame. On the board vda and the userdata dm device read back 8192 KiB after boot; why is not yet known |
  | `DomaNoSafeAreaRRO/` | Product RRO on CarSystemUI: no per-display safe area and toolbar, so a full-screen app covers the display and a WebView's video can go on a plane (the same as the Raspberry Pi 5 product's) |
  | `xenvm_trout_rpi4_arm64/media_codecs_c2.xml` | Describes the vendor C2 decoder to the media framework: decoders only, H.264 only, 1080p max |
  | `xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy` | The extended seccomp policy the C2 service needs for its V4L2 ioctls |
@@ -62,10 +67,10 @@ index 62129bb..cde8e78 100644
  # so that trigger never fires; overriding that is deliberate and argued in the .rc.
 diff --git a/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc b/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc
 new file mode 100644
-index 0000000..bddb675
+index 0000000..2f541e5
 --- /dev/null
 +++ b/xenvm_trout_rpi4_arm64/init.xenvm-readahead.rc
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,41 @@
 +# SPDX-License-Identifier: Apache-2.0
 +#
 +# DomA's block read-ahead at 512 KiB instead of the 8192 KiB this board's virtio-blk
@@ -79,6 +84,11 @@ index 0000000..bddb675
 +# time went away under a cold read of the disk, and in the 580 s runs of a WebView's
 +# 720p60 H.264 the main loop held the BQL for a vsync or more only with single GPU
 +# commands. The Raspberry Pi 5 product keeps the kernel's default.
++#
++# Observed on the board (2026-11-02, this rc as merged): after boot the dm devices
++# read back 512 KiB, but vda and the dm device under /data (userdata) read back
++# 8192 KiB. What sets those two back is not yet known, so for them this rc does not
++# yet achieve the figure above.
 +#
 +# Written at post-fs-data, after late-fs has mounted /data: /data sits on a dm device
 +# of its own (metadata encryption) that mount_all --late creates, after post-fs. init's
@@ -102,3 +112,6 @@ index 0000000..bddb675
 +    write /sys/block/dm-13/queue/read_ahead_kb 512
 +    write /sys/block/dm-14/queue/read_ahead_kb 512
 +    write /sys/block/dm-15/queue/read_ahead_kb 512
+-- 
+2.43.0
+

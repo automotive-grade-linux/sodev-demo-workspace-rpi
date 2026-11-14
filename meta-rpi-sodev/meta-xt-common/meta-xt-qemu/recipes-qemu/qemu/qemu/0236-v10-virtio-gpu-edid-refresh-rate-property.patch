@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 20:07:37 +0900
+Date: Sat, 5 Sep 2026 20:07:37 +0900
 Subject: [PATCH] virtio-gpu: add a refresh_rate property for the generated
  EDID
 
@@ -12,6 +12,11 @@ model config pin the rate (mHz).
 Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
+---
+ hw/display/virtio-gpu-base.c   | 11 ++++++++++-
+ include/hw/virtio/virtio-gpu.h |  8 +++++++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
 diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
 index 7827536ac46..5dd9b1be5f1 100644
 --- a/hw/display/virtio-gpu-base.c

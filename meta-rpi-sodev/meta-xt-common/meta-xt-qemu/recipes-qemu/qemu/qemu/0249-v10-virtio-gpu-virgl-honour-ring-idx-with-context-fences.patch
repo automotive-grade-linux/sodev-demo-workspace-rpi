@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Fri, 2 Oct 2026 11:51:06 +0900
 Subject: [PATCH] virtio-gpu-virgl: honour INFO_RING_IDX with context fences
@@ -31,9 +32,14 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ hw/display/virtio-gpu-virgl.c | 68 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 13dbf8eda87..9b94a707d59 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -550,6 +550,35 @@
+@@ -550,6 +550,35 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
      virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen, cc.debug_name);
  }
  
@@ -69,7 +75,7 @@ Upstream-Status: Pending
  static void virgl_cmd_context_destroy(VirtIOGPU *g,
                                        struct virtio_gpu_ctrl_command *cmd)
  {
-@@ -559,6 +588,12 @@
+@@ -559,6 +588,12 @@ static void virgl_cmd_context_destroy(VirtIOGPU *g,
      trace_virtio_gpu_cmd_ctx_destroy(cd.hdr.ctx_id);
  
      virgl_renderer_context_destroy(cd.hdr.ctx_id);
@@ -82,7 +88,7 @@ Upstream-Status: Pending
  }
  
  static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
-@@ -1177,6 +1212,20 @@
+@@ -1177,6 +1212,20 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
      }
  
      trace_virtio_gpu_fence_ctrl(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
@@ -103,7 +109,7 @@ Upstream-Status: Pending
      virgl_renderer_create_fence(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
  }
  
-@@ -1193,6 +1242,10 @@
+@@ -1193,6 +1242,10 @@ static void virgl_write_fence(void *opaque, uint32_t fence)
          if (cmd->cmd_hdr.fence_id > fence) {
              continue;
          }
@@ -114,7 +120,7 @@ Upstream-Status: Pending
          trace_virtio_gpu_fence_resp(cmd->cmd_hdr.fence_id);
          virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
          QTAILQ_REMOVE(&g->fenceq, cmd, next);
-@@ -1237,9 +1290,22 @@
+@@ -1237,9 +1290,22 @@ static int virgl_make_context_current(void *opaque, int scanout_idx,
                                     qctx);
  }
  

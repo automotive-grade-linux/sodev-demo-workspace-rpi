@@ -2,7 +2,7 @@ SUMMARY = "AAOS (DomA) guest kernel + vendor_boot ramdisk for SD p1"
 DESCRIPTION = "\
     Places the DomA (AAOS) boot binaries into DEPLOY_DIR_IMAGE. \
     rouge (ninja image-full) grafts them onto SD p1 (FAT) as \
-    aaos-android-kernel / aaos-vendor-boot-ramdisk, and Dom0's \
+    aaos-android-kernel / aaos-vendor-boot-ramdisk, and the toolstack domain's \
     xl-create-doma.service runs xl create with doma.cfg \
     (kernel=/mnt/aaos-android-kernel, ramdisk=/mnt/aaos-vendor-boot-ramdisk) \
     after mounting /mnt. \
@@ -60,19 +60,7 @@ DESCRIPTION = "\
 #     build can differ.
 #
 # So these artefacts aggregate material under at least GPL-2.0-family, Apache-2.0
-# and 0BSD terms. OpenEmbedded's LICENSE field cannot be
-# left unset -- bitbake defaults it to "INVALID" and base.bbclass makes that a fatal
-# error -- so a value has to be chosen. "CLOSED" is the one that asserts nothing
-# about which licenses apply to the aggregate or how they combine; naming a license,
-# or an expression joining several, would be a statement this recipe is not in a
-# position to make about binaries it does not build. Its practical effect, measured
-# against a normal recipe in the same build: insane.bbclass skips LIC_FILES_CHKSUM
-# validation, and license.bbclass collects no license text under
-# ${LICENSE_DIRECTORY}/${PN}/ -- only a recipeinfo reading "LICENSE: CLOSED", where
-# openssh in the same build gets its LICENCE plus one generic_* file per license.
-# Note that the package is still listed in the image license.manifest, as
-# "LICENSE: CLOSED"; that manifest is written from every installed package's LICENSE
-# without filtering.
+# and 0BSD terms.
 #
 # Note that this repository ships neither artefact: both are produced by the build (or,
 # in --aaos=prebuilt, taken from a bundle and .gitignore'd), so nothing is redistributed
@@ -91,8 +79,8 @@ LICENSE = "GPL-2.0-only & Apache-2.0"
 # Naming real licences (instead of the previous CLOSED) makes LIC_FILES_CHKSUM
 # mandatory. Both artifacts are build outputs of the doma_kernel / doma components,
 # so there is no upstream licence file inside this recipe to point at; reference the
-# canonical texts. The AOSP NOTICE that accompanies the redistributed userspace bits
-# is shipped by xt-aaos-host-services (Apache-2.0 section 4d).
+# canonical texts. No NOTICE for the ramdisk's AOSP userspace is shipped by any recipe
+# here (the one xt-aaos-host-services installs covers only its own two files).
 LIC_FILES_CHKSUM = "\
     file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d171dd6425610833a22dbe6 \
     file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10 \

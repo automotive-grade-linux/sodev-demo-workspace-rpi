@@ -1,22 +1,30 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:49:46 +0900
 Subject: [PATCH] virtio-media: add output-coherent and gpu-fence-fd
 
 qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0242-v10-virtio-media-output-coherent-and-gpu-fence-fd.patch;
 that patch's description has the reasoning and the measurements.
 
+Changed in the q11 series (review 2026-11-11): output-coherent applies
+to the OUTPUT queue only, as its name and comment say; before, with
+gpu-xfer off, a CAPTURE REQBUFS fell into its branch and lost the
+cacheable buffers q11-030 asks for. gpu-fence-fd is one setting for the
+device model (the bridge's GL context is shared); the first device
+realized decides and a later device asking for the other value is
+logged and ignored, where before the last realize silently won.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-virgl-stub.c    |   4 +
- hw/virtio/virtio-media-virgl.c         | 120 ++++++++++++++++++++++++-
- hw/virtio/virtio-media.c               |  23 +++++
+ hw/virtio/virtio-media-virgl.c         | 130 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media.c               |  24 +++++
  include/hw/virtio/virtio-media-virgl.h |   6 ++
  include/hw/virtio/virtio-media.h       |  17 ++++
- 5 files changed, 169 insertions(+), 1 deletion(-)
+ 5 files changed, 180 insertions(+), 1 deletion(-)
 
 diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
 index b58febb59..6494912ad 100644
@@ -34,7 +42,7 @@ index b58febb59..6494912ad 100644
  {
  }
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index b7a8b49ca..9bdc3f498 100644
+index cc1e10db2..2047d0bc2 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
 @@ -11,6 +11,12 @@
@@ -50,7 +58,7 @@ index b7a8b49ca..9bdc3f498 100644
  
  /* drm_fourcc.h values, spelled out to avoid a libdrm dependency. */
  #define VM_DRM_FORMAT_ABGR8888  0x34324241u   /* 'AB24': R,G,B,A byte order */
-@@ -54,6 +60,17 @@ typedef struct VirtIOMediaGpuBuf {
+@@ -55,6 +61,17 @@ typedef struct VirtIOMediaGpuBuf {
      GLuint tex;
      GLuint read_fbo;          /* the blit's read FBO, made on first use */
      GLsync sync;              /* last copy that read this buffer, or NULL */
@@ -68,27 +76,37 @@ index b7a8b49ca..9bdc3f498 100644
      /* host-nv12: two planes of one NV12 buffer, converted by a shader. */
      bool nv12;
      uint32_t src_width;
-@@ -163,6 +180,19 @@ static bool gpu_create_context(EGLDisplay dpy, EGLContext share)
+@@ -169,6 +186,29 @@ static bool gpu_create_context(EGLDisplay dpy, EGLContext share)
      return true;
  }
  
 +/*
 + * gpu-fence-fd, and whether the driver can actually do it. Set from the device
 + * property at realize; the extension is probed once, the first time a fence is
-+ * created, because that is the first point where a display is known.
++ * created, because that is the first point where a display is known. One value
++ * for the device model: the bridge context is shared by every virtio-media
++ * device in the process, so the first device realized decides, and a later one
++ * asking for the other value is warned about and does not change it.
 + */
 +static bool gpu_fence_fd_want;
++static bool gpu_fence_fd_set;
 +static int gpu_fence_fd_ok = -1;   /* -1 = not probed yet */
 +
 +void virtio_media_gpu_set_fence_fd(bool on)
 +{
++    if (gpu_fence_fd_set && gpu_fence_fd_want != on) {
++        qemu_log("virtio-media-diag: gpu-fence-fd is one setting for the device "
++                 "model; keeping %s\n", gpu_fence_fd_want ? "on" : "off");
++        return;
++    }
 +    gpu_fence_fd_want = on;
++    gpu_fence_fd_set = true;
 +}
 +
  /*
   * Switch to the bridge context. false = nothing current (virgl idle or not
   * initialised) or the context could not be created: caller falls back.
-@@ -403,6 +433,7 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
+@@ -409,6 +449,7 @@ void *virtio_media_gpu_import_nv12(int dmabuf_fd, uint32_t src_width,
          return NULL;
      }
      b = g_new0(VirtIOMediaGpuBuf, 1);
@@ -96,7 +114,7 @@ index b7a8b49ca..9bdc3f498 100644
      b->fd = dmabuf_fd;
      b->nv12 = true;
      b->width = dst_width;
-@@ -527,6 +558,7 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
+@@ -531,6 +572,7 @@ void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
      }
  
      b = g_new0(VirtIOMediaGpuBuf, 1);
@@ -104,7 +122,7 @@ index b7a8b49ca..9bdc3f498 100644
      b->fd = dmabuf_fd;
      b->width = width;
      b->height = height;
-@@ -602,6 +634,14 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+@@ -604,6 +646,14 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
          glDeleteSync(b->sync);
          b->sync = NULL;
      }
@@ -119,7 +137,7 @@ index b7a8b49ca..9bdc3f498 100644
  
      if (b->nv12) {
          ret = gpu_draw_nv12(b, info.tex_id);
-@@ -638,6 +678,42 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+@@ -640,6 +690,42 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
          ret = -EIO;
          goto out;
      }
@@ -162,7 +180,7 @@ index b7a8b49ca..9bdc3f498 100644
      b->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
      /* Submit now so virgl's next draw (other context) orders behind it. */
      glFlush();
-@@ -653,7 +729,41 @@ int virtio_media_gpu_wait(void *handle)
+@@ -655,7 +741,41 @@ int virtio_media_gpu_wait(void *handle)
      GLenum r;
      int ret;
  
@@ -205,7 +223,7 @@ index b7a8b49ca..9bdc3f498 100644
          return 0;
      }
      if (!gpu_enter(&sv)) {
-@@ -683,6 +793,14 @@ void virtio_media_gpu_release(void *handle)
+@@ -685,6 +805,14 @@ void virtio_media_gpu_release(void *handle)
          return;
      }
      close(b->fd);
@@ -221,14 +239,15 @@ index b7a8b49ca..9bdc3f498 100644
          gpu_free_buf(b);
          gpu_leave(&sv);
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 4de592d4c..faac3cdc5 100644
+index 487bbe430..e77c7dff3 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -991,6 +991,26 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+@@ -1012,6 +1012,27 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
       */
      if (s->vm->gpu_xfer && virtio_media_queue_index(rb->type) == 1) {
          host_rb.flags = 0;
-+    } else if (s->vm->output_coherent) {
++    } else if (s->vm->output_coherent &&
++               virtio_media_queue_index(rb->type) == 0) {
 +        /*
 +         * NOTE: output-coherent: ask for a COHERENT (Normal-NC) OUTPUT buffer too.
 +         *
@@ -251,7 +270,7 @@ index 4de592d4c..faac3cdc5 100644
      } else {
          host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
      }
-@@ -1802,6 +1822,7 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
+@@ -1831,6 +1852,7 @@ static void virtio_media_realize(DeviceState *dev, Error **errp)
      vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
      vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
      vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
@@ -259,7 +278,7 @@ index 4de592d4c..faac3cdc5 100644
  
      info_report("virtio-media: proxying %s (device_caps 0x%08x)",
                  vm->v4l2_device, vm->device_caps);
-@@ -1841,6 +1862,8 @@ static const Property virtio_media_properties[] = {
+@@ -1870,6 +1892,8 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
      DEFINE_PROP_BOOL("host-nv12", VirtIOMedia, host_nv12, true),
@@ -286,10 +305,10 @@ index 6917d37de..07b2e0069 100644
  
  #endif
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 0731dacd2..78b14da9d 100644
+index ea459eba3..32dc04a3c 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -274,6 +274,23 @@ struct VirtIOMedia {
+@@ -276,6 +276,23 @@ struct VirtIOMedia {
       * cannot take the GPU path are converted on the CPU (slow, correct).
       */
      bool host_nv12;

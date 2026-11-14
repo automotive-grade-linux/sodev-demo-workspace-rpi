@@ -26,8 +26,8 @@ the pinned commit to see the whole delta.
 Only the `_4.2.0` recipes are buildable on this board -- `optee.inc` sets
 `COMPATIBLE_MACHINE ?= "invalid"` and the RPi5 override is supplied by
 `meta-xt-rpi5/recipes-security/optee/*_4.2.0.bbappend`, so the 4.1.0 recipes are
-never parsed for `MACHINE=raspberrypi5`. They are kept so the layer stays close to
-upstream and can be rebased without conflicts.
+parsed but skipped by COMPATIBLE_MACHINE for `MACHINE=raspberrypi5`. They are kept
+so the layer stays close to upstream and can be rebased without conflicts.
 
 Those layers *may* be added and used manually, but they were written
 with [Moulin](https://moulin.readthedocs.io/en/latest/) build system,
@@ -59,6 +59,9 @@ List of layers:
 
 * meta-xt-doma - recipes for an Android Automotive OS (AAOS) guest
   domain (DomA), gated by ENABLE_ANDROID.
+
+* meta-xt-domz - the Zephyr RTOS guest domain (DomZ): its xl config and
+  xl-create unit, and the Zephyr application under zephyr-apps/domz.
 
 * meta-xt-security - OP-TEE / secure-world recipes.
 

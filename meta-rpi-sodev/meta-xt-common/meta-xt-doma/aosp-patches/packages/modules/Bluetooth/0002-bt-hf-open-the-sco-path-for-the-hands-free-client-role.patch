@@ -1,6 +1,6 @@
-From ef98b0093acfebabad0ba8d4d60d86e4e26be224 Mon Sep 17 00:00:00 2001
+From edd3e2a4ce39e8bba5ce0b32f32e767b70f6a83e Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 23 Sep 2026 20:28:56 +0900
+Date: Wed, 11 Nov 2026 08:49:32 +0900
 Subject: [PATCH] bt-hf: open the SCO path for the hands-free client role
 
 Incoming-call audio never arrived. The audio HAL client gated the receive path on the
@@ -34,22 +34,44 @@ and the call voice both reach the speakers (2026-09-19). Without these four piec
 (2026-09-23) the HAL refuses the SCO stream and Telecom routes the call to the bus
 speaker with nothing on it.
 
+This depends on the frameworks/base change "audio: stop dropping the SCO device on
+an HF-client product": the state machine's active-device message goes through
+AudioDeviceBroker's isProfileProxyConnected(HEADSET) gate, which that change opens
+for an HF-client product; without it the message is dropped ("MSG_L_SET_BT_ACTIVE_DEVICE
+received with null profile proxy").
+
+Running both HFP roles at once (bluetooth.profile.hfp.ag.enabled=true next to
+hf.enabled=true) is not supported by this change: the gates here are on the HF
+software data path and on sco.managed_by_audio, not on the AG role being off, so
+HeadsetService and HeadsetClientStateMachine would both report an active SCO device,
+and whichever role takes the HfpClientInterface singleton first owns the data path.
+
+Test build: net_test_stack_btm compiles stack/btm/btm_sco_hci.cc with neither libbt-bta
+nor libbt-bta-mock, so its stack_btm_test.cc gets stubs for the three HF entry points
+next to the AG ones; libbt-bta-mock gets mock/mock_bta_hf_client_sco.cc for the four
+targets that link it together with libbt-audio-hal-interface. Neither test target has
+been built here.
+
 Assisted-by: Claude Code:claude-opus-5-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
- .../hfpclient/HeadsetClientStateMachine.java  |  63 +++++
+ .../hfpclient/HeadsetClientStateMachine.java  |  68 +++++
  .../audio_bluetooth_hw/device_port_proxy.cc   |  54 ++++
  .../aidl/client_interface_aidl.cc             |   3 +-
  .../aidl/hfp_client_interface_aidl.cc         |  58 ++++
- system/bta/hf_client/bta_hf_client_int.h      |  19 ++
+ system/bta/hf_client/bta_hf_client_int.h      |  21 ++
  system/bta/hf_client/bta_hf_client_main.cc    |  12 +
- system/bta/hf_client/bta_hf_client_sco.cc     | 267 +++++++++++++++++-
+ system/bta/hf_client/bta_hf_client_sco.cc     | 270 +++++++++++++++++-
+ system/bta/mock/mock_bta_hf_client_sco.cc     |  54 ++++
  system/stack/btm/btm_sco_hci.cc               |  29 +-
- 8 files changed, 495 insertions(+), 10 deletions(-)
+ system/stack/test/btm/stack_btm_test.cc       |   3 +
+ 10 files changed, 562 insertions(+), 10 deletions(-)
+ create mode 100644 system/bta/mock/mock_bta_hf_client_sco.cc
 
 diff --git a/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java b/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java
-index 1567a9b..343bbce 100644
+index 1567a9b..44409c9 100644
 --- a/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java
 +++ b/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java
 @@ -54,6 +54,7 @@ import android.content.Intent;
@@ -60,7 +82,7 @@ index 1567a9b..343bbce 100644
  import android.os.Bundle;
  import android.os.Looper;
  import android.os.Message;
-@@ -934,12 +935,74 @@ public class HeadsetClientStateMachine extends StateMachine {
+@@ -934,12 +935,79 @@ public class HeadsetClientStateMachine extends StateMachine {
          debug("hfp_enable=" + enable);
          if (enable && !sAudioIsRouted) {
              mAudioManager.setHfpEnabled(true);
@@ -74,42 +96,47 @@ index 1567a9b..343bbce 100644
  
 +    /**
 +     * Tell the audio framework which device owns the SCO link, the way the AG role already does
-+     * (HeadsetService.java:1113-1120 and :1199-1205).
++     * (HeadsetService, where it reports its active device to AudioManager).
 +     *
 +     * WHY THIS IS NEEDED. setHfpEnabled() above is only
-+     * AudioSystem.setParameters("hfp_enable=...") (AudioManager.java:4075-4077) -- a string to
++     * AudioSystem.setParameters("hfp_enable=...") (AudioManager.setHfpEnabled) -- a string to
 +     * the audio HAL. It registers no device. Without a registration the SCO ports declared in
 +     * bluetooth_audio_policy_configuration.xml never become available, so nothing can open the
-+     * `hfp input` stream, so audio_bluetooth_hw/stream_apis.cc:1064 in_read() never runs, so
-+     * BluetoothAudioPortAidl::Start (device_port_proxy.cc:516) never calls StartStream (:528),
-+     * so HfpTransport::StartRequest() is never reached -- and the far-end PCM is dropped by
-+     * audio_hal_interface/hfp_client_interface.cc:200-205, which returns len as if it had
-+     * written everything. The whole chain is reader-driven; this call is its first link.
-+     * Measured on the board 2026-09-13 across the three SCO stages.
++     * `hfp input` stream, so in_read() in audio_bluetooth_hw/stream_apis.cc never runs, so
++     * BluetoothAudioPortAidl::Start (device_port_proxy.cc) never calls StartStream, so
++     * HfpTransport::StartRequest() is never reached -- and the far-end PCM is dropped by
++     * HfpClientInterface::Decode::Write() (audio_hal_interface/hfp_client_interface.cc), which
++     * returns len as if it had written everything. The whole chain is reader-driven; this
++     * call is its first link. Measured on the board 2026-09-13 across the three SCO stages.
 +     *
 +     * WHY THE AG API IS THE RIGHT ONE FOR THE HF ROLE.
 +     *  - createHfpInfo() reports BluetoothProfile.HEADSET
-+     *    (BluetoothProfileConnectionInfo.java:188-191), and that is exactly the profile
++     *    (BluetoothProfileConnectionInfo.createHfpInfo), and that is exactly the profile
 +     *    AudioService.handleBluetoothActiveDeviceChanged accepts while isScoManagedByAudio()
-+     *    is true (AudioService.java:9659-9666). HEADSET_CLIENT would be rejected there.
-+     *  - AudioDeviceInventory.java:1067-1076 then calls
-+     *    AudioDeviceBroker.onSetBtScoActiveDevice() WITHOUT needing the AG profile proxy, and
-+     *    BtHelper.java:1403 / :1426 register the SCO output and the SCO INPUT
-+     *    (DEVICE_IN_BLUETOOTH_SCO_HEADSET -- the only place in the tree that does).
-+     *  - BLUETOOTH_STACK is required (AudioManager.java:7420-7422) and this app already holds
-+     *    it (android/app/AndroidManifest.xml:38); hfp/ and hfpclient/ are the same app.
++     *    is true. HEADSET_CLIENT would be rejected there.
++     *  - AudioDeviceInventory then calls AudioDeviceBroker.onSetBtScoActiveDevice(), and
++     *    BtHelper.onSetBtScoActiveDevice registers the SCO output and the SCO INPUT
++     *    (DEVICE_IN_BLUETOOTH_SCO_HEADSET -- the only place in the tree that does). The
++     *    AudioDeviceBroker gate in front of it, isProfileProxyConnected(HEADSET), is opened
++     *    for an HF-client product by this product's frameworks/base change ("audio: stop
++     *    dropping the SCO device on an HF-client product"); without it the message is
++     *    dropped with "MSG_L_SET_BT_ACTIVE_DEVICE received with null profile proxy".
++     *  - BLUETOOTH_STACK is required (AudioManager.handleBluetoothActiveDeviceChanged) and
++     *    this app already holds it (android/app/AndroidManifest.xml); hfp/ and hfpclient/ are
++     *    the same app.
 +     *
 +     * WHY IT IS SAFE WITH THE AG PROFILE DISABLED (this product: no
 +     * bluetooth.profile.hfp.ag.enabled, so HeadsetService.isEnabled() is false):
-+     * BtHelper.mScoHelper is only created in onHeadsetProfileConnected (BtHelper.java:1305) and
-+     * therefore stays null, and both BtHelper.startBluetoothSco (:749-757) and
-+     * stopBluetoothSco (:759-767) null-check it and return false. Under
-+     * bluetooth.sco.managed_by_audio the AmScoHelper would not establish SCO anyway -- its own
-+     * class comment says start/stop "doesn't actually start or stop SCO" -- so the HF stack
-+     * keeps owning SCO establishment and nothing here fights it.
++     * BtHelper.mScoHelper is only created in onHeadsetProfileConnected and therefore stays
++     * null, and both BtHelper.startBluetoothSco and stopBluetoothSco null-check it and
++     * return false. Under bluetooth.sco.managed_by_audio the AmScoHelper would not establish
++     * SCO anyway -- its own class comment says start/stop "doesn't actually start or stop
++     * SCO" -- so the HF stack keeps owning SCO establishment and nothing here fights it.
++     * A product that enables both roles is not supported by this change: HeadsetService and
++     * this state machine would then both report an active device through createHfpInfo().
 +     *
 +     * Repeated calls are harmless: BtHelper.onSetBtScoActiveDevice returns early when the
-+     * device is unchanged (BtHelper.java:1451-1453).
++     * device is unchanged.
 +     */
 +    private void notifyAudioFrameworkScoActiveDevice(
 +            BluetoothDevice newDevice, BluetoothDevice previousDevice) {
@@ -229,7 +256,7 @@ index 8f79bd4..9e6af99 100644
               transport_->GetSessionType() == SessionType::HFP_SOFTWARE_DECODING_DATAPATH)));
    bool is_a2dp_offload_session =
 diff --git a/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc b/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc
-index 088a8cb..493bb64 100644
+index 088a8cb..24e9e7b 100644
 --- a/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc
 +++ b/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc
 @@ -28,6 +28,7 @@
@@ -258,9 +285,9 @@ index 088a8cb..493bb64 100644
 +   *     AUDIO_STATE_CONNECTED.
 +   * So for HF we only have to answer "yes, a link is up" and activate the stream.
 +   * Returning SUCCESS_FINISHED synchronously (like the bta_ag_sco_is_open() path
-+   * below) also keeps hfp_pending_cmd_ at HFP_CTRL_CMD_NONE, which is what
-+   * HfpClientInterface::Decode::ConfirmStreamingRequest() expects to never see a
-+   * dangling START for.
++   * below) also keeps hfp_pending_cmd_ at HFP_CTRL_CMD_NONE, so the HF role never
++   * has a START pending and never calls ConfirmStreamingRequest(), which only
++   * answers one.
 +   *
 +   * Without this branch the stream stays inactive and
 +   * HfpClientInterface::Decode::Write() drops every far-end packet while
@@ -312,10 +339,10 @@ index 088a8cb..493bb64 100644
    if (addr.IsEmpty()) {
      log::error("No active device found");
 diff --git a/system/bta/hf_client/bta_hf_client_int.h b/system/bta/hf_client/bta_hf_client_int.h
-index 53702e3..ba944a2 100644
+index 53702e3..fffbacf 100644
 --- a/system/bta/hf_client/bta_hf_client_int.h
 +++ b/system/bta/hf_client/bta_hf_client_int.h
-@@ -267,6 +267,25 @@ void bta_hf_client_sco_conn_close(tBTA_HF_CLIENT_DATA* p_data);
+@@ -267,6 +267,27 @@ void bta_hf_client_sco_conn_close(tBTA_HF_CLIENT_DATA* p_data);
  void bta_hf_client_sco_open(tBTA_HF_CLIENT_DATA* p_data);
  void bta_hf_client_sco_close(tBTA_HF_CLIENT_DATA* p_data);
  void bta_hf_client_sco_shutdown(tBTA_HF_CLIENT_CB* client_cb);
@@ -325,7 +352,9 @@ index 53702e3..ba944a2 100644
 + * bta_hf_client_sco.cc for why the HF role needs its own copy and how it is gated.
 + *
 + * bta_hf_client_sco_datapath_active() is the dispatch predicate used by
-+ * stack/btm/btm_sco_hci.cc. It must NOT be inferred from a zero return of
++ * stack/btm/btm_sco_hci.cc and by the AIDL audio HAL client
++ * (audio_hal_interface/aidl/client_interface_aidl.cc and
++ * hfp_client_interface_aidl.cc). It must NOT be inferred from a zero return of
 + * bta_hf_client_sco_read(): zero also means "no data right now".  */
 +bool bta_hf_client_sco_datapath_active();
 +/* True when an HF-role SCO link is up; fills `addr` with that peer.  The AIDL HFP
@@ -372,7 +401,7 @@ index 4a19682..532952b 100644
    bta_sys_deregister(BTA_ID_HS);
  }
 diff --git a/system/bta/hf_client/bta_hf_client_sco.cc b/system/bta/hf_client/bta_hf_client_sco.cc
-index 8ae7f0b..bc4b680 100644
+index 8ae7f0b..15ca811 100644
 --- a/system/bta/hf_client/bta_hf_client_sco.cc
 +++ b/system/bta/hf_client/bta_hf_client_sco.cc
 @@ -23,16 +23,20 @@
@@ -443,10 +472,10 @@ index 8ae7f0b..bc4b680 100644
 + * StartSession() is self-contained -- it builds a default PCM config and needs
 + * neither a peer address nor codec state -- so hanging it off conn_open is safe.
 + *
-+ * LAYERING CAVEAT: ::hfp::pcm_config and the HfpClientInterface header live under
-+ * bta/include/bta_ag_api.h and bta/ag/bta_ag_int.h, i.e. the HF role here takes a
-+ * dependency on AG headers. That is not upstreamable as-is; it is carried as a
-+ * fork. Measured on the board 2026-08-27.
++ * LAYERING CAVEAT: ::hfp::pcm_config is defined in bta/include/bta_ag_api.h, and
++ * audio_hal_interface/hfp_client_interface.h itself includes bta/ag/bta_ag_int.h,
++ * i.e. the HF role here takes a dependency on AG headers. That is not upstreamable
++ * as-is; it is carried as a fork. Measured on the board 2026-08-27.
 + * ------------------------------------------------------------------------- */
 +using HfpInterface = bluetooth::audio::hfp::HfpClientInterface;
 +
@@ -651,7 +680,7 @@ index 8ae7f0b..bc4b680 100644
    }
  
    /* if initiating set current scb and peer bd addr */
-@@ -571,6 +779,40 @@ void bta_hf_client_sco_conn_open(tBTA_HF_CLIENT_DATA* p_data) {
+@@ -571,6 +779,43 @@ void bta_hf_client_sco_conn_open(tBTA_HF_CLIENT_DATA* p_data) {
  
    bta_sys_sco_open(BTA_ID_HS, 1, client_cb->peer_addr);
  
@@ -680,19 +709,22 @@ index 8ae7f0b..bc4b680 100644
 +     * time) and UpdateAudioConfigToHal() from bta_ag_sco_conn_open (:1506-1507, when
 +     * SCO comes up with the negotiated codec).  The HF role has no active-device
 +     * transition to hang the session start off, so both happen here and the order has
-+     * to be spelled out.  Measured on the board. */
++     * to be spelled out.  Measured on the board.
++     *
++     * No ConfirmStreamingRequest() here, unlike bta_ag_sco_conn_open(): it answers a
++     * pending START from the HAL, and the HF role's HfpTransport::StartRequest()
++     * returns SUCCESS_FINISHED synchronously without leaving one pending, so the
++     * call would only log "no pending start stream request". */
 +    hfp_encode_interface->StartSession();
 +    hfp_decode_interface->StartSession();
 +    hfp_encode_interface->UpdateAudioConfigToHal(config);
 +    hfp_decode_interface->UpdateAudioConfigToHal(config);
-+    hfp_encode_interface->ConfirmStreamingRequest();
-+    hfp_decode_interface->ConfirmStreamingRequest();
 +  }
 +
    if (client_cb->negotiated_codec == BTM_SCO_CODEC_LC3) {
      bta_hf_client_cback_sco(client_cb, BTA_HF_CLIENT_AUDIO_LC3_OPEN_EVT);
    } else if (client_cb->negotiated_codec == BTM_SCO_CODEC_MSBC) {
-@@ -608,6 +850,17 @@ void bta_hf_client_sco_conn_close(tBTA_HF_CLIENT_DATA* p_data) {
+@@ -608,6 +853,17 @@ void bta_hf_client_sco_conn_close(tBTA_HF_CLIENT_DATA* p_data) {
  
    bta_sys_sco_unuse(BTA_ID_HS, 1, client_cb->peer_addr);
  
@@ -710,6 +742,66 @@ index 8ae7f0b..bc4b680 100644
    /* call app callback */
    bta_hf_client_cback_sco(client_cb, BTA_HF_CLIENT_AUDIO_CLOSE_EVT);
  
+diff --git a/system/bta/mock/mock_bta_hf_client_sco.cc b/system/bta/mock/mock_bta_hf_client_sco.cc
+new file mode 100644
+index 0000000..c106a3c
+--- /dev/null
++++ b/system/bta/mock/mock_bta_hf_client_sco.cc
+@@ -0,0 +1,54 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * Mock of the HF-role software SCO data path (bta/hf_client/bta_hf_client_sco.cc).
++ * Hand-written on the pattern of mock_bta_ag_sco.cc for the entry points that
++ * other libraries reference: stack/btm/btm_sco_hci.cc and the AIDL audio HAL
++ * client (audio_hal_interface/aidl/client_interface_aidl.cc and
++ * hfp_client_interface_aidl.cc). libbt-bta-mock picks this file up through
++ * its mock/*.cc glob.
++ */
++
++#include <cstddef>
++#include <cstdint>
++
++#include "bta/hf_client/bta_hf_client_int.h"
++#include "test/common/mock_functions.h"
++
++bool bta_hf_client_sco_datapath_active() {
++  inc_func_call_count(__func__);
++  return false;
++}
++
++bool bta_hf_client_sco_get_active_device(RawAddress* /* addr */) {
++  inc_func_call_count(__func__);
++  return false;
++}
++
++void bta_hf_client_init_hfp_client_interface() { inc_func_call_count(__func__); }
++
++void bta_hf_client_release_hfp_client_interface() { inc_func_call_count(__func__); }
++
++size_t bta_hf_client_sco_read(uint8_t* /* p_buf */, uint32_t /* len */) {
++  inc_func_call_count(__func__);
++  return 0;
++}
++
++size_t bta_hf_client_sco_write(const uint8_t* /* p_buf */, uint32_t /* len */) {
++  inc_func_call_count(__func__);
++  return 0;
++}
 diff --git a/system/stack/btm/btm_sco_hci.cc b/system/stack/btm/btm_sco_hci.cc
 index a09fc1d..afe8fec 100644
 --- a/system/stack/btm/btm_sco_hci.cc
@@ -758,3 +850,20 @@ index a09fc1d..afe8fec 100644
  #endif
  
  enum decode_buf_state {
+diff --git a/system/stack/test/btm/stack_btm_test.cc b/system/stack/test/btm/stack_btm_test.cc
+index e4b2107..c4a1e81 100644
+--- a/system/stack/test/btm/stack_btm_test.cc
++++ b/system/stack/test/btm/stack_btm_test.cc
+@@ -69,6 +69,9 @@ void bta_gattc_continue_discovery_if_needed(const RawAddress&, uint16_t) {}
+ void bta_sys_notify_collision(const RawAddress&) {}
+ size_t bta_ag_sco_read(uint8_t*, uint32_t) { return 0; }
+ size_t bta_ag_sco_write(const uint8_t*, uint32_t) { return 0; }
++bool bta_hf_client_sco_datapath_active() { return false; }
++size_t bta_hf_client_sco_read(uint8_t*, uint32_t) { return 0; }
++size_t bta_hf_client_sco_write(const uint8_t*, uint32_t) { return 0; }
+ 
+ void btm_inq_remote_name_timer_timeout(void*) {}
+ 
+-- 
+2.43.0
+

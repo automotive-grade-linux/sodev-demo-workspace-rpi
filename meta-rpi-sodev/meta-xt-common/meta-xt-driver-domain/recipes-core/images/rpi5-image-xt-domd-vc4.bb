@@ -132,7 +132,9 @@ DEBUG_PACKAGES = " \
 #                              jitter-entropy daemon seeds the CRNG quickly.
 #   - bash                   : the qemu wrapper installed below is #!/bin/bash.
 #   - libsdl2                : qemu -display sdl,gl=on.
-#   - rp1-touch-bridge       : forwards the RP1 touch controller to the guests.
+#   - rp1-touch-bridge       : udev rules that give the USB touch panel weston's
+#                              DomA output (WL_OUTPUT) and ignore its mouse-
+#                              emulation duplicates; no forwarding.
 #   - kernel-module-bridge   : xenbr0 (CONFIG_BRIDGE=m).
 #   - kernel-module-pwm-fan  : cooling-device of the cpu_thermal zone.
 #   - openssh-sftp-server    : scp/sftp onto DomD.
@@ -197,8 +199,9 @@ BAD_RECOMMENDATIONS += "busybox-syslog"
 SYSTEMD_DEFAULT_TARGET = "graphical.target"
 
 #
-# systemd-coredump is enabled for weston SEGV analysis
-# (via PACKAGECONFIG coredump in systemd_%.bbappend).
+# systemd-coredump is enabled for weston SEGV analysis: meta-xt-dom0-linux's
+# systemd_%.bbappend adds PACKAGECONFIG coredump (this layer's systemd_%.bbappend
+# only turns on networkd/resolved).
 #
 
 #
@@ -374,15 +377,21 @@ ROOTFS_POSTPROCESS_COMMAND += "install_v4h_sodev_bits_ext4"
 
 install_v4h_sodev_bits_ext4() {
     # 1. qemu wrapper.
-    # Under DISTRO_FEATURES += vmsep, DomD cannot read another domain's
-    # /local/domain/<id>/name due to xenstore VM separation. libxl starts the
-    # device-model with `-name domain-<domid>` (not `-name DomU`). weston
-    # kiosk-shell routes the output by app-id (SDL_VIDEO_WAYLAND_WMCLASS), so a
-    # WMCLASS of domain-<id> mismatches the weston.ini app-ids (DomA/DomU) and
-    # the guest screen is not routed to any output. The wrapper recovers the
-    # guest identity from argv (DomA = Android guest: argv contains an
-    # android_vm virtual console chardev; otherwise DomU). No machine
-    # translation is needed (qemu TYPE_XEN_ARM "xenpv" matches libxl's -M xenpv).
+    # The wrapper takes the guest identity from argv rather than from xenstore:
+    # under the Linux Dom0 flavour (C xenstored, DISTRO_FEATURES += vmsep) DomD
+    # cannot read another domain's /local/domain/<id>/name, and under the Zephyr
+    # Dom0 flavour it can (the xenstore server treats the toolstack domid, DomD,
+    # as privileged: meta-xt-dom0-zephyr 0006-xenlib-xenstore-toolstack-domid),
+    # so argv is the one source that works in both. weston kiosk-shell routes
+    # the output by app-id (SDL_VIDEO_WAYLAND_WMCLASS), which the wrapper sets
+    # from qemu's -name. Xen 4.22's libxl gives the guest's device model
+    # `-name <domain name>` (libxl_dm.c, the c_info->name argument), which is
+    # the weston.ini app-id already; `-name domain-<domid>` is what libxl's
+    # libxl__spawn_qdisk_backend() gives the PV-backend qemu it runs for a
+    # domain's qdisks (-xen-attach -M xenpv), and for that case the wrapper
+    # tells DomA (argv carries an android_vm virtual console chardev) from
+    # DomU. No machine translation is needed (qemu TYPE_XEN_ARM "xenpv"
+    # matches libxl's -M xenpv).
     if [ -e ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64 ] && \
        [ ! -e ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64.bin ]; then
         mv ${IMAGE_ROOTFS}/usr/bin/qemu-system-aarch64 \

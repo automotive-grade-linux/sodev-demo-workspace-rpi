@@ -7,8 +7,8 @@ require recipes-kernel/linux/linux-yocto.inc
 # to build multiple virtual/kernel providers, e.g. as dependency of
 # core-image-rt-sdk, core-image-rt.
 python () {
-    if d.getVar("PREFERRED_PROVIDER_virtual/kernel", True) != "linux-virtio-armv8":
-        raise bb.parse.SkipPackage("Set PREFERRED_PROVIDER_virtual/kernel to linux-virtio-armv8 to enable it")
+    if d.getVar("PREFERRED_PROVIDER_virtual/kernel") != "linux-virtio-armv8":
+        raise bb.parse.SkipRecipe("Set PREFERRED_PROVIDER_virtual/kernel to linux-virtio-armv8 to enable it")
 }
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"

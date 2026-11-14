@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:39:36 +0900
 Subject: [PATCH] hw/virtio-media: drive decoder mode with the v4l2request
  hwaccel
 
@@ -10,13 +10,13 @@ that patch's description has the reasoning and the measurements.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216) and on the v4l2request hwaccel that only rpidistro-ffmpeg carries]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216) and on the v4l2request hwaccel that only rpidistro-ffmpeg carries]
 ---
  hw/virtio/virtio-media-decoder.c | 107 +++++++++++++++++++++++++++++++
  1 file changed, 107 insertions(+)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 4e724f1a5..322f56cfd 100644
+index 8e04c1092..ff2a1eb0e 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -62,6 +62,8 @@
@@ -45,7 +45,7 @@ index 4e724f1a5..322f56cfd 100644
  };
  
  /* ------------------------------------------------------------------------- */
-@@ -527,6 +539,45 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -522,6 +534,45 @@ static void dec_pump(VirtIOMediaSession *s)
              return;
          }
  
@@ -91,7 +91,7 @@ index 4e724f1a5..322f56cfd 100644
          /*
           * First frame, or a mid-stream resolution change: tell the guest and
           * stop until it has re-negotiated. The frame itself is kept -- dropping
-@@ -642,6 +693,34 @@ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
+@@ -641,6 +692,34 @@ bool virtio_media_dec_realize(VirtIOMedia *vm, Error **errp)
      return true;
  }
  
@@ -126,7 +126,7 @@ index 4e724f1a5..322f56cfd 100644
  int virtio_media_dec_open(VirtIOMediaSession *s)
  {
      VirtIOMediaDec *d;
-@@ -675,6 +754,30 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -674,6 +753,30 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
       * across calls in a way the buffer accounting here does not model.
       */
      d->avctx->thread_count = 1;
@@ -157,7 +157,7 @@ index 4e724f1a5..322f56cfd 100644
      if (avcodec_open2(d->avctx, codec, NULL) < 0) {
          goto fail;
      }
-@@ -689,6 +792,8 @@ fail:
+@@ -688,6 +791,8 @@ fail:
      }
      av_packet_free(&d->pkt);
      av_frame_free(&d->frame);
@@ -166,7 +166,7 @@ index 4e724f1a5..322f56cfd 100644
      g_free(d);
      return ENOMEM;
  }
-@@ -706,6 +811,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -705,6 +810,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
      av_packet_free(&d->pkt);
      av_frame_free(&d->frame);
      av_frame_free(&d->held);

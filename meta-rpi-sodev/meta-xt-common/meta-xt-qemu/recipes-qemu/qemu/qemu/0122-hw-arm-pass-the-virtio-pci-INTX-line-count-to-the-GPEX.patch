@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Tue, 22 Sep 2026 16:56:39 +0900
 Subject: [PATCH] hw/arm: pass the virtio-pci INTX line count to the GPEX
@@ -30,8 +31,11 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [downstream fork / xenstore layout is fork-only]
 ---
+ hw/arm/xen-pvh.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
 diff --git a/hw/arm/xen-pvh.c b/hw/arm/xen-pvh.c
-index 6a66478af0c..c77c6fa6775 100644
+index a40a3cf0976..5fd14844b48 100644
 --- a/hw/arm/xen-pvh.c
 +++ b/hw/arm/xen-pvh.c
 @@ -90,7 +90,7 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)

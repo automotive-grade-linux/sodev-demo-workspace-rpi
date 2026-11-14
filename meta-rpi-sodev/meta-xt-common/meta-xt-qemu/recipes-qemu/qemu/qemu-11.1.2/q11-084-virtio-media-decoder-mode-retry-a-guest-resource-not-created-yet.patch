@@ -39,10 +39,10 @@ Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
  3 files changed, 18 insertions(+), 4 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index e7fcc05f6..0bb221e37 100644
+index 944f442df..735a69e76 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
-@@ -477,6 +477,7 @@ struct VirtIOMediaDec {
+@@ -484,6 +484,7 @@ struct VirtIOMediaDec {
      bool gpu_off;
      bool gpu_logged;
      unsigned gpu_again;
@@ -50,7 +50,7 @@ index e7fcc05f6..0bb221e37 100644
      AVBufferRef *gpu_fctx; /* the hw_frames_ctx the imports came from */
      DecGpuEntry gpu[DEC_GPU_CACHE];
      unsigned gpu_n;
-@@ -800,6 +801,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+@@ -805,6 +806,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
      d->gpu_off = false;
      d->sw_off = false;
      d->gpu_again = 0;
@@ -58,7 +58,7 @@ index e7fcc05f6..0bb221e37 100644
      /*
       * q11-dec-zero-copy: the imports go and the GPU path gets another try.
       * The pool stays: a stream of the same size (after a seek, say) takes it
-@@ -2146,7 +2148,7 @@ static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -2151,7 +2153,7 @@ static int dec_zc_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          }
      }
      r = virtio_media_gpu_blit(d->zc_gpu[idx], gb->virgl_res);
@@ -67,7 +67,7 @@ index e7fcc05f6..0bb221e37 100644
          return -ERANGE;   /* this guest buffer (its size, or no resource) */
      }
      if (r) {
-@@ -2218,7 +2220,13 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -2223,7 +2225,13 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
              *bytesused = need;
              return true;
          }
@@ -82,7 +82,7 @@ index e7fcc05f6..0bb221e37 100644
              d->gpu_off = true;
              dec_gpu_clear(d);
              warn_report("virtio-media/dec: host-sand: the GPU cannot take this "
-@@ -2274,7 +2282,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -2279,7 +2287,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
              *bytesused = need;
              return true;
          }
@@ -92,10 +92,10 @@ index e7fcc05f6..0bb221e37 100644
              dec_sw_clear(d);
              warn_report("virtio-media/dec: sw-gpu: the GPU cannot take this "
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index 3fe379ccb..0aab9f155 100644
+index 66048897b..9cf254a5e 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -1078,7 +1078,7 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+@@ -1086,7 +1086,7 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
      }
      memset(&info, 0, sizeof(info));
      if (virgl_renderer_resource_get_info(res_id, &info) != 0 || !info.tex_id) {

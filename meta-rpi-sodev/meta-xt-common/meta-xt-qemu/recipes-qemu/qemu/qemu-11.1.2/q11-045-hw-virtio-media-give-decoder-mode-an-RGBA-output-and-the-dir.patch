@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:57:57 +0900
 Subject: [PATCH] hw/virtio-media: give decoder mode an RGBA output and the
  direct virgl transfer
 
@@ -8,15 +8,20 @@ qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0245-v10-hw-virtio-media-give-decoder-mode-an-RGBA-output-and-the-direct-virgl-transfer.patch;
 that patch's description has the reasoning and the measurements.
 
+Changed in the q11 series (review 2026-11-11): the CAPTURE format
+reports V4L2_COLORSPACE_SRGB and full range for the RGBA it now carries,
+as the proxy's RGBA output does (q11-048); dec_fill_fmt() had left the
+REC709 that fits the bitstream side on both queues.
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
- hw/virtio/virtio-media-decoder.c | 106 ++++++++++++++++++++++++-------
- 1 file changed, 82 insertions(+), 24 deletions(-)
+ hw/virtio/virtio-media-decoder.c | 109 ++++++++++++++++++++++++-------
+ 1 file changed, 85 insertions(+), 24 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 1e61c3deb..d9d595045 100644
+index 20f094d95..869734587 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -20,7 +20,7 @@
@@ -68,7 +73,7 @@ index 1e61c3deb..d9d595045 100644
  
  /*
   * What we tell the guest before the stream's own resolution is known.
-@@ -264,15 +276,14 @@ static void dec_norm_dims(uint32_t *w, uint32_t *h)
+@@ -266,15 +278,14 @@ static void dec_norm_dims(uint32_t *w, uint32_t *h)
  static uint32_t dec_cap_sizeimage(uint32_t w, uint32_t h)
  {
      /*
@@ -90,7 +95,7 @@ index 1e61c3deb..d9d595045 100644
          return 0;   /* callers treat 0 as "refuse" */
      }
      return (uint32_t)sz;
-@@ -303,7 +314,7 @@ static void dec_fill_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
+@@ -305,9 +316,12 @@ static void dec_fill_fmt(VirtIOMediaDec *d, struct v4l2_format *f)
          pix->pixelformat = DEC_CAP_FOURCC;
          pix->width = d->coded_w;
          pix->height = d->coded_h;
@@ -98,8 +103,13 @@ index 1e61c3deb..d9d595045 100644
 +        pix->plane_fmt[0].bytesperline = d->coded_w * 4;
          pix->plane_fmt[0].sizeimage = dec_cap_sizeimage(d->coded_w,
                                                          d->coded_h);
++        /* RGB out of the converter: SRGB, full range, as the proxy's RGBA says. */
++        pix->colorspace = V4L2_COLORSPACE_SRGB;
++        pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
      }
-@@ -410,9 +421,19 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+ }
+ 
+@@ -412,9 +426,19 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
      uint8_t *buf;
      bool ok;
  
@@ -120,7 +130,7 @@ index 1e61c3deb..d9d595045 100644
                       gb->num_planes ? gb->planes[0].len : 0u, need, w, h);
          return false;
      }
-@@ -426,9 +447,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -428,9 +452,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
       */
      buf = g_malloc(need);
      dst_data[0] = buf;
@@ -131,7 +141,7 @@ index 1e61c3deb..d9d595045 100644
  
      /*
       * The fast path is only valid when the frame IS the size the guest's buffer
-@@ -438,11 +457,11 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -440,11 +462,11 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
       * of the source planes. Route any mismatch through swscale, which is what
       * the scaling case already does.
       */
@@ -145,7 +155,7 @@ index 1e61c3deb..d9d595045 100644
      } else {
          /*
           * THE CACHE KEY INCLUDES THE INPUT GEOMETRY.
-@@ -462,7 +481,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -464,7 +486,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
              d->sws_w != (int)w || d->sws_h != (int)h) {
              sws_freeContext(d->sws);
              d->sws = sws_getContext(fr->width, fr->height, fr->format,
@@ -154,7 +164,7 @@ index 1e61c3deb..d9d595045 100644
                                      SWS_BILINEAR, NULL, NULL, NULL);
              d->sws_src_fmt = fr->format;
              d->sws_src_w = fr->width;
-@@ -471,7 +490,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -473,7 +495,7 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
              d->sws_h = h;
          }
          if (!d->sws) {
@@ -163,7 +173,7 @@ index 1e61c3deb..d9d595045 100644
                           fr->format);
              g_free(buf);
              return false;
-@@ -480,6 +499,45 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -482,6 +504,45 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
                    0, fr->height, dst_data, dst_linesize);
      }
  
@@ -180,7 +190,7 @@ index 1e61c3deb..d9d595045 100644
 +     * TRANSFER_FROM_HOST first and would overwrite the frame with the host's
 +     * empty resource.
 +     *
-+     * 0228 already built the way out for the proxy path: the guest passes the
++     * q11-031 (the port of 0228) already built the way out for the proxy path: the guest passes the
 +     * resource id of the gralloc buffer in v4l2_buffer.reserved2 (v4l2_codec2
 +     * fills it in) and
 +     * virtio_media_virgl_transfer() writes the host bytes into the resource
@@ -209,7 +219,7 @@ index 1e61c3deb..d9d595045 100644
      ok = virtio_media_sg_copy(s->vm, &gb->planes[0], buf, need, true);
      g_free(buf);
      if (!ok) {
-@@ -980,7 +1038,7 @@ static int dec_enum_fmt(struct v4l2_fmtdesc *f)
+@@ -986,7 +1047,7 @@ static int dec_enum_fmt(struct v4l2_fmtdesc *f)
      f->flags = out ? V4L2_FMT_FLAG_COMPRESSED : 0;
      f->pixelformat = out ? DEC_OUT_FOURCC : DEC_CAP_FOURCC;
      pstrcpy((char *)f->description, sizeof(f->description),

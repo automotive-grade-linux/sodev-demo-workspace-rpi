@@ -1,6 +1,6 @@
-From ec58043753fe638bf5e2c0477b486ca46e923687 Mon Sep 17 00:00:00 2001
+From e13215f1a19f5fe149bbd9a773475da5f4d97876 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 5 Sep 2026 16:45:28 +0900
+Date: Wed, 11 Nov 2026 08:35:15 +0900
 Subject: [PATCH] virtio-media: do not kick the event queue when recycling an
  event buffer
 
@@ -25,13 +25,13 @@ not been checked.
 Change-Id: I2289ad7088ceb4cc29967026af2618d32368ae0d
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [relies on the qemu virtio-media device model (q11-085 in meta-xt-qemu) holding an event until the next command or its timer; other device models have not been checked]
 ---
  driver/virtio_media_driver.c | 24 ++++++++++++++++++++----
  1 file changed, 20 insertions(+), 4 deletions(-)
 
 diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
-index 071396a..36acfa5 100644
+index 071396a..96cf5eb 100644
 --- a/driver/virtio_media_driver.c
 +++ b/driver/virtio_media_driver.c
 @@ -386,9 +386,10 @@ int virtio_media_send_command(struct virtio_media *vv, struct scatterlist **sgs,
@@ -88,3 +88,6 @@ index 071396a..36acfa5 100644
  		if (ret)
  			goto err_send_event_buffer;
  	}
+-- 
+2.43.0
+

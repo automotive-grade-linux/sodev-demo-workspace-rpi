@@ -8,6 +8,12 @@ Description=Mock GNSS Host Agent
 StartLimitIntervalSec=0
 
 [Service]
+# /run/gnss-uart is a chardev DomA's qemu creates when DomA starts, which can be two
+# minutes into boot (xl-create-doma.service waits for weston first). ExecStartPre
+# counts against TimeoutStartSec, so at the default 90 s the wait below failed the
+# unit and Restart=always retried it until DomA was up. The wait has no bound on
+# purpose, so the start must not time out either (as in domd-wifi-agent.service).
+TimeoutStartSec=infinity
 ExecStartPre=/bin/sh -c 'while [ ! -e /run/gnss-uart ]; do sleep 0.2; done'
 ExecStart=/usr/bin/python3 /usr/bin/gnss_replay.py -s /run/gnss-uart -i /usr/share/gnss/test.csv
 Restart=always

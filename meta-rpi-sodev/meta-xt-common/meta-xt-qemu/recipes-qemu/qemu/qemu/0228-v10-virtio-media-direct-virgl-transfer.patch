@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 20:05:38 +0900
+Date: Wed, 11 Nov 2026 09:39:42 +0900
 Subject: [PATCH] virtio-media: write decoded frames straight into the guest's
  virgl resource
 
@@ -27,11 +27,29 @@ setting reserved2 nothing changes. The guest pages are not updated in this
 mode; only GL sampling of the host resource (the compositor path) sees the
 frame, which is what video playback uses.
 
+The host QBUF zeroes reserved2 because the uapi asks applications to:
+vb2 ignores the field on QBUF and writes 0 to it on DQBUF (the comment
+used to say vb2 rejects a non-zero value, which it does not).
+
 Assisted-by: Claude Code:claude-opus-5
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/display/virtio-gpu-virgl.c          |  4 ++
+ hw/virtio/meson.build                  |  2 +
+ hw/virtio/virtio-media-virgl-stub.c    | 14 +++++++
+ hw/virtio/virtio-media-virgl.c         | 35 +++++++++++++++++
+ hw/virtio/virtio-media.c               | 53 ++++++++++++++++++++++++++
+ include/hw/virtio/virtio-gpu.h         |  7 ++++
+ include/hw/virtio/virtio-media-virgl.h | 22 +++++++++++
+ include/hw/virtio/virtio-media.h       | 21 ++++++++++
+ 8 files changed, 158 insertions(+)
+ create mode 100644 hw/virtio/virtio-media-virgl-stub.c
+ create mode 100644 hw/virtio/virtio-media-virgl.c
+ create mode 100644 include/hw/virtio/virtio-media-virgl.h
+
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
 index 7bbeadb2e91..d53d08239a2 100644
 --- a/hw/display/virtio-gpu-virgl.c
@@ -131,7 +149,7 @@ index 00000000000..46f3528775c
 +                                             0, &iov, 1);
 +}
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 1643f65452c..ff65444d76d 100644
+index 1643f65452c..ecccfa4a5ba 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -16,12 +16,14 @@
@@ -203,7 +221,7 @@ index 1643f65452c..ff65444d76d 100644
  
      for (i = 0; i < host_rb.count; i++) {
          struct v4l2_buffer b = { .type = rb->type, .index = i };
-@@ -817,6 +859,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -817,6 +859,15 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
      gb = &q->guest[b->index];
      virtio_media_free_buffer_sgl(gb);
      gb->num_planes = nplanes;
@@ -212,13 +230,14 @@ index 1643f65452c..ff65444d76d 100644
 +     * resource id of the gralloc buffer these USERPTR pages belong to (0 when
 +     * the HAL has none). The V4L2 core passes the field through
 +     * untouched and so does the guest virtio-media driver. It is zeroed for
-+     * the host QBUF below; vb2 rejects non-zero reserved fields.
++     * the host QBUF below: vb2 ignores it on QBUF and writes 0 to it on DQBUF,
++     * and the uapi asks applications to zero it.
 +     */
 +    gb->virgl_res = b->reserved2;
  
      for (p = 0; p < nplanes; p++) {
          uint32_t plane_len = guest_planes ? guest_planes[p].length : b->length;
-@@ -894,6 +944,7 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -894,6 +945,7 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
          struct v4l2_plane host_planes[VIDEO_MAX_PLANES] = {};
  
          hb.memory = V4L2_MEMORY_MMAP;
@@ -226,7 +245,7 @@ index 1643f65452c..ff65444d76d 100644
          if (guest_planes) {
              memcpy(host_planes, guest_planes, nplanes * sizeof(host_planes[0]));
              for (p = 0; p < nplanes; p++) {
-@@ -1402,6 +1453,7 @@ static const VMStateDescription vmstate_virtio_media = {
+@@ -1402,6 +1454,7 @@ static const VMStateDescription vmstate_virtio_media = {
  
  static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
@@ -281,10 +300,10 @@ index 00000000000..04a25e0f2b9
 +
 +#endif
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index fd7836557fb..19cc345e8cf 100644
+index 80e1d045dc5..12137109680 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -169,6 +169,11 @@ typedef struct VirtIOMediaPlaneSg {
+@@ -171,6 +171,11 @@ typedef struct VirtIOMediaPlaneSg {
  typedef struct VirtIOMediaBuffer {
      bool queued;
      uint32_t num_planes;          /* 1 for single-planar */
@@ -296,7 +315,7 @@ index fd7836557fb..19cc345e8cf 100644
      VirtIOMediaPlaneSg planes[VIDEO_MAX_PLANES];
  } VirtIOMediaBuffer;
  
-@@ -180,6 +185,10 @@ typedef struct VirtIOMediaQueue {
+@@ -182,6 +187,10 @@ typedef struct VirtIOMediaQueue {
      bool streaming;
      uint32_t num_bufs;
      uint32_t num_host_planes;
@@ -307,7 +326,7 @@ index fd7836557fb..19cc345e8cf 100644
      /* Host MMAP buffers this device allocated on the host fd, mmap()ed. */
      void *host_map[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
      uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
-@@ -205,6 +214,18 @@ struct VirtIOMedia {
+@@ -207,6 +216,18 @@ struct VirtIOMedia {
  
      /* Properties. */
      char *v4l2_device;            /* host /dev/videoN to proxy */

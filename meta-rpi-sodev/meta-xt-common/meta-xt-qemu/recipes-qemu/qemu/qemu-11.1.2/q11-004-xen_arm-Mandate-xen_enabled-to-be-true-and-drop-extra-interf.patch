@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Andrii <andrii_chepurnyi@epam.com>
-Date: Mon, 18 Aug 2025 18:04:59 +0000
+Date: Wed, 11 Nov 2026 08:32:32 +0900
 Subject: [PATCH] xen_arm: Mandate xen_enabled() to be true and drop extra
  interface opening
 
@@ -21,9 +21,17 @@ Original patch: 6a2fd4e314da9c34398445931f8929fab2078a02
 
 (cherry picked from commit 20db6464821d4e364a376a165e089324a74aee74)
 
+Note for the 11.1.2 port: xen_register_ioreq() exits on failure (its
+err: path is error_report() + exit(1)), so when it returns it returns 0.
+The `if (rc)` branch in xen_pvh_init() and the `return rc` after the
+exit(1) are not reached; they are kept as the fork has them, so that the
+patch stays the fork's commit.
+
 Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
 Signed-off-by: Andrii <andrii_chepurnyi@epam.com>
 Signed-off-by: Leonid Komarianskyi <leonid_komarianskyi@epam.com>
+Assisted-by: Claude Code:claude-fable-5-1
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [downstream fork / BSP-layer delta; not submitted upstream]
 Local-Modifications: rebased onto qemu 11.1.2; the changed lines are the original commit's, the context (xen_register_ioreq's mapcache argument) is 11.1.2's
 Origin: https://github.com/xen-troops/qemu commit 20db6464821d4e364a376a165e089324a74aee74

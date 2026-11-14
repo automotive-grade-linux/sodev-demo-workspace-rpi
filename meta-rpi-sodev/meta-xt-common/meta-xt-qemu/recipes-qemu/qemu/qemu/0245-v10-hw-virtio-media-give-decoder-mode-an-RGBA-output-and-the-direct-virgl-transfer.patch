@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Tue, 22 Sep 2026 03:07:19 +0900
-Subject: [PATCH] hw/virtio-media: give decoder mode an RGBA output and the direct virgl transfer
+Subject: [PATCH] hw/virtio-media: give decoder mode an RGBA output and the
+ direct virgl transfer
 
 0219 and 0244 got the decode itself right: a 1080p30 HEVC clip now runs
 frames=876 dropped=1 at 29.8 fps with zero "Decode fail", the dynamic
@@ -61,8 +63,11 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media-decoder.c | 106 ++++++++++++++++++++++++-------
+ 1 file changed, 82 insertions(+), 24 deletions(-)
+
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 9fbb7d2c076..07bec2470dd 100644
+index 1e61c3debda..d9d5950452a 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -20,7 +20,7 @@

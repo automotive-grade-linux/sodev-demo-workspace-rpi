@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 15:14:24 +0900
-Subject: [PATCH] virtio-media: decoder mode: convert hardware frames on
- the GPU
+Date: Wed, 11 Nov 2026 08:39:39 +0900
+Subject: [PATCH] virtio-media: decoder mode: convert hardware frames on the
+ GPU
 
 In decoder mode each hardware-decoded frame was brought back to the CPU:
 av_hwframe_transfer_data() detiled the SAND frame into YUV420P, swscale
@@ -57,13 +57,13 @@ order and with the right colours (checked with a webcam).
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media decoder mode (q11-041), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-decoder.c | 367 ++++++++++++++++++++++++++++++-
  1 file changed, 359 insertions(+), 8 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index d9d5950..a90f873 100644
+index 869734587..fcce3887a 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -64,6 +64,7 @@
@@ -117,7 +117,7 @@ index d9d5950..a90f873 100644
  /*
   * THE TIMESTAMP OF AN OUTPUT BUFFER MUST COME BACK WITH IT.
   *
-@@ -204,6 +241,9 @@ struct VirtIOMediaDec {
+@@ -211,6 +248,9 @@ struct VirtIOMediaDec {
      int sws_src_fmt;
      int sws_src_w, sws_src_h;
      int sws_w, sws_h;
@@ -127,7 +127,7 @@ index d9d5950..a90f873 100644
  
      /*
       * v4l2request hwaccel. hwdev is NULL when it could not be opened, and
-@@ -214,6 +254,22 @@ struct VirtIOMediaDec {
+@@ -221,6 +261,22 @@ struct VirtIOMediaDec {
      AVBufferRef *hwdev;
      AVFrame *swframe;
      bool hw_logged;
@@ -150,7 +150,7 @@ index d9d5950..a90f873 100644
  };
  
  /* ------------------------------------------------------------------------- */
-@@ -400,6 +456,257 @@ static int dec_next_cap_buffer(VirtIOMediaSession *s)
+@@ -405,6 +461,257 @@ static int dec_next_cap_buffer(VirtIOMediaSession *s)
      return -1;
  }
  
@@ -408,7 +408,7 @@ index d9d5950..a90f873 100644
  /*
   * Write one decoded frame into the guest's pages as NV12.
   *
-@@ -445,6 +752,36 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -450,6 +757,36 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
       * strides. One memcpy per frame is the same cost the proxy path already
       * pays for bcm2835-codec.
       */
@@ -445,7 +445,7 @@ index d9d5950..a90f873 100644
      buf = g_malloc(need);
      dst_data[0] = buf;
      dst_linesize[0] = (int)(w * 4);
-@@ -476,18 +813,25 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -481,18 +818,25 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
           * the guest's page. A host memory disclosure, and a SIGSEGV on the last
           * row.
           */
@@ -472,7 +472,7 @@ index d9d5950..a90f873 100644
          }
          if (!d->sws) {
              error_report_once("virtio-media/dec: no conversion from %d to RGBA",
-@@ -556,8 +900,10 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
+@@ -561,8 +905,10 @@ static bool dec_deliver(VirtIOMediaSession *s, AVFrame *fr)
      if (index < 0) {
          return false;
      }
@@ -484,7 +484,7 @@ index d9d5950..a90f873 100644
          return true;   /* consumed: the session is broken either way */
      }
      dec_complete_buffer(s, 1, (uint32_t)index, bytesused, 0, fr->pts);
-@@ -732,11 +1078,12 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -737,11 +1083,12 @@ static void dec_pump(VirtIOMediaSession *s)
           * memcpy into the guest pages, so bring it back to the CPU and carry on
           * with the frame the rest of this file already knows how to handle.
           *
@@ -502,7 +502,7 @@ index d9d5950..a90f873 100644
           *   ffmpeg -hwaccel drm -i <clip> -pix_fmt nv12 -f rawvideo  -> 300 frames
           * So no COL128-specific code is needed here, and none is added.
           *
-@@ -744,7 +1091,7 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -749,7 +1096,7 @@ static void dec_pump(VirtIOMediaSession *s)
           * d->frame (dec_deliver, d->held), and swapping in place keeps all of
           * that ownership unchanged.
           */
@@ -511,7 +511,7 @@ index d9d5950..a90f873 100644
              int t;
  
              av_frame_unref(d->swframe);
-@@ -817,6 +1164,7 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -826,6 +1173,7 @@ static void dec_pump(VirtIOMediaSession *s)
                   */
                  d->held = av_frame_clone(d->frame);
                  av_frame_unref(d->frame);
@@ -519,7 +519,7 @@ index d9d5950..a90f873 100644
                  d->awaiting_reconfig = true;
                  dec_send_v4l2_event(s, V4L2_EVENT_SOURCE_CHANGE,
                                      V4L2_EVENT_SRC_CH_RESOLUTION);
-@@ -996,6 +1344,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -1005,6 +1353,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
      if (!d) {
          return;
      }
@@ -528,7 +528,7 @@ index d9d5950..a90f873 100644
      if (d->avctx) {
          avcodec_free_context(&d->avctx);
      }
-@@ -1472,6 +1822,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+@@ -1480,6 +1830,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
              avcodec_flush_buffers(d->avctx);
              av_frame_free(&d->held);
              dec_backlog_clear(d);

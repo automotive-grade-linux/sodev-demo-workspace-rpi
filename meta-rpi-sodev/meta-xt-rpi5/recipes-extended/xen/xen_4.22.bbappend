@@ -8,9 +8,9 @@
 # (set in the DomD build's local.conf / rpi5-sodev.yaml linux_domain_conf).
 #
 # [4.22] The recipe it attaches to is NO LONGER the stock meta-virtualization
-# one. meta-virtualization master (526c9725) stops at xen_4.21.bb, so this layer
-# carries an interim local xen_4.22.bb alongside this file, to be submitted
-# upstream and deleted once accepted. See that recipe's header. Everything else
+# one. meta-virtualization master (526c9725) stops at xen_4.21.bb, so
+# meta-xt-common/meta-xt-domx/recipes-extended/xen/ carries an interim xen_4.22.bb,
+# to be submitted upstream and deleted once accepted. See that recipe's header. Everything else
 # about the arrangement is unchanged from 4.21: a pristine xenbits stable-4.22
 # tree plus an ordered file:// patch series.
 #
@@ -187,12 +187,9 @@ SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 #   also listed after xen-hyp-config.cfg.
 SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://xen-config-rpi5-passthrough.cfg"
 
-# --- hypervisor Kconfig fragment: SCMI/SCI (conditional on the scmi MACHINE_FEATURE,
-#     mirrors the fork's xt-prod-devel-rpi5-domd xen_git.bbappend anonymous-python) ---
-python __anonymous() {
-    if bb.utils.contains('MACHINE_FEATURES', 'scmi', True, False, d):
-        d.appendVar('SRC_URI', ' file://xen-scmi.cfg')
-}
+# No SCMI fragment: stable-4.22's xen/arch/arm/firmware/Kconfig makes SCMI_SMC the
+# default of the "ARM SCI driver type" choice (it selects ARM_SCI), so
+# CONFIG_ARM_SCI=y / CONFIG_SCMI_SMC=y are in the .config with nothing added here.
 
 # --- patch-fuzz QA: left at ERROR (the OE default) ---------------------------
 # [4.22] The 4.21 bbappend demoted patch-fuzz to a warning here:
@@ -201,10 +198,12 @@ python __anonymous() {
 # with its own CAVEAT noting that a permanent demotion lets a silently
 # mis-applied patch (fuzz, or a hunk landing at the wrong offset after a context
 # shift) pass do_patch with only a warning. Both lines are REMOVED for 4.22:
-# every patch in the series applies to stable-4.22 with zero fuzz and zero offset
-# warnings (0008/0018 regenerated, 0022/4.22-0001 rebased), so there is nothing
-# left to tolerate, and a mis-apply on a future point update should fail the
-# build rather than warn. If a stable-4.22.x bump shifts context, refresh the
+# every patch in the series applies to stable-4.22 with zero fuzz (0008/0018
+# regenerated, 0022/4.22-0001 rebased). Hunks do land at offsets, which the
+# patch-fuzz check does not look at (insane.bbclass reads only the "Patch fuzz"
+# block of the patch log), so there is nothing left to tolerate, and a mis-apply
+# on a future point update should fail the build rather than warn. If a
+# stable-4.22.x bump shifts context, refresh the
 # affected patch -- do not re-add the demotion.
 # Upstream-Status is present on every patch, so the separate patch-status QA is
 # satisfied and is not touched here.

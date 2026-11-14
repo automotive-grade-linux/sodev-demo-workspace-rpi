@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 00:46:03 +0900
-Subject: [PATCH] virtio-media: decoder mode: convert software frames on
- the GPU
+Date: Wed, 11 Nov 2026 08:39:44 +0900
+Subject: [PATCH] virtio-media: decoder mode: convert software frames on the
+ GPU
 
 A software-decoded frame (YUV420P) reached the guest's RGBA resource
 through swscale, which has no NEON path from yuv420p to rgba, and
@@ -31,13 +31,13 @@ core and V3D 48% busy, 720p60 at 61.1 fps with 37 to 38% and 38 to
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media decoder mode (q11-041), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-decoder.c | 233 ++++++++++++++++++++++++++++++-
  1 file changed, 230 insertions(+), 3 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 1b182b8..053cea7 100644
+index fbe09a2a9..e11088e64 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -71,6 +71,10 @@
@@ -74,7 +74,7 @@ index 1b182b8..053cea7 100644
  /* A blitted hardware frame and the import whose GPU work reads it. */
  typedef struct DecGpuHeld {
      AVFrame *frame;
-@@ -376,6 +396,15 @@ struct VirtIOMediaDec {
+@@ -383,6 +403,15 @@ struct VirtIOMediaDec {
      bool ds_logged;
      uint64_t ds_pub_n, ds_skip_n, ds_catch_n, ds_lost_n, ds_evict_held_n;
      uint64_t ds_starved_n, ds_evict_release_n;
@@ -90,7 +90,7 @@ index 1b182b8..053cea7 100644
  };
  
  /* ------------------------------------------------------------------------- */
-@@ -609,6 +638,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+@@ -614,6 +643,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
      av_buffer_unref(&d->gpu_fctx);
      d->ds_refs_cap = 0;
      d->gpu_off = false;
@@ -98,7 +98,7 @@ index 1b182b8..053cea7 100644
      d->gpu_again = 0;
  }
  
-@@ -1297,11 +1327,184 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -1302,11 +1332,184 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      return 0;
  }
  
@@ -286,7 +286,7 @@ index 1b182b8..053cea7 100644
   * something else again, so this stays a general conversion rather than an
   * assumption about the backend.
   */
-@@ -1381,6 +1584,23 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -1386,6 +1589,23 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
          fr = d->swframe;
      }
  
@@ -310,7 +310,7 @@ index 1b182b8..053cea7 100644
      /* q11-dec-sand-scanout: the CPU wrote this copy, so no offer stands for it */
      if (d->ds_epoch && gb->virgl_res) {
          uint32_t tex = virtio_media_gpu_res_tex(gb->virgl_res);
-@@ -2020,6 +2240,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
+@@ -2029,6 +2249,7 @@ static int dec_codec_switch(VirtIOMediaSession *s, const DecCodec *c)
          return EBUSY;
      }
      dec_gpu_reset(d);
@@ -318,7 +318,7 @@ index 1b182b8..053cea7 100644
      dec_backlog_clear(d);
      av_frame_free(&d->held);
      avcodec_free_context(&d->avctx);
-@@ -2044,6 +2265,9 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
+@@ -2053,6 +2274,9 @@ int virtio_media_dec_open(VirtIOMediaSession *s)
  
      d = g_new0(VirtIOMediaDec, 1);
      d->codec = dec_codec_nth(s->vm, 0);
@@ -328,7 +328,7 @@ index 1b182b8..053cea7 100644
      d->backlog = g_queue_new();
      d->coded_w = DEC_MIN_W;
      d->coded_h = DEC_MIN_H;
-@@ -2088,6 +2312,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
+@@ -2097,6 +2321,8 @@ void virtio_media_dec_close(VirtIOMediaSession *s)
          return;
      }
      dec_gpu_clear(d);
@@ -337,7 +337,7 @@ index 1b182b8..053cea7 100644
      av_buffer_unref(&d->gpu_fctx);
      if (d->avctx) {
          avcodec_free_context(&d->avctx);
-@@ -2574,6 +2800,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
+@@ -2582,6 +2808,7 @@ static int dec_streamon(VirtIOMediaSession *s, uint32_t type, bool on)
              av_frame_free(&d->held);
              dec_backlog_clear(d);
              dec_gpu_reset(d);

@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 05 Sep 2026 00:49:16 +0900
-Subject: [PATCH] virtio-media: copy decoded frames into the virgl resource on the GPU
+Date: Sat, 5 Sep 2026 00:49:16 +0900
+Subject: [PATCH] virtio-media: copy decoded frames into the virgl resource on
+ the GPU
 
 0228 pushes the decoded RGBA frame from the host V4L2 buffer into the
 guest's virgl resource through virgl_renderer_transfer_write_iov, i.e.
@@ -33,6 +35,14 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/meson.build                  |   4 +-
+ hw/virtio/virtio-media-virgl-stub.c    |  24 ++
+ hw/virtio/virtio-media-virgl.c         | 389 ++++++++++++++++++++++++-
+ hw/virtio/virtio-media.c               |  66 +++++
+ include/hw/virtio/virtio-media-virgl.h |  47 ++-
+ include/hw/virtio/virtio-media.h       |  16 +
+ 6 files changed, 539 insertions(+), 7 deletions(-)
+
 diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
 index 109d6005fe6..107cf64462b 100644
 --- a/hw/virtio/meson.build
@@ -491,7 +501,7 @@ index 46f3528775c..de09cb2889d 100644
 +    }
 +}
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index ff65444d76d..789456dd5ca 100644
+index ecccfa4a5ba..4c81def015e 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
 @@ -153,6 +153,10 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
@@ -572,7 +582,7 @@ index ff65444d76d..789456dd5ca 100644
                      if (vm->host_xfer && gb->virgl_res && p == 0 &&
                          gb->num_planes == 1 && q->width && q->height) {
                          int r = virtio_media_virgl_transfer(
-@@ -938,6 +995,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
+@@ -939,6 +996,14 @@ static int virtio_media_qbuf(VirtIOMediaSession *s, uint8_t *payload,
          }
      }
  
@@ -587,7 +597,7 @@ index ff65444d76d..789456dd5ca 100644
      /* Now queue the host's own buffer, which is MMAP. */
      {
          struct v4l2_buffer hb = *b;
-@@ -1454,6 +1519,7 @@ static const VMStateDescription vmstate_virtio_media = {
+@@ -1455,6 +1520,7 @@ static const VMStateDescription vmstate_virtio_media = {
  static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
@@ -658,10 +668,10 @@ index 04a25e0f2b9..6193a4cfde0 100644
 +
  #endif
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 19cc345e8cf..2da0ed63daa 100644
+index 12137109680..dd013b87fc7 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -191,6 +191,14 @@ typedef struct VirtIOMediaQueue {
+@@ -193,6 +193,14 @@ typedef struct VirtIOMediaQueue {
      uint32_t bytesperline;
      /* Host MMAP buffers this device allocated on the host fd, mmap()ed. */
      void *host_map[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
@@ -676,7 +686,7 @@ index 19cc345e8cf..2da0ed63daa 100644
      uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
      /* Guest buffers by index, mirrored onto the host buffer of the same index. */
      VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
-@@ -226,6 +234,14 @@ struct VirtIOMedia {
+@@ -228,6 +236,14 @@ struct VirtIOMedia {
       */
      bool host_xfer;
      uint64_t host_xfer_fail;

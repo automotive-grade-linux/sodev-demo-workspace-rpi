@@ -1,6 +1,6 @@
-From 4577d73133b8dc2aa94dda49af9665c9374d3fb8 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 9 Nov 2026 13:41:11 +0900
+Date: Wed, 11 Nov 2026 09:41:27 +0900
 Subject: [PATCH] wifi: DomD's join and typed passphrases in the relay and
  DomaWifiRelay
 
@@ -40,7 +40,10 @@ DomaWifiRelay now:
   device-protected storage and does not send them again after a boot;
 - takes down the framework's "Failed to connect" (42) that the local
   handshake against the placeholder, and its own connect after a
-  refusal, make it post.
+  refusal, make it post;
+- repair() refuses an SSID or passphrase with a tab, CR or LF, which
+  the tab-separated request line cannot carry, without spending the
+  attempt (the daemon's psk_valid refuses a control character too).
 
 xenvm_trout_rpi4_arm64/doma-wifi-relay.sh, sepolicy/doma_shadow_ap.te
 and DomaWifiRelay/ become the same files as the Raspberry Pi 5's relay
@@ -52,15 +55,17 @@ right one reached CONNECTED 25.6 s after the tap with one hostapd
 restart.
 
 Assisted-by: Claude Code:claude-opus-5-5
+Assisted-by: Claude Code:claude-fable-5-1
+Assisted-by: Claude Code:claude-fable-5-1
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
 ---
  DomaWifiRelay/res/drawable/ic_wifi.xml        |   13 +
  DomaWifiRelay/res/values/strings.xml          |   19 +
- .../xt/domawifirelay/RelayService.java        | 1075 +++++++++++++++--
+ .../xt/domawifirelay/RelayService.java        | 1105 +++++++++++++++--
  sepolicy/doma_shadow_ap.te                    |    4 +
  xenvm_trout_rpi4_arm64/doma-wifi-relay.sh     |  491 ++++++--
- 5 files changed, 1438 insertions(+), 164 deletions(-)
+ 5 files changed, 1463 insertions(+), 169 deletions(-)
  create mode 100644 DomaWifiRelay/res/drawable/ic_wifi.xml
  create mode 100644 DomaWifiRelay/res/values/strings.xml
 
@@ -109,7 +114,7 @@ index 0000000..b9d91f9
 +    <string name="lost_text">The connection to the access point was lost.</string>
 +</resources>
 diff --git a/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java b/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
-index ec2c252..5ba6df3 100644
+index ec2c252..5446fbe 100644
 --- a/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
 +++ b/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
 @@ -3,11 +3,17 @@
@@ -266,7 +271,7 @@ index ec2c252..5ba6df3 100644
       */
      private static final File STATE = new File(REQ_DIR, "relay.state");
      /**
-@@ -164,31 +235,28 @@ public final class RelayService extends Service {
+@@ -164,31 +235,30 @@ public final class RelayService extends Service {
      private static final long WATCH_RETRY_MS = 5000;
  
      /**
@@ -289,18 +294,25 @@ index ec2c252..5ba6df3 100644
 +     * for {@link #REQ} and {@link #REQ_BUSY} to be gone.
       *
       * <p>The bound comes from the daemon's own worst case rather than from its poll
-      * interval. In one iteration of doma-wifi-relay.sh, {@code restart_hostapd} can
-      * spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
+-     * interval. In one iteration of doma-wifi-relay.sh, {@code restart_hostapd} can
+-     * spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
 -     * {@code confirm_hostapd_running} (6 x 0.5 s) -- about 13 s; its own
 -     * comment says the wait STALLS THE MAIN LOOP FOR UP TO 10 s -- and BOTH
-+     * {@code confirm_hostapd_running} (6 x 0.25 s) -- about 11.5 s -- and BOTH
-      * {@code handle_aps} and {@code flush_pending_restart} can fire it in the
-      * same iteration, with
+-     * {@code handle_aps} and {@code flush_pending_restart} can fire it in the
+-     * same iteration, with
 -     * {@code read -t 2} on top: roughly 28 s. (The one figure actually measured on a PC
-+     * {@code read -t 2} on top: roughly 25 s. (The one figure actually measured on a PC
-      * is 10.371 s for a single restart_hostapd, which does not include the confirm
+-     * is 10.371 s for a single restart_hostapd, which does not include the confirm
 -     * window.) 10 x 4 s = 40 s therefore covers a healthy-but-busy daemon, and the cost
 -     * is zero on the normal path, where the request is gone at the first check.
++     * interval. In one pass of doma-wifi-relay.sh's main loop, {@code restart_hostapd}
++     * can spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
++     * {@code confirm_hostapd_running} (6 x 0.25 s) -- about 11.5 s -- and a pass can
++     * reach it three times: from the {@code read} branch ({@code handle_aps}, or
++     * {@code handle_state} on a restart), from {@code flush_pending_restart} and from
++     * the STATE_RESTART block. A request that lands just after the read branch waits
++     * for the latter two, the next {@code read -t 2} and the next read branch:
++     * 3 x 11.5 + 2 = 36.5 s at worst. (The one figure actually measured on a PC is
++     * 10.371 s for a single restart_hostapd, which does not include the confirm
 +     * window.) 160 x 250 ms = 40 s therefore covers a healthy-but-busy daemon, and the
 +     * cost is zero on the normal path, where the request is handled within 2 s.
       */
@@ -309,7 +321,7 @@ index ec2c252..5ba6df3 100644
  
      /**
       * The daemon's init service state: the on/off switch of this service, not a liveness
-@@ -207,6 +275,14 @@ public final class RelayService extends Service {
+@@ -207,6 +277,14 @@ public final class RelayService extends Service {
      private static final String PROP_RELAY_SVC_STATE = "init.svc.doma_wifi_relay";
  
      private WifiManager mWifi;
@@ -324,7 +336,7 @@ index ec2c252..5ba6df3 100644
      private HandlerThread mThread;
      private Handler mHandler;
      /** Watches {@link #REQ_DIR}; null until the directory can be reached. */
-@@ -236,6 +312,37 @@ public final class RelayService extends Service {
+@@ -236,6 +314,37 @@ public final class RelayService extends Service {
       */
      private final Set<String> mAttempted = new HashSet<>();
  
@@ -362,7 +374,7 @@ index ec2c252..5ba6df3 100644
      /** init has the daemon running, i.e. the switch is on (see {@link #PROP_RELAY_SVC_STATE}). */
      static boolean isEnabled() {
          return "running".equals(SystemProperties.get(PROP_RELAY_SVC_STATE, ""));
-@@ -244,12 +351,45 @@ public final class RelayService extends Service {
+@@ -244,12 +353,45 @@ public final class RelayService extends Service {
      private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
          @Override
          public void onReceive(Context context, Intent intent) {
@@ -410,7 +422,7 @@ index ec2c252..5ba6df3 100644
              } else {
                  mHandler.post(RelayService.this::sweep);
              }
-@@ -277,6 +417,13 @@ public final class RelayService extends Service {
+@@ -277,6 +419,13 @@ public final class RelayService extends Service {
              stopSelf();
              return;
          }
@@ -424,7 +436,7 @@ index ec2c252..5ba6df3 100644
          mThread = new HandlerThread(TAG);
          mThread.start();
          mHandler = new Handler(mThread.getLooper());
-@@ -291,8 +438,14 @@ public final class RelayService extends Service {
+@@ -291,8 +440,14 @@ public final class RelayService extends Service {
          filter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
          // And the station's state, to re-arm a network once it has associated.
          filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
@@ -439,7 +451,7 @@ index ec2c252..5ba6df3 100644
          mHandler.post(this::sweep);
          mHandler.post(this::watchReqDir);
      }
-@@ -321,17 +474,47 @@ public final class RelayService extends Service {
+@@ -321,17 +476,47 @@ public final class RelayService extends Service {
                      // dead, so watch the one init or the daemon makes next.
                      mHandler.post(RelayService.this::rewatchReqDir);
                  } else if (STATE.getName().equals(path)) {
@@ -489,7 +501,7 @@ index ec2c252..5ba6df3 100644
      private void rewatchReqDir() {
          if (mObserver != null) {
              mObserver.stopWatching();
-@@ -403,22 +586,41 @@ public final class RelayService extends Service {
+@@ -403,22 +588,41 @@ public final class RelayService extends Service {
          Log.i(TAG, "wifi-cycle: Wi-Fi on again");
      }
  
@@ -542,7 +554,7 @@ index ec2c252..5ba6df3 100644
          if ("up".equals(f[0])) {
              sweep();
          } else {
-@@ -426,6 +628,695 @@ public final class RelayService extends Service {
+@@ -426,6 +630,699 @@ public final class RelayService extends Service {
          }
      }
  
@@ -1130,8 +1142,12 @@ index ec2c252..5ba6df3 100644
 +    private static final String CH_FAILURE = "doma_wifi_failure";
 +    /** One notification, replaced by each report: only the latest join matters. */
 +    private static final int NOTE_ID = 1;
-+    /** A "connecting" goes after this long: DomD's agent answers a connect in 75 s at
-+     *  most (a 30 s join, then up to 6 DHCP tries), and a lost answer must not leave it. */
++    /** A "connecting" goes after this long, so that a lost answer does not leave it.
++     *  DomD's agent can take longer than this: a 30 s join, then
++     *  {@code udhcpc -n -t 6 -T 3} under a 60 s timeout, then up to 10 s for the address
++     *  to appear -- about 100 s at worst. An "online" that arrives after this is still
++     *  handled: {@link #handleState} holds it back ({@code connectHeldBack}) and the join
++     *  completes, only the notification is gone by then. */
 +    private static final long CONNECTING_TIMEOUT_MS = 90_000;
 +    private static final long CONNECTED_TIMEOUT_MS = 10_000;
 +    private static final long FAILED_TIMEOUT_MS = 300_000;
@@ -1238,7 +1254,7 @@ index ec2c252..5ba6df3 100644
      /**
       * DomD has {@link #mOnlineSsid}: enable again a saved network of it that AAOS disabled
       * as NO_INTERNET_PERMANENT, so auto-join can pick it. Run for each DomD report and at
-@@ -497,6 +1388,7 @@ public final class RelayService extends Service {
+@@ -497,6 +1394,7 @@ public final class RelayService extends Service {
          }
          // A "no internet" verdict that came after DomD's report (see recheckInternet).
          recheckInternet();
@@ -1246,7 +1262,7 @@ index ec2c252..5ba6df3 100644
          final List<WifiConfiguration> configs;
          try {
              configs = mWifi.getPrivilegedConfiguredNetworks();
-@@ -517,6 +1409,17 @@ public final class RelayService extends Service {
+@@ -517,6 +1415,17 @@ public final class RelayService extends Service {
              Log.w(TAG, "getPrivilegedConfiguredNetworks returned null");
              return;
          }
@@ -1264,7 +1280,7 @@ index ec2c252..5ba6df3 100644
          for (WifiConfiguration c : configs) {
              if (c == null || c.getNetworkSelectionStatus() == null) {
                  continue;
-@@ -535,11 +1438,28 @@ public final class RelayService extends Service {
+@@ -535,11 +1444,28 @@ public final class RelayService extends Service {
                  continue;
              }
              final String key = c.networkId + " " + psk;
@@ -1294,7 +1310,7 @@ index ec2c252..5ba6df3 100644
                  // Nothing was written, so nothing is spent: try the next candidate.
                  // continue rather than return -- the drop-box is untouched so there is
                  // no race to lose, and no connect() was issued so this cannot loop.
-@@ -590,6 +1510,8 @@ public final class RelayService extends Service {
+@@ -590,6 +1516,8 @@ public final class RelayService extends Service {
          if (mAttempted.removeIf(k -> k.startsWith(prefix))) {
              Log.i(TAG, "netId=" + wi.getNetworkId() + " associated; its repair is re-armed");
          }
@@ -1303,7 +1319,7 @@ index ec2c252..5ba6df3 100644
      }
  
      /**
-@@ -618,7 +1540,9 @@ public final class RelayService extends Service {
+@@ -618,7 +1546,9 @@ public final class RelayService extends Service {
       * @return true if a request was written -- i.e. if the caller should spend the
       *         attempt. False means nothing was written and nothing is spent.
       */
@@ -1314,13 +1330,22 @@ index ec2c252..5ba6df3 100644
          if (requestPending()) {
              Log.w(TAG, "a request is still unconsumed in " + REQ + "; the daemon is not"
                      + " reading it (" + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
-@@ -627,59 +1551,74 @@ public final class RelayService extends Service {
+@@ -627,59 +1557,88 @@ public final class RelayService extends Service {
                      + " logcat -s doma-wifi-relay");
              return false;
          }
 +        if (mWait != null) {
 +            Log.i(TAG, "netId=" + mWait.netId + " is still waiting for DomD; netId=" + netId
 +                    + " after it -- attempt NOT spent");
++            return false;
++        }
++        // The request line is tab-separated and ends at a newline, so a tab, CR or LF in
++        //   the SSID or the passphrase would split or cut it on the daemon's side (a
++        //   passphrase has no control character anyway; the daemon's psk_valid refuses
++        //   one). Nothing is written, so nothing is spent. Neither value is logged.
++        if (hasTabOrLineBreak(ssid) || hasTabOrLineBreak(psk)) {
++            Log.w(TAG, "netId=" + netId + ": the SSID or the passphrase has a tab or a"
++                    + " line break, which a request line cannot carry -- attempt NOT spent");
 +            return false;
 +        }
          Log.i(TAG, "repairing netId=" + netId + " ssid=" + ssid);
@@ -1400,6 +1425,11 @@ index ec2c252..5ba6df3 100644
              }
 -        }, DAEMON_GRACE_MS);
 +        }, POLL_MS);
++    }
++
++    /** True if {@code s} has a character a tab-separated, newline-terminated line cannot carry. */
++    private static boolean hasTabOrLineBreak(String s) {
++        return s.indexOf('\t') >= 0 || s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0;
      }
  
      /**
@@ -1415,7 +1445,7 @@ index ec2c252..5ba6df3 100644
          if (!REQ_DIR.isDirectory()) {
              // isDirectory() is also false when the directory exists but a parent denies
              // search, which is the failure this path actually hit (see the field's
-@@ -692,7 +1631,7 @@ public final class RelayService extends Service {
+@@ -692,7 +1651,7 @@ public final class RelayService extends Service {
          }
          try (FileOutputStream fos = new FileOutputStream(REQ_TMP);
                  OutputStreamWriter w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
@@ -1440,7 +1470,7 @@ index 180c889..eedf2c5 100644
  # name ctl.vendor.doma_shadow_hostapd, which falls to the `ctl.` prefix,
  # ctl_default_prop, a system_public_prop a vendor domain may set
 diff --git a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
-index dcb80d0..c0942f2 100755
+index e7ac474..4b71f27 100755
 --- a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
 +++ b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
 @@ -41,9 +41,22 @@
@@ -1654,7 +1684,7 @@ index dcb80d0..c0942f2 100755
                  return 0
              fi
              RESTART_PENDING=1
-@@ -1182,7 +1254,7 @@ handle_aps() {
+@@ -1191,7 +1263,7 @@ handle_aps() {
          rm -f "$_tmp"
          return 0
      fi
@@ -1663,7 +1693,7 @@ index dcb80d0..c0942f2 100755
      # SIGKILL at shutdown can land mid-write, and a truncated $APS loses every
      # PSK in it. The temporary file is in the same directory, so it has the same label.
      chmod 0660 "$_tmp" 2>/dev/null
-@@ -1199,7 +1271,10 @@ handle_aps() {
+@@ -1208,7 +1280,10 @@ handle_aps() {
          # The idle-only exception (see BOUNCE_ON_APS): nothing to disrupt.
          if conf_is_idle "$LIVE"; then
              log "aps: hostapd beacons only the hidden idle BSS -- applying the list despite ...wifi_relay_bounce_on_aps=false"
@@ -1675,7 +1705,7 @@ index dcb80d0..c0942f2 100755
              return 0
          fi
          # The rate-limited form (see BOUNCE_MIN_S).
-@@ -1208,32 +1283,36 @@ handle_aps() {
+@@ -1217,32 +1292,36 @@ handle_aps() {
          if [ "$_min" -gt 0 ]; then
              write_hostapd_conf || return 0
              if cmp -s "$CONF" "$LIVE" 2>/dev/null; then
@@ -1727,7 +1757,7 @@ index dcb80d0..c0942f2 100755
          return 0
      fi
      write_hostapd_conf || return 0
-@@ -1241,11 +1320,11 @@ handle_aps() {
+@@ -1250,11 +1329,11 @@ handle_aps() {
      #   rewrite that only added the last newline): no restart, and none pending.
      if cmp -s "$CONF" "$LIVE" 2>/dev/null; then
          [ "$RESTART_PENDING" = 1 ] && log "aps: hostapd.conf is back to what hostapd beacons -- the deferred restart is not needed"
@@ -1741,7 +1771,7 @@ index dcb80d0..c0942f2 100755
          log "aps: a station is associated -- deferring the hostapd restart (the conf is already updated; it will be applied once the station leaves)"
      else
          restart_hostapd
-@@ -1266,8 +1345,9 @@ flush_pending_restart() {
+@@ -1275,8 +1354,9 @@ flush_pending_restart() {
      # then costs no exec per tick.
      stations_present && return 0
      # A restart deferred by BOUNCE_MIN_S waits for its interval as well.
@@ -1752,7 +1782,7 @@ index dcb80d0..c0942f2 100755
      # NOT WHILE doma_shadow_ap IS ITSELF BRINGING hostapd UP. Both run at
      # sys.boot_completed, and on the board a deferred restart that landed
      # between the oneshot's `ctl.start` and its confirmation left the log saying
-@@ -1276,10 +1356,7 @@ flush_pending_restart() {
+@@ -1285,10 +1365,7 @@ flush_pending_restart() {
      # until then.
      [ "$(getprop init.svc.vendor.doma_shadow_ap 2>/dev/null)" = running ] && return 0
      log "applying deferred hostapd conf (no station associated)"
@@ -1764,7 +1794,7 @@ index dcb80d0..c0942f2 100755
  }
  
  # set_row_psk <ssid> <psk> -- give the SSID's row in $APS this PSK (appending the row
-@@ -1335,17 +1412,19 @@ state_restart() {
+@@ -1344,17 +1421,19 @@ state_restart() {
  pending_add() {
      PENDING_SEQ=$((PENDING_SEQ+1))
      _pid=$$-$PENDING_SEQ
@@ -1786,7 +1816,7 @@ index dcb80d0..c0942f2 100755
      done
      PENDING=$_pk2
  }
-@@ -1381,7 +1460,8 @@ hold_add() {
+@@ -1390,7 +1469,8 @@ hold_add() {
      hold_active "$1"
      case "$FAIL_HOLDS" in *"$NL$1$TAB"*) _hr=${FAIL_HOLDS#*"$NL$1$TAB"}
          FAIL_HOLDS=${FAIL_HOLDS%%"$NL$1$TAB"*}$NL${_hr#*"$NL"};; esac
@@ -1796,7 +1826,7 @@ index dcb80d0..c0942f2 100755
  }
  hold_del() {
      case "$FAIL_HOLDS" in *"$NL$1$TAB"*) ;; *) return 1;; esac
-@@ -1408,34 +1488,103 @@ holds_seen() {
+@@ -1417,34 +1497,103 @@ holds_seen() {
      done
      FAIL_HOLDS_GONE=$_gone
  }
@@ -1906,7 +1936,7 @@ index dcb80d0..c0942f2 100755
      FAIL_HOLDS=${FAIL_HOLDS%%"$NL$1$TAB"*}$NL${_hr#*"$NL"}
      return 1
  }
-@@ -1453,12 +1602,83 @@ state_sta() {
+@@ -1462,12 +1611,83 @@ state_sta() {
      fi
  }
  
@@ -1991,7 +2021,7 @@ index dcb80d0..c0942f2 100755
  #   FAILED for a connect in PENDING: with WRONG_KEY, its passphrase is remembered as
  #     rejected (REJECT_*), and forgotten from $LEARNED if that is the one kept there
  #     (the AP's key changed). An answer that matches no connect (from before a restart
-@@ -1475,7 +1695,8 @@ state_sta() {
+@@ -1484,7 +1704,8 @@ state_sta() {
  #   LOST while DomA's station is on the SSID: the row goes (drop_row) and is held as
  #     above, until BACK.
  #   BACK (DomD rejoined the SSID on its own): its hold goes, so the next publication
@@ -2001,7 +2031,7 @@ index dcb80d0..c0942f2 100755
  #   Each of COMPLETED, BACK, LOST and FAILED is also written to $STATE_FILE
  #   (state_publish).
  #   Anything else is only logged. Each restart waits for doma_shadow_ap
-@@ -1491,27 +1712,62 @@ handle_state() {
+@@ -1500,27 +1721,62 @@ handle_state() {
      case "$_hst" in COMPLETED|FAILED)
          json_str id "$1" && pending_take "$_js" && [ "$_pp_s" = "$_hs" ] && _tk=1;;
      esac
@@ -2073,7 +2103,7 @@ index dcb80d0..c0942f2 100755
              # Only a row that is there: an SSID out of the list stays out. An open
              #   row (empty PSK) has no passphrase to undo.
              if [ "$_wk" = 1 ] && _rp=$(psk_of "$_hs" 2>/dev/null) && [ -n "$_rp" ]; then
-@@ -1522,7 +1778,16 @@ handle_state() {
+@@ -1531,7 +1787,16 @@ handle_state() {
                  if [ "$_rp" != "$_sp" ]; then
                      set_row_psk "$_hs" "$_sp"
                      log "state: DomD did not accept the passphrase for $_hs -- its row is back to the $_src PSK"
@@ -2091,7 +2121,7 @@ index dcb80d0..c0942f2 100755
                      return 0
                  fi
              fi
-@@ -1530,9 +1795,12 @@ handle_state() {
+@@ -1539,9 +1804,12 @@ handle_state() {
              if [ -n "$_sta" ] && [ "$_hs" = "$_sta" ]; then
                  hold_add "$_hs"
                  drop_row "$_hs" "DomD could not join it; not listed again for $FAIL_HOLD_S s"
@@ -2106,7 +2136,7 @@ index dcb80d0..c0942f2 100755
              state_sta
              if [ -n "$_sta" ] && [ "$_hs" = "$_sta" ]; then
                  hold_add "$_hs"
-@@ -1540,17 +1808,27 @@ handle_state() {
+@@ -1549,17 +1817,27 @@ handle_state() {
              fi;;
          BACK)
              hold_del "$_hs" && log "state: DomD has $_hs back; it is listed again from the next publication"
@@ -2139,7 +2169,7 @@ index dcb80d0..c0942f2 100755
      # A PSK psk_valid refuses goes nowhere, neither into $APS nor to DomD, and
      #   the log names neither the value nor its length. NOR DOES AN EMPTY ONE: it
      #   would make the row open, a secured SSID's open shadow BSS is the dead end
-@@ -1558,39 +1836,34 @@ handle_psk() {
+@@ -1567,39 +1845,34 @@ handle_psk() {
      #   row comes only from DomD's "sec".
      if [ -z "${_p:-}" ] || ! psk_valid "$_p"; then
          log "WARNING: psk: PSK for $_s is empty, or not 8..63 bytes or 64 hex; dropped"
@@ -2189,7 +2219,7 @@ index dcb80d0..c0942f2 100755
      fi
  }
  
-@@ -1657,6 +1930,9 @@ mirror_station() {
+@@ -1666,6 +1939,9 @@ mirror_station() {
      fi
      STA_LAST_SSID=$_ss
      STA_LAST_UPC=$_uc
@@ -2199,7 +2229,7 @@ index dcb80d0..c0942f2 100755
      # The PSK of the BSS the station joined: from $LIVE, what hostapd beacons. $APS can
      # be ahead of it while a restart is deferred -- an open BSS still on the air while
      # its row already holds the placeholder, say -- and the station joined the beacon.
-@@ -1700,8 +1976,10 @@ mirror_station() {
+@@ -1709,8 +1985,10 @@ mirror_station() {
      pending_add "$_ss" "$_pk" m
      if printf '{"t":"connect","id":"%s","ssid":"%s","psk":"%s"}\n' "$_pid" "$(json_esc "$_ss")" "$(json_esc "$_pk")" >&3; then
          pending_commit
@@ -2210,7 +2240,7 @@ index dcb80d0..c0942f2 100755
      else
          log "WARNING: mirror: could not write connect($_ss) to $CHAN"
      fi
-@@ -1775,6 +2053,10 @@ fi
+@@ -1784,6 +2062,10 @@ fi
  # fragment; this keeps the channel clean for an agent that does not.)
  printf '\n' >&3 2>/dev/null || log "WARNING: chan: could not write the flushing newline to $CHAN"
  
@@ -2221,7 +2251,7 @@ index dcb80d0..c0942f2 100755
  log "started (chan=$CHAN aps=$APS req=$REQ)"
  state_publish up
  
-@@ -1853,15 +2135,22 @@ while :; do
+@@ -1862,15 +2144,22 @@ while :; do
  
      # A request stays in place while the toggle is off, and one left from the previous
      # boot waits for doma_shadow_ap to finish, as the publications above do: until then
@@ -2248,7 +2278,7 @@ index dcb80d0..c0942f2 100755
                  '')  ;;
                  *)   log "unknown request verb: $verb";;
              esac
-@@ -1871,5 +2160,15 @@ while :; do
+@@ -1880,5 +2169,15 @@ while :; do
  
      mirror_station
      flush_pending_restart
@@ -2265,6 +2295,3 @@ index dcb80d0..c0942f2 100755
 +    fi
 +    flush_due       # a restart of this pass (handle_aps, flush_pending_restart, above)
  done
--- 
-2.43.0
-

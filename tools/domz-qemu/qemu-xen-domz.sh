@@ -74,7 +74,6 @@ EOF
   fi
 
   tmpcfg="$(mktemp -d)"
-  trap 'rm -rf "$tmpcfg"' EXIT
   # gic_version="v2" for the same reason as on the board: this host has no usable
   # vGICv3 (QEMU is started with gic-version=2 above, so a v3 guest would fail to
   # create with rc=-19).
@@ -97,6 +96,7 @@ EOF
   mkfs.vfat -n DOMZSHARE "$SHARE" >/dev/null
   mcopy -i "$SHARE" "$DOMZ_BIN" ::domz.bin
   mcopy -i "$SHARE" "$tmpcfg/domz.cfg" ::
+  rm -rf "$tmpcfg"
   echo ">> share.img built:$(mdir -i "$SHARE" :: | grep -E "^ +[0-9]+ files")"
 fi
 

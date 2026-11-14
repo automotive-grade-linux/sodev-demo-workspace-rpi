@@ -1,8 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 6e523be86df9170c87628f9f9d5be856f0f5c5fc Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 18:33:29 +0900
-Subject: [PATCH] v4l2request: bound the wait for a free destination
- buffer
+Date: Wed, 11 Nov 2026 08:37:55 +0900
+Subject: [PATCH] v4l2request: bound the wait for a free destination buffer
 
 Once the destination queue cannot grow any more (VIDIOC_CREATE_BUFS
 fails at the driver's limit, 32 buffers for rpi-hevc-dec), a frame
@@ -28,6 +27,12 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ libavcodec/v4l2_req_hevc_vx.c |  4 +++
+ libavcodec/v4l2_req_media.c   | 49 ++++++++++++++++++++++++++++++++---
+ 2 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/libavcodec/v4l2_req_hevc_vx.c b/libavcodec/v4l2_req_hevc_vx.c
+index a6339600..23c8d005 100644
 --- a/libavcodec/v4l2_req_hevc_vx.c
 +++ b/libavcodec/v4l2_req_hevc_vx.c
 @@ -759,6 +759,10 @@ static int v4l2_request_hevc_start_frame(AVCodecContext *avctx,
@@ -41,6 +46,8 @@ Upstream-Status: Pending
              return AVERROR(ENOMEM);
          }
      }
+diff --git a/libavcodec/v4l2_req_media.c b/libavcodec/v4l2_req_media.c
+index 3feb55ab..be5c3691 100644
 --- a/libavcodec/v4l2_req_media.c
 +++ b/libavcodec/v4l2_req_media.c
 @@ -31,6 +31,7 @@
@@ -124,3 +131,6 @@ Upstream-Status: Pending
      }
      else {
          be_dst = base_to_dst(queue_tryget_free(mbc->dst));
+-- 
+2.43.0
+

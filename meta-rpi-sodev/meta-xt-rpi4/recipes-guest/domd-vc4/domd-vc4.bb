@@ -4,8 +4,9 @@ DESCRIPTION = "Compiles and deploys the DomD partial device tree \
 dom0less DomD, and stages the shared DomD kernel Image for reference. DomD owns \
 vc4-drm (HVS + HDMI x2 + the VideoCore mailbox) and v3d (3D), plus GENET and — in \
 the Zephyr flavour — the SD card, and runs weston as the sole compositor for both \
-micro-HDMI outputs (HDMI-A-1 = Cluster IC, HDMI-A-2 = the DomU/DomA surface via \
-virglrenderer). \
+micro-HDMI outputs (HDMI-A-1 = the DomA surface via virglrenderer, the one wired \
+panel on this board; HDMI-A-2 = the DomU cluster -- the routing is in \
+recipes-graphics/wayland/weston-init.bbappend). \
 Under the shipping dom0less setup DomD is created by Xen from boot modules, so no \
 xl config or systemd service is shipped here; only the DTB (via do_deploy) is \
 consumed downstream."
@@ -41,12 +42,6 @@ COMPATIBLE_MACHINE = "^raspberrypi4-64$"
 # `passthrough` nodes, so an empty /passthrough copies nothing — the device nodes
 # needed for phandle resolution are absent, vc4-drm never binds, /dev/dri is not
 # created and weston crash-loops.
-#
-# Validate the file before building:
-#   The DT cross-check
-# which dtc-compiles it and runs the DomD passthrough cross-check against the real
-# bcm2711-rpi-4-b.dtb (page-aligned + non-overlapping xen,reg, xen,path targets
-# that exist, and GIC SPIs that match the host nodes).
 do_compile() {
     dts="${UNPACKDIR}/${DOMD_VC4_DT_NAME}.dts"
     if [ "${DOM0_OS}" = "linux" ]; then

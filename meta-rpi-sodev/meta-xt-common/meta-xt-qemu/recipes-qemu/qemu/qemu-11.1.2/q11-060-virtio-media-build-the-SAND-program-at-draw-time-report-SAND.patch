@@ -34,10 +34,10 @@ Upstream-Status: Inappropriate [fix-up of this layer's host-sand patch]
  2 files changed, 22 insertions(+), 1 deletion(-)
 
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index b640c68de..0caf7f4f0 100644
+index 6e24a511b..c28e38471 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -601,6 +601,15 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+@@ -615,6 +615,15 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
      glDisable(GL_DEPTH_TEST);
      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
      glViewport(0, 0, b->width, b->height);
@@ -54,10 +54,10 @@ index b640c68de..0caf7f4f0 100644
          GLenum target = b->sand ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
  
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 9af507712..48971cd50 100644
+index bdaf3c98f..22dfac63e 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -800,6 +800,15 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -803,6 +803,15 @@ static void virtio_media_host_readable_body(void *opaque)
                                      qemu_log("virtio-media-diag: gpu_xfer: "
                                               "import failed (%d), GPU path "
                                               "off for this queue\n", e);
@@ -73,7 +73,7 @@ index 9af507712..48971cd50 100644
                                  }
                              }
                          }
-@@ -1692,13 +1701,16 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1719,13 +1728,16 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
                  }
              }
          }

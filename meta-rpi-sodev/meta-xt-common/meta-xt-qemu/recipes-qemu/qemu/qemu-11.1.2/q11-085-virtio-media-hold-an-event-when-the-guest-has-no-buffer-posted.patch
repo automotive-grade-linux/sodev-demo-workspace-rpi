@@ -67,10 +67,10 @@ Upstream-Status: Inappropriate [depends on this layer's virtio-media device]
  2 files changed, 283 insertions(+), 15 deletions(-)
 
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 40caf7455..4726b93c0 100644
+index cbc2b4e8a..296a835a8 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -504,16 +504,9 @@ bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
+@@ -507,16 +507,9 @@ bool virtio_media_sg_copy(VirtIOMedia *vm, VirtIOMediaPlaneSg *sg,
  /* events                                                                    */
  /* ------------------------------------------------------------------------- */
  
@@ -90,7 +90,7 @@ index 40caf7455..4726b93c0 100644
  {
      VirtIODevice *vdev = VIRTIO_DEVICE(vm);
      VirtQueueElement *elem;
-@@ -521,13 +514,226 @@ void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
+@@ -524,13 +517,226 @@ void virtio_media_send_event(VirtIOMedia *vm, const void *evt, size_t len)
  
      elem = virtqueue_pop(vm->event_vq, sizeof(VirtQueueElement));
      if (!elem) {
@@ -319,7 +319,7 @@ index 40caf7455..4726b93c0 100644
  }
  
  void virtio_media_send_error_event(VirtIOMediaSession *s, int err)
-@@ -2100,6 +2306,7 @@ static int virtio_media_do_close(VirtIOMedia *vm, uint32_t session_id)
+@@ -2158,6 +2364,7 @@ static int virtio_media_do_close(VirtIOMedia *vm, uint32_t session_id)
      if (!s) {
          return EINVAL;
      }
@@ -327,7 +327,7 @@ index 40caf7455..4726b93c0 100644
      QLIST_REMOVE(s, next);
      virtio_media_session_free(s);
      return 0;
-@@ -3018,6 +3225,16 @@ static void virtio_media_command_bh(void *opaque)
+@@ -3089,6 +3296,16 @@ static void virtio_media_command_bh(void *opaque)
                  status = virtio_media_passthrough(s, desc->code, payload,
                                                    work_len);
              }
@@ -344,7 +344,7 @@ index 40caf7455..4726b93c0 100644
  
              /*
               * The response payload exists only for _IOR / _IOWR. Its size comes
-@@ -3067,6 +3284,15 @@ static void virtio_media_command_bh(void *opaque)
+@@ -3138,6 +3355,15 @@ static void virtio_media_command_bh(void *opaque)
          if (resp_len) {
              iov_from_buf(elem->in_sg, elem->in_num, 0, resp, resp_len);
          }
@@ -360,7 +360,7 @@ index 40caf7455..4726b93c0 100644
          virtqueue_push(vq, elem, resp_len);
          g_free(elem);
      }
-@@ -3090,12 +3316,13 @@ static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
+@@ -3161,12 +3387,13 @@ static void virtio_media_handle_command(VirtIODevice *vdev, VirtQueue *vq)
  }
  
  /*
@@ -377,7 +377,7 @@ index 40caf7455..4726b93c0 100644
  }
  
  /* ------------------------------------------------------------------------- */
-@@ -3219,6 +3446,10 @@ init_common:
+@@ -3290,6 +3517,10 @@ init_common:
      vm->command_vq = virtio_add_queue(vdev, 64, virtio_media_handle_command);
      vm->event_vq = virtio_add_queue(vdev, 64, virtio_media_handle_event);
      vm->command_bh = virtio_bh_new_guarded(dev, virtio_media_command_bh, vm);
@@ -388,7 +388,7 @@ index 40caf7455..4726b93c0 100644
      virtio_media_gpu_set_fence_fd(vm->gpu_fence_fd);
  
      /*
-@@ -3238,6 +3469,22 @@ init_common:
+@@ -3309,6 +3540,22 @@ init_common:
      }
  }
  
@@ -411,7 +411,7 @@ index 40caf7455..4726b93c0 100644
  static void virtio_media_unrealize(DeviceState *dev)
  {
      VirtIODevice *vdev = VIRTIO_DEVICE(dev);
-@@ -3249,6 +3496,7 @@ static void virtio_media_unrealize(DeviceState *dev)
+@@ -3320,6 +3567,7 @@ static void virtio_media_unrealize(DeviceState *dev)
          virtio_media_session_free(s);
      }
      g_clear_pointer(&vm->command_bh, qemu_bh_delete);
@@ -419,7 +419,7 @@ index 40caf7455..4726b93c0 100644
      g_free(vm->cmd_buf);
      vm->cmd_buf = NULL;
      virtio_delete_queue(vm->command_vq);
-@@ -3295,6 +3543,7 @@ static void virtio_media_class_init(ObjectClass *klass, const void *data)
+@@ -3366,6 +3614,7 @@ static void virtio_media_class_init(ObjectClass *klass, const void *data)
      set_bit(DEVICE_CATEGORY_MISC, dc->categories);
      vdc->realize = virtio_media_realize;
      vdc->unrealize = virtio_media_unrealize;
@@ -428,10 +428,10 @@ index 40caf7455..4726b93c0 100644
      vdc->get_features = virtio_media_get_features;
  }
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index c4a78ce14..e7ef9ac3a 100644
+index 16bee6cd6..26a714b14 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -142,6 +142,16 @@ struct virtio_media_event_event {
+@@ -145,6 +145,16 @@ struct virtio_media_event_event {
   */
  #define VIRTIO_MEDIA_EVENT_MAX_SIZE sizeof(struct virtio_media_event_dqbuf)
  
@@ -448,7 +448,7 @@ index c4a78ce14..e7ef9ac3a 100644
  /*
   * Enough for any single V4L2 ioctl payload plus the arrays that follow it: a
   * v4l2_buffer with VIDEO_MAX_PLANES planes and one SG list per plane. A 4 KiB
-@@ -481,6 +491,15 @@ struct VirtIOMedia {
+@@ -486,6 +496,15 @@ struct VirtIOMedia {
       * allocation out of the path.
       */
      uint8_t *cmd_buf;

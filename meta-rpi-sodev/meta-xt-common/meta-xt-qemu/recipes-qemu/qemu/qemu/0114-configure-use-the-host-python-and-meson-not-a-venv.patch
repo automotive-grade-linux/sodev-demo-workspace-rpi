@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Sun, 6 Sep 2026 01:09:22 +0900
 Subject: [PATCH] configure: use the host python and meson instead of a venv
@@ -32,9 +33,11 @@ Upstream-Status: Inappropriate [oe specific; see the oe-core originals]
  configure | 6 +++---
  1 file changed, 3 insertions(+), 3 deletions(-)
 
+diff --git a/configure b/configure
+index 02f1dd2311f..b3ed3697bd7 100755
 --- a/configure
 +++ b/configure
-@@ -969,14 +969,14 @@
+@@ -969,14 +969,14 @@ python="$(command -v "$python")"
  echo "python determined to be '$python'"
  echo "python version: $($python --version)"
  
@@ -51,7 +54,7 @@ Upstream-Status: Inappropriate [oe specific; see the oe-core originals]
  
  # Finish preparing the virtual environment using vendored .whl files
  
-@@ -988,7 +988,7 @@
+@@ -988,7 +988,7 @@ $mkvenv ensuregroup --dir "${source_path}/python/wheels" \
  # We ignore PATH completely here: we want to use the venv's Meson
  # *exclusively*.
  

@@ -27,8 +27,8 @@ from the R-Car V4H AGL SoDeV reference it came from.
 | DomA | 2 | vCPU 0 → 2, vCPU 1 → 3 | AAOS guest (virtio-pci/-gpu/-blk, vhost-net/-vsock) |
 | DomZ | 1 | 0 | Zephyr RTOS guest (`xenvm` board); no virtio at all — PV console only |
 
-`domain-cpu-pin.service` in DomD pins DomD and sets its weight; the guests pin
-themselves through `cpus` in their xl cfgs. Inside DomD on the Raspberry Pi 5, the
+`domain-cpu-pin.service` in DomD pins Dom0 to pCPU 0 and DomD one vCPU per pCPU,
+and sets DomD's weight; the guests pin themselves through `cpus` in their xl cfgs. Inside DomD on the Raspberry Pi 5, the
 qemu wrapper keeps DomA's device model on CPU 0 -- the vCPU that shares pCPU 0 only
 with Dom0 and DomZ -- and DomU's on CPU 1 (`XT_QEMU_DM_PLACEMENT`; the Raspberry Pi
 4 leaves its device models on both CPUs); the H.264 decoder's frame threads run on
@@ -340,7 +340,7 @@ it as `AGENT_NAME:MODEL_VERSION` and treats the space inside `Claude Code` as
 malformed, so each kernel patch that carries it draws a `BAD_SIGN_OFF` warning
 from it; that warning is expected. Not every patch carries it: among those that
 do not are the xen-troops fork series in `recipes-extended/xen-common` and
-third-party backports such as the qemu 7.0 `0113`. A
+third-party patches carried as they came, such as EPAM's qemu 7.0 `0111`. A
 patch sent to an upstream project is given the trailer form that project asks
 for when it is sent.
 
@@ -439,7 +439,7 @@ identical and what this port changes:
 - **No IOMMU** → direct-map DomD; DomU grant DMA / DomA foreign mapping (`grant_usage=0`). Guest disks per
   flavour: with the thin **Linux Dom0**, Dom0 owns the SD and attaches guest
   disks via `xl block-attach phy:` (kernel blkback; the legacy qdisk unit is
-  masked); with the default **Zephyr Dom0* (`docs/DESIGN.md`)*, the SD (SoC SDHCI) is passed
+  masked); with the default **Zephyr Dom0** (see *Zephyr Dom0* above), the SD (SoC SDHCI) is passed
   through to DomD, whose own xl attaches the guest disks locally.
 - **Disaggregated control plane (zephyr flavour)**: Dom0 is reduced to a
   xenstore server; the toolstack lives in the driver domain. This follows the
@@ -468,11 +468,14 @@ identical and what this port changes:
   the 24.2.7 recipes. DomD's Mesa is pinned again now, ahead of wrynose, to
   26.2.4: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
   `meta-xt-driver-domain`'s `mesa.bbappend` carries the pin (in both `--gpu`
-  lanes), glvnd, and four source patches of its own: egl/wayland allocating a
+  lanes), glvnd, and five source patches of its own: egl/wayland allocating a
   client's scanout buffers on the display device, v3d filling its tiled blit
   temporary with the TFU, v3dv building a submit's signal fence once instead
-  of once per signal, and v3dv sizing explicitly laid out planes from their own
-  offset.
+  of once per signal, v3dv sizing explicitly laid out planes from their own
+  offset, and the Vulkan runtime sleeping between the polls of
+  `spin_wait_for_sync_file()` after the first eight yields (a Venus ring thread
+  of the cluster's context had kept DomD's CPU 1 busy yielding while weston,
+  holding the V3D mutex on that CPU, got none; RPi5, 2026-10-24).
 
 ## DomD compositor startup and rootfs (V4H-aligned)
 

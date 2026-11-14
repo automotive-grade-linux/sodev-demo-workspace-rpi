@@ -26,10 +26,10 @@ Upstream-Status: Inappropriate [fix-up of this layer's host-sand patch]
  2 files changed, 13 insertions(+), 3 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index 41bc35cae..6baf08ce4 100644
+index e2764e548..876a12b85 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -652,7 +652,8 @@ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
+@@ -666,7 +666,8 @@ void *virtio_media_gpu_import_sand_linear(int dmabuf_fd, uint32_t src_width,
      GpuSaved sv;
      VirtIOMediaGpuBuf *b;
  
@@ -40,10 +40,10 @@ index 41bc35cae..6baf08ce4 100644
          qemu_log("virtio-media-diag: gpu_xfer: host-sand=2 geometry refused (len %u, "
                   "w %u, luma %u, col %u)\n", len, src_width, luma_rows, col_height);
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index b1c88105a..f6c590ae6 100644
+index b087173f8..1e3904cae 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -784,8 +784,17 @@ static void virtio_media_host_readable_body(void *opaque)
+@@ -787,8 +787,17 @@ static void virtio_media_host_readable_body(void *opaque)
                                                  eb.fd, q->width, luma_rows,
                                                  q->sand_col_height,
                                                  dst_bpl / 4, dst_h, scale,
@@ -60,6 +60,6 @@ index b1c88105a..f6c590ae6 100644
 +                                                    q->host_len[idx][p]
 +                                                    ? q->host_sizeimage : 0,
 +                                                q->matrix, &e);
-                                     } else
-                                     q->gpu_buf[idx] =
-                                         virtio_media_gpu_import_nv12(
+                                     } else {
+                                         q->gpu_buf[idx] =
+                                             virtio_media_gpu_import_nv12(

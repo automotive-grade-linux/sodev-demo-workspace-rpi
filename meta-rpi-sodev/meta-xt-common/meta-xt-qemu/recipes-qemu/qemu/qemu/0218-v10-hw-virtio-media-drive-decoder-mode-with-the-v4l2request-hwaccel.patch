@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Mon, 21 Sep 2026 14:18:54 +0900
-Subject: [PATCH] hw/virtio-media: drive decoder mode with the v4l2request hwaccel
+Subject: [PATCH] hw/virtio-media: drive decoder mode with the v4l2request
+ hwaccel
 
 0217 added decoder mode -- the guest is offered an ordinary STATEFUL HEVC decoder
 (V4L2_PIX_FMT_HEVC in, linear NV12 out) because BCM2712's only decode block,
@@ -52,8 +54,11 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216) and on the v4l2request hwaccel that only rpidistro-ffmpeg carries]
 ---
+ hw/virtio/virtio-media-decoder.c | 107 +++++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index a32a7a48e43..09fe9c3a8dc 100644
+index 4e724f1a53c..322f56cfd57 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -62,6 +62,8 @@

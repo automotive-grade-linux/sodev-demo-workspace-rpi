@@ -41,10 +41,6 @@ set -u
 # shell at all. DOM0 is kept as a deprecated alias for existing callers.
 DOMD="${DOMD:-${DOM0:-root@192.168.10.10}}"
 DEV="${DEV:-/dev/mmcblk0p4}"
-# DomD domid that owns the p4 block device (xvdc). Fixed at 1 in the SoDeV
-# disaggregated layout (Dom0=Zephyr, DomD=domid 1); overridable via env if the
-# toolstack assigns a different id.
-DOMD_ID="${DOMD_ID:-1}"
 # SSH transport prefix. Default: plain ssh (use keys/agent). For the closed-lab
 # empty-root image, run non-interactively with:  SSH_PREFIX="sshpass -e" SSHPASS= ...
 SSH_PREFIX="${SSH_PREFIX:-}"
@@ -243,7 +239,12 @@ cmd_check() {
 # never touched (system side unchanged).
 #
 # Prerequisites:
-#   - p4 must not be in use by DomA / DomD (xl destroy DomA + xl block-detach 1 xvdc done)
+#   - p4 must not be open on DomD. DomA's device model (qemu on DomD) opens it
+#     directly (doma.cfg: -drive file=/dev/mmcblk0p4), so DomA must not have been
+#     created in this boot, or must have been stopped. Do NOT `xl destroy` it to
+#     get there: docs/TROUBLESHOOTING.md (Known issues) -- the vhost domid
+#     mapping breaks and the domain can be left a zombie. The board is rebooted
+#     after a reinit anyway, which is also how DomA comes back.
 #   - pristine material: $PRISTINE_GZ (gzip of the first 64MiB of userdata.pristine.raw)
 # ============================================================================
 cmd_reinit() {
@@ -282,10 +283,19 @@ cmd_reinit() {
   echo "[pre] DomD reachability + p4 existence..."
   "${SSH[@]}" "ls $DEV" >/dev/null || { echo "NG: cannot reach $DEV"; exit 1; }
 
-  echo "[pre] check p4 is not in use (xl list / block list)..."
-  "${SSH[@]}" "xl list" | sed 's/^/    /'
-  if "${SSH[@]}" "xl block-list $DOMD_ID 2>/dev/null" | grep -q xvdc; then
-    echo "NG: xvdc (=p4) is still attached to DomD (domid $DOMD_ID). Run xl destroy DomA && xl block-detach $DOMD_ID xvdc first."
+  echo "[pre] check p4 is not in use (xl list / fuser)..."
+  local xl_out
+  xl_out=$("${SSH[@]}" "xl list") || { echo "NG: xl list failed on $DOMD (not the toolstack domain?)"; exit 1; }
+  printf '%s\n' "$xl_out" | sed 's/^/    /'
+  # Two checks, because DomA's qemu on DomD opens p4 itself: a zombie DomA can
+  # be gone from `xl list` while its device model still holds the device.
+  if printf '%s\n' "$xl_out" | awk 'NR>1{print $1}' | grep -qx DomA; then
+    echo "NG: DomA is running and its device model holds p4. Reinit needs a boot in which DomA"
+    echo "    was not created, or has been stopped. Do not 'xl destroy' it (docs/TROUBLESHOOTING.md, Known issues)."
+    exit 1
+  fi
+  if "${SSH[@]}" "fuser $DEV >/dev/null 2>&1"; then
+    echo "NG: $DEV is open on DomD (fuser). A device model still holds it; see docs/TROUBLESHOOTING.md before going on."
     exit 1
   fi
 
@@ -368,6 +378,7 @@ cmd_reinit() {
   echo
   echo "DONE: the next DomA boot is equivalent to a first boot (metadata key regeneration + /data rebuild)."
   echo "      Duration is comparable to the first boot (measured: scanout ~62s)."
+  echo "      Reboot the board to start DomA: it is not re-created in place (docs/TROUBLESHOOTING.md)."
 }
 
 case "${1:-}" in

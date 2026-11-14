@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 04 Sep 2026 15:58:51 +0900
+Date: Fri, 4 Sep 2026 15:58:51 +0900
 Subject: [PATCH] xen/mapcache: keep foreign bucket heads mapped when unlocked
 
 Since the grant-mapping series (9.1, "xen: mapcache: Unmap first entries in
@@ -38,6 +38,9 @@ Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ hw/xen/xen-mapcache.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
 diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
 index c5616ca54d1..dccf33045f8 100644
 --- a/hw/xen/xen-mapcache.c

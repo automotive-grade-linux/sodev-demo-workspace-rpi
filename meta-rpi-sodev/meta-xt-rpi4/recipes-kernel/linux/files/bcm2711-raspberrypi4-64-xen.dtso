@@ -110,9 +110,8 @@
 		 * naturally-aligned POWER-OF-TWO block, trying `bits` upward from the
 		 * order so the first success is in the lowest window that can hold it,
 		 * and halving the order (down to 128 MiB) if none can — see the full
-		 * derivation in boot.cmd.xen.linux-dom0.in -- which predates the numbers
-		 * below, and still concludes one 256 MiB bank; that file contradicts it
-		 * at :238-239. The SIZE here is NOT 256 MiB: dom0_mem caps the order and
+		 * derivation in boot.cmd.xen.linux-dom0.in ("Dom0 size" section).
+		 * The SIZE here is NOT 256 MiB: dom0_mem caps the order and
 		 * min(dom0_mem, 128 MiB) floors it, and the firmware drops the host DT
 		 * blob at 0x2eff1f00, inside the window this layout leaves free. Both
 		 * flavours were MEASURED with bank[0] at 0x20000000, 128 MiB -- zephyr

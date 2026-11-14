@@ -1,6 +1,6 @@
-From 69578a8c60aaf07cc7ec9e96ed027c0e01d84ef7 Mon Sep 17 00:00:00 2001
+From 2e491cae32d877a5e12b7c7d830c4bcee129378b Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 25 Jun 2026 13:00:00 +0900
+Date: Wed, 11 Nov 2026 08:37:51 +0900
 Subject: [PATCH] drm/v3d: pin V3D runtime-active under Xen DomD passthrough
 
 Linux 6.18 introduced Runtime PM + autosuspend for V3D ("drm/v3d:
@@ -38,6 +38,7 @@ Upstream-Status: Pending
  1 file changed, 6 deletions(-)
 
 diff --git a/drivers/gpu/drm/v3d/v3d_drv.c b/drivers/gpu/drm/v3d/v3d_drv.c
+index 96c052b158bbf..453fa174e73a3 100644
 --- a/drivers/gpu/drm/v3d/v3d_drv.c
 +++ b/drivers/gpu/drm/v3d/v3d_drv.c
 @@ -431,9 +431,6 @@ static int v3d_platform_drm_probe(struct platform_device *pdev)
@@ -50,8 +51,7 @@ diff --git a/drivers/gpu/drm/v3d/v3d_drv.c b/drivers/gpu/drm/v3d/v3d_drv.c
  	ret = drm_dev_register(drm, 0);
  	if (ret)
  		goto runtime_pm_put;
-@@ -442,10 +439,7 @@ static int v3d_platform_drm_probe(struct platform_device *pdev)
- 	ret = v3d_sysfs_init(dev);
+@@ -442,9 +439,6 @@ static int v3d_platform_drm_probe(struct platform_device *pdev)
  	if (ret)
  		goto drm_unregister;
  

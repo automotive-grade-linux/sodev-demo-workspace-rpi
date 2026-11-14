@@ -1,18 +1,18 @@
-AAOS host-side backend daemons for DomA (RPi5 Xen SoDeV)
-=========================================================
+AAOS host-side glue for DomA (Xen SoDeV, Raspberry Pi 4 and Raspberry Pi 5)
+===========================================================================
 
-The following files redistributed by this recipe originate in the Android Open
-Source Project (AOSP) and are licensed under the Apache License, Version 2.0.
-
-Prebuilt aarch64 binaries:
-
-  * vehicle_hal_grpc_server   (AAOS VehicleHAL + power-state gRPC backend)
-  * dumpstate_grpc_server     (AAOS dumpstate gRPC backend)
-
-Source and configuration:
+The following files installed by the xt-aaos-host-services recipe originate in
+the Android Open Source Project (AOSP) and are licensed under the Apache
+License, Version 2.0:
 
   * gnss_replay.py            (mock GNSS host agent; modified -- see the file)
   * aaos.dumpstate.xml        (dumpstate configuration)
+
+The gRPC backends these are configured for, vehicle_hal_grpc_server and
+dumpstate_grpc_server, are not part of this package: google-trout-agl-services
+builds them from source in the same build and declares the licences of the
+sources they are built from (see its trout-sources.inc; the NOTICE files those
+sources carry are the Apache-2.0 text itself).
 
 Copyright (C) The Android Open Source Project
 
@@ -26,11 +26,3 @@ Unless required by applicable law or agreed to in writing, software distributed
 under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
-
------------------------------------------------------------------------------
-NOTE (staging): This NOTICE accompanies the prebuilt binaries per Apache-2.0
-section 4(d). It is a staged artifact (like the binaries themselves) and is not
-committed to the PR repository. When building the AAOS host services from a real
-AOSP tree, replace this file with the authoritative NOTICE emitted by that
-build (out/target/.../NOTICE or the components' own NOTICE files) so that all
-upstream copyright attributions are propagated verbatim.

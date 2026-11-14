@@ -1,12 +1,9 @@
 COMPATIBLE_MACHINE = "raspberrypi5"
 OPTEEMACHINE:raspberrypi5 ?= "rpi5"
 
-# Pin the OP-TEE version explicitly. Both 4.1.0 and 4.2.0 recipes exist in
-# meta-xt-security (kept there to stay close to its upstream), and with no
-# PREFERRED_VERSION bitbake would simply take the higher one -- 4.2.0 is what this
-# board wants, but by accident rather than by statement. Say it, so a later 4.3.0
-# landing upstream does not silently change what this board builds.
-PREFERRED_VERSION_optee-os = "4.2.0"
-PREFERRED_VERSION_optee-os-tadevkit = "4.2.0"
-PREFERRED_VERSION_optee-client = "4.2.0"
-PREFERRED_VERSION_optee-test = "4.2.0"
+# This is what selects 4.2.0: meta-xt-security carries 4.1.0 and 4.2.0, its
+# optee.inc defaults COMPATIBLE_MACHINE to "invalid", and only the 4.2.0 bbappends
+# in this directory require this file, so 4.1.0 is skipped for this MACHINE. A
+# PREFERRED_VERSION written in a recipe would not do it -- bitbake reads that from
+# the configuration datastore (providers.py findPreferredProvider), so a pin
+# belongs in the yaml's conf, not here.

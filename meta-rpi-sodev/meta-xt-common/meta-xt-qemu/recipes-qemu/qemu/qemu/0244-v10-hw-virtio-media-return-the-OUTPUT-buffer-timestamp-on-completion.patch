@@ -1,6 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Date: Tue, 22 Sep 2026 01:21:41 +0900
-Subject: [PATCH] hw/virtio-media: return the OUTPUT buffer timestamp on completion
+Subject: [PATCH] hw/virtio-media: return the OUTPUT buffer timestamp on
+ completion
 
 With 0219 the stateful handshake completes on the board: the guest renegotiates
 to 1920x1080 and QBUF never fails. Playback still produced no picture, and the
@@ -50,8 +52,11 @@ Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Inappropriate [depends on the downstream virtio-media device
  (0216), which upstream qemu does not have]
 ---
+ hw/virtio/virtio-media-decoder.c | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index 85f5e990b11..9fbb7d2c076 100644
+index 7ac6fcb92cd..1e61c3debda 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -109,6 +109,33 @@

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 3 Oct 2026 12:20:32 +0900
+Date: Wed, 11 Nov 2026 08:49:19 +0900
 Subject: [PATCH] virtio-media: run the CAPTURE queue as NV12 on the host,
  convert on the GPU
 
@@ -8,16 +8,24 @@ qemu 11.1.2 port of
 meta-xt-qemu/recipes-qemu/qemu/qemu/0231-v10-virtio-media-host-nv12-capture-with-gpu-conversion.patch;
 that patch's description has the reasoning and the measurements.
 
+Changed in the q11 series (review 2026-11-11): the CPU fallback checks
+the host geometry (bytesperline >= width, bpl * height * 3 / 2 within
+the host buffer) before it reads the host mapping, as the GPU path's
+geom_ok does, and drops the frame with an error event otherwise; a G_FMT
+that finds the host in some format other than NV12 clears nv12_host, so
+QUERYBUF stops reporting the RGBA size for a host that is not NV12 any
+more. The GPU buffer no longer stores stride and len (q11-032).
+
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Inappropriate [depends on the downstream virtio-media device (0216), which upstream qemu does not have]
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device (q11-023, the port of 0216), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-virgl-stub.c    |  12 +
- hw/virtio/virtio-media-virgl.c         | 310 +++++++++++++++++++++++--
- hw/virtio/virtio-media.c               | 291 ++++++++++++++++++++++-
+ hw/virtio/virtio-media-virgl.c         | 308 ++++++++++++++++++++++--
+ hw/virtio/virtio-media.c               | 310 ++++++++++++++++++++++++-
  include/hw/virtio/virtio-media-virgl.h |  14 ++
  include/hw/virtio/virtio-media.h       |  26 +++
- 5 files changed, 623 insertions(+), 30 deletions(-)
+ 5 files changed, 640 insertions(+), 30 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-virgl-stub.c b/hw/virtio/virtio-media-virgl-stub.c
 index 093593a96..b58febb59 100644
@@ -43,15 +51,15 @@ index 093593a96..b58febb59 100644
  {
      return -ENOTSUP;
 diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
-index de09cb288..b7a8b49ca 100644
+index 2b29ea3f3..cc1e10db2 100644
 --- a/hw/virtio/virtio-media-virgl.c
 +++ b/hw/virtio/virtio-media-virgl.c
-@@ -50,12 +50,20 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
+@@ -51,12 +51,20 @@ int virtio_media_virgl_transfer(uint32_t res_id, uint32_t width,
  
  typedef struct VirtIOMediaGpuBuf {
      int fd;
--    uint32_t width, height, stride, len;
-+    uint32_t width, height, stride, len;   /* width = destination width */
+-    uint32_t width, height;
++    uint32_t width, height;                /* width = destination width */
      GLuint tex;
      GLuint read_fbo;          /* the blit's read FBO, made on first use */
      GLsync sync;              /* last copy that read this buffer, or NULL */
@@ -68,7 +76,7 @@ index de09cb288..b7a8b49ca 100644
  /*
   * Context discipline. The display is SDL (gl=es) or egl-headless; either way
   * virglrenderer's context is current on the main loop while it processes
-@@ -71,6 +79,10 @@ static struct {
+@@ -72,6 +80,10 @@ static struct {
      EGLDisplay dpy;
      EGLContext ctx;
      GLuint draw_fbo;
@@ -79,7 +87,7 @@ index de09cb288..b7a8b49ca 100644
  } gpu;
  
  typedef struct GpuSaved {
-@@ -98,6 +110,9 @@ static void gpu_free_buf(VirtIOMediaGpuBuf *b)
+@@ -99,6 +111,9 @@ static void gpu_free_buf(VirtIOMediaGpuBuf *b)
      if (b->read_fbo) {
          glDeleteFramebuffers(1, &b->read_fbo);
      }
@@ -89,7 +97,7 @@ index de09cb288..b7a8b49ca 100644
      glDeleteTextures(1, &b->tex);
      g_free(b);
  }
-@@ -218,6 +233,254 @@ static void gpu_leave(const GpuSaved *sv)
+@@ -224,6 +239,252 @@ static void gpu_leave(const GpuSaved *sv)
      }
  }
  
@@ -268,8 +276,6 @@ index de09cb288..b7a8b49ca 100644
 +    b->width = dst_width;
 +    b->height = src_height;
 +    b->src_width = src_width;
-+    b->stride = stride;
-+    b->len = len;
 +    b->matrix = matrix;
 +    b->tex = gpu_import_plane(dmabuf_fd, VM_DRM_FORMAT_R8, src_width,
 +                              src_height, stride, 0);
@@ -344,7 +350,7 @@ index de09cb288..b7a8b49ca 100644
  void *virtio_media_gpu_import(int dmabuf_fd, uint32_t width, uint32_t height,
                                uint32_t stride, uint32_t len, int *err)
  {
-@@ -340,27 +603,34 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
+@@ -344,27 +605,34 @@ int virtio_media_gpu_blit(void *handle, uint32_t res_id)
          b->sync = NULL;
      }
  
@@ -399,10 +405,10 @@ index de09cb288..b7a8b49ca 100644
      if (gl_err != GL_NO_ERROR) {
          qemu_log("virtio-media-diag: gpu_xfer: copy to res %u tex %u failed, "
 diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
-index 4b8977736..0e1040c2c 100644
+index 3c07a4679..07cdb3001 100644
 --- a/hw/virtio/virtio-media.c
 +++ b/hw/virtio/virtio-media.c
-@@ -170,6 +170,140 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
+@@ -168,6 +168,140 @@ static void virtio_media_queue_release(VirtIOMediaSession *s, VirtIOMediaQueue *
      q->num_host_planes = 0;
      q->streaming = false;
      q->gpu_failed = false;
@@ -543,7 +549,7 @@ index 4b8977736..0e1040c2c 100644
  }
  
  static void virtio_media_session_free(VirtIOMediaSession *s)
-@@ -471,9 +605,15 @@ static void virtio_media_host_readable(void *opaque)
+@@ -474,9 +608,15 @@ static void virtio_media_host_readable(void *opaque)
                       * The width handed to GL is the padded one, which is
                       * also the gralloc resource's width.
                       */
@@ -561,7 +567,7 @@ index 4b8977736..0e1040c2c 100644
                          uint32_t idx = evt.buffer.index;
                          int r;
  
-@@ -490,10 +630,20 @@ static void virtio_media_host_readable(void *opaque)
+@@ -493,10 +633,20 @@ static void virtio_media_host_readable(void *opaque)
                                           "VIDIOC_EXPBUF failed (%d), GPU "
                                           "path off for this queue\n", errno);
                              } else {
@@ -586,7 +592,7 @@ index 4b8977736..0e1040c2c 100644
                                  if (!q->gpu_buf[idx] && e != -EAGAIN) {
                                      q->gpu_failed = true;
                                      qemu_log("virtio-media-diag: gpu_xfer: "
-@@ -517,12 +667,41 @@ static void virtio_media_host_readable(void *opaque)
+@@ -520,12 +670,57 @@ static void virtio_media_host_readable(void *opaque)
                              }
                          }
                      }
@@ -601,7 +607,23 @@ index 4b8977736..0e1040c2c 100644
 +
 +                    if (q->nv12_host) {
 +                        size_t need = (size_t)q->rgba_sizeimage;
++                        size_t src_need = (size_t)q->bytesperline * q->height * 3 / 2;
 +
++                        /*
++                         * The geometry is the host's own G_FMT reply, so this
++                         * cannot be the guest's doing; it still bounds the read.
++                         */
++                        if (q->bytesperline < q->width ||
++                            src_need > q->host_len[evt.buffer.index][p]) {
++                            error_report_once("virtio-media: host_nv12: the host's "
++                                              "%ux%u NV12 (bpl %u) does not fit "
++                                              "its %u-byte buffer; frame dropped",
++                                              q->width, q->height, q->bytesperline,
++                                              q->host_len[evt.buffer.index][p]);
++                            gb->queued = false;
++                            virtio_media_send_error_event(s, EIO);
++                            return;
++                        }
 +                        if (q->conv_scratch_len < need) {
 +                            g_free(q->conv_scratch);
 +                            q->conv_scratch = g_malloc(need);
@@ -630,7 +652,7 @@ index 4b8977736..0e1040c2c 100644
                          if (r == 0) {
                              continue;
                          }
-@@ -533,8 +712,7 @@ static void virtio_media_host_readable(void *opaque)
+@@ -536,8 +731,7 @@ static void virtio_media_host_readable(void *opaque)
                                       gb->virgl_res, r);
                          }
                      }
@@ -638,9 +660,9 @@ index 4b8977736..0e1040c2c 100644
 -                                              q->host_map[evt.buffer.index][p],
 +                    if (!virtio_media_sg_copy(vm, &gb->planes[p], src_map,
                                                used, true)) {
+                         gb->queued = false;
                          virtio_media_send_error_event(s, EFAULT);
-                         return;
-@@ -558,6 +736,24 @@ static void virtio_media_host_readable(void *opaque)
+@@ -562,6 +756,24 @@ static void virtio_media_host_readable(void *opaque)
               * crosses into the guest anyway, which costs nothing and does not
               * depend on the driver continuing to do that.
               */
@@ -665,7 +687,7 @@ index 4b8977736..0e1040c2c 100644
              evt.buffer.memory = V4L2_MEMORY_USERPTR;
              memset(&evt.buffer.m, 0, sizeof(evt.buffer.m));
              if (q->mplane) {
-@@ -820,6 +1016,16 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+@@ -825,6 +1037,16 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
                  q->height = fmt.fmt.pix.height;
                  q->bytesperline = fmt.fmt.pix.bytesperline;
              }
@@ -682,7 +704,7 @@ index 4b8977736..0e1040c2c 100644
          }
      }
  
-@@ -1149,7 +1355,71 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
+@@ -1159,7 +1381,74 @@ static int virtio_media_passthrough(VirtIOMediaSession *s, unsigned long code,
          }
      }
  
@@ -728,8 +750,11 @@ index 4b8977736..0e1040c2c 100644
 +                                                           : f->fmt.pix.height,
 +                         q->rgba_bytesperline, q->rgba_sizeimage, q->matrix);
 +            }
-+        } else if (code == VIDIOC_S_FMT && capture) {
-+            /* The host ended up in some other format: no translation. */
++        } else if ((code == VIDIOC_S_FMT || code == VIDIOC_G_FMT) && capture) {
++            /*
++             * The host ended up in (S_FMT), or turns out to be in (G_FMT), some
++             * other format: no translation until a later S_FMT makes it NV12.
++             */
 +            q->nv12_host = false;
 +        }
 +        return 0;
@@ -754,7 +779,7 @@ index 4b8977736..0e1040c2c 100644
      virtio_media_unpoint(code, payload);
      if (ret) {
          return ret;
-@@ -1533,6 +1803,7 @@ static const Property virtio_media_properties[] = {
+@@ -1543,6 +1832,7 @@ static const Property virtio_media_properties[] = {
      DEFINE_PROP_STRING("v4l2-device", VirtIOMedia, v4l2_device),
      DEFINE_PROP_BOOL("host-xfer", VirtIOMedia, host_xfer, true),
      DEFINE_PROP_BOOL("gpu-xfer", VirtIOMedia, gpu_xfer, true),
@@ -788,10 +813,10 @@ index 6193a4cfd..6917d37de 100644
  int virtio_media_gpu_wait(void *handle);
  void virtio_media_gpu_release(void *handle);
 diff --git a/include/hw/virtio/virtio-media.h b/include/hw/virtio/virtio-media.h
-index 2da0ed63d..6b145becc 100644
+index 82caaa561..f28bff618 100644
 --- a/include/hw/virtio/virtio-media.h
 +++ b/include/hw/virtio/virtio-media.h
-@@ -199,6 +199,22 @@ typedef struct VirtIOMediaQueue {
+@@ -201,6 +201,22 @@ typedef struct VirtIOMediaQueue {
       */
      void *gpu_buf[VIRTIO_MEDIA_MAX_BUFFERS];
      bool gpu_failed;
@@ -814,7 +839,7 @@ index 2da0ed63d..6b145becc 100644
      uint32_t host_len[VIRTIO_MEDIA_MAX_BUFFERS][VIDEO_MAX_PLANES];
      /* Guest buffers by index, mirrored onto the host buffer of the same index. */
      VirtIOMediaBuffer guest[VIRTIO_MEDIA_MAX_BUFFERS];
-@@ -242,6 +258,16 @@ struct VirtIOMedia {
+@@ -244,6 +260,16 @@ struct VirtIOMedia {
       */
      bool gpu_xfer;
      uint64_t gpu_xfer_fail;

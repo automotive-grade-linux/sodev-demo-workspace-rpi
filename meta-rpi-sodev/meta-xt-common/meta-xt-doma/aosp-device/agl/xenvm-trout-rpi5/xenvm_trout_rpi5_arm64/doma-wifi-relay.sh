@@ -850,7 +850,12 @@ byte_len() {
     case $- in *U*) set +U; _bl=${#1}; set -U;; *) _bl=${#1};; esac
 }
 
-# ssid_hostapd_safe <ssid> -- false for a name hostapd.conf cannot carry.
+# ssid_hostapd_safe <ssid> -- false for a name hostapd.conf or $APS cannot carry.
+#
+# A leading # marks a comment row in $APS: handle_aps keeps such a row as it is,
+# psk_of and both generators skip it. An SSID starting with # could be written
+# as a row but would never be beaconed or listed, so it is refused here, where
+# the skip is logged like every other refused name.
 #
 # ONE bad SSID makes hostapd reject the WHOLE config, and with it the shadow AP
 # and all of DomA's Wi-Fi: measured 2026-09-17, an AP beaconing 20 NUL bytes
@@ -862,7 +867,7 @@ byte_len() {
 # well. Count BYTES: mksh's ${#s} counts characters under UTF-8.
 # doma-shadow-ap.sh carries the same function.
 ssid_hostapd_safe() {
-    case "$1" in ''|*\\*) return 1;; esac
+    case "$1" in ''|'#'*|*\\*) return 1;; esac
     # Printable ASCII: one byte per character, so ${#1} is the byte count without
     #   running wc (an SSID is checked on every publication).
     case "$1" in *[!\ -~]*) ;; *) [ "${#1}" -le 32 ]; return;; esac
@@ -879,7 +884,10 @@ psk_is_hex() {
 # psk_valid <psk> -- is this a PSK both hostapd and DomD's wpa_supplicant
 # accept?
 #
-# Two forms exist. A passphrase is 8..63 BYTES (count bytes, as above). A raw
+# Two forms exist. A passphrase is 8..63 BYTES (count bytes, as above) with no
+# control character: hostapd checks only the length, but DomD's agent refuses one
+# with a control character, and a TAB or CR would split or shift the fields of
+# the request line and of a row in $APS. A raw
 # PSK is 64 hex digits (psk_is_hex): AAOS's Wi-Fi dialog LEGITIMATELY ACCEPTS
 # ONE and stores it unquoted
 # (packages/apps/Car/Settings/.../WifiUtil.java:285-288 puts it into
@@ -897,6 +905,7 @@ psk_is_hex() {
 # GUARD IN THE APP ALONE IS NOT THE LAST LINE OF DEFENCE.
 psk_valid() {
     psk_is_hex "$1" && return 0
+    case "$1" in *[[:cntrl:]]*) return 1;; esac
     byte_len "$1"; _n=$_bl
     [ "$_n" -ge 8 ] && [ "$_n" -le 63 ]
 }

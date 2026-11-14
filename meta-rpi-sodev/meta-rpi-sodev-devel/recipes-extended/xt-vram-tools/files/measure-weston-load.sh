@@ -91,6 +91,6 @@ fi
 echo ""
 echo "[load-measure] Done. Next: optionally start weston-simple-egl manually and inspect the animation."
 echo ""
-echo "Acceptance criteria (pixman production):"
+echo "Acceptance criteria:"
 echo "  - weston CPU < 80% sustained = the compositor has spare headroom"
 echo "  - weston CPU > 95% sustained = possible framerate drop, consider another renderer"

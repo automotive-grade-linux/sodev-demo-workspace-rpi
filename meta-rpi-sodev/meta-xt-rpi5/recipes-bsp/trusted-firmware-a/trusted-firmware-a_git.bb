@@ -26,17 +26,6 @@ do_compile:append:raspberrypi5() {
        		of=${BUILD_DIR}/armstub8-2712.bin bs=1024 seek=512 conv=notrunc
 }
 
-# in TF-A src, docs/getting_started/prerequisites.rst lists the expected version mbedtls
-# mbedtls-3.4.1
-SRC_URI_MBEDTLS = "git://github.com/ARMmbed/mbedtls.git;name=mbedtls;protocol=https;destsuffix=git/mbedtls;branch=master"
-SRCREV_mbedtls = "72718dd87e087215ce9155a826ee5a66cfbe9631"
-
-LIC_FILES_CHKSUM_MBEDTLS = "file://mbedtls/LICENSE;md5=3b83ef96387f14655fc854ddc3c6bd57"
-
-SRC_URI += "\
-"
-
-
 # ---------------------------------------------------------------------------
 # BCM2712 stepping for the SCMI pinctrl server
 # ---------------------------------------------------------------------------

@@ -17,14 +17,10 @@
  *
  * Removed versus BCM2712: cpu_l2_irq, disp_intr, bsc_irq, mop, moplet, the
  * BCM2712 IOMMU, dma32/dma40 HDMI audio DMA and the 40-bit 0x10_7c...... bus
- * wrapper. Added/changed: single `aon_intr` L2 controller (GIC SPI 96, EDGE),
+ * wrapper. Added/changed: single `aon_intr` L2 controller (GIC SPI 96, LEVEL_HIGH),
  * HVS straight on GIC SPI 97, `txp` for the transposer CRTC, `pm` for V3D's
  * power domain + reset, pixelvalve2/pixelvalve4 as the two HDMI CRTCs, and
  * `brcm,bcm2711-vc5` on a childless /gpu node.
- *
- * Validate with:
- *   The DomD passthrough cross-check <compiled base+overlay> \
- *       --host bcm2711-rpi-4-b.dtb
  * ============================================================================
  */
 

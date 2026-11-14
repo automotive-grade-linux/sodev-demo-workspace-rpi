@@ -254,9 +254,11 @@ if want_phase 3; then
             bad "$CL exited early -- host Vulkan rendering is not working"
             tail -12 "$LOG" 2>/dev/null | sed 's/^/           /'
         fi
-    elif [ -e /usr/lib/libweston-15/headless-backend.so ] || [ -e /usr/lib/libweston/headless-backend.so ]; then
-        # FALLBACK, only if this image actually has the headless backend: a
-        # throwaway compositor on its own socket. Judged on weston's SUCCESS-ONLY
+    elif compgen -G '/usr/lib/libweston-*/headless-backend.so' >/dev/null || [ -e /usr/lib/libweston/headless-backend.so ]; then
+        # FALLBACK, only if this image actually has the headless backend (the
+        # module dir carries libweston's major: 15 on the gl lane, 16 on the
+        # vulkan lane, hence the glob): a throwaway compositor on its own
+        # socket. Judged on weston's SUCCESS-ONLY
         # line -- "vulkan" appears in the log on failure paths too (the pre-check
         # lines at vulkan-renderer.c:3786/:4411, and the dlerror text at
         # compositor.c:10440).
@@ -328,9 +330,9 @@ fi
 if [ "$INCONCLUSIVE" != 0 ]; then
     echo "  INCONCLUSIVE -- something needed to decide is not installed:${INCONCLUSIVE_WHY}"
     if [ "$NEED_VENUS_PKGS" != 0 ]; then
-        echo "  Rebuild with ./build.sh --devel (the default lane is already Vulkan),"
-        echo "  which installs"
-        echo "  mesa-vulkan-drivers / vulkan-loader / vulkan-tools into DomD, and rerun."
+        echo "  This DomD was built with --gpu=gl: rebuild with ./build.sh --gpu=vulkan"
+        echo "  (the default), whose 'venus' DISTRO_FEATURE installs mesa-vulkan-drivers /"
+        echo "  vulkan-loader / vulkan-tools into DomD, and rerun."
     else
         echo "  Install it (or run this on DomD, which is where the GPU and the"
         echo "  device models are) and rerun."

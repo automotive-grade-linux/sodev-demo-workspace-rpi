@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 19:23:16 +0900
+Date: Wed, 11 Nov 2026 08:39:40 +0900
 Subject: [PATCH] virtio-media: decoder mode: hand the SAND buffers to the
  display
 
@@ -62,7 +62,7 @@ comes after twice as many misses, up to 3600 (2 lines a minute).
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [depends on this layer's virtio-media decoder mode (q11-041), which upstream qemu does not have]
 ---
  hw/virtio/virtio-media-decoder.c | 591 ++++++++++++++++++++++++++++++-
  include/ui/direct-scanout.h      |   2 +
@@ -71,7 +71,7 @@ Upstream-Status: Pending
  4 files changed, 602 insertions(+), 9 deletions(-)
 
 diff --git a/hw/virtio/virtio-media-decoder.c b/hw/virtio/virtio-media-decoder.c
-index a90f873..93d268d 100644
+index fcce3887a..052729dee 100644
 --- a/hw/virtio/virtio-media-decoder.c
 +++ b/hw/virtio/virtio-media-decoder.c
 @@ -58,6 +58,8 @@
@@ -155,7 +155,7 @@ index a90f873..93d268d 100644
  /* A blitted hardware frame and the import whose GPU work reads it. */
  typedef struct DecGpuHeld {
      AVFrame *frame;
-@@ -270,6 +335,25 @@ struct VirtIOMediaDec {
+@@ -277,6 +342,25 @@ struct VirtIOMediaDec {
      unsigned gpu_n;
      DecGpuHeld gpu_held[DEC_GPU_HOLD];
      unsigned gpu_held_n;
@@ -181,7 +181,7 @@ index a90f873..93d268d 100644
  };
  
  /* ------------------------------------------------------------------------- */
-@@ -474,10 +558,14 @@ static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
+@@ -479,10 +563,14 @@ static void dec_gpu_unhold_oldest(VirtIOMediaDec *d)
              d->gpu_held_n * sizeof(d->gpu_held[0]));
  }
  
@@ -196,7 +196,7 @@ index a90f873..93d268d 100644
      /* the held frames' waits use the imports, so they go first */
      while (d->gpu_held_n) {
          dec_gpu_unhold_oldest(d);
-@@ -497,6 +585,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
+@@ -502,6 +590,7 @@ static void dec_gpu_reset(VirtIOMediaDec *d)
  {
      dec_gpu_clear(d);
      av_buffer_unref(&d->gpu_fctx);
@@ -204,7 +204,7 @@ index a90f873..93d268d 100644
      d->gpu_off = false;
      d->gpu_again = 0;
  }
-@@ -533,6 +622,404 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
+@@ -538,6 +627,404 @@ static void dec_gpu_hold(VirtIOMediaDec *d, const AVFrame *fr, void *handle)
      d->gpu_held_n++;
  }
  
@@ -609,7 +609,7 @@ index a90f873..93d268d 100644
  /* Keep hardware frames as DRM_PRIME for dec_gpu_write instead of downloading. */
  static bool dec_gpu_wanted(VirtIOMediaSession *s)
  {
-@@ -606,10 +1093,11 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -611,10 +1098,11 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
      DecGpuEntry *e = NULL;
      struct stat st;
      uint64_t mod;
@@ -622,7 +622,7 @@ index a90f873..93d268d 100644
  
      if (!gb->virgl_res || gb->num_planes != 1 || !desc) {
          return -EINVAL;
-@@ -645,6 +1133,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -650,6 +1138,7 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          dec_gpu_clear(d);
          av_buffer_unref(&d->gpu_fctx);
          d->gpu_fctx = av_buffer_ref(fr->hw_frames_ctx);
@@ -630,7 +630,7 @@ index a90f873..93d268d 100644
      }
  
      for (i = 0; i < d->gpu_n; i++) {
-@@ -688,14 +1177,77 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
+@@ -693,14 +1182,77 @@ static int dec_gpu_write(VirtIOMediaSession *s, VirtIOMediaBuffer *gb,
          e->w = w;
          e->h = h;
          e->matrix = matrix;
@@ -712,7 +712,7 @@ index a90f873..93d268d 100644
      if (!d->gpu_logged) {
          d->gpu_logged = true;
          d->hw_logged = true;
-@@ -770,6 +1322,15 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -775,6 +1327,15 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
              warn_report("virtio-media/dec: host-sand: no GL context for %u "
                          "frames; converting them on the CPU", d->gpu_again);
          }
@@ -728,7 +728,7 @@ index a90f873..93d268d 100644
          /* This frame on the CPU, as dec_pump does without host-sand. */
          av_frame_unref(d->swframe);
          t = av_hwframe_transfer_data(d->swframe, fr, 0);
-@@ -782,6 +1343,15 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
+@@ -787,6 +1348,15 @@ static bool dec_write_frame(VirtIOMediaSession *s, int index, AVFrame *fr,
          fr = d->swframe;
      }
  
@@ -744,7 +744,7 @@ index a90f873..93d268d 100644
      buf = g_malloc(need);
      dst_data[0] = buf;
      dst_linesize[0] = (int)(w * 4);
-@@ -982,7 +1552,7 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
+@@ -987,7 +1557,7 @@ static void dec_backlog_drain(VirtIOMediaDec *d)
          g_queue_pop_head(d->backlog);
          d->backlog_bytes -= (size_t)p->size;
          av_packet_free(&p);
@@ -753,7 +753,7 @@ index a90f873..93d268d 100644
              error_report_once("virtio-media/dec: backlog send_packet: %d", r);
              dec_backlog_clear(d);
              return;
-@@ -1068,6 +1638,9 @@ static void dec_pump(VirtIOMediaSession *s)
+@@ -1073,6 +1643,9 @@ static void dec_pump(VirtIOMediaSession *s)
              return;
          }
          if (r < 0) {
@@ -763,7 +763,7 @@ index a90f873..93d268d 100644
              error_report_once("virtio-media/dec: avcodec_receive_frame: %d", r);
              virtio_media_send_error_event(s, EIO);
              return;
-@@ -1652,6 +2225,9 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -1661,6 +2234,9 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
          return EINVAL;
      }
      gb->queued = true;
@@ -773,7 +773,7 @@ index a90f873..93d268d 100644
  
      if (qi == 0) {
          size_t used = guest_planes ? guest_planes[0].bytesused : b->bytesused;
-@@ -1782,7 +2358,8 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
+@@ -1790,7 +2366,8 @@ static int dec_qbuf(VirtIOMediaSession *s, uint8_t *payload, size_t payload_len)
              gb->queued = false;
              return EAGAIN;
          }
@@ -784,7 +784,7 @@ index a90f873..93d268d 100644
              gb->queued = false;
              return EIO;
 diff --git a/include/ui/direct-scanout.h b/include/ui/direct-scanout.h
-index 577835f..58c0e1f 100644
+index 577835ffa..58c0e1fa9 100644
 --- a/include/ui/direct-scanout.h
 +++ b/include/ui/direct-scanout.h
 @@ -53,5 +53,7 @@ void direct_scanout_note_flush(bool hit);
@@ -796,7 +796,7 @@ index 577835f..58c0e1f 100644
  
  #endif
 diff --git a/ui/direct-scanout.c b/ui/direct-scanout.c
-index 188141c..7ce4ef8 100644
+index 188141c79..7ce4ef82a 100644
 --- a/ui/direct-scanout.c
 +++ b/ui/direct-scanout.c
 @@ -78,6 +78,12 @@ void direct_scanout_note_flush(bool hit)
@@ -813,10 +813,10 @@ index 188141c..7ce4ef8 100644
  {
      static int64_t checked = -1000000;
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
-index b2ff49d..aec8bf2 100644
+index c9a2d9b81..1e7b46b44 100644
 --- a/ui/sdl2-wl-scanout.c
 +++ b/ui/sdl2-wl-scanout.c
-@@ -471,7 +471,7 @@ void sdl2_wl_scanout_off(void)
+@@ -469,7 +469,7 @@ void sdl2_wl_scanout_off(void)
  void sdl2_wl_scanout_miss(const char *why)
  {
      static struct { const char *why; uint64_t n; } m[8];
@@ -825,7 +825,7 @@ index b2ff49d..aec8bf2 100644
      GString *g;
      int i;
  
-@@ -485,9 +485,17 @@ void sdl2_wl_scanout_miss(const char *why)
+@@ -483,9 +483,17 @@ void sdl2_wl_scanout_miss(const char *why)
          m[i].why = why;
          m[i].n++;
      }

@@ -26,7 +26,7 @@
 		mmc-ddr-3_3v;
 		sdhci-caps = <0x0 0x0>;
 		sdhci-caps-mask = <0xc000 0x0>;
-		xen,path = "/soc/mmc@fff000";
+		xen,path = "/soc@107c000000/mmc@fff000";
 		xen,force-assign-without-iommu;
 		xen,reg = <0x10 0xfff000 0x0 0x1000 0x10 0xfff000
 			   0x10 0x1504000 0x0 0x1000 0x10 0x1504000
@@ -61,7 +61,7 @@
 		reg = <0x10 0x7d517c00 0x00 0x40>;
 		brcm,gpio-direct;
 		brcm,gpio-bank-widths = <0x11 0x6>;
-		xen,path = "/soc/gpio@7d517c00";
+		xen,path = "/soc@107c000000/gpio@7d517c00";
 		xen,force-assign-without-iommu;
 		xen,reg = <0x10 0x7d517000 0x0 0x1000 0x10 0x7d517000>;
 	};

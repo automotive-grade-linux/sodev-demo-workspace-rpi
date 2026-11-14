@@ -64,4 +64,8 @@ while [ "$i" -lt 40 ]; do
     fi
     i=$((i + 1)); sleep 1
 done
+# Say so in the journal. Still exit 0: the unit is oneshot and nothing Requires
+# it, so a failed status would only mark the boot without changing it, and DomD
+# may simply not have brought its netfront up yet.
+echo "dom0-domd-vif-up: $VIF not reachable ($PEER) after $i tries; Dom0 has no route to the flat segment" >&2
 exit 0

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Fri, 16 Oct 2026 14:19:32 +0900
+Date: Wed, 11 Nov 2026 08:33:45 +0900
 Subject: [PATCH] ui/sdl2-wl-scanout: cover the window under the planes
 
 With the plane handoff, the guest's primary plane is a subsurface over
@@ -25,16 +25,16 @@ screen.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Upstream-Status: Pending
+Upstream-Status: Inappropriate [this layer's q11 plane handoff]
 ---
  ui/sdl2-wl-scanout.c | 122 ++++++++++++++++++++++++++++++++++++++++++-
  1 file changed, 121 insertions(+), 1 deletion(-)
 
 diff --git a/ui/sdl2-wl-scanout.c b/ui/sdl2-wl-scanout.c
-index e7ae32e..b2ff49d 100644
+index ccdf15f08..c9a2d9b81 100644
 --- a/ui/sdl2-wl-scanout.c
 +++ b/ui/sdl2-wl-scanout.c
-@@ -28,6 +28,9 @@
+@@ -29,6 +29,9 @@
  #include <wayland-client.h>
  #include "linux-dmabuf-unstable-v1-client-protocol.h"
  #include "viewporter-client-protocol.h" /* q11-plane-handoff */
@@ -44,7 +44,7 @@ index e7ae32e..b2ff49d 100644
  #include "ui/egl-helpers.h"
  
  #define WL_DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' = V4L2 RGBA32 byte order */
-@@ -873,6 +876,103 @@ static void pl_resource_gone(uint32_t res)
+@@ -909,6 +912,103 @@ static void pl_resource_gone(uint32_t res)
      }
  }
  
@@ -148,7 +148,7 @@ index e7ae32e..b2ff49d 100644
  static bool planes_create(void)
  {
      if (pl.s[0]) {
-@@ -881,6 +981,7 @@ static bool planes_create(void)
+@@ -917,6 +1017,7 @@ static bool planes_create(void)
      if (!wl.compositor || !wl.subcomp || !wl.viewporter) {
          return false;
      }
@@ -156,7 +156,7 @@ index e7ae32e..b2ff49d 100644
      for (int i = 0; i < WL_PLANES; i++) {
          struct wl_region *none = wl_compositor_create_region(wl.compositor);
  
-@@ -890,7 +991,8 @@ static bool planes_create(void)
+@@ -926,7 +1027,8 @@ static bool planes_create(void)
          /* no input on the planes: touches and pointer stay with the window (SDL) */
          wl_surface_set_input_region(pl.s[i], none);
          wl_region_destroy(none);
@@ -166,7 +166,7 @@ index e7ae32e..b2ff49d 100644
          wl_subsurface_set_sync(pl.ss[i]);
      }
      q11_resource_gone_cb = pl_resource_gone;
-@@ -960,6 +1062,21 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
+@@ -996,6 +1098,21 @@ static void plane_show(int i, WlPlaneBuf *b, bool y0_top, int sx, int sy, int sw
      pl.gw[i] = dw;
      pl.gh[i] = dh;
      wl_subsurface_set_position(pl.ss[i], dx, dy);
@@ -188,7 +188,7 @@ index e7ae32e..b2ff49d 100644
      wl_surface_attach(pl.s[i], b->wb, 0, 0);
      wl_surface_damage_buffer(pl.s[i], 0, 0, INT32_MAX, INT32_MAX);
      wl_surface_commit(pl.s[i]);
-@@ -1006,9 +1123,11 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
+@@ -1042,9 +1159,11 @@ bool sdl2_wl_planes(struct sdl2_console *scon, int ww, int wh)
          int sh = scon->h ? (int)scon->h : scon->guest_fb.height;
  
          if (rect) {
@@ -200,7 +200,7 @@ index e7ae32e..b2ff49d 100644
              plane_show(0, b[0], scon->y0_top, sx, sy, sw, sh, 0, 0, ww, wh, ww, wh);
          }
      }
-@@ -1043,6 +1162,7 @@ void sdl2_wl_planes_off(void)
+@@ -1079,6 +1198,7 @@ void sdl2_wl_planes_off(void)
      for (int i = 0; i < WL_PLANES; i++) {
          plane_hide(i);
      }

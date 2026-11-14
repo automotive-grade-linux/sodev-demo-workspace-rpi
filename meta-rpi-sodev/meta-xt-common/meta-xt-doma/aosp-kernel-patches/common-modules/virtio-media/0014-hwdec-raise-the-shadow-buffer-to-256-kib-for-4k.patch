@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f1b299c0f5e6422628e57f4418b78a33ef03afa0 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Thu, 15 Oct 2026 14:26:45 +0900
+Date: Wed, 11 Nov 2026 08:35:16 +0900
 Subject: [PATCH] virtio-media: raise the shadow buffer to 256 KiB for 4K
 
 A 4K RGBA decoder output could not be queued: QBUF's SG entry array
@@ -23,6 +23,33 @@ Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ driver/scatterlist_builder.c | 10 ++++------
+ driver/session.h             | 33 +++++++++++++++++----------------
+ 2 files changed, 21 insertions(+), 22 deletions(-)
+
+diff --git a/driver/scatterlist_builder.c b/driver/scatterlist_builder.c
+index 3a7100f..fdb8a95 100644
+--- a/driver/scatterlist_builder.c
++++ b/driver/scatterlist_builder.c
+@@ -702,12 +702,10 @@ static int scatterlist_builder_add_sgt(struct scatterlist_builder *builder,
+ 		 * entry array -- at 16 bytes per virtio_media_sg_entry.
+ 		 *
+ 		 * A guest GL without GL_EXT_YUV_target makes the decoder
+-		 * output RGBA. A 1920x1088 RGBA frame is 8,355,840 bytes =
+-		 * 2040 pages, and its sg_table measured 2033 entries =
+-		 * 32,528 bytes (RPi4, 2026-09-04), which fits. 4K RGBA
+-		 * (33,177,600 bytes = 8100 pages = 129,600 bytes of entries)
+-		 * does not fit and needs the entry array split across
+-		 * descriptors, which is not done here.
++		 * output RGBA: 129,600 bytes of entries for a fully
++		 * fragmented 4K frame, which the 256 KiB buffer holds (see
++		 * session.h). An array larger than the buffer would have to
++		 * be split across descriptors, which is not done here.
+ 		 *
+ 		 * A fully fragmented 1080p NV12 plane is 3110400 bytes = 760
+ 		 * 4 KiB pages, which fits with margin (and contiguous runs
+diff --git a/driver/session.h b/driver/session.h
+index 60c05b0..440a3ad 100644
 --- a/driver/session.h
 +++ b/driver/session.h
 @@ -18,30 +18,31 @@
@@ -73,22 +100,6 @@ Upstream-Status: Pending
  
  /**
   * struct virtio_media_dmabuf - Cached import of one V4L2_MEMORY_DMABUF plane.
---- a/driver/scatterlist_builder.c
-+++ b/driver/scatterlist_builder.c
-@@ -702,12 +702,10 @@
- 		 * entry array -- at 16 bytes per virtio_media_sg_entry.
- 		 *
- 		 * A guest GL without GL_EXT_YUV_target makes the decoder
--		 * output RGBA. A 1920x1088 RGBA frame is 8,355,840 bytes =
--		 * 2040 pages, and its sg_table measured 2033 entries =
--		 * 32,528 bytes (RPi4, 2026-09-04), which fits. 4K RGBA
--		 * (33,177,600 bytes = 8100 pages = 129,600 bytes of entries)
--		 * does not fit and needs the entry array split across
--		 * descriptors, which is not done here.
-+		 * output RGBA: 129,600 bytes of entries for a fully
-+		 * fragmented 4K frame, which the 256 KiB buffer holds (see
-+		 * session.h). An array larger than the buffer would have to
-+		 * be split across descriptors, which is not done here.
- 		 *
- 		 * A fully fragmented 1080p NV12 plane is 3110400 bytes = 760
- 		 * 4 KiB pages, which fits with margin (and contiguous runs
+-- 
+2.43.0
+
