@@ -1,8 +1,10 @@
-From afb69e0ce6fe2e7a0985af25d85abee643d0c801 Mon Sep 17 00:00:00 2001
+From b2a58f8055a33374b3bb7b58dfda886188d3b1f3 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 08 Jul 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:35:01 +0900
 Subject: [PATCH] xenlib: DomD-as-toolstack xenstore support
-
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 DomD-as-toolstack: let an external privileged control domain (DomD, a dom0less
 domain with capabilities=0x1) create/destroy guests via `xl create`/ `xl
@@ -18,7 +20,10 @@ console seeder that satisfies libxl's console waits).
     (XS_RELEASE op9) + table entries + wire NUL-bound parse + is_privileged +
     ESRCH->ENOENT; notify_watchers("@introduceDomain"/"@releaseDomain");
     transaction handling made non-blocking (running_transaction as a count) so
-    DomD's multiplexed xl+xenconsoled transactions no longer collide.
+    DomD's multiplexed xl+xenconsoled transactions no longer collide. The
+    deferred XS_TRANSACTION_END reply (stop_transaction_id /
+    pending_stop_transaction and the worker loop's check of it) goes with it:
+    the handler replies itself, so nothing set the flag any more.
 
 Depends on 0005 (xenlib initrd) and 0006 (xenstore toolstack-domid).
 
@@ -26,12 +31,19 @@ Local-Modifications: regenerated against zephyrproject-rtos/zephyr-xenlib main
 (7f08845). d506546 split xenstore-common out of xenstore-srv, which moved
 every line number in xenstore_srv.c and added an <xenstore_common.h> include
 ahead of the block this patch extends. The xen-dom-mgmt.c hunks moved too.
-Content is unchanged; only context was retaken.
+The removal of the transaction-stop deferral described above is a later
+change on top of that regeneration, not part of it.
 
 Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending
 ---
+ xen-dom-mgmt/include/xen_dom_mgmt.h |  25 +++
+ xen-dom-mgmt/src/xen-dom-mgmt.c     | 232 +++++++++++++++++++++++++++-
+ xenstore-srv/include/xenstore_srv.h |   2 -
+ xenstore-srv/src/xenstore_srv.c     | 163 ++++++++++++++++---
+ 4 files changed, 393 insertions(+), 29 deletions(-)
+
 diff --git a/xen-dom-mgmt/include/xen_dom_mgmt.h b/xen-dom-mgmt/include/xen_dom_mgmt.h
 index 1a49896..94777c7 100644
 --- a/xen-dom-mgmt/include/xen_dom_mgmt.h
@@ -69,7 +81,7 @@ index 1a49896..94777c7 100644
   * Destroys the specified domain.
   *
 diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
-index e490247..5262d94 100644
+index 926d0e5..faef1de 100644
 --- a/xen-dom-mgmt/src/xen-dom-mgmt.c
 +++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
 @@ -26,6 +26,9 @@
@@ -82,7 +94,7 @@ index e490247..5262d94 100644
  #ifdef CONFIG_XSTAT
  #include <xstat.h>
  #endif
-@@ -1167,14 +1170,25 @@ static int dom0less_init_domain(uint32_t domid, struct xen_domctl_getdomaininfo
+@@ -1173,14 +1176,25 @@ static int dom0less_init_domain(uint32_t domid, struct xen_domctl_getdomaininfo
  	LOG_DBG("dom0less: remote_domid=%d, xenstore.remote_evtchn = %d", domain->domid,
  		domain->xenstore.remote_evtchn);
  
@@ -112,7 +124,7 @@ index e490247..5262d94 100644
  
  	/* init Xenstore */
  	rc = start_domain_stored(domain, magic_base_pfn);
-@@ -1215,12 +1229,210 @@ err_free:
+@@ -1221,12 +1235,210 @@ err_free:
  	return rc;
  }
  
@@ -323,7 +335,7 @@ index e490247..5262d94 100644
  
  	do {
  		rc = dom0less_get_next_domain(domid_start, &dominfo);
-@@ -1234,12 +1446,24 @@ static int dom0less_init(void)
+@@ -1240,12 +1452,24 @@ static int dom0less_init(void)
  			break;
  		}
  
@@ -348,8 +360,21 @@ index e490247..5262d94 100644
  	return rc == -ESRCH ? 0 : rc;
  }
  #endif /* CONFIG_XEN_DOM0LESS_BOOT */
+diff --git a/xenstore-srv/include/xenstore_srv.h b/xenstore-srv/include/xenstore_srv.h
+index cd5138a..91f191a 100644
+--- a/xenstore-srv/include/xenstore_srv.h
++++ b/xenstore-srv/include/xenstore_srv.h
+@@ -39,8 +39,6 @@ struct xenstore {
+ 	size_t xs_stack_slot;
+ 	int transaction;
+ 	int running_transaction;
+-	int stop_transaction_id;
+-	bool pending_stop_transaction;
+ };
+ 
+ /**
 diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
-index 9bbc4ff..d62898e 100644
+index 9bbc4ff..180349c 100644
 --- a/xenstore-srv/src/xenstore_srv.c
 +++ b/xenstore-srv/src/xenstore_srv.c
 @@ -22,6 +22,7 @@
@@ -397,8 +422,8 @@ index 9bbc4ff..d62898e 100644
 +	if (xenstore->running_transaction > 0) {
 +		xenstore->running_transaction--;
 +	}
-+	/* Ack directly rather than via the single-slot pending_stop_transaction
-+	 * deferral, which cannot represent multiple concurrent transaction ends. */
++	/* Reply from the handler: transaction ends can arrive back to back, so the
++	 * reply cannot be deferred through a single slot. */
 +	send_reply(xenstore, id, XS_TRANSACTION_END, "OK");
  }
  
@@ -540,3 +565,22 @@ index 9bbc4ff..d62898e 100644
  					    [XS_GET_DOMAIN_PATH] = { handle_get_domain_path },
  					    [XS_WRITE] = { handle_write },
  					    [XS_MKDIR] = { handle_mkdir },
+@@ -1842,18 +1969,8 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
+ 
+ 	xenstore->transaction = 0;
+ 	xenstore->running_transaction = 0;
+-	xenstore->stop_transaction_id = 0;
+-	xenstore->pending_stop_transaction = false;
+ 
+ 	while (!atomic_get(&xenstore->thrd_stop)) {
+-		if (xenstore->pending_stop_transaction) {
+-			send_reply(xenstore,
+-				   xenstore->stop_transaction_id,
+-				   XS_TRANSACTION_END, "");
+-			xenstore->stop_transaction_id = 0;
+-			xenstore->pending_stop_transaction = false;
+-		}
+-
+ 		if (!xenstore->running_transaction) {
+ 			process_pending_watch_events(domain);
+ 		}

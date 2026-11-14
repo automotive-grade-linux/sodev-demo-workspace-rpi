@@ -16,7 +16,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
-#include <version.h>
+#include <zephyr/version.h>
 
 LOG_MODULE_REGISTER(domz, LOG_LEVEL_INF);
 

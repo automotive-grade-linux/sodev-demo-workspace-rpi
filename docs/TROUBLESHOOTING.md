@@ -271,14 +271,39 @@ in practice an image `XT_DOCKER` points at, such as a pre-rename `sodev-builder`
 `PYTHON_MINIMUM_REQUIRED 3.12`; the distro python3 in the image is 3.10 and stays 3.10
 on purpose (Yocto and the AOSP host tools are validated against it). What the current
 `docker/Dockerfile.builder` does is install python3.12 alongside, put Zephyr's
-`requirements-base.txt` in `/opt/zephyr-venv`, and point `/usr/local/bin/west` at that
-interpreter -- `west build` then hands cmake the 3.12 it is running under. An old image
+`requirements-base.txt` in `/opt/zephyr-venv`, and make `/usr/local/bin/west` run the
+venv's `west` -- `west build` then hands cmake the 3.12 it is running under. An old image
 has `west` on 3.10 instead, and cmake stops as above.
 
-**Fix.** `./build.sh --rebuild-images ...` once. To confirm which image you have:
-`docker run --rm sodev-builder-rpi head -1 /usr/local/bin/west` should print
-`#!/opt/zephyr-venv/bin/python3.12`. Note that `tools/check-domz.sh` uses the same
+**Fix.** `./build.sh --rebuild-images ...` once. To confirm which image you have, see
+the check at the end of the next section. Note that `tools/check-domz.sh` uses the same
 `XT_DOCKER` default, so a stale image makes its DomZ build step fail the same way.
+
+## A Zephyr build stops at "CMake 3.28.0 or higher is required"
+
+```
+CMake Error at .../zephyr/cmake/modules/zephyr_default.cmake:18 (cmake_minimum_required):
+  CMake 3.28.0 or higher is required.  You are running version 3.22.1
+```
+
+**Cause.** Zephyr 4.5 requires CMake 3.28, and Ubuntu 22.04's is 3.22. Two ways to get
+here:
+- The image predates the Zephyr 4.5.0 move. The current `docker/Dockerfile.builder`
+  pip-installs CMake 3.31.6 into `/opt/zephyr-venv` and makes `/usr/local/bin/west` a
+  wrapper that puts the venv's `bin` first on `PATH`; an older image runs the distro
+  3.22.
+- The image is current but a Zephyr build dir was configured by 3.22 (a build root
+  that last built Zephyr 4.4.1): its `build.ninja` re-runs the CMake recorded in
+  `CMakeCache.txt`. `build.sh` removes such a build dir before ninja (it prints
+  `configured by CMake 3.22, west runs 3.31 -- removing it for a pristine build`), so
+  this only remains if Zephyr is built some other way; remove the build dir by hand.
+
+**Fix.** `./build.sh --rebuild-images ...` once. To confirm which image you have:
+`docker run --rm sodev-builder-rpi cat /usr/local/bin/west` should print a two-line
+`#!/bin/sh` wrapper that runs `/opt/zephyr-venv/bin/west`, and
+`docker run --rm sodev-builder-rpi /opt/zephyr-venv/bin/cmake --version` should print
+3.31.6. An image whose `west` is still a symlink to the venv (first line
+`#!/opt/zephyr-venv/bin/python3.12` via `head -1`) predates the 4.5.0 move.
 
 ## DomZ does not start
 

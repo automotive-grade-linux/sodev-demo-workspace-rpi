@@ -1,8 +1,7 @@
-From 0c1a23f0e0e107ba083d2d24e1f1f510b567950f Mon Sep 17 00:00:00 2001
+From 646fb0a36401acaf6be80dd6e09d523dd107aa54 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Wed, 08 Jul 2026 00:00:00 +0900
+Date: Wed, 11 Nov 2026 08:33:32 +0900
 Subject: [PATCH] dom0-xt: Kconfig: add DOM_CFG_SODEV and AAOS domain symbols
-
 
 Add DOM_CFG_SODEV (gates the SoDeV DomU/DomA guests) and DOM_CFG_AAOS_DOMAIN
 (upstream single-AAOS example). Neither exists at the pinned rev.
@@ -11,11 +10,15 @@ Assisted-by: Claude Code:claude-opus-4-8
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
+ Kconfig           | 22 ++++++++++++++++++++++
+ boards/rpi_5.conf |  2 +-
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
 diff --git a/Kconfig b/Kconfig
-index 039ace4..04b5607 100644
+index 039ace4..85f7192 100644
 --- a/Kconfig
 +++ b/Kconfig
-@@ -70,6 +70,29 @@ config DOM_CFG_LINUX_PV_DOMAIN
+@@ -70,6 +70,28 @@ config DOM_CFG_LINUX_PV_DOMAIN
  	  It is expected to be placed on the storage device, connected to
  	  Dom0.
  
@@ -27,7 +30,6 @@ index 039ace4..04b5607 100644
 +	  (init_boot ramdisk + vendor_ramdisk + bootconfig trailer) from
 +	  /1:/dom0/domu_aaos_{kernel,ramdisk}. Pairs with the DomD-side
 +	  DomD device-model qemu (spawned by the DomD toolstack per doma.cfg).
-+	  Targets PROFILE=agl-aaos in the rpi5.yaml moulin profile.
 +
 +config DOM_CFG_SODEV
 +	bool "Enable RPi5 SoDeV production guests (Zephyr Dom0 hybrid)"

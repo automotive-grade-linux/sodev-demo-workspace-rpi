@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] prj.conf: MP_NUM_CPUS -> MP_MAX_NUM_CPUS for Zephyr 4.x
 
 
@@ -14,7 +14,7 @@ symbol fails the build rather than being ignored.
 The value is unchanged: the 3.6 build's .config already had both
 CONFIG_MP_NUM_CPUS=1 and CONFIG_MP_MAX_NUM_CPUS=1.
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---

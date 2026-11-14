@@ -340,7 +340,7 @@ it as `AGENT_NAME:MODEL_VERSION` and treats the space inside `Claude Code` as
 malformed, so each kernel patch that carries it draws a `BAD_SIGN_OFF` warning
 from it; that warning is expected. Not every patch carries it: among those that
 do not are the xen-troops fork series in `recipes-extended/xen-common` and
-third-party backports such as Zephyr's `0022`-`0024` and the qemu 7.0 `0113`. A
+third-party backports such as the qemu 7.0 `0113`. A
 patch sent to an upstream project is given the trailer form that project asks
 for when it is sent.
 
@@ -354,13 +354,15 @@ process*. It is built from:
   @ `rpi5-v0.4.0`, fetched by moulin as a `west` source; zephyr builder,
   board `rpi_5`.
 - **Patch series**: `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`
-  (0002-0033, with 0001/0010/0013 retired — its own README carries the per-patch
-  rationale, the retirement reasons and the required `west build` flags).
-  Highlights: 0021 moves the west manifest to Zephyr 4.4.1 and takes
+  (27 patches numbered 0002-0034; retired numbers are not reused — its own README
+  carries the per-patch rationale, the retirement reasons and the required
+  `west build` flags).
+  Highlights: 0021 moves the west manifest to upstream Zephyr 4.5.0 and takes
   `zephyr-xenlib` from zephyrproject-rtos (so the Xen ABI headers come from
-  there, which is what retired 0001), 0033 raises the domctl interface version to
-  0x18 for Xen 4.22 (load-bearing, and silent if missed: out of the Kconfig range
-  kconfiglib discards the value and falls back to 0x17), 0004 adds the SoDeV
+  there, which is what retired 0001), 0008/0019 set the domctl interface version
+  to 0x18 for Xen 4.22 (load-bearing, and silent if missed: Zephyr's default is
+  still 0x17, and upstream `c5f988e70d7` is what lets the Kconfig range accept
+  0x18), 0004 adds the SoDeV
   DomU/DomA `dom_cfg` entries, 0006/0007 move the toolstack role to DomD,
   0012/0014-0016 harden the xenstore server against ring wedges, 0018 zeroes the
   `createdomain` hypercall argument (without it guest creation failed rc=-3), and

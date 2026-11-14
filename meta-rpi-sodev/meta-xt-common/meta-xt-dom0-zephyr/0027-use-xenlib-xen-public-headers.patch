@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Mon, 17 Aug 2026 00:36:57 +0900
+Date: Wed, 11 Nov 2026 08:37:09 +0900
 Subject: [PATCH] dom0-xt: take the Xen public headers from zephyr-xenlib
 
 
 Zephyr used to vendor its own trimmed copy of the Xen public headers under
-include/zephyr/xen/public/. Upstream removed it (commit d58fbb8cfc58,
-backported here as 0024) and made zephyr-xenlib the single source: xenlib's
+include/zephyr/xen/public/. Upstream removed it (commit d58fbb8cfc58, in
+v4.5.0) and made zephyr-xenlib the single source: xenlib's
 include/xen/public/ is a byte-for-byte copy of Xen 4.21.0's public headers,
 and its CMakeLists.txt puts that directory on the include path
 unconditionally.
@@ -27,9 +27,9 @@ possible, while this patch's whole job is the header move for zephyr-dom0-xt. Th
 consequence is an ordering constraint - 0019/0020 must be applied before this one,
 which is why apply-zephyr-patches.sh no longer keeps them at the end of the series.
 
-Depends on 0024 (zephyr), and on 0020 for src/dom_cfg/rpi_4b.c.
+Depends on 0020 for src/dom_cfg/rpi_4b.c.
 
-Assisted-by: Claude Code:claude-opus-5[1m]
+Assisted-by: Claude Code:claude-opus-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---

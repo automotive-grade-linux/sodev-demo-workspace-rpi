@@ -29,9 +29,11 @@
 #       multilib/ncurses/squashfs/... per          moulin `android` builder under
 #       source.android.com host requirements)      ninja (repo sync + lunch + build).
 #   - Zephyr SDK 1.0.1 (aarch64-zephyr-elf)     -> Zephyr Dom0 (DOM0_OS=zephyr).
-#   - Python 3.12 (deadsnakes) + a 3.12 `west`  -> Zephyr 4.4 requires >= 3.12
+#   - Python 3.12 (deadsnakes) + a 3.12 `west`  -> Zephyr 4.4+ requires >= 3.12
 #       (cmake/modules/python.cmake). The Yocto/AOSP side keeps the distro
 #       python3 (3.10); see the Python 3.12 layer below for why both exist.
+#   - CMake 3.31 in the same venv               -> Zephyr 4.5 requires >= 3.28;
+#       only `west` sees it (the distro cmake 3.22 stays for everything else).
 FROM ubuntu:22.04
 
 ARG USER_ID=1000
@@ -120,7 +122,7 @@ RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
 
 # Python 3.12 for the Zephyr build only.
 #
-# Zephyr 4.4 sets PYTHON_MINIMUM_REQUIRED 3.12 (cmake/modules/python.cmake) and
+# Zephyr 4.4 and later set PYTHON_MINIMUM_REQUIRED 3.12 (cmake/modules/python.cmake) and
 # Ubuntu 22.04 ships 3.10, so the Zephyr Dom0 build cannot use the distro python3.
 # Yocto (wrynose/scarthgap) and the AOSP host tools, on the other hand, are only
 # validated against the distro python3 here — so this does NOT replace python3;
@@ -146,7 +148,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Zephyr's scripts/requirements-base.txt, in a 3.12 virtualenv.
+# Zephyr v4.5.0's scripts/requirements-base.txt, in its order, in a 3.12 virtualenv
+# (west pinned, windows-curses left out). 4.5.0 raised requests to >=2.33.0 and
+# added spdx-python-model (west spdx) and tabulate (hardenconfig) to that file.
 #
 # The venv is not optional. deadsnakes' python3.12 keeps /usr/lib/python3/dist-packages
 # on its sys.path, i.e. it shares the *distro* package directory with python3.10.
@@ -155,10 +159,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # which silently removes yaml from python3.10 and breaks moulin
 # ("ModuleNotFoundError: No module named 'yaml'"). Observed, not hypothetical.
 #
-# Symlinking the venv's west over /usr/local/bin/west is the hand-off: `west build`
-# reports its own interpreter as WEST_PYTHON, python.cmake adopts that as
-# Python3_EXECUTABLE, and the venv is where Zephyr's python deps live. moulin and
-# bitbake keep using the distro python3, untouched.
+# /usr/local/bin/west is the hand-off: `west build` reports its own interpreter as
+# WEST_PYTHON, python.cmake adopts that as Python3_EXECUTABLE, and the venv is where
+# Zephyr's python deps live. moulin and bitbake keep using the distro python3,
+# untouched.
+#
+# CMake goes into the venv the same way. Zephyr 4.5 requires CMake 3.28
+# (cmake/modules/zephyr_default.cmake) and Ubuntu 22.04 ships 3.22, but Yocto
+# builds its own cmake-native and AOSP uses its prebuilts, so the distro cmake is
+# left in place and the newer one is only visible to the Zephyr build. west finds
+# cmake on PATH (scripts/west_commands/zcmake.py: shutil.which('cmake')), so
+# /usr/local/bin/west is a two-line wrapper that puts the venv's bin first for west
+# and its children, instead of a symlink. Nothing outside `west` sees the change.
 #
 # --retry rides out a flaky proxy. Kept as a LATE layer so it never invalidates the
 # moulin git-install cache above.
@@ -168,9 +180,12 @@ RUN python3.12 -m venv /opt/zephyr-venv \
         'west==1.5.0' \
         'pyelftools>=0.29' 'PyYAML>=6.0' pykwalify jsonschema \
         canopen packaging 'patool>=2.0.0' 'psutil>=5.6.6' pylink-square \
-        pyserial 'requests>=2.32.4' semver 'tqdm>=4.67.1' 'reuse>=6.0.0' \
-        anytree intelhex \
-    && ln -sf /opt/zephyr-venv/bin/west /usr/local/bin/west
+        pyserial 'requests>=2.33.0' semver 'tqdm>=4.67.1' 'reuse>=6.0.0' \
+        'spdx-python-model>=0.0.5' anytree tabulate intelhex \
+        'cmake==3.31.6' \
+    && printf '#!/bin/sh\nPATH=/opt/zephyr-venv/bin:$PATH exec /opt/zephyr-venv/bin/west "$@"\n' \
+        > /usr/local/bin/west \
+    && chmod 755 /usr/local/bin/west
 # Make the failure mode described above impossible to repeat by hand: a bare
 # `python3.12 -m pip install X` inside the container would again reach
 # /usr/lib/python3/dist-packages and uninstall the distro package. Installs must go
@@ -178,7 +193,7 @@ RUN python3.12 -m venv /opt/zephyr-venv \
 ENV PIP_REQUIRE_VIRTUALENV=1
 
 # Zephyr SDK 1.0.1 (aarch64-zephyr-elf), which is what zephyr/SDK_VERSION asks for
-# at Zephyr 4.4.1 (3.6 wanted 0.16.x). Two layout changes since 0.16:
+# at Zephyr 4.5.0 (3.6 wanted 0.16.x). Two layout changes since 0.16:
 #   - the toolchain tarball is named `toolchain_gnu_...`
 #   - it must be unpacked under `gnu/`, not the SDK root. cmake/zephyr/gnu/generic.cmake
 #     globs ${ZEPHYR_SDK_INSTALL_DIR}/gnu/*-*zephyr-* and fails with "Unable to find

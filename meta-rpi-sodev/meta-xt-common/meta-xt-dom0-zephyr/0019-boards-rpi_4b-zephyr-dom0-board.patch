@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From b370fe52800c90ef46d0e6c4174e79efc03c90db Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sat, 08 Aug 2026 20:58:15 +0900
+Date: Wed, 11 Nov 2026 08:33:32 +0900
 Subject: [PATCH] boards/rpi_4b: add Zephyr Dom0 board conf + overlay (BCM2711)
 
 Add the Raspberry Pi 4 (BCM2711) counterpart of boards/rpi_5.{conf,overlay}.
@@ -36,8 +36,9 @@ Three things are genuinely different on BCM2711 and are commented in place:
 
 * SRAM RELINK to 0x20000000, derived rather than measured. Xen's rpi4 platform
   sets .dma_bitsize = 30, so allocate_memory_11() confines Dom0's bank[0] to
-  below 1 GiB -- RPi5 has no platform entry, gets the 32-bit default and landed
-  at 0xc0000000. boot.cmd.xen.zephyr-dom0.in passes dom0_mem=128M
+  below 1 GiB -- RPi5 has no platform entry, gets the 32-bit default and
+  measured bank[0] at 0xa0000000 (0008). boot.cmd.xen.zephyr-dom0.in passes
+  dom0_mem=128M
   (get_allocation_size(128 MiB) is exactly order 15), and the first free
   naturally-aligned 128 MiB block below 1 GiB in that memory map is
   0x20000000-0x28000000. (dom0_mem used to be 256M; the overlay body records why
@@ -73,23 +74,55 @@ every board, so rpi_4b moves with rpi_5):
    the symbol is invisible without an SDHC node, and 0026 fixes the Kconfig default
    the pin was working around.
  - CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16, CONFIG_XEN_REGIONS=y and
-   CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16 are added, matching rpi_5.conf: 0022
-   widens the sysctl range, 0023 backports the extended-regions driver (opt-in
-   upstream, where the fork defaulted it on) and 0031 needs the depth bound.
+   CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH=16 are added, matching rpi_5.conf:
+   upstream 31d2bd60 widened the sysctl range, the extended-regions driver
+   (26d1dce5) is opt-in upstream where the fork defaulted it on, and 0031 needs
+   the depth bound.
  - the chosen zephyr,entropy property, the gpio-leds node and its led0 alias are
    deleted, and gpio1 disabled - the same dangling-phandle class of failure that
    CONFIG_PCIE=n works around for rpi_5.
 
+Carried to Zephyr 4.5.0, whose rpi_4b board grew from a UART-only target
+into a 4-core SMP board with the VideoCore firmware interface, Ethernet, USB and
+I2C. Dom0 owns none of that, so the overlay and the conf keep this Dom0 where
+4.4.1 had it (compared node by node with the 4.4.1 build's edt.pickle and
+symbol by symbol with its .config):
+ - dram0, the board's new zephyr,sram, is deleted and chosen points back at
+   this overlay's sram0 bank. zephyr,display is deleted.
+ - the firmware node (with the GPIO expander and the thermal sensor under it),
+   the framebuffer, the USB power domain and the VideoCore shared memory at
+   0x3f800000 are deleted, and with them the led1, i2c-1 and die-temp0 aliases.
+   The mailbox is the firmware channel DomD's kernel drives.
+ - mbox0, i2c1, eth0, mdio0 and usb0 are disabled; eth0's phy-handle and
+   usb0's power-domains go with the nodes they name.
+ - the pin controller (pin-controller@fe200000, DomD's GPIO block) is
+   disabled: inert while CONFIG_PINCTRL is off, one `select` away otherwise.
+ - cpu@1-3 are deleted: they carry spin-table release addresses, and Dom0 has
+   one vCPU (dom0_max_vcpus=1, CONFIG_MP_MAX_NUM_CPUS=1).
+ - SMP, PM_CPU_OPS, PM_DEVICE(_POWER_DOMAIN), POWER_DOMAIN and the
+   soc's new CACHE_MANAGEMENT default are turned back off, and KERNEL_VM_SIZE
+   goes back to 8 MiB. UART_INTERRUPT_DRIVEN=n stops the Kconfig warning
+   about the board's (disabled) UART.
+ - the comments name the upstream commits instead of 0022-0024, which are
+   upstream in 4.5.0.
+
 Assisted-by: Claude Code:claude-opus-5
+Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
 Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
+ boards/rpi_4b.conf    | 156 +++++++++++++++++++++
+ boards/rpi_4b.overlay | 307 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 463 insertions(+)
+ create mode 100644 boards/rpi_4b.conf
+ create mode 100644 boards/rpi_4b.overlay
+
 diff --git a/boards/rpi_4b.conf b/boards/rpi_4b.conf
 new file mode 100644
-index 0000000..e1c7411
+index 0000000..d1aee42
 --- /dev/null
 +++ b/boards/rpi_4b.conf
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,156 @@
 +# Copyright (c) 2026 Yuichi Kusakabe
 +# SPDX-License-Identifier: Apache-2.0
 +#
@@ -109,7 +142,7 @@ index 0000000..e1c7411
 +#   - the 0x18 domctl interface version for Xen 4.22,
 +#   - the SD-less Dom0 handling.
 +#
-+# Written for Zephyr 4.4.1. The 3.6-era spellings this file used to carry are gone:
++# Written for upstream Zephyr 4.x. The 3.6-era spellings this file used to carry are gone:
 +# FS_MULTI_PARTITION is FS_FATFS_MULTI_PARTITION upstream, and
 +# XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} existed only in the xen-troops
 +# Zephyr fork -- on 4.x an assignment to an undefined symbol is a hard Kconfig
@@ -147,6 +180,30 @@ index 0000000..e1c7411
 +CONFIG_STACK_SENTINEL=y
 +CONFIG_MAX_XLAT_TABLES=32
 +
++# [rpi4] Zephyr 4.5's rpi_4b_defconfig turns the board into a 4-core SMP target
++# with CPU and device power management. Dom0 is one vCPU under Xen
++# (dom0_max_vcpus=1, and prj.conf's CONFIG_MP_MAX_NUM_CPUS=1), the VideoCore
++# power domains behind POWER_DOMAIN are DomD's firmware channel (rpi_4b.overlay
++# deletes them), and none of it was in the 4.4.1 Dom0 this board was verified
++# with. Turn it back off. KERNEL_VM_SIZE goes back to 4.4.1's 8 MiB for the same
++# reason: the board's 16 MiB is for the VideoCore framebuffer, which Dom0 does not
++# map.
++CONFIG_SMP=n
++CONFIG_PM_CPU_OPS=n
++CONFIG_PM_DEVICE=n
++CONFIG_PM_DEVICE_POWER_DOMAIN=n
++CONFIG_POWER_DOMAIN=n
++CONFIG_KERNEL_VM_SIZE=0x800000
++# [rpi4] soc/brcm/bcm2711/Kconfig.defconfig turns CACHE_MANAGEMENT on in 4.5. xenlib
++# does not depend on it (it calls the arm64 arch_dcache_* inlines directly, which
++# issue the DC instructions either way); what it changes is the kernel's own
++# sys_cache_* paths, which were no-ops in the verified 4.4.1 Dom0 and still are on
++# rpi_5. Keep them off.
++CONFIG_CACHE_MANAGEMENT=n
++# The board's UART is disabled (Dom0 uses the Xen PV console), so the board's
++# UART_INTERRUPT_DRIVEN=y cannot be satisfied and Kconfig warns. Say n outright.
++CONFIG_UART_INTERRUPT_DRIVEN=n
++
 +CONFIG_XEN_VCH=y
 +CONFIG_XEN_DOM0LESS_BOOT=y
 +
@@ -161,7 +218,7 @@ index 0000000..e1c7411
 +# FS_FATFS_MULTI_PARTITION, not the fork's FS_MULTI_PARTITION (upstream spelling,
 +# subsys/fs/Kconfig.fatfs).
 +CONFIG_FS_FATFS_MULTI_PARTITION=y
-+# Volume "0:", not "1:". On Zephyr 4.4 FF_VOLUMES is derived from the number of
++# Volume "0:", not "1:". On Zephyr 4.x FF_VOLUMES is derived from the number of
 +# status-okay devicetree disk nodes, and rpi_4b.overlay declares exactly one (the
 +# inert ramdisk0 it adds so FatFs compiles at all), so "1:" is out of range.
 +CONFIG_DOM_STORAGE_FATFS_LOGICAL_DRIVE_NAME="0"
@@ -189,23 +246,24 @@ index 0000000..e1c7411
 +# rpi_4b.overlay therefore does not enable any SDHC node.
 +#
 +# Neither CONFIG_DISK_DRIVER_SDMMC=n nor a FS_FATFS_WINDOW_ALIGNMENT pin is set:
-+# with no SDHC node upstream 4.4.1 leaves DISK_DRIVER_SDMMC invisible (assigning to
++# with no SDHC node upstream leaves DISK_DRIVER_SDMMC invisible (assigning to
 +# it risks a Kconfig warning, which 4.x turns into a build error), and patch 0026
 +# fixes zephyr-dom0-xt/Kconfig to read `default SDHC_BUFFER_ALIGNMENT if SDHC` /
 +# `default 4`, so the empty, invisible SDHC_BUFFER_ALIGNMENT can no longer leak
 +# into the generated misc/generated/configs.c assembly.
 +
-+# Xen 4.21 ABI. XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n
++# Xen ABI versions: zephyr-xenlib's headers are Xen 4.21.0's, the hypervisor is
++# 4.22. XEN_DOMCTL_XENTROOPS_ARCH_{VGSX_OSID,SCI_TYPE} used to be set to n
 +# here to keep arm_sci_type/vgsx_osid out of xen_arch_domainconfig; those symbols
-+# exist only in the xen-troops Zephyr fork and are absent from 4.4.1, where patch
-+# 0024 removes the vendored public headers entirely and the ABI comes from
++# exist only in the xen-troops Zephyr fork and are absent upstream, where the
++# vendored public headers are gone (d58fbb8c) and the ABI comes from
 +# zephyr-xenlib's copy of Xen 4.21.0's.
 +CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18
-+# Xen 4.21's sysctl.h declares 0x16. Patch 0022 widens the Kconfig range that far;
++# Xen 4.21's sysctl.h declares 0x16. Upstream 31d2bd60 widened the Kconfig range that far;
 +# at 0x15 `xu list` and `xstat physinfo` print nothing at all, silently.
 +CONFIG_XEN_SYSCTL_INTERFACE_VERSION=0x16
 +
-+# Extended regions (patch 0023 backports the upstream driver). Without this xenlib
++# Extended regions (the upstream driver, 26d1dce5). Without this xenlib
 +# carves the guest-image mapping window out of Dom0's own 2 MiB heap, which a
 +# multi-MiB guest kernel does not fit.
 +CONFIG_XEN_REGIONS=y
@@ -223,10 +281,10 @@ index 0000000..e1c7411
 +CONFIG_DOM_CFG_SODEV=y
 diff --git a/boards/rpi_4b.overlay b/boards/rpi_4b.overlay
 new file mode 100644
-index 0000000..4f3f660
+index 0000000..07abd91
 --- /dev/null
 +++ b/boards/rpi_4b.overlay
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,307 @@
 +/*
 + * Copyright (C) 2026 Yuichi Kusakabe
 + *
@@ -257,11 +315,18 @@ index 0000000..4f3f660
 + *  3. NO SDHC. The RPi4 SD controller (/emmc2bus/mmc@7e340000) is handed to DomD
 + *     by boot.cmd.xen.zephyr-dom0.in, and the pinned rpi_4b board does not define
 + *     an SDHC node at all — so unlike rpi_5.overlay there is nothing to disable
-+ *     here. boards/rpi_4b.conf still sets CONFIG_DISK_DRIVER_SDMMC=n so the disk
-+ *     driver is not built.
++ *     here. boards/rpi_4b.conf sets neither CONFIG_DISK_DRIVER_SDMMC nor the
++ *     FATFS alignment pin: without an SDHC node the symbol is invisible and the
++ *     disk driver is not built.
 + */
 +
 +/delete-node/ &sram0;
++/*
++ * Zephyr 4.5's rpi_4b.dts points zephyr,sram at its own 8 MiB dram0 at 0x200000
++ * (below the Xen binary) instead of sram0. Dom0's RAM is the sram0 bank defined
++ * below, so the board's node goes and chosen is pointed back at ours.
++ */
++/delete-node/ &dram0;
 +
 +#include <mem.h>
 +
@@ -278,6 +343,12 @@ index 0000000..4f3f660
 +		 * error. rpi_5 needed CONFIG_PCIE=n for exactly this reason.
 +		 */
 +		/delete-property/ zephyr,entropy;
++		zephyr,sram = &sram0;
++		/*
++		 * 4.5 also points zephyr,display at the VideoCore framebuffer, which is
++		 * deleted below with the firmware node it talks through.
++		 */
++		/delete-property/ zephyr,display;
 +	};
 +
 +	psci {
@@ -298,8 +369,7 @@ index 0000000..4f3f660
 +	 *   (XEN) Grant table range: 0x............-0x............
 +	 *   (XEN) d0: extended region 1: 0x..........->0x..........
 +	 *
-+	 * Derivation of the values below (see also
-+	 * rpi4-port/meta-rpi5-sodev/meta-xt-common/meta-xt-dom0-zephyr/RPI4-PORT.md):
++	 * Derivation of the values below:
 +	 *
 +	 *   grant table: find_gnttab_region() in xen/arch/arm/domain_build.c sets
 +	 *     gnttab_start = __pa(_stext), i.e. where boot.cmd loaded the Xen binary
@@ -336,12 +406,12 @@ index 0000000..4f3f660
 +	 * garbage and faults before console init — on RPi5 the symptom was total UART
 +	 * silence and no xu-create.
 +	 *
-+	 * 0x20000000 is derived, not copied from RPi5 (which uses 0xc0000000):
++	 * 0x20000000 is derived, not copied from RPi5 (measured at 0xa0000000):
 +	 *   - Xen's rpi4 platform sets .dma_bitsize = 30
 +	 *     (xen/arch/arm/platforms/brcm-raspberry-pi.c), so allocate_memory_11()
 +	 *     computes lowmem_bitsize = min(32, 30) = 30 and confines bank[0] to
 +	 *     below 1 GiB. RPi5 has no platform entry, gets the 32-bit default, and
-+	 *     therefore landed at 0xc0000000.
++	 *     measured bank[0] at 0xa0000000 (patch 0008).
 +	 *   - boot.cmd.xen.zephyr-dom0.in passes dom0_mem=128M, and
 +	 *     get_allocation_size(128 MiB) is exactly order 15 = 128 MiB.
 +	 *   - In that boot script's memory map the first free naturally-aligned
@@ -390,8 +460,33 @@ index 0000000..4f3f660
 +	 */
 +	aliases {
 +		/delete-property/ led0;
++		/*
++		 * Zephyr 4.5 adds three more aliases, each naming a node this overlay
++		 * deletes or disables: led_pwr (a child of the deleted leds node),
++		 * i2c1 and the firmware's vc_thermal.
++		 */
++		/delete-property/ led1;
++		/delete-property/ i2c-1;
++		/delete-property/ die-temp0;
 +	};
 +	/delete-node/ leds;
++
++	/*
++	 * Zephyr 4.5 adds the VideoCore firmware interface: a mailbox client
++	 * (firmware, with a GPIO expander and the thermal sensor under it), a
++	 * framebuffer and a USB power domain that go through it, and the 8 MiB of
++	 * VideoCore shared memory it uses at 0x3f800000. None of it is Dom0's. The
++	 * VideoCore mailbox is the firmware channel DomD's kernel drives (clocks,
++	 * power, the display), a second client would race it, and 0x3f800000 is not
++	 * in Dom0's RAM bank at all. Children first: a node that still references a
++	 * deleted one is a devicetree error.
++	 */
++	/delete-node/ framebuffer;
++	/delete-node/ power-domains;
++	/delete-node/ firmware;
++	reserved-memory {
++		/delete-node/ memory@3f800000;
++	};
 +
 +	/*
 +	 * Zephyr 4.x derives FatFs's FF_VOLUMES from the devicetree instead of letting
@@ -444,5 +539,56 @@ index 0000000..4f3f660
 + * blacklist protects (brcm,bcm2835-aux / -aux-spi).
 + */
 +&uart1 {
++	status = "disabled";
++};
++
++/*
++ * Zephyr 4.5 enables these on rpi_4b. All are DomD's (the mailbox is the firmware
++ * channel above; the I2C header, the GENET Ethernet and the xHCI behind PCIe are
++ * DomD devices on this board), and an enabled node whose MMIO Dom0 does not own
++ * is the SYS_INIT hang described for &rng above. The USB controller's
++ * power-domains property names the power domain deleted above, so it goes too.
++ */
++&mbox0 {
++	status = "disabled";
++};
++
++&i2c1 {
++	status = "disabled";
++};
++
++&eth0 {
++	/delete-property/ phy-handle;
++	status = "disabled";
++};
++
++&mdio0 {
++	status = "disabled";
++};
++
++&usb0 {
++	/delete-property/ power-domains;
++	status = "disabled";
++};
++
++/*
++ * Zephyr 4.5 describes all four Cortex-A72 cores, and with them spin-table SMP
++ * bring-up through release addresses at 0xd8-0xf0. Dom0 has one vCPU
++ * (boot.cmd passes dom0_max_vcpus=1) and does not own that page, so only cpu@0
++ * stays, as on 4.4.1.
++ */
++/delete-node/ &cpu1;
++/delete-node/ &cpu2;
++/delete-node/ &cpu3;
++
++/* The PHY of the Ethernet controller disabled above (its phy-handle is gone). */
++/delete-node/ &phy1;
++
++/*
++ * The BCM2711 pin controller (pin-controller@fe200000) is the GPIO block DomD's
++ * kernel drives. It is inert while CONFIG_PINCTRL is off, which is the same
++ * one-`select`-away hazard as gpio1 above, so it is disabled too.
++ */
++&pinctrl {
 +	status = "disabled";
 +};

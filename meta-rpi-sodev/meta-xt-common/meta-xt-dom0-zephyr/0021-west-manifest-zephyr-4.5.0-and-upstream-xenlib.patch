@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 10 Nov 2026 01:09:27 +0900
+Subject: [PATCH] west.yml: Zephyr 4.5.0 and zephyrproject-rtos xenlib
+
+Move the Dom0 west pins to upstream Zephyr v4.5.0 and switch zephyr-xenlib to
+its upstream at zephyrproject-rtos.
+
+xen-troops/zephyr has no branch for 4.5, so zephyr is pinned to the upstream
+tag itself. Nothing is lost by leaving the fork: the zephyr-v4.4.1-xt branch
+this series used before is upstream v4.4.1 at the same SHA (1f6485eca254).
+
+fatfs has to move with Zephyr: modules/fatfs/zephyr_fatfs_config.h asserts
+`FFCONF_DEF == 80386`, which the original pin (80286) fails. 4f60a12c is what
+v4.5.0's own west.yml points at: FatFs R0.16 with upstream patches 1 and 2 and
+the fixes for CVE-2026-6682, -6683, -6685, -6686 and -6687.
+
+zephyr-xenlib stays at 7f088456. v4.5.0's own west.yml names a newer xenlib
+(8b13d0b7), but its xenstore server was reworked there and seven of the eleven
+xenlib patches in this series no longer apply. v4.5.0 builds against 7f088456
+(every Xen public header it includes is there), so moving xenlib is left to a
+change of its own. zephyr-xrun is unchanged too.
+
+moulin's west source can only pin the manifest repository's url/rev, so the
+project pins can only be changed by patching this file - which is why this
+patch is applied first and `west update` is then re-run (see apply-zephyr-
+patches.sh).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
+---
+diff --git a/west.yml b/west.yml
+index fdc0ac8..4bbb0c2 100644
+--- a/west.yml
++++ b/west.yml
+@@ -12,16 +12,28 @@ manifest:
+       url-base: https://github.com/zephyrproject-rtos/
+ 
+   projects:
++    # Pins are SHAs, not branch/tag names: a branch name makes the build
++    # irreproducible (it changes the moment upstream moves) and unreviewable in
++    # a PR. The symbolic name each SHA came from is in the comment.
++    # xen-troops has no branch for Zephyr 4.5, so this pins the upstream tag
++    # directly.
+     - name: zephyr
+-      remote: xentroops
+-      revision: f12d445f792d562f23c107379267f07674ab5ebd
++      remote: zephyrproject-rtos
++      revision: 41d10b59730406bbab4ca9f1fbbe9e96aafb4966  # v4.5.0
+       west-commands: scripts/west-commands.yml
++    # zephyrproject-rtos is the upstream for xenlib now; xen-troops/zephyr-xenlib
++    # is a mirror. The upstream side carries no tags at all, so the old `v3.2.0`
++    # tag cannot be expressed here - this pin is a main commit.
+     - name: zephyr-xenlib
+-      remote: xentroops
+-      revision: v3.2.0
++      remote: zephyrproject-rtos
++      revision: 7f0884563f865a2a223f26dd0d847fb0faad397d  # main
++    # Must track what this Zephyr expects: modules/fatfs/zephyr_fatfs_config.h
++    # has `#if FFCONF_DEF != 80386`, and the original pin (427159bf) is
++    # FF_DEFINED 80286 -> hard compile error. 4f60a12c is what v4.5.0's own
++    # west.yml points at (FatFs R0.16 with upstream patches 1-2).
+     - name: fatfs
+       remote: zephyrproject-rtos
+-      revision: 427159bf95ea49b7680facffaa29ad506b42709b
++      revision: 4f60a12c58c3de4246857ad87c40239ecd93349b  # v4.5.0 west.yml
+     - name: zephyr-xrun
+       remote: xentroops
+-      revision: 5b6ecf274bac79b0be740693766a88d3eedf3b44
++      revision: 5b6ecf274bac79b0be740693766a88d3eedf3b44  # v0.1.0, unchanged

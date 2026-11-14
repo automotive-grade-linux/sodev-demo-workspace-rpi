@@ -168,7 +168,7 @@ disables the heavy Android/Flatcar guests by default).
 | (`XT_AAOS_SYNC_JOBS`) | 4 | Parallelism of the **reference-mirror pre-sync** (only with `--aaos-ref`/`--aaos-kernel-ref`); raise it on a fast link, lower it behind a rate-limited proxy. The plain `source`-mode sync is moulin's own `repo` fetch and is not affected |
 | (`XT_CACHE_MOUNTS`) | — | Extra `docker -v` mount specs (space-separated) bind-mounted into the builders, e.g. to share an sstate/downloads cache |
 | `--proxy=<url>` | — | HTTP(S) proxy for the docker builds and the fetches. `--proxy` sets all four proxy variables; without it `HTTPS_PROXY` (or `https_proxy`) fills the ones that are not set, and an HTTP proxy set apart is kept. A proxy change does not need `--rebuild-images` |
-| `--rebuild-images` | off | Force-rebuild the `XT_DOCKER` image (`sodev-builder-rpi`). It never touches the V4H workspace's `sodev-builder` -- the two workspaces use different Dockerfiles and, since this series, different tags. Not needed for the Zephyr SDK 1.0.1 / python3.12 move that this series makes: the new tag has no pre-existing image, so the first build creates it already up to date. You need it only when `XT_DOCKER` points at an older image (a pre-rename `sodev-builder`, say), which fails the Zephyr build with `Could NOT find Python3: Found unsuitable version "3.10.12"` (Zephyr 4.4 sets `PYTHON_MINIMUM_REQUIRED 3.12`) |
+| `--rebuild-images` | off | Force-rebuild the `XT_DOCKER` image (`sodev-builder-rpi`). It never touches the V4H workspace's `sodev-builder` -- the two workspaces use different Dockerfiles and, since this series, different tags. On a host with no `sodev-builder-rpi` image yet it is not needed: the first build creates the image already up to date. **An existing checkout needs it once for the Zephyr 4.5.0 move**: `build.sh` reuses an existing image by tag, and one built before the move has no CMake 3.28 or newer, so the Zephyr configure fails with `CMake 3.28.0 or higher is required. You are running version 3.22.1`. An older image under another tag (a pre-rename `sodev-builder`, say) fails earlier, with `Could NOT find Python3: Found unsuitable version "3.10.12"` (Zephyr 4.4 and later set `PYTHON_MINIMUM_REQUIRED 3.12`) |
 | `--west-cache=<dir>` (`XT_WEST_CACHE_DIR`) | — | Point the Zephyr west fetches at a pre-populated reference workspace, so `west update` runs offline (the AAOS analogue is `--aaos-ref`). Used for both west workspaces: Dom0's and DomZ's |
 | `--memory=<size>` (`XT_DOCKER_MEMORY`) | — (unlimited) | Cap each build container's RAM via docker `--memory` **and** `--memory-swap` (equal ⇒ no host-swap spill, so an unbounded moulin/AOSP/Yocto build cannot OOM the host), e.g. `24g` |
 | (`XT_DOCKER_NETWORK`) | — (Docker bridge) | `--network` value for the build containers, e.g. `host`. Needed when the build has to reach a proxy or package mirror bound to the **host's** loopback: a bridged container's `127.0.0.1` is its own, not the host's. Applies to `docker run` and `docker build` -- the image build fetches packages too. **Only `host`, `none` and `default` work there**: BuildKit refuses `docker build --network=bridge` and named networks (rc=1, measured on docker 29.7.2), so reach those through `XT_DOCKER_RUN_OPTS` instead. `build.sh` refuses any other value at the point where it has to build the image, and names three ways on: build the image once with `host`, use `DOCKER_BUILDKIT=0` (the classic builder does take a bridge and named networks), or move the network to `XT_DOCKER_RUN_OPTS` and clear this variable. With the image already present nothing is refused -- the value never reaches `docker build`. A `--network` in both places lands twice on the same `docker run`, which `build.sh` refuses up front |
@@ -345,7 +345,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | DomD device-model | `--gpu=vulkan` (the default): QEMU 11.1.2 (the upstream release with the 10.0.2-xt patches ported onto it) on both boards; `--gpu=gl`: 7.0.0-xt. Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock. The fork's 10.0.2-xt recipe stays in `meta-xt-qemu` and is selected by setting `PREFERRED_VERSION_qemu` to `"10.0.2"` on the `vulkan` lane's DomD conf line of the board yaml (with weston and virglrenderer back to 15.% and 1.2.%) and, for `--dom0=linux`, `XT_DOM0_QEMU_VERSION` to the same value (that Dom0 writes the guest cfgs). [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) section 4 lists what only 11.1.2 has |
 | DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch and the overlay-plane patch DomA's kernel has (`virtio_gpu.overlay_planes`, set by `XT_DOMU_OVERLAY_PLANES`), plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
 | DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). The virtio contract is the V4H one: a complete V4H-built AAOS image (kernel, ramdisk and p4 from one build) boots unmodified -- measured in 2026-07 with a V4H Android 17 image on this stack while it was still Android 15. `build.sh` nevertheless accepts only prebuilt bundles that declare this tree's own generation (Android 17 / GKI 6.18.32, `BUNDLE-INFO`): the failure it guards against is a *mixed* set, a guest kernel and a `vendor_dlkm` from different builds, which share no `module_layout` and boot to a black panel |
-| DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`meta-xt-domz/zephyr-apps/domz/`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
+| DomZ guest | Zephyr 4.5.0 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.5.0 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`meta-xt-domz/zephyr-apps/domz/`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 
 
 See also:
@@ -365,7 +365,7 @@ See also:
 ├── meta-rpi-sodev/          # ALL RPi5/Xen delta, consolidated on the upstream meta-xt-* layout
 │   ├── meta-xt-common/
 │   │   ├── meta-xt-dom0-linux/      # thin LINUX Dom0 image, xl-create service chain, xen-tools cfg
-│   │   ├── meta-xt-dom0-zephyr/     # ZEPHYR Dom0 patch series (Zephyr 4.4.1 +
+│   │   ├── meta-xt-dom0-zephyr/     # ZEPHYR Dom0 patch series (Zephyr 4.5.0 +
 │   │   │                            #   zephyrproject-rtos xenlib, xenstore server, dom_cfg,
 │   │   ├── meta-xt-driver-domain/   # DomD image (p2 rootfs), kernel (vhost_xen/vc4), weston, qemu, xen-network
 │   │   ├── meta-xt-domu/            # DomU xl cfg + cluster recipes + virtio kernel
@@ -508,9 +508,11 @@ accepts only prebuilt bundles that declare this tree's generation (`BUNDLE-INFO`
 generation is outside what this tree verifies, not something it has been shown to break.
 
 **DomZ (`-z`) is verified on hardware in all four verification patterns** (RPi4 and
-RPi5, Zephyr-Dom0 and thin-Linux-Dom0): `xl list` shows the domain at 16 MiB / 1 vCPU,
-`xl console DomZ` prints `DomZ up: Zephyr 4.4.1 as Xen DomU (AGL SoDeV)` and the
-heartbeat, and the interval measured 10 s with no missed ticks. The unit that creates it
+RPi5, Zephyr-Dom0 and thin-Linux-Dom0), on Zephyr 4.4.1: `xl list` shows the domain at
+16 MiB / 1 vCPU, `xl console DomZ` prints `DomZ up: Zephyr 4.4.1 as Xen DomU (AGL SoDeV)`
+and the heartbeat, and the interval measured 10 s with no missed ticks. On Zephyr 4.5.0
+DomZ has been built and checked on a PC only (its `zephyr.bin` carries `DomZ up: Zephyr
+4.5.0 as Xen DomU (AGL SoDeV)`); it has not been run on a board yet. The unit that creates it
 lands in the toolstack domain of either flavour (DomD for Zephyr-Dom0, the thin Dom0 for
 the Linux one) and is `active` in both. The RPi4 runs used the 4 GiB board, with images
 built before `build.sh` began refusing `-z` on `--ram=4g`. This tree builds DomZ for the
@@ -537,7 +539,7 @@ On a PC, before that:
 - **DomZ was created and booted under QEMU first** -- aarch64 with Xen 4.21.1-pre and a
   minimal Linux Dom0 (`tools/domz-qemu/qemu-xen-domz.sh`): `xl create` accepted the image,
   `xl list` showed `DomZ ... -b----` (idle, i.e. healthy) and `xl console DomZ` printed
-  the banner (that run predates the move to 4.4.1). The image format holds for the
+  the banner (that run predates the moves to 4.4.1 and 4.5.0). The image format holds for the
   reason libxc's loaders say it should: Zephyr's arm64 output carries a Linux arm64
   Image header (`"ARM\x64"` at offset 0x38), which `xc_dom_probe_zimage64_kernel()`
   claims (the multiboot `bin` loader would have rejected a bare blob).
