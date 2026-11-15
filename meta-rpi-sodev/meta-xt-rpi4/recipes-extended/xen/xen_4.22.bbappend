@@ -143,9 +143,9 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # that both this hypervisor bbappend and the xen-tools bbappend point at; the Venus
 # lane adds 4.22-0008 to both from there as well, and keeps the hypervisor-only
 # 4.22-0007 there too so the two boards carry one copy rather than two;
-# 4.22-0006 and 4.22-0013, also hypervisor-only, live there for the same reason.
-# Only the hypervisor-only 0025, the rpi4-only 4.22-0011/0012/0014 and the Kconfig
-# .cfg fragments remain in ./files here.
+# 0025, 4.22-0006 and 4.22-0013, also hypervisor-only, live there for the same
+# reason, as does xen-config-ioreq.cfg. Only the rpi4-only 4.22-0011/0012/0014,
+# xen-hyp-config.cfg and xen-config-rpi4-passthrough.cfg remain in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series ---

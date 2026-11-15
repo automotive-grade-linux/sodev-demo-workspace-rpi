@@ -7,8 +7,9 @@ modified for the RPi5 SoDeV port. Changes against the upstream tree:
 - `meta-xt-control-domain` removed (unused on this board)
 - `meta-xt-dom0-zephyr` added (Zephyr thin Dom0 patch series)
 - `meta-xt-doma` added (Android Automotive guest layer)
-- `recipes-extended/xen-common/` added: the Xen patch series shared by the
-  hypervisor and toolstack recipes, which live in different layers
+- `recipes-extended/xen-common/` added: the Xen patches and Kconfig fragment
+  both boards share, for the hypervisor and toolstack recipes, which live in
+  different layers
 
 These layers are hardware- and product-independent; they provide common
 facilities that may be used by any xt-based product.

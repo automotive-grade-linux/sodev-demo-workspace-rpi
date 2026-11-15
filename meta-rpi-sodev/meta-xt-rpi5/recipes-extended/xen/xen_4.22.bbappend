@@ -122,12 +122,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # copy of each -- both SRC_URI lists name those same 28 files, plus 4.22-0008
 # which the Venus lane adds to both (4.22-0007 is hypervisor-only but lives in the
 # shared dir too, so the two boards carry one copy rather than two). This bbappend adds
-# three hypervisor-only ones (xen/ only, no tools/ hunk) -- 0025 from ./files, and
-# 4.22-0006 and 4.22-0013 from the shared dir -- and the Vulkan lane adds a
+# three hypervisor-only ones (xen/ only, no tools/ hunk) -- 0025, 4.22-0006 and
+# 4.22-0013, all from the shared dir -- and the Vulkan lane adds a
 # fourth, 4.22-0007. That is why it fetches 31 (33 in the default Vulkan lane)
 # where the toolstack fetches 28 of the shared set plus its own lane additions.
-# Only 0025 and the Kconfig .cfg fragments live in
-# ./files here.
+# Only xen-hyp-config.cfg and xen-config-rpi5-passthrough.cfg live in ./files
+# here; xen-config-ioreq.cfg is in the shared dir.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series (order matters; matches the verified git-apply order) ---

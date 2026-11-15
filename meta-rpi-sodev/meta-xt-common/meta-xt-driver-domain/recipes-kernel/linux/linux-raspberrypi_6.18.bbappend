@@ -6,10 +6,9 @@
 # 0009 (pinctrl writel skip) avoids a BCM2712 pinctrl Async SError under Xen
 # Dom0; 0010 allocates dev->dma_mask before vc4_drm_bind calls dma_set_mask
 # (otherwise the axi:gpu container node's dma_mask is NULL and bind fails -EIO).
-# NOTE: xen-config-a4b-frontend.cfg (CONFIG_DRM_VC4=m, CONFIG_XEN_BLKDEV_FRONTEND=y,
-# CONFIG_XEN_NETDEV_FRONTEND=y) was a byte-identical duplicate of the meta-xt-rpi5
-# copy; both layers are always co-present in the dom0/domd kernel builds, so it is
-# now supplied solely by meta-xt-rpi5's linux-raspberrypi_6.18.bbappend.
+# files/ also holds the Xen fragments both boards' bbappends name in SRC_URI
+# (xen-config-a4b-frontend.cfg, xen-frontend-force.cfg, xen-kernel-config.cfg);
+# this layer is in both boards' Dom0 and DomD kernel builds.
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 # RPi5-specific kernel fixes for this Xen topology. 0011 (DT-based vc4 component

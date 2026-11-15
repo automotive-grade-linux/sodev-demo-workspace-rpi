@@ -358,7 +358,7 @@ exceptions:
 |---|---|---|
 | `conf/layer.conf`, `recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb`, `recipes-bsp/xt-rpi-u-boot-scr/xt-rpi-u-boot-scr.bb` and `.bbappend`, `recipes-core/images/rpi5-image-minimal-domd.bb` and `rpi5-image-xt-domd-v4h.bbappend`, `recipes-extended/rp1-touch-forward/rp1-touch-bridge.bbappend`, `recipes-extended/xt-aaos-host-services/xt-aaos-host-services.bbappend`, `recipes-extended/xt-xen-cfg-doma/xt-xen-cfg-doma_%.bbappend`, `recipes-graphics/wayland/weston-init.bbappend`, `recipes-kernel/linux/linux-raspberrypi_6.18.bbappend` | MIT (`SPDX-License-Identifier: MIT`) | recipe metadata, tagged as the meta-xt-common recipes they extend are |
 | `recipes-bsp/trusted-firmware-a/trusted-firmware-a.inc` | MIT, no SPDX tag | derived from meta-arm's `recipes-bsp/trusted-firmware-a/trusted-firmware-a.inc` (meta-arm is MIT, its `COPYING.MIT`) with local changes; the same file is in `meta-xt-rpi5` |
-| `recipes-extended/xen/files/*.patch`, `recipes-kernel/linux/files/*.patch`, `recipes-bsp/u-boot/files/*.patch` | the license of the project each one modifies: Xen (GPL-2.0-only; `0025-*.patch` adds a file with that SPDX tag), the Raspberry Pi kernel (GPL-2.0), U-Boot (GPL-2.0+) | a patch is a change to that project, not to this layer |
+| `recipes-extended/xen/files/*.patch`, `recipes-kernel/linux/files/*.patch`, `recipes-bsp/u-boot/files/*.patch` | the license of the project each one modifies: Xen (GPL-2.0-only), the Raspberry Pi kernel (GPL-2.0), U-Boot (GPL-2.0+) | a patch is a change to that project, not to this layer |
 
 ## Layout
 
