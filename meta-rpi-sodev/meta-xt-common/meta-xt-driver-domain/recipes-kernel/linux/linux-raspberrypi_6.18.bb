@@ -61,22 +61,13 @@ DEPLOYDEP = ""
 DEPLOYDEP:raspberrypi-armv7 = "${RASPBERRYPI_v7_KERNEL}:do_deploy"
 do_deploy[depends] += "${DEPLOYDEP}"
 
-# do_kernel_configcheck is off. It was switched off on scarthgap, whose
-# kern-tools-native kconfiglib could not parse the 'transitional' Kconfig keyword
-# that 6.18's arch/Kconfig uses and died with an exception (only the Yocto-side
-# config audit; the kernel's own Kconfig = do_configure succeeds). wrynose's
-# kern-tools (a4a362d9) does parse it -- its kconfiglib.py tracks a transitional
-# context -- so the audit may run again on this release; that has not been tried
-# on a build here, and the switch stays until it is.
-do_kernel_configcheck[noexec] = "1"
-
-# With the audit off nothing would notice a fragment that stopped applying, so
-# check the symbols the Xen fragments set once olddefconfig has written the final
-# .config. DRM_VC4 and I2C_BRCMSTB are the two that the board layer's
-# xen-config-a4b-frontend.cfg demotes to =m against vc4graphics.cfg's =y (see
-# above: the override only holds while merge_config sees the Xen fragment after
-# the stock one); XEN_GNTDEV_DMABUF comes from venus-gntdev-dmabuf.cfg and is
-# expected only on the venus lane.
+# do_kernel_configcheck only warns about a fragment value that did not reach the
+# final .config, so make the ones that matter fatal: check the symbols the Xen
+# fragments set once olddefconfig has written it. DRM_VC4 and I2C_BRCMSTB are
+# the two that xen-config-a4b-frontend.cfg demotes to =m against vc4graphics.cfg's
+# =y (see above: the override only holds while merge_config sees the Xen
+# fragment after the stock one); XEN_GNTDEV_DMABUF comes from
+# venus-gntdev-dmabuf.cfg and is expected only on the venus lane.
 do_configure:append() {
     for s in CONFIG_DRM_VC4=m CONFIG_I2C_BRCMSTB=m \
              ${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'CONFIG_XEN_GNTDEV_DMABUF=y', '', d)}; do
