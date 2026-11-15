@@ -28,10 +28,11 @@ variables:
   DOMU_BUILD_DIR: "build-domu"
   MACHINE: "raspberrypi5"
   SOC_FAMILY: "bcm2712"
-  # BCM2712 D0 boards only: TF-A is built with the D0 pin controller tables
-  # (meta-xt-rpi5/recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb). The
-  # firmware applies overlays/bcm2712d0.dtbo, a p1 boot item below, on D0 boards
-  # only and ignores it on C0.
+  # BCM2712 D0 boards only: DomD drives the pin controller with the D0
+  # compatible, see
+  # meta-xt-rpi5/recipes-guest/domd-vc4/files/bcm2712-raspberrypi5-domd-vc4.dts.
+  # The firmware applies overlays/bcm2712d0.dtbo, a p1 boot item below, on D0
+  # boards only and ignores it on C0.
   DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}
   BOARD_RAM: "16g"           # default 16g (16 GB board); overridable: --BOARD_RAM {16g|8g}
 
@@ -1223,10 +1224,6 @@ components:
         #     that restated them is gone).
         #   xt-rpi-u-boot-scr.bbappend -> appends to XEN_OVERLAYS/DOMD_OVERLAYS,
         #     which the rpi5 static boot.cmd does not consume.
-        #
-        # This is how Wi-Fi and Bluetooth get their pins on this board: DomD
-        # asks TF-A over SCMI, and TF-A programs the pin controller
-        # (pinctrl@7d504100) at EL3.
         - [MACHINE_FEATURES:append, " scmi"]
         - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
         # weston and virglrenderer: a newer recipe for either in meta-xt-driver-domain

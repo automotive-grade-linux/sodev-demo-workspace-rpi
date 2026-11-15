@@ -305,9 +305,9 @@ assembled the V4H way from the `doma`/`doma_kernel` moulin components).
   full 4-domain build comes to 9728 MiB on 16g and 7680 MiB on 8g — see *Board RAM size*
   (`docs/DESIGN.md`). Official 27 W (5 A) PSU required — 3 A supplies negotiate low
   current and corrupt the HDMI scanout.
-  Only boards with the BCM2712 **D0** stepping are supported: TF-A is built with
-  the D0 pin controller tables, see
-  `meta-rpi-sodev/meta-xt-rpi5/recipes-bsp/trusted-firmware-a/`.
+  Only boards with the BCM2712 **D0** stepping are supported: DomD drives the pin
+  controller with the D0 compatible, see
+  `meta-rpi-sodev/meta-xt-rpi5/recipes-guest/domd-vc4/files/bcm2712-raspberrypi5-domd-vc4.dts`.
 - Raspberry Pi 4 Model B (BCM2711), via `--board=rpi4`. **8 GB** and **4 GB** SKUs;
   four domains need the 8 GB board. Every USB-A port is behind the VL805 xHCI, so the
   touch panel depends on passing that controller through. What is and is not verified on

@@ -931,7 +931,8 @@
 				 * the single 512-byte MAI FIFO fill that got through).
 				 * Measured TI PER_MAP was 17 where bare metal used 13.
 				 * A C0 board needs 17 here instead. This tree already commits to
-				 * D0: TF-A is built with RPI5_PINCTRL_D0=1 (trusted-firmware-a_git.bb).
+				 * D0: the pin controller is given to DomD with the D0 compatible
+				 * (brcm,bcm2712d0-pinctrl, below).
 				 *
 				 * 0x41fa000d = 13|(1<<30)|(1<<24)|(10<<16)|(15<<20)
 				 *
@@ -1294,17 +1295,15 @@
 		 * zephyr flavour's boot.cmd; the linux flavour strips the UART and needs
 		 * none.
 		 *
-		 * pinctrl IS wired, through SCMI. The host node points at
-		 * &uarta_24_pins and &bt_shutdown_pins under pinctrl@7d504100, which
-		 * DomD does not drive directly (see the SCMI node below). GPIO24-27 are
-		 * muxed to f_uart0 by scmi_uarta_24_pins in the SCMI node; BT_ON (gio
-		 * line 29) is already function f_gpio at reset, so bt_shutdown_pins
-		 * needs no SCMI group and shutdown-gpios below is enough.
+		 * pinctrl IS wired: GPIO24-27 are muxed to uart0 by uarta_24_pins under
+		 * DomD's own pinctrl@107d504100 node below. BT_ON (gio line 29) is
+		 * already function gpio at reset, so the host's bt_shutdown_pins needs
+		 * no group here and shutdown-gpios below is enough.
 		 */
 		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: the Bluetooth UART. domd-vc4.bb
-		 * strips it for DOM0_OS=linux. That flavour sets up no SCMI (see its
-		 * boot.cmd), so GPIO24-27 are never muxed to the UART and Bluetooth
-		 * cannot work there; and its boot.cmd does not mark the host node
+		 * strips it for DOM0_OS=linux. That flavour gives DomD no pin controller
+		 * (it is stripped below), so GPIO24-27 are never muxed to the UART and
+		 * Bluetooth cannot work there; and its boot.cmd does not mark the host node
 		 * xen,passthrough, so Xen gives the node and SPI 276 to the Linux Dom0
 		 * and a DomD that claimed them as well would fail to be created
 		 * (-EBUSY). Nothing outside this block refers to uart_bt or to its
@@ -1322,7 +1321,7 @@
 			auto-flow-control;
 			skip-init;
 			pinctrl-names = "default";
-			pinctrl-0 = <&scmi_uarta_24_pins>;
+			pinctrl-0 = <&uarta_24_pins>;
 			xen,path = "/soc@107c000000/serial@7d50c000";
 			xen,force-assign-without-iommu;
 			xen,reg = <0x10 0x7d50c000 0x0 0x1000 0x10 0x7d50c000>;
@@ -1381,17 +1380,16 @@
 
 		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb strips everything from here to
 		 * the matching end marker below wl_on_reg for DOM0_OS=linux:
-		 * gio, the SCMI shared memory and protocol nodes with their pin
-		 * groups, the Wi-Fi SDIO controller and wl_on_reg. That flavour
-		 * applies no SCMI host overlay, so there is no SCMI server for
-		 * these nodes to reach, the Wi-Fi pins cannot be muxed and the
-		 * shared-memory page is not set aside. The Wi-Fi SDIO
+		 * gio, the pin controller with its pin groups, the Wi-Fi SDIO
+		 * controller and wl_on_reg. That flavour's boot.cmd does not mark the
+		 * host pin controller xen,passthrough, so it stays with the Linux Dom0
+		 * and the Wi-Fi pins cannot be muxed from here. The Wi-Fi SDIO
 		 * controller stays with the Linux Dom0, which also takes its
 		 * interrupt (SPI 274): a DomD that claimed it too would make
 		 * Xen panic at DomD creation (route_irq_to_guest -EBUSY).
 		 * Nothing that survives the strip may refer to a label inside it: the
 		 * Bluetooth UART's block above, stripped in the same flavour, is the
-		 * one user outside it (&gio, &scmi_uarta_24_pins). */
+		 * one user outside it (&gio, &uarta_24_pins). */
 		/* gio: the 32+4-bit GPIO bank at 0x7d508500. BT_ON is line 29
 		 * (gpio-line-names index 29 in the host DT), and the bluetooth node
 		 * above drives it through shutdown-gpios.
@@ -1458,165 +1456,82 @@
 				"WIFI_SDIO_D3";     /* 35 */
 		};
 
-		/* ===== SCMI: how DomD muxes its pins on the pin controller =====
+		/* ===== the pin controller -> DomD =====
 		 *
-		 * pinctrl@7d504100 (the pin controller that muxes these pins and sets their
-		 * pulls) is not given to DomD. Measured, twice: putting the node in this
-		 * partial DT with the C0 compatible (brcm,bcm2712c0-pinctrl) panics DomD
-		 * with an Asynchronous SError Interrupt inside brcmstb_pull_config_set(), and
-		 * reading a pad register (0x107d504124) from the U-Boot prompt SErrors the
-		 * same way. A blind `mw.l` premux from boot.cmd left the console dead. Both
-		 * SErrors are C0 pad offsets past the end of the 0x20 D0 block (see the
-		 * TF-A D0 patch), so the in-tree route is SCMI: DomD asks EL3 to do the mux.
+		 * pinctrl@7d504100 muxes the Wi-Fi SDIO and Bluetooth UART pins and sets
+		 * their pulls. This board is BCM2712 D0, where the block is 0x20 bytes and
+		 * both its mux and pad fields sit elsewhere than on C0; the VideoCore
+		 * firmware's bcm2712d0.dtbo rewrites the host node to
+		 * brcm,bcm2712d0-pinctrl / reg 0x20 on D0 boards only. So the compatible
+		 * here is the D0 one, and DomD's kernel drives the block with the D0 data
+		 * of drivers/pinctrl/bcm/pinctrl-brcmstb-bcm2712.c
+		 * (CONFIG_PINCTRL_BCM2712=y). Given the C0 compatible, the same driver
+		 * aims the pad writes for these pins past the end of the block and DomD
+		 * takes an asynchronous SError on the first one (measured).
 		 *
-		 * The server is TF-A's (xen-troops fork, plat/rpi/rpi5/scmi/* plus
-		 * drivers/scmi-msg/scmi_pinctrl.c, protocol 0x19). It is compiled in by
-		 * SCMI_SERVER_SUPPORT=1, which the xt-prod-devel-rpi5-domd bbappend ties to
-		 * MACHINE_FEATURES += "scmi" -- the same switch that pulls scmi-config.cfg
-		 * (CONFIG_ARM_SCMI_PROTOCOL / CONFIG_PINCTRL_SCMI) into this kernel.
+		 * The block is the only thing in its 4 KiB page (bcm2712-ds.dtsi,
+		 * bcm2712d0-rpi-5-b.dts), so the whole page is mapped, as for the other
+		 * passthrough nodes. boot.cmd marks the host node xen,passthrough,
+		 * and also bcm2712-rpi.dtsi's gpiomem@7d504100, which names the
+		 * same block for /dev/gpiomem3, so that the page is not mapped into
+		 * Dom0 too; this DT does not carry gpiomem.
 		 *
-		 * Why DomD may drive it at all, and why no permission handshake appears
-		 * here: Xen 4.22's mediator (xen/arch/arm/firmware/scmi-smc.c)
-		 * forwards exactly ONE SMC function ID -- the host DT's arm,smc-id -- and
-		 * only from the single domain that has xen,sci_type = "scmi_smc". boot.cmd
-		 * puts that on /chosen/domD and adds `scmi-smc-passthrough` to the
-		 * hypervisor command line (without it scmi_smc_domain_init() returns
-		 * -EINVAL for a non-hardware domain and DomD is never created). TF-A maps
-		 * 0x82000002 to agent 0 (plat/rpi/rpi5/rpi5_svc_setup.c), and
-		 * plat_scmi_pinctrl_{pin,group}_permitted() in scmi_policy.c return true
-		 * unconditionally for agent 0. So DomD is agent 0 and every pin is already
-		 * permitted; scmi_policy.c needs no change, and neither the
-		 * `access-controllers` binding nor the EPAM multi-agent
-		 * `epam,secondary-agents` extension (absent from upstream Xen) is used.
-		 *
-		 * protocol@16 (reset) is deliberately NOT declared: nothing in this guest
-		 * consumes it -- pciex takes its resets from reset_controller119500, which
-		 * is proven on this board -- and an unused protocol is one more thing that
-		 * can fail at probe.
+		 * Group contents mirror the host DT's sdio2_30_pins / uarta_24_pins.
+		 * The pulls are not optional. Measured on this board, mux-only vs
+		 * mux+pulls, with everything else identical:
+		 *   mux only : brcmfmac: F1 signature read @0x18000000=0xffffffff
+		 *              brcmf_chip_recognition: MMIO read failed -> probe -52
+		 *   mux+pulls: brcmfmac: F1 signature read @0x18000000=0x15264345
+		 *              using brcm/brcmfmac43455-sdio for chip BCM4345/6
+		 * i.e. without the pull-ups on CMD and DAT0-3 the card answers CMD5 but
+		 * every backplane read comes back all-ones.
 		 */
-		scmi_shm0: scmi_shm@3ff00000 {
-			compatible = "arm,scmi-shmem";
-			reg = <0x00 0x3ff00000 0x00 0x1000>;
-			/*
-			 * Agent 0's channel. Base and layout are TF-A's, not ours:
-			 * plat/rpi/rpi5/platform.mk sets RPI_SCMI_SHMEM_BASE := 0x3ff00000
-			 * and scmi.c places agent n at base + n * PAGE_SIZE. The host DT
-			 * overlay (bcm2712-raspberrypi5-scmi-host.dtso) reserves the whole
-			 * 64 KiB window; only this one page is mapped here.
-			 *
-			 * xen,reg WITHOUT xen,path is legal and intentional: dom0less-build.c
-			 * requires xen,reg whenever xen,path is present, but accepts xen,reg
-			 * alone when xen,force-assign-without-iommu is set (handle_prop_pfdt(),
-			 * and handle_passthrough_prop() returns 0 early for a NULL path). That
-			 * is what we want -- this is a RAM carve-out with no interrupts and no
-			 * IOMMU stream ID, so there is nothing for xen,path to resolve.
-			 * Mapped 1:1 (DomD is direct-mapped), as p2m_mmio_direct_dev, which
-			 * matches the devm_ioremap() the arm,scmi-shmem consumer does.
-			 */
+		pinctrl: pinctrl@107d504100 {
+			compatible = "brcm,bcm2712d0-pinctrl";
+			reg = <0x10 0x7d504100 0x00 0x20>;
+			xen,path = "/soc@107c000000/pinctrl@7d504100";
 			xen,force-assign-without-iommu;
-			xen,reg = <0x00 0x3ff00000 0x00 0x1000 0x00 0x3ff00000>;
-		};
+			xen,reg = <0x10 0x7d504000 0x0 0x1000 0x10 0x7d504000>;
 
-		scmi: scmi {
-			compatible = "arm,scmi-smc";
-			/* = RPI5_SIP_SMC_SCMI (plat/rpi/rpi5/include/rpi5_smc.h). Xen matches
-			 * this against the host DT's arm,smc-id and forwards only that fid. */
-			arm,smc-id = <0x82000002>;
-			#address-cells = <0x01>;
-			#size-cells = <0x00>;
-			shmem = <&scmi_shm0>;
-
-			scmi_pinctrl: protocol@19 {
-				reg = <0x19>;
-				#pinctrl-cells = <0x00>;
-
-				/*
-				 * Group names and contents mirror pinctrl@7d504100's
-				 * sdio2_30_pins / uarta_24_pins in the shipped
-				 * bcm2712-rpi-5-b.dtb, with one difference: the function
-				 * strings carry the f_ prefix. The native
-				 * brcm,bcm2712c0-pinctrl driver calls them "sd2"/"uart0";
-				 * TF-A's SCMI server builds its names with FUNC(f) =
-				 * "f_" #f (bcm2712_pinctrl.c), so over SCMI they are
-				 * "f_sd2"/"f_uart0".
-				 *
-				 * The nested pin_* subnode form is what
-				 * pinconf_generic_dt_node_to_map_all() wants (pinctrl-scmi
-				 * sets it as .dt_node_to_map): it maps the group node AND
-				 * each child. `pins` + `function` yields a mux map keyed by
-				 * the pin name, which resolves because TF-A exposes a 1:1
-				 * pin-to-group mapping with identical names (see the comment
-				 * in plat_scmi_pinctrl_group_permitted()). The former
-				 * bcm2712-raspberrypi5-domd-scmi.dtso (EPAM's, since removed)
-				 * left these groups EMPTY and relied on a Linux Dom0 having
-				 * applied the host
-				 * DT's copy; this board's Dom0 is Zephyr, so the settings
-				 * have to be here or nothing is muxed at all.
-				 *
-				 * bias-* IS written here, which is safe only with TF-A's D0 tables.
-				 * Both the mux and the pad registers of this block moved between
-				 * BCM2712 steppings, and the xen-troops TF-A this build fetches
-				 * carries only the C0 map: on this D0 board it aims the pull writes
-				 * for these pins at offset 0x24, four bytes past the end of the 0x20
-				 * window the firmware's bcm2712d0.dtbo declares. That
-				 * is an unrecoverable abort in EL3 -- release builds have
-				 * CRASH_REPORTING=0 -- so the CPU that issued the request simply never
-				 * came back: RCU reported a stall on it, the IPI from the other CPU was
-				 * never taken, and because the console is synchronous the whole board
-				 * went silent. meta-xt-rpi5's
-				 * 0001-plat-rpi5-pinctrl-add-BCM2712-D0-stepping-tables.patch adds the
-				 * D0 map (pads land at 0x14/0x18) and RPI5_PINCTRL_D0=1 selects it.
-				 *
-				 * The pulls are not optional. Measured on this board, mux-only vs
-				 * mux+pulls, with everything else identical:
-				 *   mux only : brcmfmac: F1 signature read @0x18000000=0xffffffff
-				 *              brcmf_chip_recognition: MMIO read failed -> probe -52
-				 *   mux+pulls: brcmfmac: F1 signature read @0x18000000=0x15264345
-				 *              using brcm/brcmfmac43455-sdio for chip BCM4345/6
-				 * i.e. without the pull-ups on CMD and DAT0-3 the card answers CMD5 but
-				 * every backplane read comes back all-ones.
-				 */
-				scmi_sdio2_30_pins: scmi_sdio2_30_pins {
-					pin_clk {
-						function = "f_sd2";
-						pins = "gpio30";
-						bias-disable;
-					};
-					pin_cmd {
-						function = "f_sd2";
-						pins = "gpio31";
-						bias-pull-up;
-					};
-					pins_dat {
-						function = "f_sd2";
-						pins = "gpio32", "gpio33", "gpio34", "gpio35";
-						bias-pull-up;
-					};
+			sdio2_30_pins: sdio2_30_pins {
+				pin_clk {
+					function = "sd2";
+					pins = "gpio30";
+					bias-disable;
 				};
-
-				scmi_uarta_24_pins: scmi_uarta_24_pins {
-					pin_rts {
-						function = "f_uart0";
-						pins = "gpio24";
-						bias-disable;
-					};
-					pin_cts {
-						function = "f_uart0";
-						pins = "gpio25";
-						bias-pull-up;
-					};
-					pin_txd {
-						function = "f_uart0";
-						pins = "gpio26";
-						bias-disable;
-					};
-					pin_rxd {
-						function = "f_uart0";
-						pins = "gpio27";
-						bias-pull-up;
-					};
+				pin_cmd {
+					function = "sd2";
+					pins = "gpio31";
+					bias-pull-up;
 				};
+				pins_dat {
+					function = "sd2";
+					pins = "gpio32", "gpio33", "gpio34", "gpio35";
+					bias-pull-up;
+				};
+			};
 
+			uarta_24_pins: uarta_24_pins {
+				pin_rts {
+					function = "uart0";
+					pins = "gpio24";
+					bias-disable;
+				};
+				pin_cts {
+					function = "uart0";
+					pins = "gpio25";
+					bias-pull-up;
+				};
+				pin_txd {
+					function = "uart0";
+					pins = "gpio26";
+					bias-disable;
+				};
+				pin_rxd {
+					function = "uart0";
+					pins = "gpio27";
+					bias-pull-up;
+				};
 			};
 		};
 
@@ -1628,9 +1543,7 @@
 		 * so this is not an rpi5 gap to fix) and therefore carries no
 		 * __symbols__ for &passthrough to bind to; and the dtso's own
 		 * gpio@107d508500 / clk_emmc2 would collide with the nodes this file
-		 * already has. Merging resolves both by construction. The dtso also had
-		 * an unresolved apply-order dependency on scmi_sdio2_30_pins, which
-		 * disappears here.
+		 * already has. Merging resolves both by construction.
 		 *
 		 * Radio: BCM43455 (same part as RPi4 -- rpm -qlp
 		 * linux-firmware-rpidistro-bcm43455 ships
@@ -1639,14 +1552,13 @@
 		 * (mmc@1000fff000): SPI 274 vs SPI 273, and separate MMIO.
 		 * Unlike RPi4 -- where mmcnr and emmc2 share SPI 126 -- there
 		 * is no interrupt to arbitrate here. The block is stripped for
-		 * DOM0_OS=linux all the same, because that flavour has no SCMI
-		 * to mux the SDIO pins (see the marker above gio).
+		 * DOM0_OS=linux all the same, because that flavour gives DomD no pin
+		 * controller to mux the SDIO pins (see the marker above gio).
 		 *
-		 * pinctrl IS wired, through SCMI. GPIO30-35 must be muxed to
-		 * f_sd2 or the controller sees no card: left to the VideoCore
-		 * firmware, on the assumption that it pre-muxes them before Xen
-		 * starts, the radio did not enumerate. scmi_sdio2_30_pins above
-		 * makes DomD do the mux itself via EL3.
+		 * pinctrl IS wired. GPIO30-35 must be muxed to sd2 or the
+		 * controller sees no card: left to the VideoCore firmware, on the
+		 * assumption that it pre-muxes them before Xen starts, the radio did
+		 * not enumerate. sdio2_30_pins above makes DomD do the mux itself.
 		 *
 		 * xen,reg maps 0x1100000 page-rounded. The host reg is two windows
 		 * (host @0x1100000 len 0x260, cfg @0x1100400 len 0x200); both fall in
@@ -1745,7 +1657,7 @@
 			sd-uhs-ddr50;
 			non-removable;
 			pinctrl-names = "default";
-			pinctrl-0 = <&scmi_sdio2_30_pins>;
+			pinctrl-0 = <&sdio2_30_pins>;
 			xen,path = "/axi/mmc@1100000";
 			xen,force-assign-without-iommu;
 			xen,reg = <0x10 0x1100000 0x00 0x1000 0x10 0x1100000>;
@@ -1763,8 +1675,8 @@
 				 * missing root compatible is why of_have_populated_dt() is false here
 				 * and the regulator core refuses dummy supplies). So it asked for the
 				 * generic brcm/brcmfmac43455-sdio.bin, which linux-firmware does not
-				 * ship: only per-board names exist. Measured, once the SCMI pinmux
-				 * made the chip reachable at all:
+				 * ship: only per-board names exist. Measured, once the pinmux made
+				 * the chip reachable at all:
 				 *   brcmfmac: F1 signature read @0x18000000=0x15264345   <- chip OK
 				 *   brcmfmac: using brcm/brcmfmac43455-sdio for chip BCM4345/6
 				 *   Direct firmware load for brcm/brcmfmac43455-sdio.bin failed -2

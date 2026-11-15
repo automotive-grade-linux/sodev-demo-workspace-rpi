@@ -297,15 +297,17 @@ fdt set /soc@107c000000/gpio@7d508500 xen,passthrough
 #     mmc1: Failed to initialize a non-removable card        (no wlan0)
 #     Bluetooth: hci0: command 0xfc18 tx timeout             (BCM: Reset failed)
 # even though BT_ON/WL_ON on the gio bank above are driveable (measured 2026-09-20).
-# The DomD DTS deliberately does NOT carry this controller: DomD muxes these
-# pins over SCMI instead (protocol 0x19, the /passthrough/scmi node in its
-# partial DT), with TF-A doing the register access at EL3 from its D0 tables.
-# Given to DomD with the C0 compatible (brcm,bcm2712c0-pinctrl), a native
-# pinctrl driver takes an asynchronous SError on its first bias write, because
-# the C0 pad offset for these pins is past the end of the D0 block. This marker
-# exists so Xen does not hand the controller to the hardware domain as well.
+# DomD drives it itself: its partial DT carries the node with the D0
+# compatible (brcm,bcm2712d0-pinctrl). With the C0 compatible the pad offsets
+# for these pins fall past the end of the D0 block and the first bias write is
+# an asynchronous SError. This marker releases the controller from the hardware
+# domain. gpiomem@7d504100 (/dev/gpiomem3) names the same block, in the same
+# 4 KiB page; it is marked too, or Xen would still map that page into this
+# Dom0.
 echo "passthrough: /soc/pinctrl@7d504100 (pinmux: sd2 + uart0 pins -> DomD)"
 fdt set /soc@107c000000/pinctrl@7d504100 xen,passthrough
+echo "passthrough: /soc/gpiomem@7d504100 (same page as the pin controller)"
+fdt set /soc@107c000000/gpiomem@7d504100 xen,passthrough
 
 echo "passthrough: /axi/codec (HEVC decoder -> DomD)"
 fdt set /axi/codec@800000 xen,passthrough
