@@ -12,8 +12,12 @@
 #    (fdtdec_setup_memory_banksize) and the /memory node re-written into the
 #    DTB passed to Xen (arch_fixup_fdt -> fdt_fixup_memory_banks), capping
 #    visible RAM at exactly 4 banks = 8GB on the 16GB board.
+#
+# 3) rpi5-no-video-bcm2835.cfg: keeps U-Boot from asking the VideoCore for a
+#    framebuffer (see the file).
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 SRC_URI += "file://0001-bcm2712-expand-MMU-to-16GB-for-dom0less-DomU.patch \
             file://rpi5-16gb-dram-banks.cfg \
+            file://rpi5-no-video-bcm2835.cfg \
             "

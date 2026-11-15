@@ -756,5 +756,13 @@ fdt set /chosen/dom0 bootargs "console=hvc0 earlycon=xen earlyprintk=xen rdinit=
 # ------------------------------------------------------------------
 # Boot Xen → Xen starts the Zephyr Dom0 and the dom0less DomD
 # ------------------------------------------------------------------
+# ft_board_setup() runs during `booti` and adds a /framebuffer node after this
+# script's framebuffer removals. With a video driver it asks the VideoCore for a
+# framebuffer and gives the node a reg in the VideoCore carve-out;
+# rpi5-no-video-bcm2835.cfg leaves U-Boot without one, and skip_board_fixup=1
+# stops ft_board_setup() altogether (boot/image-fdt.c). It also skips
+# update_fdt_from_fw(), which does nothing here: this script boots the
+# firmware's own DT.
+setenv skip_board_fixup 1
 setenv fdt_high 0xffffffffffffffff
 booti 0x2000000 - ${fdt_addr}
