@@ -56,12 +56,10 @@
 #
 #   4.22-0013  xen/arm: Fix evaluation of parameters for SMCCC calls. NOT
 #              board-specific; a backport of stable-4.22 781b60f951 (master
-#              95302b3943), which the pinned SRCREV predates. Without it
-#              scmi_handle_smc() reaches TF-A with the wrong SMCCC function ID
-#              (evaluating the arguments clobbers x0), DomD's arm-scmi fails with
-#              -EOPNOTSUPP, the SCMI pinctrl never registers, and the Wi-Fi SDIO
-#              host and the Bluetooth UART stay in deferred probe: no Wi-Fi and
-#              no Bluetooth on this board. Measured on hardware 2026-09-24.
+#              95302b3943), which the pinned SRCREV predates. Without it an
+#              SMCCC call whose arguments are function calls can reach EL3 with
+#              the argument registers clobbered. Both boards carry it so that
+#              they share one SMCCC helper.
 # NOTE on ThumbEE: [4.22] no longer relevant. In 4.21 the stock xen_4.21.bb
 # SRC_URI carried 0001-ARM-Drop-ThumbEE-support.patch (Andrew Cooper 5bbe1fe413,
 # binutils/gcc15 fix) and this bbappend documented that it was therefore not
@@ -190,6 +188,8 @@ SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://
 # No SCMI fragment: stable-4.22's xen/arch/arm/firmware/Kconfig makes SCMI_SMC the
 # default of the "ARM SCI driver type" choice (it selects ARM_SCI), so
 # CONFIG_ARM_SCI=y / CONFIG_SCMI_SMC=y are in the .config with nothing added here.
+# The mediator is built in but idle: the host DT has no arm,scmi-smc node for it
+# to bind.
 
 # --- patch-fuzz QA: left at ERROR (the OE default) ---------------------------
 # [4.22] The 4.21 bbappend demoted patch-fuzz to a warning here:

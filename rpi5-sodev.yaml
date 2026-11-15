@@ -67,12 +67,6 @@ variables:
   # --- DomD / DomU build dirs + machines + image names (copied from rpi5.yaml) ---
   DOMU_MACHINE: "virtio-armv8-xt"
   XT_XEN_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen.dtbo"
-  XEN_DT_SCMI_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen-scmi"
-  # meta-xt-rpi5 own host overlay that publishes the TF-A SCMI server to Xen.
-  # Distinct from XEN_DT_SCMI_NAME above, which is only the name xt-prod-devel's
-  # pristine xt-rpi-u-boot-scr.bbappend appends to XEN_OVERLAYS (nothing consumes
-  # it, and that overlay is no longer built).
-  XT_SCMI_HOST_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-scmi-host.dtbo"
   # DomD = V4H sodev pattern (weston + qemu virtio-gpu backend + xen-tools-devd +
   #   V4H helpers) so the DomU/DomA -> DomD weston -> HDMI display chain renders.
   #   The -v4h recipe lives in the linux-dom0-poc layer (added to the domd
@@ -384,11 +378,11 @@ parameters:
           DOM0_DOMU_KERNEL_DEP: "%{DOMU_BUILD_DIR}/tmp/deploy/images/%{DOMU_MACHINE}/Image"
           # No hardware decode for DomA in this flavour. It is this tree's
           # choice for the flavour on this board, which README.md's --dom0
-          # row records. What is known about it: nothing in DomD's HEVC
-          # node depends on SCMI (its clock is firmware clock 11 over the
-          # mailbox, which this flavour's DomD DT keeps), and the flavour's
-          # board run of 2026-08-18 did not cover decode. domd-vc4.bb strips
-          # the decoder and its IOMMU out of DomD's DT here, and this value
+          # row records. What is known about it: DomD's HEVC node takes its
+          # clock from firmware clock 11 over the mailbox, which this
+          # flavour's DomD DT keeps, and the flavour's board run of
+          # 2026-08-18 did not cover decode. domd-vc4.bb strips the decoder
+          # and its IOMMU out of DomD's DT here, and this value
           # keeps the virtio-media device and the codec2 HAL out of DomA (see
           # XT_DOMA_HWDEC in the GPU parameter).
           XT_DOMA_HWDEC_VULKAN: "false"
@@ -1210,21 +1204,6 @@ components:
         # xen-tools_4.22.bb does not require the xen-source.inc chain that
         # appended those patches). See the dom0 component comment.
         - [PREFERRED_VERSION_u-boot, "2024.04"]
-        - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
-        # SCMI. One switch for what SCMI needs on this board, which is why it is
-        # a MACHINE_FEATURE and not separate edits:
-        #   trusted-firmware-a -> SCMI_SERVER_SUPPORT=1, i.e. the SCMI server
-        #     (protocol 0x19 pinctrl) is compiled into the armstub.
-        #   linux-raspberrypi_6.18.bbappend -> scmi-config.cfg
-        #     (CONFIG_ARM_SCMI_PROTOCOL + CONFIG_PINCTRL_SCMI; the SMC transport is
-        #     default y once the protocol is on) and the host DT overlay below.
-        # Two more consumers change nothing here:
-        #   xen_4.22.bbappend -> no fragment any more: CONFIG_ARM_SCI and
-        #     CONFIG_SCMI_SMC are Xen 4.22's Kconfig defaults (the xen-scmi.cfg
-        #     that restated them is gone).
-        #   xt-rpi-u-boot-scr.bbappend -> appends to XEN_OVERLAYS/DOMD_OVERLAYS,
-        #     which the rpi5 static boot.cmd does not consume.
-        - [MACHINE_FEATURES:append, " scmi"]
         - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
         # weston and virglrenderer: a newer recipe for either in meta-xt-driver-domain
         # would, as the higher-priority layer, win over poky's 15.0.0 / 1.2.0 without a
@@ -1372,10 +1351,6 @@ components:
       target_images:
         - "tmp/deploy/images/%{MACHINE}/xen-%{MACHINE}"
         - "tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
-        # Host SCMI overlay. Deployed by the kernel recipe only when the scmi
-        # MACHINE_FEATURE is set, which the local_conf edit above does, so the two
-        # must be changed together or this target does not exist.
-        - "tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"
         - "tmp/deploy/images/%{MACHINE}/u-boot-%{MACHINE}.bin"
         - "tmp/deploy/images/%{MACHINE}/boot.scr"
         - "tmp/deploy/images/%{MACHINE}/bcm2712-rpi-5-b.dtb"
@@ -1685,8 +1660,6 @@ images:
           # bcm2712d0.dtbo. Matches upstream external/meta-xt-prod-devel-rpi5/rpi5.yaml.
           "overlays/bcm2712d0.dtbo": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712d0.dtbo"
           "%{XT_XEN_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
-          # Applied by boot.cmd immediately after the Xen overlay above.
-          "%{XT_SCMI_HOST_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"
           # [DOM0_OS] The dom0-kernel boot item is supplied per-variant by the DOM0_OS
           # parameter (see `parameters:`): linux -> initramfs-xt-dom0-thin.cpio.gz;
           # zephyr -> zephyr.bin. It is NOT in this common base so only the selected

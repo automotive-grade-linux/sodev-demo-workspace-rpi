@@ -1,15 +1,15 @@
 # BCM2712 / Raspberry Pi 5 kernel delta for the Xen Dom0/DomD split, on
 # meta-xt-driver-domain's linux-raspberrypi_6.18.bb.
 #
-# This file declares its own SRC_URI: the device-tree set in files/ (the Xen host
-# overlay bcm2712-raspberrypi5-xen.dtso -- DomD GPU passthrough, Dom0 device
-# ownership, 4 GB static-mem; the SCMI host overlay; the base DomD partial DT and
-# its feature overlays), the two EPAM kernel patches, and the Kconfig fragments.
+# This file declares its own SRC_URI: the device-tree set in files/ (the Xen
+# host overlay bcm2712-raspberrypi5-xen.dtso -- DomD GPU passthrough, Dom0
+# device ownership, 4 GB static-mem; the base DomD partial DT and its feature
+# overlays), the two EPAM kernel patches, and the Kconfig fragments.
 # The host overlay's history: a 2 GB static-mem map first, raised to 4 GB when two
 # qemu device-models + weston + the VHAL backend OOM-killed xl devd at 2 GB.
 #
-# Of the device trees only bcm2712-raspberrypi5-xen.dtbo and the SCMI host overlay
-# reach p1 and are applied by boot.cmd; the DomD DT that boot.cmd loads is
+# Of the device trees only bcm2712-raspberrypi5-xen.dtbo reaches p1 and is
+# applied by boot.cmd; the DomD DT that boot.cmd loads is
 # recipes-guest/domd-vc4's. The base -domd.dts and the mmc/usb/pcie1/hdmi/can
 # overlays are the upstream single-overlay flow, kept building (and, for the
 # unconditional ones, deployed) so that path stays available.
@@ -26,12 +26,6 @@ PCIE1_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-pcie1"
 CAN_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-can-${DOMD_CAN_TYPE}"
 HDMI_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-hdmi"
 HDMI_PASSTHROUGH_NAME = "hdmi-passthrough"
-# Host (hypervisor) DT overlay that publishes the TF-A SCMI server to Xen. This is
-# OURS, not the bcm2712-raspberrypi5-xen-scmi.dtso meta-xt-driver-domain used to ship:
-# that one flipped the ROOT node to #size-cells = <1> and wrote the EPAM-downstream
-# property name xen,arm_sci, where upstream Xen reads xen,sci_type. The scmi-host
-# .dtso header documents both in full.
-SCMI_HOST_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-scmi-host"
 
 
 RPI_KERNEL_DEVICETREE:append = " \
@@ -52,10 +46,6 @@ RPI_KERNEL_DEVICETREE:append = " \
     ${@bb.utils.contains('MACHINE_FEATURES', 'domd_hdmi', \
                           ' broadcom/${HDMI_DT_NAME}.dtbo \
                             broadcom/${HDMI_PASSTHROUGH_NAME}.dtbo ', '', d)} \
-"
-
-RPI_KERNEL_DEVICETREE:append = " \
-    ${@bb.utils.contains('MACHINE_FEATURES', 'scmi', 'broadcom/${SCMI_HOST_DT_NAME}.dtbo', '', d)} \
 "
 
 KERNEL_IMAGETYPES:append = " Image.gz"
@@ -100,10 +90,6 @@ python __anonymous() {
         hdmi = d.getVar('HDMI_DT_NAME')
         hdmi_pt = d.getVar('HDMI_PASSTHROUGH_NAME')
         d.appendVar('SRC_URI', ' file://%s.dtso;%s file://%s.dtso;%s' % (hdmi, subdir, hdmi_pt, subdir))
-    if bb.utils.contains('MACHINE_FEATURES', 'scmi', True, False, d):
-        d.appendVar('SRC_URI', ' file://scmi-config.cfg')
-        scmi_host = d.getVar('SCMI_HOST_DT_NAME')
-        d.appendVar('SRC_URI', ' file://%s.dtso;%s' % (scmi_host, subdir))
 }
 
 # [P1 fix] Apply the shared Dom0/DomD Image config to the Dom0 build as well.

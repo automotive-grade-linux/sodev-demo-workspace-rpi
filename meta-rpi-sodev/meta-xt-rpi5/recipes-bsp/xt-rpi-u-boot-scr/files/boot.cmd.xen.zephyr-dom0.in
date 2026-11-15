@@ -77,53 +77,6 @@ fdt resize 32768
 fatload mmc 0 0x2200000 bcm2712-raspberrypi5-xen.dtbo
 fdt apply 0x2200000
 
-# ------------------------------------------------------------------
-# Apply the SCMI host overlay (publishes the TF-A SCMI server to Xen).
-# ------------------------------------------------------------------
-# Adds /firmware/scmi (compatible arm,scmi-smc + arm,smc-id 0x82000002), the
-# agent-0 shmem node at 0x3ff00000, and a /reserved-memory entry for the whole
-# 64 KiB TF-A channel window. Xen's DEVICE_FIRMWARE probe needs that node to
-# register the SCI mediator; without it the xen,sci_type below is rejected and
-# DomD is never created.
-#
-# Reloads over the SAME 0x2200000 scratch address as the xen.dtbo above -- that
-# buffer is only needed until `fdt apply` has copied the fragments into the live
-# FDT at ${fdt_addr}, so reuse is safe and keeps the load-address budget intact.
-#
-# Must come AFTER the xen.dtbo apply for no reason of its own (it targets only /
-# and /reserved-memory), but the ORDER MATTERS for the `fdt set` calls further
-# down that touch /chosen/domD: that node comes from xen.dtbo.
-#
-# This is meta-xt-rpi5's own bcm2712-raspberrypi5-scmi-host.dtbo, not the
-# bcm2712-raspberrypi5-xen-scmi.dtbo meta-xt-driver-domain used to build (never
-# loaded; since removed). That one set the ROOT node's #size-cells to 1 (so its
-# 3-cell reg parsed),
-# which silently reinterprets the `ranges` of every root child on a 2/2 board, and
-# it writes the EPAM property name xen,arm_sci instead of upstream's xen,sci_type.
-# Do not swap one for the other.
-#
-# FAIL-SOFT, deliberately. If the overlay is not on p1 (older SD, half-finished
-# file deploy) a hard `fatload` + `fdt apply` would still leave xen,sci_type set
-# further down, Xen would find no arm,scmi-smc node, sci_domain_init() would
-# reject the domain, and the board would come up with NO DomD -- no display, no
-# network, nothing to debug from. Gating on scmi_ok degrades a missing overlay
-# to exactly the pre-SCMI behaviour instead: everything boots, only Wi-Fi and
-# Bluetooth are missing. A failed `fdt apply` is gated the same way, but libfdt
-# documents that the base tree may be modified even when the apply fails, so
-# that boot is not guaranteed to be the pre-SCMI one. The
-# `scmi-smc-passthrough` bootarg is harmless with no mediator.
-setenv scmi_ok 0
-if fatload mmc 0 0x2200000 bcm2712-raspberrypi5-scmi-host.dtbo ; then
-    if fdt apply 0x2200000 ; then
-        setenv scmi_ok 1
-        echo "SCMI: host overlay applied (/firmware/scmi + shmem@3ff00000)"
-    else
-        echo "SCMI: fdt apply FAILED -> booting without SCMI (no Wi-Fi/BT pinmux)"
-    fi
-else
-    echo "SCMI: bcm2712-raspberrypi5-scmi-host.dtbo not on p1 -> booting without SCMI"
-fi
-
 # -----------------------------------------------------------------------------
 # 8 GiB SKU: shrink DomD from 4096 to 3072 MiB.
 # -----------------------------------------------------------------------------
@@ -321,9 +274,9 @@ fdt set /axi/codec@800000 xen,passthrough
 # vs SPI 273, separate MMIO, so DomD can own it independently of the SD card. On
 # RPi4 the equivalent pair (mmcnr and emmc2) SHARE SPI 126, which is why that
 # board needed a different arrangement. The linux flavour does not hand it over
-# at all: it has no SCMI to mux the SDIO pins, so domd-vc4.bb strips the
-# controller from DomD's partial DT there, and that script leaves the node with
-# Dom0.
+# at all: it gives DomD no pin controller to mux the SDIO pins, so domd-vc4.bb
+# strips the controller from DomD's partial DT there, and that script leaves the
+# node with Dom0.
 #
 # The WL_ON side needs nothing extra: it is gio line 28, and gio is already
 # marked above for BT_ON on line 29. That is the whole of what
@@ -602,7 +555,7 @@ fdt rm /framebuffer@3f800000
 # without the other gives a Zephyr that executes garbage -> UART silence, no
 # xu-create. If you change this value, read the new BANK[0] from the Xen log and
 # update patch 0008 to match.
-fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=/soc@107c000000/serial@7d001000 dom0_mem=512M dom0_max_vcpus=1 xsm=dummy gnttab_max_frames=512 bootscrub=off loglvl=all guest_loglvl=all sync_console scmi-smc-passthrough"
+fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=/soc@107c000000/serial@7d001000 dom0_mem=512M dom0_max_vcpus=1 xsm=dummy gnttab_max_frames=512 bootscrub=off loglvl=all guest_loglvl=all sync_console"
 
 # ------------------------------------------------------------------
 # Load Xen
@@ -690,19 +643,6 @@ if fatload mmc 0 0xc000000 Image ; then
     # screen (confirmed via HW strace). DomD gets domid 1 because it is the first
     # /chosen domain child; anything that needs the id must look it up at runtime.
     fdt set /chosen/domD capabilities <0x1>
-    # SCMI: make DomD the SCI domain. The property name is upstream Xen's (added
-    # in 4.21; this tree builds 4.22)
-    # (domu_dt_sci_parse() reads xen,sci_type); the EPAM overlays write
-    # xen,arm_sci, which this hypervisor ignores. Together with
-    # scmi-smc-passthrough in xen,xen-bootargs above this makes DomD TF-A's SCMI
-    # agent 0, which is what lets it mux the Wi-Fi SDIO and BT UART pins through
-    # TF-A.
-    # Gated on scmi_ok (set where the overlay is applied): setting this without the
-    # host DT node in place costs the whole domain, not just SCMI.
-    if test "${scmi_ok}" = "1" ; then
-        fdt set /chosen/domD xen,sci_type "scmi_smc"
-        echo "SCMI: DomD is the SCI domain (agent 0)"
-    fi
     # cpus is left at the overlay default of 2. Raising it was tried and the second
     # vcpu's SMP bringup (PSCI CPU_ON) hung, stopping the domain before it reached
     # xenbus.

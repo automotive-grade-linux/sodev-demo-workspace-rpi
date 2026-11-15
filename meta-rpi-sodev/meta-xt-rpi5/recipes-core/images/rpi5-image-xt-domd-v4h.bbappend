@@ -15,10 +15,10 @@
 # to make here.
 #
 # The hardware side is in this layer: the boot script marks that UART
-# xen,passthrough, and bcm2712-raspberrypi5-domd-vc4.dts gives DomD the UART with
-# its brcm,bcm43438-bt child (BT_ON on gio line 29) and the uarta pin group, which
-# TF-A muxes over SCMI. Without the passthrough hci0 never appears and btproxy has
-# nothing to open.
+# xen,passthrough, and bcm2712-raspberrypi5-domd-vc4.dts gives DomD the UART
+# with its brcm,bcm43438-bt child (BT_ON on gio line 29) and the pin controller
+# with the uarta pin group. Without the passthrough hci0 never appears and
+# btproxy has nothing to open.
 #
 # No kernel rebuild. The kernel built from bcm2712_defconfig already has BT=m,
 # BT_HCIUART=m and BT_HCIUART_BCM=y, which the defconfig names, and
@@ -70,8 +70,8 @@ IMAGE_INSTALL:append = " ${DOMD_BT_PACKAGES}"
 # This file supplies the SOFTWARE. The hardware side is in this layer: the boot
 # script marks the SDIO controller (/axi/mmc@1100000) xen,passthrough, and
 # bcm2712-raspberrypi5-domd-vc4.dts gives DomD the mmc node with its wifi@1
-# child, wl_on_reg, the shared gio bank and the sdio2 pin group that TF-A muxes
-# over SCMI. That is the zephyr Dom0 flavour: with DOM0_OS=linux the controller
+# child, wl_on_reg, the shared gio bank and the pin controller with the sdio2
+# pin group. That is the zephyr Dom0 flavour: with DOM0_OS=linux the controller
 # stays with Dom0, domd-vc4.bb strips those nodes out of DomD's partial DT, and
 # the packages below are inert.
 #

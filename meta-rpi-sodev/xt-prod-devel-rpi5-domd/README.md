@@ -3,7 +3,7 @@
 The V4H production base carried in this workspace for the Raspberry Pi 5 DomD build
 (`rpi5-sodev.yaml` lists it; `rpi4-sodev.yaml` does not, and says why). Its
 `trusted-firmware-a_git.bbappend` is load-bearing: it points the TF-A recipe at the
-xen-troops fork that carries the Raspberry Pi 5 platform and SCMI server.
+xen-troops fork, whose Raspberry Pi 5 platform carries the OP-TEE support.
 
 ## Licenses in this layer
 

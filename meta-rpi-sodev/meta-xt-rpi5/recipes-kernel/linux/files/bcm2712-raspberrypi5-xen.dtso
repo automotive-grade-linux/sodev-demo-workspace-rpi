@@ -105,11 +105,10 @@
  *
  * Root is targeted via &{/} (a path reference) rather than a label so it never
  * depends on a symbol being present in the base DTB __symbols__ (see the GPU
- * note below); reserved-memory then merges into the base host node at fdt apply.
- * This is the same idiom the former bcm2712-raspberrypi5-xen-scmi.dtso used to
- * add its scmi_shm reserved-memory entry. Cells are 2/2 to match the base
- * bcm2712.dtsi root and its rmem node; declaring them on &{/} keeps the empty
- * "ranges" consistent (the merge into the 2/2 root writes identical values).
+ * note below); reserved-memory then merges into the base host node at fdt
+ * apply. Cells are 2/2 to match the base bcm2712.dtsi root and its rmem node;
+ * declaring them on &{/} keeps the empty "ranges" consistent (the merge into
+ * the 2/2 root writes identical values).
  */
 &{/} {
 	#address-cells = <0x02>;

@@ -23,29 +23,14 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Bertrand Marquis <bertrand.marquis@arm.com>
 (cherry picked from commit 95302b39430c9d2d4b50c2c63f56629e543b29e6)
 
-Why this tree carries it: the pinned SRCREV (d45d5687f1) predates the fix, and
-on the Raspberry Pi 5 the bug disables SCMI completely. scmi_handle_smc()
-passes get_user_reg() calls as the SMCCC arguments. In the 4.22.0 build for
-this board the compiler emits the seven get_user_reg() calls back to back and
-then `mov x7, x0; smc #0`: the SCMI function ID is never placed in x0, which
-still holds the last call's return value (the guest's x7), and x1..x6 are
-whatever the calls left behind. So Xen forwards DomD's SCMI call to TF-A with
-the wrong function ID instead of 0x82000002. TF-A does not recognise it, and
-DomD's arm-scmi driver fails:
-
-  arm-scmi arm-scmi.0.auto: error -EOPNOTSUPP: unable to communicate with SCMI
-
-The SCMI pinctrl provider never registers, so the Wi-Fi SDIO host
-(mmc@1001100000) and the Bluetooth UART (serial@107d50c000), whose pinctrl-0
-point at SCMI pin groups, stay in deferred probe: no Wi-Fi and no Bluetooth on
-the board. Xen 4.21.0, which this tree used before, does not contain
-67bcf5eae709 and so does not have the bug.
-
-On the Raspberry Pi 5 the same clobbering also lets DomD choose the function
-ID that Xen issues at EL3. The fix is general (any SMCCC call whose arguments
-are function calls) and the hypervisor series is shared, so the Raspberry Pi 4
-carries it too; nothing there enables SCMI forwarding, so no call site in that
-configuration is known to hit the bug.
+Why this tree carries it: the pinned SRCREV (d45d5687f1) predates the fix,
+and with the bug an SMCCC call whose arguments are function calls can reach
+EL3 with the argument registers clobbered. It was found on the Raspberry Pi 5
+in scmi_handle_smc(), which passes get_user_reg() calls as the arguments: the
+4.22.0 build emitted the seven calls back to back and then `mov x7, x0;
+smc #0`, so x0 still held the last call's return value instead of the function
+ID. Xen 4.21.0 does not contain 67bcf5eae709 and so does not have the bug.
+The hypervisor series is shared, so both boards carry the fix.
 
 Assisted-by: Claude Code:claude-opus-5-5
 Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>

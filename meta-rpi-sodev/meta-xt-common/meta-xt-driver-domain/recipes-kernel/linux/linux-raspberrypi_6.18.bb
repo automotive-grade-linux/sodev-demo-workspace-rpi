@@ -92,8 +92,8 @@ do_configure:append() {
 # kernel-source (S=${STAGING_KERNEL_DIR}=work-shared/.../kernel-source) broadcom dir
 # → RPI_KERNEL_DEVICETREE's domd.dtb etc. fail with "No rule to make target".
 # Land every .dts/.dtso the board layer's bbappend stages (meta-xt-rpi5 and
-# meta-xt-rpi4: the domd .dts and the xen / passthrough overlays, plus scmi-host on
-# the Pi 5) from the post-unpack UNPACKDIR into the real kernel-source broadcom dir
+# meta-xt-rpi4: the domd .dts and the xen / passthrough overlays) from the
+# post-unpack UNPACKDIR into the real kernel-source broadcom dir
 # (since the source is shared, overwrite-copy on every do_compile:prepend to
 # reliably apply the patched version).
 do_compile:prepend() {
