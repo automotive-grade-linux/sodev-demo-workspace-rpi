@@ -1,0 +1,106 @@
+From 65291bbbd65baee420bcf2ba14867d67fe1e551d Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 10:02:42 +0900
+Subject: [PATCH] libxl: let devd stop its QEMU when the toolstack is the
+ backend
+
+With a Zephyr Dom0 the toolstack runs in the dom0less DomD (domid 1),
+which is also the backend domain of the guests' virtio devices, and
+"xl devd" in DomD spawns their QEMU. devd's remove_device() is what
+stops that QEMU and removes the backend directory, once it reads
+state == Closed && online == 0 for a QDISK, 9PFS or QVIRTIO device.
+
+`xl destroy` of such a guest left the QEMU running and the domain
+"(null) --p--d" until the QEMU was sent SIGHUP by hand:
+
+- libxl__initiate_device_generic_remove() takes the "4.2 Bodge due to
+  QEMU" for a paused, dying or shut-down guest only when my_domid is
+  LIBXL_TOOLSTACK_DOMID (0). The regular path wrote online=0 and
+  state=Closing and waited 10s for a QEMU that does not close a paused
+  guest's device:
+
+    libxl_device.c:1217:device_backend_callback: Domain 17:unable to
+    remove device with path /local/domain/1/backend/qvirtio/17/0 - rc -9
+
+- device_hotplug() waits for the backend's removal only when the
+  backend is another domain. Here it is our own, so the toolstack went
+  straight on to libxl__device_destroy() and removed the backend
+  directory itself, and devd never saw state Closed.
+
+For those device kinds, when the toolstack is not domid 0 but is their
+backend domain, take the bodge (whose timeout handler, with 0061,
+writes online=0 and state=Closed after 2s) and then wait for devd to
+remove the backend directory, as for a backend in another driver
+domain. devd stops the QEMU with the guest's last such device. If devd
+does not remove it, the wait times out after 10s and the toolstack
+removes the directory itself, as before. Other device kinds, a domid 0
+toolstack and devd's own removals are unchanged; VFB, VKBD and QUSB
+are left out on purpose, as devd starts no QEMU for them.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ tools/libs/light/libxl_device.c | 35 +++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/tools/libs/light/libxl_device.c b/tools/libs/light/libxl_device.c
+index eeb8d14..4b50fe1 100644
+--- a/tools/libs/light/libxl_device.c
++++ b/tools/libs/light/libxl_device.c
+@@ -1012,6 +1012,23 @@ out:
+     return;
+ }
+ 
++/*
++ * True when this toolstack is not domid 0 but is the backend domain of a
++ * device whose QEMU "xl devd" runs in this same domain: a toolstack in a
++ * dom0less driver domain, as with a Zephyr Dom0. For QDISK, 9PFS and
++ * QVIRTIO, devd's remove_device() stops that QEMU and removes the backend
++ * directory once it sees state Closed and online 0, and nothing else here
++ * stops it.
++ */
++static bool devd_qemu_backend_here(uint32_t my_domid, const libxl__device *dev)
++{
++    return my_domid != LIBXL_TOOLSTACK_DOMID &&
++           dev->backend_domid == my_domid &&
++           (dev->backend_kind == LIBXL__DEVICE_KIND_QDISK ||
++            dev->backend_kind == LIBXL__DEVICE_KIND_9PFS ||
++            dev->backend_kind == LIBXL__DEVICE_KIND_QVIRTIO);
++}
++
+ void libxl__initiate_device_generic_remove(libxl__egc *egc,
+                                            libxl__ao_device *aodev)
+ {
+@@ -1033,7 +1050,14 @@ void libxl__initiate_device_generic_remove(libxl__egc *egc,
+         goto out;
+     }
+ 
+-    if (my_domid == LIBXL_TOOLSTACK_DOMID) {
++    /*
++     * The bodge below is otherwise taken only by a domid 0 toolstack. A
++     * toolstack that is the backend of a devd-run QEMU takes it too: without
++     * it the removal waited 10s for a QEMU that does not close a paused
++     * guest's device, and devd never saw state Closed with online 0.
++     */
++    if (my_domid == LIBXL_TOOLSTACK_DOMID ||
++        devd_qemu_backend_here(my_domid, aodev->dev)) {
+         rc = libxl_domain_info(CTX, &info, domid);
+         if (rc) {
+             LOGD(ERROR, domid, "unable to get info for domain %d", domid);
+@@ -1255,7 +1279,14 @@ static void device_hotplug(libxl__egc *egc, libxl__ao_device *aodev)
+         LOGD(ERROR, aodev->dev->domid, "Failed to get domid");
+         goto out;
+     }
+-    if (aodev->dev->backend_domid != domid) {
++    /*
++     * Also wait for devd when it runs this device's QEMU in our own domain:
++     * removing the backend directory here would race devd's read of state
++     * and online, and devd would leave the QEMU running.
++     */
++    if (aodev->dev->backend_domid != domid ||
++        (aodev->action == LIBXL__DEVICE_ACTION_REMOVE &&
++         devd_qemu_backend_here(domid, aodev->dev))) {
+         LOGD(DEBUG, aodev->dev->domid,
+              "Backend domid %d, domid %d, assuming driver domains",
+              aodev->dev->backend_domid, domid);

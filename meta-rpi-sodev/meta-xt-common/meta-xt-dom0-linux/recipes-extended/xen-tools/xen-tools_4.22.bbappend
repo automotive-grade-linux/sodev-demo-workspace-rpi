@@ -66,8 +66,8 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # the hypervisor xen_4.22.bbappend point at -- the two SRC_URI lists name the
 # same 28 files, plus 4.22-0008 which the Venus lane adds to both. Only the
 # toolstack-only patches -- the project's 0001-qemu_envs / 0059 / 0061 / 0062 /
-# 0063 and the Venus lane's 4.22-0009 / 4.22-0010 -- and the systemd unit are in
-# ./files here. The interim recipe's pre-patches are not: meta-xt-domx's
+# 0063 / 0064 and the Venus lane's 4.22-0009 / 4.22-0010 -- and the systemd unit
+# are in ./files here. The interim recipe's pre-patches are not: meta-xt-domx's
 # xen-tools_4.22.bb takes two from meta-virtualization's files/ and its refreshed
 # tests-vpci one from its own files/.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../recipes-extended/xen-common/files:"
@@ -78,7 +78,8 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/../../../recipes-extended/xen-common/file
 # --- reserved-range.patch and 4.22-0013-xen-arm-Fix-evaluation-of-parameters-
 # --- for-SMCCC-calls.patch touch xen/ (arch) only, with no tools/ hunk, so all
 # --- three are intentionally excluded from the toolstack series here. The
-# --- toolstack-only patches (qemu_envs, 0059, 0061, 0062, 0063) follow below.
+# --- toolstack-only patches (qemu_envs, 0059, 0061, 0062, 0063, 0064) follow
+# --- below.
 
 SRC_URI:append = " \
     file://0002-xen-arm-ignore-spurious-interrupts-from-virtual-time.patch \
@@ -133,7 +134,7 @@ SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
      file://4.22-0009-libxl-arm-give-a-virtio-pci-host-a-256M-prefetchable-.patch \
      file://4.22-0010-libxl-arm-one-SPI-per-virtio-pci-slot.patch', '', d)}"
 
-# --- project toolstack feature patches (verified: all 5 apply CLEAN on 4.22) ---
+# --- project toolstack feature patches (verified: all 6 apply CLEAN on 4.22) ---
 # qemu_envs   : pass WAYLAND_DISPLAY/XDG_RUNTIME_DIR/SDL_VIDEODRIVER/WMCLASS to
 #               the guest device-model (doma.cfg display path).
 # 0059        : libxl__domain_make pre-creates the qdisk backend xenstore tree
@@ -145,6 +146,10 @@ SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
 #               double-spawn fix; rc=-3 on hardware).
 # 0062        : init-dom0less per-vcpu availability fix (multi-vCPU dom0less
 #               domains; upstream submission candidate).
+# 0064        : when the toolstack is the backend domain of a devd-run QEMU
+#               (DomD-as-toolstack), take the QEMU removal bodge and wait for
+#               devd, so 0061 runs and devd stops the guest's qemu on xl
+#               destroy instead of leaving a (null) domain.
 # (0053/0055/0052/0050/0058 are NOT added, unchanged from 4.21: 0053/0055/0052/0050
 #  REJECTed on 4.21, and 0058 initialized a b_info field 4.21 had removed ->
 #  compile error. All were already disabled in the fork _git bbappend for 4.21.
@@ -158,6 +163,7 @@ SRC_URI:append = " \
     file://0061-libxl-devd-reap-dm-on-domain-death.patch \
     file://0062-init-dom0less-fix-per-vcpu-availability-writes.patch \
     file://0063-libxl-virtio-no-local-dm-when-devd-owns-backend.patch \
+    file://0064-libxl-let-devd-stop-its-qemu-when-the-toolstack-is-the-backend.patch \
 "
 
 # --- [4.22] package the two test binaries 4.22 adds --------------------------

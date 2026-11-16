@@ -352,8 +352,11 @@ Run from the toolstack domain after boot:
   Bluetooth starts off on a fresh `/data`; `settings put global bluetooth_on 0`
   turns it off again (NOT `pm disable com.android.bluetooth`, which crashes
   system_server). Also a benign boot-window dropbox race.
-- Occasional qemu cleanup timeouts leave a zombie domain on `xl destroy`; a
-  board reboot recovers.
+- With the Zephyr Dom0, `xl destroy` of a guest whose virtio backends run in the
+  QEMU that `xl devd` spawned in DomD left that QEMU running and the domain
+  `(null) --p--d`. xen-tools' 0064 has the toolstack write the backend's
+  `online=0` and `Closed`, on which devd stops the QEMU (checked on both boards).
+  If a `(null)` domain stays anyway, a board reboot recovers.
 - **DomA's AAOS home screen intermittently fails to appear, and the real cause is a
   `vhost_xen` domid race — not `/data`.** Measured across five consecutive boots of
   a byte-identical image with a pristine `userdata`: two succeeded, three left the
