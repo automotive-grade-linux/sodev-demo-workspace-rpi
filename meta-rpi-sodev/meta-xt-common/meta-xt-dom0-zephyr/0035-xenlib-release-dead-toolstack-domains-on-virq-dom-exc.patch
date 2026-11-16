@@ -1,0 +1,789 @@
+From c156b60f14988a9072e842cccbeb66ed3ba1c831 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 09:52:54 +0900
+Subject: [PATCH] xenlib: release dead toolstack domains on VIRQ_DOM_EXC
+
+A guest that DomD creates with `xl create` is introduced to this
+server (XS_INTRODUCE, 0007), and its store ring is mapped here. When
+it was destroyed nothing told the server: xs_release_domain() ran
+only on XS_RELEASE, which libxl sends only on a soft reset (which
+Xen does not offer on Arm), not on `xl destroy`. The ring stayed
+mapped, so Xen kept the domain dead with one page (`(null) --p--d`
+in `xl list`), and its CONFIG_DOMU_MAX slot stayed used: on a 5-slot
+board the fourth guest of a boot was refused with "domain limit 5
+reached".
+
+Do what the stock xenstored does (tools/xenstored/domain.c,
+check_domains()): bind VIRQ_DOM_EXC and, on each event, look up every
+toolstack-introduced domain still tracked. Xen sends this VIRQ when a
+domain shuts down, when its kill leaves it dead and when it is
+destroyed (xen/common/domain.c), to the xenstore domain, which is Dom0
+here (set_xs_domain(dom0) in xen/arch/arm/domain_build.c).
+
+- A domain the hypervisor reports dead (XEN_DOMINF_dying, which Xen sets
+  only for DOMDYING_dead) or gone (-ESRCH) is released, and
+  "@releaseDomain" is fired. A domain that has only shut down is still
+  there and is left alone.
+- The event callback runs in the event-channel ISR, so it only wakes a
+  thread. The release takes dl_mutex, joins the guest's xenstore worker
+  and frees memory; it runs on its own thread, not the system workqueue,
+  because a wedged worker can block that join for good. The port is
+  bound with the event ISR off, so no event can reach a half-set handler
+  entry.
+- Each domain is asked for with XEN_DOMCTL_getdomaininfo, which answers
+  for exactly that domid. A truncated sysctl list would make a live
+  domain look gone.
+- A scan also runs after each XS_INTRODUCE, for a domain that died
+  before it was added to the list.
+- A lookup that fails with an error other than -ESRCH is tried again a
+  second later: if that was the domain's last VIRQ, no later event comes
+  for it while its ring stays mapped. Only the first failure of a run is
+  logged as a warning.
+
+The release path changes for both callers:
+- A domain can now be released twice (the event and an XS_RELEASE).
+  f_released makes the second a no-op; before, a second release while a
+  borrower held the domain dropped the borrower's reference.
+- A release while the domain was borrowed was deferred and never
+  completed: put_domain() and unref_domain() only decremented for a
+  toolstack domain. The drop of the last reference now tears it down (on
+  the borrower's thread). Until then an XS_INTRODUCE of that domid is
+  refused (-EBUSY) instead of being taken as a duplicate.
+- Only toolstack-introduced domains are released. An XS_RELEASE that
+  named a Zephyr-created domain dropped Zephyr's state and left the
+  hypervisor domain running with no owner.
+- Only the nodes the guest owns are removed (stop_domain_stored()), as
+  the stock xenstored does on a release. /local/domain/<id>, /vm/<uuid>
+  and /libxl/<id> are owned by Dom0 and are libxl's, which removes them
+  before it destroys the domain.
+- The console is no longer stopped: this Dom0 never starts one for a
+  toolstack domain, and stopping it logged an error on every release.
+  The backend removal is dropped too: it did nothing for these domains,
+  which this Dom0 sets up no backends for.
+- The CONFIG_DOMU_MAX slot is counted free only once the guest's worker
+  has been joined and its stack slot given back, so an XS_INTRODUCE that
+  passes the check can start its own worker.
+- The guest's store event channel is unbound with the event ISR off, on
+  release and on a failed start, as the VIRQ is bound: the unbind writes
+  the handler and then its argument, and an event in between would run
+  the default handler with the wrong argument.
+- "@releaseDomain" is fired through xss_notify_release_domain().
+- Correct the comments that said `xl destroy` sends XS_RELEASE.
+
+CONFIG_XEN_DOM_EXC_RELEASE (default y) turns the event on. Without it,
+or if the bind fails (for example because another domain is the
+xenstore domain), dead domains are released only on XS_RELEASE, with
+the release path above.
+
+Link: https://github.com/automotive-grade-linux/sodev-demo-workspace-rpi/issues/9
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ Kconfig                             |  19 ++
+ xen-dom-mgmt/include/domain.h       |   8 +-
+ xen-dom-mgmt/include/xen_dom_mgmt.h |   8 +-
+ xen-dom-mgmt/src/xen-dom-mgmt.c     | 377 +++++++++++++++++++++-------
+ xenstore-srv/include/xenstore_srv.h |   6 +
+ xenstore-srv/src/xenstore_srv.c     |  40 ++-
+ 6 files changed, 356 insertions(+), 102 deletions(-)
+
+diff --git a/Kconfig b/Kconfig
+index d60c2af..10034cc 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -32,6 +32,25 @@ config XENSTORE_TOOLSTACK_DOMID
+ 	  as the toolstack domain (DomD in the Zephyr-Dom0 / DomD-as-toolstack
+ 	  configuration). Defaults to 1, the first dom0less domain on RPi5.
+ 
++config XEN_DOM_EXC_RELEASE
++	bool "Release dead toolstack-introduced domains on VIRQ_DOM_EXC"
++	depends on XEN_STORE_SRV && XEN_DOMAIN_MANAGEMENT
++	default y
++	help
++	  Bind VIRQ_DOM_EXC and, on each event, release the toolstack-introduced
++	  domains (XS_INTRODUCE) that the hypervisor reports dead or gone, as the
++	  stock xenstored does. libxl sends XS_RELEASE only on a soft reset, so
++	  without this a domain destroyed with `xl destroy` keeps its store ring
++	  mapped here, stays dead in Xen and holds a CONFIG_DOMU_MAX slot.
++
++config XEN_DOM_EXC_RELEASE_STACK_SIZE
++	int "Stack size of the VIRQ_DOM_EXC release thread"
++	depends on XEN_DOM_EXC_RELEASE
++	default 8192
++	help
++	  The thread runs the same release path as the XS_RELEASE handler, which
++	  runs on a xenstore worker; the default is that worker's stack size.
++
+ config XEN_LIBFDT
+ 	bool "Enable libfdt support"
+ 	help
+diff --git a/xen-dom-mgmt/include/domain.h b/xen-dom-mgmt/include/domain.h
+index 74e85dc..04b2992 100644
+--- a/xen-dom-mgmt/include/domain.h
++++ b/xen-dom-mgmt/include/domain.h
+@@ -239,8 +239,14 @@ struct xen_domain {
+ 	 * (DomD's `xl create`, via XS_INTRODUCE). The hypervisor domain is owned
+ 	 * by DomD, which destroys it itself; Zephyr must never call
+ 	 * xen_domctl_destroydomain() on it, and `xu destroy` must refuse it.
+-	 * Torn down on the Zephyr side only by xs_release_domain() (XS_RELEASE). */
++	 * Released on the Zephyr side when the hypervisor reports it dead or gone
++	 * (VIRQ_DOM_EXC), or on an explicit XS_RELEASE. */
+ 	bool f_toolstack:1;
++	/* The owner's reference has been dropped (xs_release_domain). Set and read
++	 * under dl_mutex. A second release is then a no-op instead of dropping a
++	 * borrower's reference, and the borrower that drops the last reference
++	 * runs the teardown. */
++	bool f_released:1;
+ };
+ 
+ struct xen_domain *get_domain(uint32_t domid);
+diff --git a/xen-dom-mgmt/include/xen_dom_mgmt.h b/xen-dom-mgmt/include/xen_dom_mgmt.h
+index 3ae2d2e..6c533b9 100644
+--- a/xen-dom-mgmt/include/xen_dom_mgmt.h
++++ b/xen-dom-mgmt/include/xen_dom_mgmt.h
+@@ -45,9 +45,11 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 
+ /**
+  * Release a toolstack-introduced domain from Zephyr Dom0's xenstore
+- * server (counterpart to xs_introduce_domain). Tears down xenstore state only;
+- * the external toolstack (DomD) owns the hypervisor destroy. Idempotent.
+- * Called from xenstore_srv's XS_RELEASE (op 9) handler.
++ * server (counterpart to xs_introduce_domain). Tears down xenstore state only,
++ * once no borrower holds the domain; the external toolstack (DomD) owns the
++ * hypervisor destroy. Only toolstack-introduced domains are released.
++ * Idempotent. Called from xenstore_srv's XS_RELEASE (op 9) handler; the
++ * VIRQ_DOM_EXC thread releases a dead domain through the same path.
+  *
+  * @param domid The domid to release.
+  * @return 0 on success, or a negative error code on failure.
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index b98388d..f5e1ff4 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -14,6 +14,12 @@
+ #include <zephyr/xen/dom0/sysctl.h>
+ #include <zephyr/xen/hvm.h>
+ #include <zephyr/logging/log.h>
++#ifdef CONFIG_XEN_DOM_EXC_RELEASE
++#include <zephyr/irq.h>
++#include <zephyr/arch/arm64/hypercall.h>
++#include <zephyr/xen/events.h>
++#include <xen/public/event_channel.h>
++#endif
+ 
+ #include <xen-dom-fdt.h>
+ #include <xen-dom-xs.h>
+@@ -717,25 +723,85 @@ struct xen_domain *get_domain(uint32_t domid)
+ 	return iter;
+ }
+ 
+-/* Drop a reference taken by get_domain() WITHOUT running the
+- * refcount==0 teardown, for read-only borrowers (e.g. the `xu xsring` diag
+- * command) that must not touch dom0less domains (put_domain() asserts
+- * !f_dom0less) and never own the last reference. The decrement is done under
+- * dl_mutex so it cannot race the locked increments/decrements in get_domain()/
+- * put_domain()/xs_release_domain() — a raw `domain->refcount--` from a shell
+- * thread could otherwise lose an update against the DomD worker thread on a
+- * preemptible single-CPU build. The caller must hold a reference (so the count
+- * stays >= 1 here and teardown is never due). */
+-void unref_domain(struct xen_domain *domain)
++/*
++ * Zephyr-side teardown of a released domain once its last reference is gone.
++ * The caller has unlinked it from domain_list under dl_mutex and dropped the
++ * lock: stop_domain_stored() joins the guest's xenstore worker, and doing that
++ * under dl_mutex would stall every get_domain/put_domain/introduce/release on
++ * the other threads. Once unlinked at refcount 0 the domain is exclusively
++ * ours. This never destroys the hypervisor domain. Only toolstack-introduced
++ * domains get here; Zephyr set up no backends for them, so there are none to
++ * remove.
++ *
++ * When the last reference is a borrower's (put_domain()/unref_domain() from a
++ * shell command), the join runs on that thread.
++ */
++static void release_teardown(struct xen_domain *domain, const char *why)
+ {
+-	if (!domain) {
+-		return;
++	domid_t domid = domain->domid;
++	int rc;
++
++	/* Also removes the nodes the guest owns, as the stock xenstored does on a
++	 * release (domain_tree_remove()). The ones Dom0 owns - /local/domain/<id>,
++	 * /vm/<uuid>, /libxl/<id> - are libxl's, which removes them before it
++	 * destroys the domain, so xs_deinitialize_domain_xenstore() is not called. */
++	rc = stop_domain_stored(domain);
++	if (rc) {
++		LOG_ERR("xs_release:domid:%u stop_stored err (%d)", domid, rc);
+ 	}
++
++	/* No console to stop: this Dom0 never starts one for a toolstack-
++	 * introduced domain (xen_start_domain_console() runs only in
++	 * domain_create()), and xen_stop_domain_console() would log an error
++	 * for every release. */
++
++	k_free(domain);
++
++	/* The slot is counted free only now. Until stop_domain_stored() has
++	 * joined the worker and given back its stack slot, an XS_INTRODUCE
++	 * that passed the CONFIG_DOMU_MAX check could not start a worker. */
+ 	k_mutex_lock(&dl_mutex, K_FOREVER);
++	--dom_num;
++	k_mutex_unlock(&dl_mutex);
++	LOG_INF("xs_release:domid:%u released (%s)", domid, why);
++}
++
++/* Drop one reference with dl_mutex held. If the domain has been released and
++ * this was its last reference, unlink it and return it: the caller must drop
++ * dl_mutex and then call release_teardown(). Otherwise return NULL. */
++static struct xen_domain *drop_ref_locked(struct xen_domain *domain)
++{
+ 	if (domain->refcount > 0) {
+ 		domain->refcount--;
+ 	}
++	if (domain->f_released && domain->refcount == 0) {
++		sys_dlist_remove(&domain->node);
++		return domain;
++	}
++	return NULL;
++}
++
++/* Drop a reference taken by get_domain(), for read-only borrowers (e.g. the
++ * `xu xsring` diag command) that must not touch dom0less domains (put_domain()
++ * asserts !f_dom0less). The decrement is done under dl_mutex so it cannot race
++ * the locked increments/decrements in get_domain()/put_domain()/
++ * xs_release_domain() -- a raw `domain->refcount--` from a shell thread could
++ * otherwise lose an update against the DomD worker thread on a preemptible
++ * single-CPU build. If the domain was released while it was borrowed, this
++ * drop is the last one and runs the teardown. */
++void unref_domain(struct xen_domain *domain)
++{
++	struct xen_domain *gone;
++
++	if (!domain) {
++		return;
++	}
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	gone = drop_ref_locked(domain);
+ 	k_mutex_unlock(&dl_mutex);
++	if (gone) {
++		release_teardown(gone, "last reference dropped");
++	}
+ }
+ 
+ void put_domain(struct xen_domain *domain)
+@@ -750,9 +816,10 @@ void put_domain(struct xen_domain *domain)
+ 	/*
+ 	 * put_domain owns full teardown+destroy ONLY for a Zephyr-CREATED
+ 	 * domain. For a dom0less domain (DomD, owned by dom0less_init) or a
+-	 * toolstack-introduced domain (owned by DomD, torn down on the Zephyr
++	 * toolstack-introduced domain (owned by DomD, released on the Zephyr
+ 	 * side by xs_release_domain), put_domain is only a borrow drop and must
+-	 * never free or destroy.
++	 * never destroy. A released domain is torn down (not destroyed) by
++	 * whichever drop is the last.
+ 	 *
+ 	 * This has to be a real runtime branch, not an __ASSERT: assertions are
+ 	 * compiled out in the shipped build (CONFIG_ASSERT=n), and what is at
+@@ -760,11 +827,14 @@ void put_domain(struct xen_domain *domain)
+ 	 * control domain -- the owner of the GPU, HDMI and SD.
+ 	 */
+ 	if (domain->f_dom0less || domain->f_toolstack) {
++		struct xen_domain *gone;
++
+ 		k_mutex_lock(&dl_mutex, K_FOREVER);
+-		if (domain->refcount > 0) {
+-			domain->refcount--;
+-		}
++		gone = drop_ref_locked(domain);
+ 		k_mutex_unlock(&dl_mutex);
++		if (gone) {
++			release_teardown(gone, "last reference dropped");
++		}
+ 		return;
+ 	}
+ 
+@@ -1303,6 +1373,10 @@ err_free:
+ 	return rc;
+ }
+ 
++#ifdef CONFIG_XEN_DOM_EXC_RELEASE
++static void dom_exc_kick(void);
++#endif
++
+ /*
+  * Introduce a domain that was created by an external
+  * privileged toolstack (DomD running `xl create`) into Zephyr Dom0's xenstore
+@@ -1315,7 +1389,8 @@ err_free:
+  * libxl's and is left alone.
+  * store_pfn/remote_evtchn come straight from the XS_INTRODUCE payload (the
+  * toolstack already allocated them), so no HVM_PARAM read is needed here.
+- * Idempotent: a duplicate introduce for an already-tracked domid succeeds.
++ * Idempotent: a duplicate introduce for an already-tracked domid succeeds,
++ * except while that domid's release waits for a borrower (-EBUSY).
+  */
+ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtchn)
+ {
+@@ -1339,23 +1414,31 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 	 * domain_create() applies, so an unbounded XS_INTRODUCE stream cannot
+ 	 * exhaust the fixed stack/bookkeeping budget. */
+ 	k_mutex_lock(&dl_mutex, K_FOREVER);
+-	if (dom_num >= CONFIG_DOMU_MAX) {
+-		k_mutex_unlock(&dl_mutex);
+-		LOG_ERR("xs_introduce:domid:%u domain limit %d reached", domid,
+-			CONFIG_DOMU_MAX);
+-		return -ENOSPC;
+-	}
+ 	SYS_DLIST_FOR_EACH_CONTAINER(&domain_list, iter, node) {
+ 		if (iter->domid == domid) {
+ 			exists = true;
+ 			break;
+ 		}
+ 	}
+-	k_mutex_unlock(&dl_mutex);
++	if (exists && iter->f_released) {
++		/* Released, but a borrower (a short `xu` shell command) still holds
++		 * it, and its teardown will unmap the ring: this is not a duplicate. */
++		k_mutex_unlock(&dl_mutex);
++		LOG_ERR("xs_introduce:domid:%u still being released, refused", domid);
++		return -EBUSY;
++	}
+ 	if (exists) {
+ 		/* Already introduced (duplicate XS_INTRODUCE): idempotent success. */
++		k_mutex_unlock(&dl_mutex);
+ 		return 0;
+ 	}
++	if (dom_num >= CONFIG_DOMU_MAX) {
++		k_mutex_unlock(&dl_mutex);
++		LOG_ERR("xs_introduce:domid:%u domain limit %d reached", domid,
++			CONFIG_DOMU_MAX);
++		return -ENOSPC;
++	}
++	k_mutex_unlock(&dl_mutex);
+ 
+ 	/* Confirm the domain exists at the hypervisor and fetch vcpu/mem info
+ 	 * (needed by xs_initialize_xenstore for the per-domain xenstore tree). */
+@@ -1381,8 +1464,8 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 	 * HVM_PARAM_STORE_EVTCHN to the same value, which is harmless. */
+ 	domain->f_dom0less = false;
+ 	/* DomD owns the hypervisor domain; mark it so Zephyr
+-	 * never destroys it via put_domain/domain_destroy (only xs_release_domain
+-	 * tears down the Zephyr-side state on XS_RELEASE). */
++	 * never destroys it via put_domain/domain_destroy. The Zephyr-side state
++	 * is released when the domain dies (VIRQ_DOM_EXC) or on XS_RELEASE. */
+ 	domain->f_toolstack = true;
+ 	snprintf(domain->name, CONTAINER_NAME_SIZE, "DomU-%u", domid);
+ 
+@@ -1416,6 +1499,11 @@ int xs_introduce_domain(uint32_t domid, uint64_t store_pfn, uint32_t remote_evtc
+ 	k_mutex_unlock(&dl_mutex);
+ 
+ 	LOG_INF("xs_introduce:domid:%u introduced by toolstack", domid);
++#ifdef CONFIG_XEN_DOM_EXC_RELEASE
++	/* A death between mapping the ring and the append above was not seen by a
++	 * scan, and no later event comes for it while the ring stays mapped. */
++	dom_exc_kick();
++#endif
+ 	return 0;
+ 
+ err_free:
+@@ -1424,23 +1512,26 @@ err_free:
+ }
+ 
+ /*
+- * Release a toolstack-introduced domain from Zephyr
+- * Dom0's xenstore server. Counterpart to xs_introduce_domain(): tears down the
+- * xenstore-side state (backends, store ring/thread, xenstore tree, console) and
+- * drops the shadow xen_domain. Driven by the XS_RELEASE (op 9) wire request
+- * that DomD's `xl destroy` issues. IMPORTANT: unlike put_domain(), this does
+- * NOT call xen_domctl_destroydomain() — the hypervisor domain is owned by the
+- * external toolstack (DomD), which destroys it itself; doing it here too would
+- * be a double-destroy. Idempotent: releasing an untracked domid succeeds.
++ * Drop the owner's reference of a domain tracked by Zephyr Dom0's xenstore
++ * server and, once no borrower holds it, tear down the xenstore-side state
++ * (the store ring and thread, and the nodes the guest owns) and free the shadow
++ * xen_domain.
++ * Counterpart to xs_introduce_domain(). Unlike put_domain(), this does NOT call
++ * xen_domctl_destroydomain(): a toolstack-introduced domain is DomD's, which
++ * destroys it itself.
++ *
++ * Two callers: the VIRQ_DOM_EXC thread below, when the hypervisor reports a
++ * toolstack-introduced domain dead or gone (libxl sends XS_RELEASE only on a
++ * soft reset, not on `xl destroy`), and the XS_RELEASE (op 9) handler. Both can
++ * name the same domain, so a second release is a no-op (f_released). Only
++ * toolstack-introduced domains are released; an untracked domid succeeds.
+  */
+-int xs_release_domain(uint32_t domid)
++static int release_domain(uint32_t domid, const char *why)
+ {
+ 	struct xen_domain *domain = NULL, *iter;
+-	int rc;
+ 
+-	/* Find the domain and run the whole release under dl_mutex, exactly like
+-	 * put_domain(). Scan directly (NOT get_domain) so we do not bump refcount
+-	 * and can inspect f_dom0less before touching it. */
++	/* Scan directly (NOT get_domain) so we do not bump refcount and can
++	 * inspect f_dom0less before touching it. */
+ 	k_mutex_lock(&dl_mutex, K_FOREVER);
+ 	SYS_DLIST_FOR_EACH_CONTAINER(&domain_list, iter, node) {
+ 		if (iter->domid == domid) {
+@@ -1448,69 +1539,179 @@ int xs_release_domain(uint32_t domid)
+ 			break;
+ 		}
+ 	}
+-	if (!domain) {
+-		/* Not tracked (already released / never introduced): idempotent. */
++	if (!domain || domain->f_released) {
++		/* Not tracked, or already released: idempotent. */
+ 		k_mutex_unlock(&dl_mutex);
+ 		return 0;
+ 	}
+-	if (domain->f_dom0less) {
+-		/* A dom0less domain (e.g. DomD itself) is owned by dom0less_init, not
+-		 * by the toolstack. Never tear it down on a stray XS_RELEASE. */
++	if (!domain->f_toolstack) {
++		/* A dom0less domain (e.g. DomD itself) is owned by dom0less_init, and
++		 * one Zephyr created by domain_create(); neither was introduced by the
++		 * toolstack. Releasing one would drop Zephyr's state but leave the
++		 * hypervisor domain running with nobody owning it. */
+ 		k_mutex_unlock(&dl_mutex);
+-		LOG_WRN("xs_release:domid:%u is dom0less, ignoring release", domid);
++		LOG_WRN("xs_release:domid:%u was not introduced by the toolstack, ignoring release",
++			domid);
+ 		return 0;
+ 	}
+ 
+-	/* Drop the reference taken by xs_introduce_domain and tear down ONLY when
+-	 * the last reference is gone (mirror put_domain's refcount==0 rule) so a
+-	 * concurrent get_domain() holder is never left with a dangling pointer.
+-	 * Unlike put_domain(), we do NOT call xen_domctl_destroydomain() — the
+-	 * hypervisor domain is owned by the external toolstack (DomD), which
+-	 * destroys it itself; doing so here would be a double-destroy. The
+-	 * teardown helpers do not re-take dl_mutex (same as put_domain). */
+-	if (--domain->refcount == 0) {
+-		/* Unlink under dl_mutex, then RELEASE the lock
+-		 * before teardown. stop_domain_stored() does k_thread_join(K_FOREVER)
+-		 * on the guest's worker; this runs on DomD's OWN xenstore worker
+-		 * thread (XS_RELEASE handler), so holding dl_mutex across a ~1s (or,
+-		 * if that worker is wedged, forever) join would stall/deadlock every
+-		 * get_domain/put_domain/introduce/release on the console-srv and shell
+-		 * threads. Once unlinked at refcount 0 the domain is exclusively ours
+-		 * (no new get_domain can find it, no outstanding reference exists), so
+-		 * the teardown is safe outside the lock. */
+-		sys_dlist_remove(&domain->node);
+-		--dom_num;
++	domain->f_released = true;
++	if (drop_ref_locked(domain)) {
+ 		k_mutex_unlock(&dl_mutex);
++		release_teardown(domain, why);
++		return 0;
++	}
+ 
+-		rc = xs_remove_xenstore_backends(domain);
+-		if (rc) {
+-			LOG_ERR("xs_release:domid:%u remove_backends err (%d)", domid, rc);
++	LOG_WRN("xs_release:domid:%u still referenced (refcount=%d), teardown when the last reference drops",
++		domid, domain->refcount);
++	k_mutex_unlock(&dl_mutex);
++	return 0;
++}
++
++int xs_release_domain(uint32_t domid)
++{
++	return release_domain(domid, "XS_RELEASE");
++}
++
++#ifdef CONFIG_XEN_DOM_EXC_RELEASE
++/*
++ * VIRQ_DOM_EXC: Xen's "exceptional event for some domain", sent when a domain
++ * shuts down, when domain_kill() finishes relinquishing it (it is then dead)
++ * and when it is finally destroyed (xen/common/domain.c). Xen routes this
++ * global VIRQ to the xenstore domain, which on this platform is Dom0
++ * (set_xs_domain(dom0) in xen/arch/arm/domain_build.c).
++ *
++ * This mirrors the stock xenstored (tools/xenstored/domain.c check_domains()):
++ * on every event look at all the domains it tracks, and release the ones the
++ * hypervisor reports dead (XEN_DOMINF_dying is set only for DOMDYING_dead) or
++ * gone. One that has only shut down is still there and is not released. Only
++ * toolstack-introduced domains are looked at: dom0less domains and the ones
++ * Zephyr creates itself have their own owners.
++ *
++ * The event callback runs in the event-channel ISR, and a release takes
++ * dl_mutex, joins the guest's xenstore worker and frees memory, so the callback
++ * only wakes a thread. That thread is not the system workqueue: a wedged guest
++ * worker can make the join block for good, which must not stall other work.
++ * (It does stall later releases.)
++ */
++static K_SEM_DEFINE(dom_exc_sem, 0, 1);
++static K_THREAD_STACK_DEFINE(dom_exc_stack, CONFIG_XEN_DOM_EXC_RELEASE_STACK_SIZE);
++static struct k_thread dom_exc_thrd;
++
++static void dom_exc_cb(void *priv)
++{
++	ARG_UNUSED(priv);
++	k_sem_give(&dom_exc_sem);
++}
++
++static void dom_exc_kick(void)
++{
++	k_sem_give(&dom_exc_sem);
++}
++
++/* Return true when a domain could not be looked up, so the caller tries again:
++ * if that was its last VIRQ (it is dead and its ring still mapped here), no
++ * later event comes for it. `again` is true on such a retry, which logs the
++ * failure at debug level only. */
++static bool dom_exc_scan(bool again)
++{
++	uint32_t ids[CONFIG_DOMU_MAX];
++	struct xen_domctl_getdomaininfo info;
++	struct xen_domain *iter;
++	bool released = false, retry = false;
++	int i, n = 0, rc;
++
++	/* Copy the domids out under dl_mutex: release_domain() takes it again. */
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	SYS_DLIST_FOR_EACH_CONTAINER(&domain_list, iter, node) {
++		if (iter->f_toolstack && !iter->f_released && n < CONFIG_DOMU_MAX) {
++			ids[n++] = iter->domid;
+ 		}
++	}
++	k_mutex_unlock(&dl_mutex);
+ 
+-		rc = stop_domain_stored(domain);
+-		if (rc) {
+-			LOG_ERR("xs_release:domid:%u stop_stored err (%d)", domid, rc);
++	for (i = 0; i < n; i++) {
++		/* One domain at a time: XEN_DOMCTL_getdomaininfo answers for exactly
++		 * that domid, and -ESRCH means it no longer exists. (A truncated
++		 * sysctl list would make a live domain look gone.) */
++		rc = xen_domctl_getdomaininfo(ids[i], &info);
++		if (rc == 0 && !(info.flags & XEN_DOMINF_dying)) {
++			continue;
++		}
++		if (rc != 0 && rc != -ESRCH) {
++			if (again) {
++				LOG_DBG("dom_exc:domid:%u getdomaininfo err (%d), tried again in 1 s",
++					ids[i], rc);
++			} else {
++				LOG_WRN("dom_exc:domid:%u getdomaininfo err (%d), tried again in 1 s",
++					ids[i], rc);
++			}
++			retry = true;
++			continue;
+ 		}
++		release_domain(ids[i], rc ? "gone" : "dead");
++		released = true;
++	}
+ 
+-		xs_deinitialize_domain_xenstore(domid);
++	if (released) {
++		/* Same watch the XS_RELEASE handler fires, so backends and libxl's
++		 * domain-death watchers see the domain go. */
++		xss_notify_release_domain();
++	}
++	return retry;
++}
+ 
+-#ifdef CONFIG_XEN_CONSOLE_SRV
+-		rc = xen_stop_domain_console(domain);
+-		if (rc) {
+-			LOG_ERR("xs_release:domid:%u stop_console err (%d)", domid, rc);
+-		}
+-#endif
++static void dom_exc_thread(void *p1, void *p2, void *p3)
++{
++	bool retry = false;
+ 
+-		k_free(domain);
+-		LOG_INF("xs_release:domid:%u released by toolstack", domid);
+-		return 0;
++	ARG_UNUSED(p1);
++	ARG_UNUSED(p2);
++	ARG_UNUSED(p3);
++
++	for (;;) {
++		k_sem_take(&dom_exc_sem, retry ? K_SECONDS(1) : K_FOREVER);
++		retry = dom_exc_scan(retry);
+ 	}
++}
+ 
+-	LOG_WRN("xs_release:domid:%u still referenced (refcount=%d), teardown deferred",
+-		domid, domain->refcount);
+-	k_mutex_unlock(&dl_mutex);
+-	return 0;
++static void dom_exc_init(void)
++{
++	struct evtchn_bind_virq bind = {
++		.virq = VIRQ_DOM_EXC,
++		.vcpu = 0,
++	};
++	unsigned int key;
++	int rc;
++
++	/* The VIRQ can fire as soon as the hypercall returns. Until
++	 * bind_event_channel() has set the callback, the port's handler is the
++	 * default one, which takes its priv for &event_channels[port]; an event
++	 * there would be handled with a half-written entry. Keep the event ISR
++	 * off across both (Dom0 has one vCPU). */
++	key = irq_lock();
++	rc = HYPERVISOR_event_channel_op(EVTCHNOP_bind_virq, &bind);
++	if (rc == 0) {
++		bind_event_channel(bind.port, dom_exc_cb, NULL);
++	}
++	irq_unlock(key);
++	if (rc) {
++		/* -EBUSY: another domain is the xenstore domain; -ENOMEM: Xen
++		 * could not allocate its domain-state bitmap for the handler. */
++		LOG_WRN("dom_exc: bind VIRQ_DOM_EXC failed (%d), dead domains are released only on XS_RELEASE",
++			rc);
++		return;
++	}
++	unmask_event_channel(bind.port);
++
++	/* An event from now on only gives dom_exc_sem; the thread takes it. */
++	k_thread_create(&dom_exc_thrd, dom_exc_stack,
++			K_THREAD_STACK_SIZEOF(dom_exc_stack), dom_exc_thread,
++			NULL, NULL, NULL, 7, 0, K_NO_WAIT);
++	k_thread_name_set(&dom_exc_thrd, "dom_exc");
++	LOG_INF("dom_exc: VIRQ_DOM_EXC bound to evtchn#%u", bind.port);
+ }
++#endif /* CONFIG_XEN_DOM_EXC_RELEASE */
+ 
+ static int dom0less_init(void)
+ {
+@@ -1607,6 +1808,12 @@ static int init_domain0(void)
+ 	ret = dom0less_init();
+ #endif /* CONFIG_XEN_DOM0LESS_BOOT */
+ 
++#ifdef CONFIG_XEN_DOM_EXC_RELEASE
++	/* After dom0less_init(): the toolstack that introduces the domains this
++	 * watches is a dom0less domain. */
++	dom_exc_init();
++#endif
++
+ out:
+ 	k_free(dom0);
+ 
+diff --git a/xenstore-srv/include/xenstore_srv.h b/xenstore-srv/include/xenstore_srv.h
+index 91f191a..120c52d 100644
+--- a/xenstore-srv/include/xenstore_srv.h
++++ b/xenstore-srv/include/xenstore_srv.h
+@@ -76,6 +76,12 @@ int xs_init_root(void);
+  */
+ void xss_set_toolstack_domid(uint32_t domid);
+ 
++/**
++ * Fires the special "@releaseDomain" watch, telling watchers (backends,
++ * libxl) that a domain has gone and they should check which.
++ */
++void xss_notify_release_domain(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 3613ce1..b2be4a7 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -14,6 +14,7 @@
+ #include <xen/public/hvm/params.h>
+ 
+ #include <zephyr/init.h>
++#include <zephyr/irq.h>
+ #include <zephyr/logging/log.h>
+ #include <zephyr/sys/barrier.h>
+ #include <zephyr/xen/events.h>
+@@ -479,11 +480,9 @@ static void invalidate_client(struct xenstore *xenstore, const char *reason, int
+ 		 * cleanup_domain_watches(); the ring mapping, event channel and
+ 		 * thread-stack slot are then reclaimed by the eventual
+ 		 * stop_domain_stored() call on the external teardown path
+-		 * (xs_release_domain from DomD's `xl destroy`, whose k_thread_join
+-		 * returns immediately since the thread has already exited). The
+-		 * toolstack (DomD) MUST issue `xl destroy` when a guest dies so this
+-		 * reclaim runs; a guest that crashes without an XS_RELEASE holds one
+-		 * of CONFIG_DOMU_MAX slots until released. */
++		 * (xs_release_domain, run when the hypervisor reports the domain
++		 * dead or gone, or on XS_RELEASE; its k_thread_join returns
++		 * immediately since the thread has already exited). */
+ 		return;
+ 	}
+ 	stop_domain_stored(xenstore->domain);
+@@ -2351,11 +2350,12 @@ static void handle_introduce(struct xenstore *xenstore, uint32_t id,
+ 
+ /*
+  * XS_RELEASE (op 9) handler. Counterpart to
+- * handle_introduce: DomD's `xl destroy` issues XS_RELEASE to remove a guest's
+- * xenstore connection. Payload is "domid\0". Was NULL in the stock server, so
+- * `xl destroy` (and the rollback path of a failed `xl create`) hung on an
+- * unknown operation. xs_release_domain tears down the xenstore-side state; the
+- * hypervisor destroy is done by DomD itself.
++ * handle_introduce: removes a guest's xenstore connection. libxl sends it on a
++ * soft reset (before introducing the domain again), not on `xl destroy`; a
++ * destroyed domain is released when Xen reports it dead (VIRQ_DOM_EXC, see
++ * xen-dom-mgmt.c). Payload is "domid\0". Was NULL in the stock server, so the
++ * request hung on an unknown operation. xs_release_domain tears down the
++ * xenstore-side state; the hypervisor destroy is done by DomD itself.
+  */
+ static void handle_release(struct xenstore *xenstore, uint32_t id,
+ 			   char *payload, uint32_t sz)
+@@ -2392,13 +2392,18 @@ static void handle_release(struct xenstore *xenstore, uint32_t id,
+ 		return;
+ 	}
+ 
+-	/* Fire "@releaseDomain" so backends tear down state for the
+-	 * gone domain (counterpart to @introduceDomain). Matches upstream. */
+-	notify_watchers("@releaseDomain", 0);
++	xss_notify_release_domain();
+ 
+ 	send_reply(xenstore, id, XS_RELEASE, "OK");
+ }
+ 
++/* Fire "@releaseDomain" so backends tear down state for the gone domain
++ * (counterpart to @introduceDomain). Matches upstream. */
++void xss_notify_release_domain(void)
++{
++	notify_watchers("@releaseDomain", 0);
++}
++
+ /* XS_IS_DOMAIN_INTRODUCED (used by init-dom0less and
+  * xenpaging via libxs). Reply "T"/"F" like upstream xenstored do_is_domain_introduced.
+  * Previously unhandled: the ENOSYS fallback used to be sent with req_id=0,
+@@ -2661,6 +2666,7 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
+ int start_domain_stored(struct xen_domain *domain, xen_pfn_t store_pfn)
+ {
+ 	int rc = 0, err_ret;
++	unsigned int key;
+ 	struct xenstore *xenstore;
+ 
+ 	__ASSERT_NO_MSG(domain);
+@@ -2739,7 +2745,9 @@ int start_domain_stored(struct xen_domain *domain, xen_pfn_t store_pfn)
+ 	 * stop_domain_stored(): unbind, close, then unmap.
+ 	 */
+ unbind_evtchn:
++	key = irq_lock();
+ 	unbind_event_channel(xenstore->local_evtchn);
++	irq_unlock(key);
+ 	err_ret = evtchn_close(xenstore->local_evtchn);
+ 	if (err_ret) {
+ 		LOG_ERR("Failed to close domain#%u xenstore evtchn#%u (rc=%d)",
+@@ -2823,6 +2831,7 @@ static void remove_ref_entries(uint32_t domid)
+ int stop_domain_stored(struct xen_domain *domain)
+ {
+ 	int rc = 0, err = 0;
++	unsigned int key;
+ 	struct xenstore *xenstore;
+ 
+ 	if (!domain) {
+@@ -2836,7 +2845,12 @@ int stop_domain_stored(struct xen_domain *domain)
+ 	k_sem_give(&xenstore->xb_sem);
+ 	k_thread_join(&xenstore->thrd, K_FOREVER);
+ 	free_stack_idx(xenstore->xs_stack_slot);
++	/* With the event ISR off, as at the VIRQ_DOM_EXC bind: the unbind writes
++	 * the port's handler and then its argument, and an event in between would
++	 * run the default handler with this xenstore as its argument. */
++	key = irq_lock();
+ 	unbind_event_channel(xenstore->local_evtchn);
++	irq_unlock(key);
+ 
+ 	rc = evtchn_close(xenstore->local_evtchn);
+ 	if (rc) {

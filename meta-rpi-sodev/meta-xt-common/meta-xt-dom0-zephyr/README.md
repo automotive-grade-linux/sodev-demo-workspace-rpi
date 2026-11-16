@@ -71,6 +71,9 @@ file refer to patches by number.
 | 0031 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xenstore-srv/src/xenstore_srv.c`, `Kconfig` | Input validation and resource bounds, from adversarial review of this series. NUL-terminate the request payload at the boundary (every path handler treated it as a C string, so `header.len == 0` or a payload without a NUL read off the end of the allocation - and construct_path() copied what it found into a key the guest can read back); refuse to free the static root node (`xs rm /` wrote through a NULL dlist pointer and k_free()d a .bss address); arm the xss_do_write() rollback before the perms allocation (a failure on the first new node left a node with an empty perms list, which check_perms() dereferences); scope key_to_watcher() by domain and compare tokens exactly; require watch prefixes to end on a path boundary; coalesce and cap pending watch events per domain (the list was unbounded and grew K*K per write); bound the work done per pass under the global tree lock; stop emitting a req_id-0 XS_ERROR for an oversized watch event; bound tree depth at creation (`CONFIG_XENSTORE_TREE_TRAVERSE_DEPTH`, set to the Kconfig maximum 16 by 0028) so the recursive free cannot overflow the xenstore worker stack, which this patch also raises from 4 to 8 KiB to match. All of these predate this series. A second review round then found defects in this patch itself - a missing `path\0token` separator check in watch/unwatch, an unterminated stored token that `fire_watcher()` leaked past, and a pending-event cap that combined with the `running_transaction` drain gate to *drop* events - and they are fixed here too; see its `Second-round review follow-ups:`. |
 | 0032 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `CMakeLists.txt`, `include/xen/public/xen-compat.h`, `vch/include/vch.h`, `vch/include/xen/public/io/libxenvchan.h` (removed), `xstat/include/xstat.h` | Finish the single-header-tree move. vch/ held a second copy of `xen/public/io/libxenvchan.h` at the same relative path, and vch.h reached it with a quoted include - so the authoritative copy was never compiled. And `__XEN_TOOLS__` was defined in xen-compat.h, which domctl.h/sysctl.h test with `#error` *before* including xen.h, so a TU whose first include was `<xen/public/domctl.h>` failed; it is now a build definition, as in upstream Xen's tools - and unconditional under `CONFIG_XEN` rather than gated on `CONFIG_XEN_DOM0`, because `XSTAT`/`XEN_DOMAIN_MANAGEMENT`/`XEN_SHELL` have no `depends on XEN_DOM0` and so a `XEN=y`/`XEN_DOM0=n` build compiles `xstat.c`, which includes `domctl.h`. Also retargets the one stale comment in `xstat/include/xstat.h` that still named `include/zephyr/xen/public/domctl.h`. |
 | 0034 | `xen-troops/zephyr-dom0-xt` | `rpi5-v0.4.0` (`03b9614`) | `CMakeLists.txt` | Drop the `include($ENV{ZEPHYR_BASE}/cmake/app/boilerplate.cmake NO_POLICY_SCOPE)`. Zephyr 4.5 deletes that file (upstream `28e363fc69c`), so the configure step stopped with `include could not find requested file`. It was a compatibility shim that only forwarded to `find_package(Zephyr)`, which the line before already calls, so nothing else changes. |
+| 0035 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `Kconfig`, `xen-dom-mgmt/{include/domain.h,src/xen-dom-mgmt.c}`, `xenstore-srv/{include/xenstore_srv.h,src/xenstore_srv.c}` | Release a toolstack-introduced domain when Xen reports it dead or gone (`VIRQ_DOM_EXC`), as the stock xenstored does. libxl sends `XS_RELEASE` only on a soft reset, so a guest removed with `xl destroy` stayed `(null) --p--d` and held a `CONFIG_DOMU_MAX` slot (issue #9). See the 0035 note below. |
+| 0036 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `Kconfig`, `xen-dom-mgmt/{include/domain.h,src/xen-dom-mgmt.c}` | Fire `@releaseDomain` once when a toolstack-introduced domain shuts down, as the stock xenstored does, so libxl applies the guest's `on_poweroff`/`on_reboot`/`on_crash`. Changes behaviour on the board: see the 0036 note below. |
+| 0037 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-dom-mgmt/src/xen-dom-mgmt.c`, `xenstore-srv/src/xenstore_srv.c` | Send every new watch its initial event, as the stock xenstored does, so xl sees a guest that shut down before its `@releaseDomain` watch was set and libxl's wait for an already removed path ends at once; log the `dom_exc` bind line on the first event, after the shell is up. See the 0037 note below. |
 
 **Gating is self-enabling.** `rpi5-sodev.yaml`'s zephyr `dom0` builder passes
 `CONFIG_DOM_CFG_SODEV=y` (alongside `CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18`),
@@ -628,8 +631,9 @@ lifecycle path (introduce/release/destroy). Two root causes:
   distinguishing it from a Zephyr-created one, so `xu destroy <DomU>` (or a
   put_domain/xs_release_domain race) double-destroyed a domain DomD owns.
 
-Fix (does NOT touch the automatic demo path — XS_INTRODUCE→xs_introduce_domain,
-XS_RELEASE→xs_release_domain — only the manual `xu` shell/lifecycle paths):
+Fix (does NOT touch the paths DomD drives — XS_INTRODUCE→xs_introduce_domain
+and the release of a toolstack domain, xs_release_domain, which 0035 also runs
+on VIRQ_DOM_EXC — only the manual `xu` shell/lifecycle paths):
 - **domain.h**: add `f_toolstack:1` to `struct xen_domain`.
 - **xs_introduce_domain**: set `f_toolstack = true` (DomD owns the hyp domain).
 - **put_domain**: replace the compiled-out `__ASSERT(!f_dom0less)` with a
@@ -641,11 +645,9 @@ XS_RELEASE→xs_release_domain — only the manual `xu` shell/lifecycle paths):
   DomD-destroy footgun, the toolstack double-destroy, and the double-put vs
   xs_release_domain use-after-free race in one guard.
 
-Residual (documented, low-priority, needs HW-validated refactor): a borrow drop
-(`xu pause/console/xsring`) that races an XS_RELEASE whose teardown was deferred
-can leave a toolstack domain linked at refcount 0 (a SAFE leak — no UAF, no wrong
-destroy). A proper fix is a `f_dying` flag so the last borrow-dropper reaps; left
-for a future HW-verified change.
+A borrow drop (`xu pause/console/xsring`) that raced a release whose teardown
+was deferred used to leave a toolstack domain linked at refcount 0. 0035 fixes
+that with `f_released`: the last borrow-dropper runs the teardown.
 
 ## 0017: guard `xu console` against unmanaged (toolstack-introduced) domains
 `xu console <domid>` on a toolstack-introduced guest (a DomU/DomA created by the
@@ -681,6 +683,89 @@ Zeroing makes it `XEN_DOMCTL_CONFIG_ARM_V8R_EL1_MSA_NONE`, which
 holds for any field a later Xen adds in padding this tree does not name. Upstream
 fixed the comma typo in the three assignments below it (`fc146cab757`); the
 initialiser is still missing in v4.5.0.
+
+## 0035: release dead toolstack domains on `VIRQ_DOM_EXC`
+A guest DomD creates with `xl create` is introduced here (`XS_INTRODUCE`, 0007)
+and its store ring is mapped by this Dom0. Before 0035 the only release was the
+`XS_RELEASE` handler, and libxl sends `XS_RELEASE` only on a soft reset (which
+Xen does not offer on Arm), not on `xl destroy`. A destroyed guest therefore
+kept its ring mapped, Xen kept it dead with one page (`(null) --p--d` in `xl
+list`), and its `CONFIG_DOMU_MAX` slot stayed used, so with 5 slots the fourth
+guest of a boot was refused (issue #9).
+
+0035 does what the stock xenstored does (`tools/xenstored/domain.c`,
+`check_domains()`). It binds `VIRQ_DOM_EXC`, which Xen sends to the xenstore
+domain (Dom0 here, `set_xs_domain(dom0)`) when a domain shuts down, dies or is
+destroyed, and on each event looks up every toolstack-introduced domain with
+`XEN_DOMCTL_getdomaininfo`. One reported dead (`XEN_DOMINF_dying`, set only for
+`DOMDYING_dead`) or gone (`-ESRCH`) is released and `@releaseDomain` is fired;
+one that has only shut down is left alone (0036 fires `@releaseDomain` for
+that).
+Dom0less and Zephyr-created domains are not looked at.
+
+The callback runs in the event-channel ISR and only wakes the `dom_exc` thread,
+which does the release (not the system workqueue: a wedged guest worker can
+block the release's `k_thread_join` for good). A scan also runs after each
+`XS_INTRODUCE`. The release path changes for both callers: `f_released` makes a
+second release a no-op; the drop of the last borrowed reference runs a deferred
+teardown, and an `XS_INTRODUCE` of that domid is refused (`-EBUSY`) until then;
+only toolstack-introduced domains are released; only the nodes the guest owns
+are removed, as the stock xenstored does (the Dom0-owned `/local/domain/<id>`,
+`/vm/<uuid>` and `/libxl/<id>` are removed by libxl before it destroys the
+domain); the console, which this Dom0 never starts for them, is no longer
+stopped; and the backend removal, which did nothing for them, is dropped. The
+`CONFIG_DOMU_MAX` slot is counted free only after the guest's worker has been
+joined and its stack slot given back, and the store event channel is unbound
+with the event ISR off. A lookup that fails with an error other than `-ESRCH`
+is tried again a second later, since no later event may come for that domain.
+
+`CONFIG_XEN_DOM_EXC_RELEASE` (default y) turns the event on. Without it, or if
+the bind fails, dead domains are released only on `XS_RELEASE`.
+
+## 0036: fire `@releaseDomain` when a toolstack domain shuts down
+libxl learns that a guest shut down from the `@releaseDomain` watch, and only
+then runs the guest's `on_poweroff`/`on_reboot`/`on_crash`. The stock xenstored
+fires it the first time it sees a domain shut down; this server did not, so a
+guest that powered off or rebooted by itself stayed shut down. 0036 fires it
+once per shutdown from the 0035 scan. The shutdown reason is kept with the flag:
+Xen resumes a suspended domain without the VIRQ and this server has no
+`XS_RESUME`, so a poweroff after a resumed suspend is told apart from the
+suspend by its reason.
+
+This changes what the board does when a guest shuts down by itself, because the
+guests are started by `Type=oneshot` units running `xl create` without `-e`, so
+xl's monitor stays up: DomU and DomZ follow their `on_reboot`/`on_poweroff`
+(restart/destroy), and DomA's `on_reboot = 'preserve'` keeps it, but DomA has no
+`on_poweroff`, so an AAOS poweroff would now destroy it. `xl shutdown -w` in the
+units' `ExecStop` now returns once the guest has shut down. DomA's Android
+acknowledges the request but does not power off (`docs/TROUBLESHOOTING.md`), so
+for DomA it still waits.
+
+## 0037: initial event of every new watch, `dom_exc` line after boot
+A new watch is owed one event at once, and the watcher reads its path again on
+it; libxl reads the domains' state on the one for `@releaseDomain`. This server
+sent it only when the path names a node the watcher may read. `@releaseDomain`
+and `@introduceDomain` are not nodes, so a guest that shut down before xl had
+set the watch was never seen: `xl create` without `-p` of a guest that powers
+off at once left it `---s--`. A path already gone got no event either, so
+libxl's wait for a backend directory removed before its watch was set (0064's
+wait for `xl devd`) ran to its 10 s timeout. The stock xenstored sends the
+initial event for any path (`tools/xenstored/watch.c`, `do_watch()`); 0037 does
+the same, through the same queue as the other events, so the coalescing and the
+per-domain cap still apply. The event carries only the path and token the
+watcher gave. Unlike the
+stock one, which sends it to the new watch alone, it reaches every watch of that
+domain on the path or a parent of it; libxl reads the state again and ignores an
+event that changes nothing.
+
+0035 logged `dom_exc: VIRQ_DOM_EXC bound to evtchn#N` from `SYS_INIT`, before
+the shell's log backend runs, and the line was lost. 0037 logs it from the
+`dom_exc` thread on its first event, which comes with the first toolstack
+domain (the scan after its `XS_INTRODUCE`). Whether the bind worked can also be
+seen at any time from `kernel thread list` (a `dom_exc` thread exists only after
+a successful bind). A failed bind's warning is still logged from `SYS_INIT`, so
+it does not reach the console either: a missing `dom_exc` thread is what shows
+it.
 
 ## Expected build warnings
 

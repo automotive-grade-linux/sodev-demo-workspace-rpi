@@ -1,0 +1,103 @@
+From a92e9672317cbf3d629da41e9d3a621956bc82de Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 10:01:20 +0900
+Subject: [PATCH] xenlib: send a new watch its initial event, say dom_exc
+ after boot
+
+Two gaps found while testing 0035 and 0036 on the RPi4:
+
+A new watch got its initial event only when the path named a node
+the watcher may read. "@releaseDomain" and "@introduceDomain" are
+not nodes, and libxl reads the domains' state on that event, so a
+guest that shut down before xl had set its "@releaseDomain" watch
+stayed shut down: `xl create` without -p of a guest that powers off
+at once left it "---s--". A watch on a path already gone got none
+either, so libxl's wait for a backend directory that was removed
+before its watch was set ran to its timeout. The stock xenstored
+sends the initial event for any path (tools/xenstored/watch.c,
+do_watch()); send it for any path too. The event carries only the
+path and token the watcher gave.
+
+The "dom_exc: VIRQ_DOM_EXC bound" line never reached the console. It
+was logged from SYS_INIT, before the shell's log backend runs. Log it
+from the dom_exc thread on its first event instead, which comes with
+the first toolstack domain.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ xen-dom-mgmt/src/xen-dom-mgmt.c | 14 ++++++++++----
+ xenstore-srv/src/xenstore_srv.c | 20 +++++++++++++-------
+ 2 files changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index ade92f8..d95ee16 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -1695,14 +1695,21 @@ static bool dom_exc_scan(bool again)
+ 
+ static void dom_exc_thread(void *p1, void *p2, void *p3)
+ {
+-	bool retry = false;
++	unsigned int port = (unsigned int)(uintptr_t)p1;
++	bool said = false, retry = false;
+ 
+-	ARG_UNUSED(p1);
+ 	ARG_UNUSED(p2);
+ 	ARG_UNUSED(p3);
+ 
+ 	for (;;) {
+ 		k_sem_take(&dom_exc_sem, retry ? K_SECONDS(1) : K_FOREVER);
++		/* Said on the first event, not at bind time: the bind runs from
++		 * SYS_INIT, before the shell's log backend, and the line was lost.
++		 * The first event comes with the first toolstack domain. */
++		if (!said) {
++			LOG_INF("dom_exc: VIRQ_DOM_EXC bound to evtchn#%u", port);
++			said = true;
++		}
+ 		retry = dom_exc_scan(retry);
+ 	}
+ }
+@@ -1739,9 +1746,8 @@ static void dom_exc_init(void)
+ 	/* An event from now on only gives dom_exc_sem; the thread takes it. */
+ 	k_thread_create(&dom_exc_thrd, dom_exc_stack,
+ 			K_THREAD_STACK_SIZEOF(dom_exc_stack), dom_exc_thread,
+-			NULL, NULL, NULL, 7, 0, K_NO_WAIT);
++			(void *)(uintptr_t)bind.port, NULL, NULL, 7, 0, K_NO_WAIT);
+ 	k_thread_name_set(&dom_exc_thrd, "dom_exc");
+-	LOG_INF("dom_exc: VIRQ_DOM_EXC bound to evtchn#%u", bind.port);
+ }
+ #endif /* CONFIG_XEN_DOM_EXC_RELEASE */
+ 
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index b2be4a7..2c2e0bd 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -2128,13 +2128,19 @@ static void handle_watch(struct xenstore *xenstore, uint32_t id, char *payload,
+ 	send_reply(xenstore, id, XS_WATCH, "OK");
+ 
+ 	k_mutex_lock(&xsel_mutex, K_FOREVER);
+-	if (key_to_entry_check_perm(path, domain->domid, XS_PERM_READ)) {
+-		/* Through the same producer as notify_watchers(), so the initial event a
+-		 * new watch is owed obeys the coalescing rule and the per-domain cap too.
+-		 * Appending directly here let a guest grow the pending list without bound
+-		 * just by re-registering a watch. */
+-		queue_pending_watch_event(domain, path);
+-	}
++	/* Every new watch is owed its initial event, as the stock xenstored
++	 * sends it for any path: a watcher reads the path again on it. Without
++	 * it a special path (@releaseDomain, @introduceDomain), which has no
++	 * node, and a path that is already gone or not readable were never
++	 * looked at: libxl missed a domain that shut down before its watch was
++	 * set, and waited out its timeout for a path removed before its watch.
++	 * The event carries only the watched path and the watcher's token.
++	 *
++	 * Through the same producer as notify_watchers(), so the initial event a
++	 * new watch is owed obeys the coalescing rule and the per-domain cap too.
++	 * Appending directly here let a guest grow the pending list without bound
++	 * just by re-registering a watch. */
++	queue_pending_watch_event(domain, path);
+ 	k_mutex_unlock(&xsel_mutex);
+ 	k_free(path);
+ 
