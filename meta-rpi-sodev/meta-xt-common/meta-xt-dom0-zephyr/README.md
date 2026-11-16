@@ -618,9 +618,8 @@ zephyr, zephyr-dom0-xt, zephyr-xenlib, zephyr-xrun; `fatfs` is the fifth workspa
 project but carries no patch). **Verified on real
 hardware:** the xenstore-server wedge fix holds — `xl create` runs
 both guests to completion, `xl list` stays responsive, and both HDMI screens render
-live under sustained load (`dmesg | grep -c 'xenbus: error'` = 0, no OOM). `xl
-destroy` + re-create of DomA carries the documented vhost-domid caveat (board
-restart required; see the top-level README Known issues). 0014-0017 are final.
+live under sustained load (`dmesg | grep -c 'xenbus: error'` = 0, no OOM).
+0014-0017 are final.
 
 ## 0016: toolstack destroy-ownership guards
 Found while reviewing the xen-dom-mgmt.c toolstack

@@ -4,7 +4,7 @@ Description=Launch DomU (AGL Cluster IC) via xl create (DomD toolstack, the disa
 # Adapted to the dom0less DomD configuration:
 #   - There is no xl-created DomD to depend on (Xen builds it dom0less from
 #     boot.cmd), so this unit waits on domd-toolstack-prep instead.
-#   - Started AFTER DomA (vhost_xen domid latch). Ordering is After= only, so DomU
+#   - Started AFTER DomA (vhost_xen binding). Ordering is After= only, so DomU
 #     still starts if DomA fails (e.g. out of memory on an 8GB configuration).
 # Runs INSIDE DomD (toolstack domain). xl-attach-disks
 # (Dom0-blkback) is gone: qemu reads /dev/mmcblk0p3 directly (DomD owns the SD).

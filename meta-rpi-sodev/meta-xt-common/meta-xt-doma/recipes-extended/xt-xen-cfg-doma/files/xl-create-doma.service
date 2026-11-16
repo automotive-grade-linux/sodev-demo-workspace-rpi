@@ -5,13 +5,13 @@ Description=Launch DomA (AAOS) via xl create (DomD toolstack, the disaggregated 
 #   - There is no xl-created DomD to depend on (Xen builds it dom0less from
 #     boot.cmd), so this unit waits on domd-toolstack-prep plus a direct xenstore
 #     poll of the driver-domain status nodes.
-#   - vhost_xen binds to a single guest domid, and it picks the LOWEST live
-#     domain that has a running device-model (see the xen_patchset 0013
-#     rebinding patch). DomA is the only guest that uses a vhost device -- its
-#     VHAL rides vhost-vsock on CID 2 -- so DomA has to be the one holding the
-#     lower domid, which means creating it BEFORE DomU
-#     (Before=xl-create-domu.service; vsock is also removed from domu.cfg as a
-#     second safeguard).
+#   - vhost_xen binds to a single guest domid: the live domain named DomA
+#     (xen_patchset 0015), or, where DomD cannot read the names, the LOWEST
+#     live domain that has a running device-model (0013). DomA is the only
+#     guest that uses a vhost device -- its VHAL rides vhost-vsock on CID 2 --
+#     so for that second rule DomA has to hold the lower domid, which means
+#     creating it BEFORE DomU (Before=xl-create-domu.service; vsock is also
+#     removed from domu.cfg as a further safeguard).
 # This unit now runs INSIDE DomD (the toolstack domain).
 # DomA's own disks need no Dom0 blkback chain: DomD owns the SD via SDHCI
 # passthrough and qemu reads /dev/mmcblk0p4 directly. (xl-attach-disks.service
