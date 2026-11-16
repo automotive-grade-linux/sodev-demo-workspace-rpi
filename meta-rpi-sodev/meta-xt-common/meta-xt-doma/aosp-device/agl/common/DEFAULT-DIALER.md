@@ -61,8 +61,9 @@ made the incoming-call screen appear on the very next call, with
 
 All of these were already correct and present, and none of them needed changing:
 
-* `packages/modules/Bluetooth` HFP client patches (`config.xml` A2DP focus,
-  `HeadsetClientStateMachine`, `client_interface_aidl.cc`, `hfp_client_interface_aidl.cc`,
+* the A2DP focus value (`a2dp_sink_automatically_request_audio_focus`, set by the
+  product overlay) and the `packages/modules/Bluetooth` HFP client patches
+  (`HeadsetClientStateMachine`, `client_interface_aidl.cc`, `hfp_client_interface_aidl.cc`,
   `bta_hf_client_int.h`, `bta_hf_client_sco.cc`)
 * `frameworks/base` `BtHelper.java` HF-role gate (`sHfClientRole`)
 * `packages/services/Car` `CarAudioService.java` HFP SCO bridge

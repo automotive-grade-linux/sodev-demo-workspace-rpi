@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 09:01:55 +0900
+Subject: [PATCH] bt-a: let A2DP take audio focus, from the product overlay
+
+A2DP is selectable but silent: the Bluetooth app's
+a2dp_sink_automatically_request_audio_focus is false in AOSP, so the
+stack requests no focus for it and the route never becomes active.
+Set it to true in this device's overlay instead of patching the
+Bluetooth module's config.xml. DEFAULT-DIALER.md now says where the
+value lives, and README.md lists the overlay and counts its value
+among the ones that stay.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ DEFAULT-DIALER.md                                 |  5 +++--
+ README.md                                         |  5 +++--
+ .../Bluetooth/android/app/res/values/config.xml   | 15 +++++++++++++++
+ 3 files changed, 21 insertions(+), 4 deletions(-)
+ create mode 100644 overlay/packages/modules/Bluetooth/android/app/res/values/config.xml
+
+diff --git a/DEFAULT-DIALER.md b/DEFAULT-DIALER.md
+index d299bb8..7e4199a 100644
+--- a/DEFAULT-DIALER.md
++++ b/DEFAULT-DIALER.md
+@@ -61,8 +61,9 @@ made the incoming-call screen appear on the very next call, with
+ 
+ All of these were already correct and present, and none of them needed changing:
+ 
+-* `packages/modules/Bluetooth` HFP client patches (`config.xml` A2DP focus,
+-  `HeadsetClientStateMachine`, `client_interface_aidl.cc`, `hfp_client_interface_aidl.cc`,
++* the A2DP focus value (`a2dp_sink_automatically_request_audio_focus`, set by the
++  product overlay) and the `packages/modules/Bluetooth` HFP client patches
++  (`HeadsetClientStateMachine`, `client_interface_aidl.cc`, `hfp_client_interface_aidl.cc`,
+   `bta_hf_client_int.h`, `bta_hf_client_sco.cc`)
+ * `frameworks/base` `BtHelper.java` HF-role gate (`sHfClientRole`)
+ * `packages/services/Car` `CarAudioService.java` HFP SCO bridge
+diff --git a/README.md b/README.md
+index 13a2b30..3e480ce 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,7 @@ reuse object files built for the other CPU.
+ | `DomaSettingsProviderRRO/` | Starts Bluetooth off on a fresh userdata. A product RRO above Car's, which turns it on |
+ | `overlay/.../core/res/res/values/config.xml` | `framework-res` overlay naming the dialer this product actually ships, so an incoming Bluetooth call reaches a screen |
+ | `DEFAULT-DIALER.md` | The measurement behind that one string, kept out of the XML because an XML comment cannot carry it |
++| `overlay/.../Bluetooth/android/app/res/values/config.xml` | Bluetooth app overlay: A2DP requests audio focus, so its route becomes active |
+ | `audio/audio_policy_configuration.xml` | Audio policy fork: names the Bluetooth audio module that exists in AOSP 17, references three XIncludes that the upstream file names but never installed and that the product makefile now installs, and raises bus0_media_out's gain ceiling from trout's 600 to 1200 mB |
+ | `audio/bluetooth_audio_policy_configuration.xml` | The Bluetooth half of that policy: the A2DP output and the SCO/HFP ports in one place |
+ | `sepolicy/` | Vendor policy: an exec type and a domain for the shadow-AP scripts, the request drop-box's own label (`doma_wifi_req_file`) and what `DomaWifiRelay` (`system_app`) may do with it, and the domain plus label for the V4L2 Codec2 HAL |
+@@ -142,8 +143,8 @@ The fix belongs upstream in `android_device_epam_xenvm-trout`, the rc as an
+ opt-in gated on a boot property. When it lands there, the rc and the two
+ animation values are deleted from both copies -- this one and the workspace one.
+ The rest of the overlay stays, because it belongs to this product: the dialer
+-name in `framework-res` and the screen-off timeout. This repository then keeps
+-the board files, that overlay and the DomA feature files.
++name in `framework-res`, the screen-off timeout and the A2DP audio focus. This
++repository then keeps the board files, that overlay and the DomA feature files.
+ 
+ ## Status
+ 
+diff --git a/overlay/packages/modules/Bluetooth/android/app/res/values/config.xml b/overlay/packages/modules/Bluetooth/android/app/res/values/config.xml
+new file mode 100644
+index 0000000..f4cb0e3
+--- /dev/null
++++ b/overlay/packages/modules/Bluetooth/android/app/res/values/config.xml
+@@ -0,0 +1,15 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++     SPDX-License-Identifier: Apache-2.0
++
++     Static overlay on the Bluetooth app (packages/modules/Bluetooth/android/app).
++
++     With AOSP's default, false, the stack requests no audio focus when an
++     A2DP sink source starts or plays, so on this car product A2DP is
++     selectable but silent: its route never becomes active.
++
++     The Raspberry Pi 5 product carries the same value in device/agl/common/overlay.
++-->
++<resources>
++    <bool name="a2dp_sink_automatically_request_audio_focus">true</bool>
++</resources>
+-- 
+2.43.0
+

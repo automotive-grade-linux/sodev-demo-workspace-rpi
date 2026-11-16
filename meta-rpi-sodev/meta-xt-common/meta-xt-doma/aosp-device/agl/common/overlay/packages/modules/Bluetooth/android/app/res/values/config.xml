@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-License-Identifier: Apache-2.0
+
+     Static overlay on the Bluetooth app (packages/modules/Bluetooth/android/app).
+
+     With AOSP's default, false, the stack requests no audio focus when an
+     A2DP sink source starts or plays, so on this car product A2DP is
+     selectable but silent: its route never becomes active.
+
+     This file is board independent, so it lives in device/agl/common/overlay,
+     which the Raspberry Pi 5 product names; the Raspberry Pi 4 device carries
+     the same value in its own overlay.
+-->
+<resources>
+    <bool name="a2dp_sink_automatically_request_audio_focus">true</bool>
+</resources>
