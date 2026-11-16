@@ -356,6 +356,7 @@ apply_one zephyr-xenlib  0032-xenlib-single-xen-public-header-tree.patch
 apply_one zephyr-xenlib  0035-xenlib-release-dead-toolstack-domains-on-virq-dom-exc.patch
 apply_one zephyr-xenlib  0036-xenlib-fire-releasedomain-when-a-toolstack-domain-shuts-down.patch
 apply_one zephyr-xenlib  0037-xenlib-send-a-new-watch-its-initial-event-say-dom-exc-after-boot.patch
+apply_one zephyr-xenlib  0038-xenlib-write-the-empty-value-for-an-xs-write-with-no-data.patch
 
 # --- [5] zephyr-xrun -------------------------------------------------------
 apply_one zephyr-xrun    0009-xrun-sdhc-fallback.patch

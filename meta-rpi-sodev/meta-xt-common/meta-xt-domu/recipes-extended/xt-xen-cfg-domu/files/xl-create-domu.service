@@ -32,7 +32,22 @@ ExecStartPre=/bin/sh -c '[ -f /mnt/linux-domu ] || mount /dev/mmcblk0p1 /mnt'
 # Wait for DomD weston to be ready (qemu SDL needs the wayland connection).
 ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do [ "$$(xenstore-read /local/domain/1/drivers/weston-up/status 2>/dev/null)" = "ready" ] && exit 0; sleep 1; done; echo "DomD weston-up not ready after 120s"; exit 1'
 ExecStart=/usr/sbin/xl create /etc/xen/domu.cfg
-ExecStop=/usr/sbin/xl shutdown -w DomU
+# `xl shutdown` returns once DomU has acknowledged the request (at most 60 s).
+# The xl process that `xl create` left running destroys DomU once it has shut
+# down (on_poweroff's default), but that process is in this unit's cgroup, and
+# systemd stops it as soon as ExecStop is done, so DomU would stay shut down
+# with its qemu running. Wait here until DomU is gone, and destroy it if it is
+# not gone 60 s later; the wait also runs when the request fails. No -w: it
+# waits for the shutdown without a limit, and a DomU that acknowledges and then
+# hangs would hold the unit until systemd kills it, the destroy never run. The
+# wait follows the domid, not the name: libxl removes the name with the rest of
+# the domain's xenstore tree before it destroys the domain, so a wait on the
+# name ends early and systemd stops xl between the two, leaving a "(null)"
+# domain. Never do this for DomA.
+ExecStop=/bin/sh -c 'd=$$(xl domid DomU 2>/dev/null) || { echo "no DomU to stop"; exit 0; }; xl shutdown $$d; for i in $$(seq 1 60); do xl list $$d >/dev/null 2>&1 || exit 0; sleep 1; done; echo "DomU $$d still there after 60 s, destroying it"; exec /usr/sbin/xl destroy $$d'
+# The acknowledgement's 60 s, the 60 s wait and the destroy: more than
+# systemd's default 90 s, which would stop the unit before the destroy runs.
+TimeoutStopSec=150
 StandardOutput=journal
 StandardError=journal
 

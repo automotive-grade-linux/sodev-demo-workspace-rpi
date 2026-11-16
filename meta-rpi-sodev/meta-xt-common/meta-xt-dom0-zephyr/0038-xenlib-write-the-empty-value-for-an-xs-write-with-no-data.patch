@@ -1,0 +1,54 @@
+From 84a41c21854e09a57e875c85c450e7b40c6c80e9 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 11:54:03 +0900
+Subject: [PATCH] xenlib: write the empty value for an XS_WRITE with no data
+
+An XS_WRITE whose payload is only the path writes the empty value in
+the stock xenstored. Here construct_data() leaves data NULL for it,
+and xss_do_write() takes NULL as "keep the value" (data_len is 0, so
+the value is not written and the write permission is not checked).
+The request was still answered "OK" and fired the watches on the path.
+
+A Linux guest acknowledges a shutdown request by writing "" to
+control/shutdown in drivers/xen/manage.c's shutdown_handler(). The
+value stayed "poweroff", so libxl never saw the acknowledgement, and
+the guest's own watch fired again on its write: the handler read
+"poweroff" once more and called orderly_poweroff() again, again and
+again. On the RPi5 `systemctl stop xl-create-domu` (`xl shutdown -w
+DomU`) left the guest starting /sbin/poweroff thousands of times until
+it ran out of memory. The guest's sysrq handler acks control/sysrq
+the same way, and a reboot request was not acknowledged either.
+
+Pass "" for an XS_WRITE with no data. The value is then written, and
+the write permission is checked, so a domain that may not write the
+node gets EACCES instead of "OK" and a watch event. An XS_MKDIR of an
+existing node still keeps its value.
+
+Both the NULL return and the data_len > 0 test are from before this
+series (24686473, 50a8eb41).
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ xenstore-srv/src/xenstore_srv.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/xenstore-srv/src/xenstore_srv.c b/xenstore-srv/src/xenstore_srv.c
+index 2c2e0bd..3d9b491 100644
+--- a/xenstore-srv/src/xenstore_srv.c
++++ b/xenstore-srv/src/xenstore_srv.c
+@@ -1611,7 +1611,12 @@ static void _handle_write(struct xenstore *xenstore, uint32_t id,
+ 		goto free_path;
+ 	}
+ 
+-	rc = xss_do_write(path, data, domain->domid, NULL, 0);
++	/* An XS_WRITE that carries no data bytes writes the empty value, as in
++	 * the stock xenstored: a guest acks control/shutdown by writing "" to it.
++	 * construct_data() leaves data NULL then, and NULL means "keep the value"
++	 * to xss_do_write(), which is what XS_MKDIR needs for an existing node. */
++	rc = xss_do_write(path, data ? data : (msg_type == XS_WRITE ? "" : NULL),
++			  domain->domid, NULL, 0);
+ 	if (rc) {
+ 		LOG_ERR("Failed to write to xenstore (rc=%d)", rc);
+ 		send_errno(xenstore, id, (rc < 0) ? -rc : rc);

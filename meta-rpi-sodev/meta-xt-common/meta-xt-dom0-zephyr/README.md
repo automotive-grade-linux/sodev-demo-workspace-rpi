@@ -74,6 +74,7 @@ file refer to patches by number.
 | 0035 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `Kconfig`, `xen-dom-mgmt/{include/domain.h,src/xen-dom-mgmt.c}`, `xenstore-srv/{include/xenstore_srv.h,src/xenstore_srv.c}` | Release a toolstack-introduced domain when Xen reports it dead or gone (`VIRQ_DOM_EXC`), as the stock xenstored does. libxl sends `XS_RELEASE` only on a soft reset, so a guest removed with `xl destroy` stayed `(null) --p--d` and held a `CONFIG_DOMU_MAX` slot (issue #9). See the 0035 note below. |
 | 0036 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `Kconfig`, `xen-dom-mgmt/{include/domain.h,src/xen-dom-mgmt.c}` | Fire `@releaseDomain` once when a toolstack-introduced domain shuts down, as the stock xenstored does, so libxl applies the guest's `on_poweroff`/`on_reboot`/`on_crash`. Changes behaviour on the board: see the 0036 note below. |
 | 0037 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xen-dom-mgmt/src/xen-dom-mgmt.c`, `xenstore-srv/src/xenstore_srv.c` | Send every new watch its initial event, as the stock xenstored does, so xl sees a guest that shut down before its `@releaseDomain` watch was set and libxl's wait for an already removed path ends at once; log the `dom_exc` bind line on the first event, after the shell is up. See the 0037 note below. |
+| 0038 | `zephyrproject-rtos/zephyr-xenlib` | `7f08845` | `xenstore-srv/src/xenstore_srv.c` | Write the empty value for an `XS_WRITE` that carries no data, as the stock xenstored does. A Linux guest acks a shutdown request by writing `""` to `control/shutdown`; the value stayed and the guest's own watch fired again, so `xl shutdown` was never acknowledged and the guest started `/sbin/poweroff` again and again until it ran out of memory. See the 0038 note below. |
 
 **Gating is self-enabling.** `rpi5-sodev.yaml`'s zephyr `dom0` builder passes
 `CONFIG_DOM_CFG_SODEV=y` (alongside `CONFIG_XEN_DOMCTL_INTERFACE_VERSION=0x18`),
@@ -737,9 +738,10 @@ guests are started by `Type=oneshot` units running `xl create` without `-e`, so
 xl's monitor stays up: DomU and DomZ follow their `on_reboot`/`on_poweroff`
 (restart/destroy), and DomA's `on_reboot = 'preserve'` keeps it, but DomA has no
 `on_poweroff`, so an AAOS poweroff would now destroy it. `xl shutdown -w` in the
-units' `ExecStop` now returns once the guest has shut down. DomA's Android
-acknowledges the request but does not power off (`docs/TROUBLESHOOTING.md`), so
-for DomA it still waits.
+units' `ExecStop` now returns once the guest has shut down (for DomU with 0038,
+which lets its acknowledgement through; the DomU unit then waits for xl to
+destroy it). DomA's Android acknowledges the request but does not power off
+(`docs/TROUBLESHOOTING.md`), so for DomA it still waits.
 
 ## 0037: initial event of every new watch, `dom_exc` line after boot
 A new watch is owed one event at once, and the watcher reads its path again on
@@ -766,6 +768,29 @@ seen at any time from `kernel thread list` (a `dom_exc` thread exists only after
 a successful bind). A failed bind's warning is still logged from `SYS_INIT`, so
 it does not reach the console either: a missing `dom_exc` thread is what shows
 it.
+
+## 0038: an `XS_WRITE` with no data writes the empty value
+An `XS_WRITE` whose payload is only the path writes the empty value in the stock
+xenstored. Here `construct_data()` left the data `NULL`, `xss_do_write()` took
+`NULL` as "keep the value" (and so skipped the write permission check as well),
+and the request was still answered `OK` and fired the watches on the path.
+
+A Linux guest acknowledges a shutdown request by writing `""` to
+`control/shutdown` (`drivers/xen/manage.c`, `shutdown_handler()`). The value
+stayed `poweroff`: libxl never saw the acknowledgement, and the guest's own
+watch fired again on its write, so the handler read `poweroff` again and called
+`orderly_poweroff()` again, again and again. On the RPi5 `systemctl stop
+xl-create-domu` (`xl shutdown -w DomU`) left DomU starting `/sbin/poweroff`
+thousands of times until it ran out of memory. The guest acks `control/sysrq`
+the same way, and a reboot request was not acknowledged either. A guest that
+powers off or reboots by itself does not go through `control/shutdown` and was
+not affected.
+
+0038 passes `""` for an `XS_WRITE` with no data, so the value is written and the
+write permission is checked: a domain that may not write the node now gets
+`EACCES` instead of `OK` and a watch event. An `XS_MKDIR` of an existing node
+still keeps its value. Both the `NULL` return and the `data_len > 0` test are
+from before this series.
 
 ## Expected build warnings
 
