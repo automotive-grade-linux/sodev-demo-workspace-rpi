@@ -240,17 +240,16 @@ fdt rm /soc@107c000000/fb
 # ------------------------------------------------------------------
 
 # ------------------------------------------------------------------
-# NO SCMI IN THIS FLAVOUR, so DomD gets no Wi-Fi here.
+# NO PIN CONTROLLER FOR DOMD IN THIS FLAVOUR, so DomD gets no Wi-Fi here.
 # ------------------------------------------------------------------
-# The zephyr flavour's script applies bcm2712-raspberrypi5-scmi-host.dtbo, marks
-# the pin controller (pinctrl@7d504100) and gio as passthrough, and makes DomD
-# TF-A's SCMI agent 0, which is how DomD's Wi-Fi SDIO pins get muxed: TF-A
-# programs them at EL3. None of that is done here: handing a single SCMI channel
-# to DomD while a Linux Dom0 is the hardware domain is a design question nobody
-# has answered yet.
+# The zephyr flavour's script marks the pin controller (pinctrl@7d504100) and
+# gio as passthrough, and DomD muxes its Wi-Fi SDIO pins itself. Neither is
+# done here: both stay with this Dom0, the hardware domain. Handing the pin
+# controller to DomD while a Linux Dom0 is the hardware domain has not been
+# designed or tried.
 #
-# So domd-vc4.bb strips the Wi-Fi SDIO controller, wl_on_reg, gio and the SCMI
-# nodes out of DomD's partial DT for this flavour, and nothing here marks
+# So domd-vc4.bb strips the Wi-Fi SDIO controller, wl_on_reg, gio and the pin
+# controller out of DomD's partial DT for this flavour, and nothing here marks
 # /axi/mmc@1100000: the controller stays with this Dom0, like any other unmarked
 # node. Marking it would not help, since its pins stay unmuxed, and a DomD that
 # still claimed it would make Xen panic at DomD creation: Dom0 is built first
@@ -261,7 +260,7 @@ fdt rm /soc@107c000000/fb
 # ------------------------------------------------------------------
 # Disable the Bluetooth UART and leave it with Dom0.
 # ------------------------------------------------------------------
-# Bluetooth needs the SCMI pin mux this flavour does not set up (above), so
+# Bluetooth needs the pin mux this flavour does not give DomD (above), so
 # domd-vc4.bb strips uart_bt from DomD's partial DT for DOM0_OS=linux, and
 # nothing in this configuration uses the UART. The node is not marked
 # xen,passthrough, so Xen gives it and SPI 276 to Dom0; status "disabled"
@@ -693,5 +692,13 @@ fdt set /chosen/dom0/module@1 reg <0x0 0xa0000000 0x0 0x${dom0_initramfs_size}>
 # ------------------------------------------------------------------
 # Boot Xen → Xen hands off to Linux Dom0 (= thin initramfs base)
 # ------------------------------------------------------------------
+# ft_board_setup() runs during `booti` and adds a /framebuffer node after this
+# script's framebuffer removals. With a video driver it asks the VideoCore for a
+# framebuffer and gives the node a reg in the VideoCore carve-out;
+# rpi5-no-video-bcm2835.cfg leaves U-Boot without one, and skip_board_fixup=1
+# stops ft_board_setup() altogether (boot/image-fdt.c). It also skips
+# update_fdt_from_fw(), which does nothing here: this script boots the
+# firmware's own DT.
+setenv skip_board_fixup 1
 setenv fdt_high 0xffffffffffffffff
 booti 0x2000000 - ${fdt_addr}

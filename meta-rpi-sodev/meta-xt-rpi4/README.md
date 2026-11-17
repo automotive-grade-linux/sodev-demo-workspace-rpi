@@ -106,9 +106,9 @@ overlay.
   xHCI behind the PCIe root complex, gpio/spi/i2c), which is why this layer adds a
   `can-passthrough.dtso` and its own `00-genet-eth0.link` that `meta-xt-rpi5` has no
   counterpart for.
-* **No SCMI, no MIP, no IOMMU.** Clocks and power come from the VideoCore firmware
-  mailbox; PCIe MSI is inside the root complex. The SCMI overlays, the SCMI Kconfig
-  fragment and the MIP MSI Xen patch are absent rather than remapped.
+* **No MIP, no IOMMU.** Clocks and power come from the VideoCore firmware
+  mailbox; PCIe MSI is inside the root complex. The MIP MSI Xen patch is absent
+  rather than remapped.
 * **Xen's console is the mini UART** (`/soc/serial@7e215040`), because the pl011 goes
   to Bluetooth. `4.22-0014` (rpi4 only) makes Xen leave its divisor as the boot loader
   programmed it: the automatic baud read returned 0 on some boots, the 16550 fallback
@@ -140,12 +140,9 @@ file://rpi4-nvmem.cfg"` and ships that fragment in its own `files/raspberrypi4/`
 exactly that one subdirectory — not meta-raspberrypi's whole `files/` — on
 `FILESEXTRAPATHS`; the reasoning for the narrow scope is in the file.
 
-Two changes in the shared layers were also needed, both machine-gated so RPi5 behaviour
-is unchanged: `meta-xt-driver-domain`'s `linux-raspberrypi_6.18.bbappend` scopes its
-SCMI/WiFi `.dtso` entries to `:raspberrypi5` (they are templated from
-`${RPI_SOC_FAMILY}-${MACHINE}` and would make `do_fetch` look for files that do not
-exist on this board), and `xt-xen-cfg-doma` gained a `DOMA_MEM_MiB` override so a board
-whose SKUs are not 16g/8g can state DomA's size directly.
+One change in the shared layers was also needed: `xt-xen-cfg-doma` gained a
+`DOMA_MEM_MiB` override so a board whose SKUs are not 16g/8g can state DomA's size
+directly.
 
 ## The AAOS guest is compiled for this board too
 
@@ -361,7 +358,7 @@ exceptions:
 |---|---|---|
 | `conf/layer.conf`, `recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb`, `recipes-bsp/xt-rpi-u-boot-scr/xt-rpi-u-boot-scr.bb` and `.bbappend`, `recipes-core/images/rpi5-image-minimal-domd.bb` and `rpi5-image-xt-domd-v4h.bbappend`, `recipes-extended/rp1-touch-forward/rp1-touch-bridge.bbappend`, `recipes-extended/xt-aaos-host-services/xt-aaos-host-services.bbappend`, `recipes-extended/xt-xen-cfg-doma/xt-xen-cfg-doma_%.bbappend`, `recipes-graphics/wayland/weston-init.bbappend`, `recipes-kernel/linux/linux-raspberrypi_6.18.bbappend` | MIT (`SPDX-License-Identifier: MIT`) | recipe metadata, tagged as the meta-xt-common recipes they extend are |
 | `recipes-bsp/trusted-firmware-a/trusted-firmware-a.inc` | MIT, no SPDX tag | derived from meta-arm's `recipes-bsp/trusted-firmware-a/trusted-firmware-a.inc` (meta-arm is MIT, its `COPYING.MIT`) with local changes; the same file is in `meta-xt-rpi5` |
-| `recipes-extended/xen/files/*.patch`, `recipes-kernel/linux/files/*.patch`, `recipes-bsp/u-boot/files/*.patch` | the license of the project each one modifies: Xen (GPL-2.0-only; `0025-*.patch` adds a file with that SPDX tag), the Raspberry Pi kernel (GPL-2.0), U-Boot (GPL-2.0+) | a patch is a change to that project, not to this layer |
+| `recipes-extended/xen/files/*.patch`, `recipes-kernel/linux/files/*.patch`, `recipes-bsp/u-boot/files/*.patch` | the license of the project each one modifies: Xen (GPL-2.0-only), the Raspberry Pi kernel (GPL-2.0), U-Boot (GPL-2.0+) | a patch is a change to that project, not to this layer |
 
 ## Layout
 

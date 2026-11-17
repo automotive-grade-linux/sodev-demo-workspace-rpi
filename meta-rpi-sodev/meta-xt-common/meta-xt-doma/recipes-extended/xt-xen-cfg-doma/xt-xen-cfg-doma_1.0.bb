@@ -3,8 +3,8 @@ DESCRIPTION = "\
     /etc/xen/doma.cfg + doma.dtb + xl-create-doma.service, plus, on the \
     Raspberry Pi 5 only, the reference /etc/xen/domd.cfg (DomA-augmented: xvdc=p4 \
     = the AAOS super.img; BCM2712 iomem/irqs; not in the dom0less boot path). \
-    DomA is created before DomU so the DomD vhost_xen backend latches the \
-    correct guest domid. Boot order is encoded in the unit files. \
+    DomA is created before DomU so the DomD vhost_xen backend binds DomA \
+    where it cannot pick DomA by name. Boot order is encoded in the unit files. \
     "
 
 LICENSE = "MIT"

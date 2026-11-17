@@ -478,9 +478,9 @@ PRODUCT_PROPERTY_OVERRIDES += \
 endif # XT_DOMA_HWDEC
 
 # ---------------------------------------------------------------------------
-# The shared overlay. Both files in it are board independent, so it lives in
-# device/agl/common/overlay; the Raspberry Pi 4 device carries the same two files
-# in its own repository. They are:
+# The shared overlay. The three files in it are board independent, so it lives
+# in device/agl/common/overlay; the Raspberry Pi 4 device carries the same three
+# files in its own repository. They are:
 #
 #   frameworks/base/packages/SettingsProvider/res/values/defaults.xml
 #     Defaults for a fresh userdata: in Settings.Global
@@ -500,6 +500,11 @@ endif # XT_DOMA_HWDEC
 #     Measured and fixed on the board, 2026-09-21; the full evidence, including the
 #     Telecom log lines and the runtime experiment that confirmed it, is in
 #     device/agl/common/DEFAULT-DIALER.md.
+#
+#   packages/modules/Bluetooth/android/app/res/values/config.xml
+#     a2dp_sink_automatically_request_audio_focus = true. With AOSP's false,
+#     A2DP is selectable but silent on this car product: the stack requests no
+#     audio focus for it, so its route never becomes active.
 #
 # DEVICE_PACKAGE_OVERLAYS and PRODUCT_PACKAGE_OVERLAYS are separate lists and both
 # are applied, so the root epam adds to PRODUCT_PACKAGE_OVERLAYS in

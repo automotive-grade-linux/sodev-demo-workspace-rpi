@@ -354,7 +354,7 @@ process*. It is built from:
   @ `rpi5-v0.4.0`, fetched by moulin as a `west` source; zephyr builder,
   board `rpi_5`.
 - **Patch series**: `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`
-  (27 patches numbered 0002-0034; retired numbers are not reused — its own README
+  (31 patches numbered 0002-0038; retired numbers are not reused — its own README
   carries the per-patch rationale, the retirement reasons and the required
   `west build` flags).
   Highlights: 0021 moves the west manifest to upstream Zephyr 4.5.0 and takes

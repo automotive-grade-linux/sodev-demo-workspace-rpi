@@ -24,15 +24,18 @@ ExecStartPre=/bin/sh -c '[ -f /mnt/zephyr-domz.bin ] || mount /dev/mmcblk0p1 /mn
 # console is the Xen PV console (`xl console DomZ`).
 ExecStart=/usr/sbin/xl create /etc/xen/domz.cfg
 # destroy, NOT `xl shutdown -w`, which the DomU/DomA units use. Those guests are
-# Linux/Android and answer the PV shutdown request; this Zephyr build has no
-# xenstore client at all (its .config has no CONFIG_XEN_STORE_SRV and there is no
-# control/shutdown watcher anywhere in the image), so nothing would ever consume
-# the request: `-w` would block until systemd's stop timeout, get SIGKILLed, and
-# leave DomZ running -- every `systemctl stop`, reboot and shutdown of the
-# toolstack domain would take DefaultTimeoutStopSec longer for nothing.
+# Linux/Android and have a PV shutdown watcher; this Zephyr build has no
+# xenstore code at all (zephyr-xenlib, the only xenstore code in the build,
+# builds nothing: every bool of its Kconfig is unset, CONFIG_XEN_STORE_SRV and
+# CONFIG_XEN_DOMAIN_MANAGEMENT among them; and no control/shutdown watcher is
+# anywhere in the image), so nothing acknowledges the request: `xl shutdown`
+# writes control/shutdown, waits 60 s for the acknowledgement, fails ("guest
+# didn't acknowledge control request") and leaves DomZ running. Every stop of
+# this unit would take that minute for nothing.
 # destroy is safe here in a way it is not for DomA: DomZ has no disks, no device
 # model and no filesystem to flush (`disk = []`, `virtio = []`), so there is no
-# state to lose. domz.cfg's on_reboot/on_poweroff never fire for the same reason.
+# state to lose. domz.cfg's on_reboot/on_poweroff fire only if DomZ shuts itself
+# down, which its application does not do.
 ExecStop=/usr/sbin/xl destroy DomZ
 StandardOutput=journal
 StandardError=journal

@@ -965,10 +965,9 @@ unset -f _asks_unconfined
 # reads them with os.getenv; passed through below). A dir already under $workdir is
 # reachable via the workspace mount, so only external paths get an extra -v.
 # docker rejects two -v with the same container path ("Duplicate mount point"), and the
-# flags legitimately overlap: --aaos-ref and --aaos-kernel-ref can name one mirror, and the
-# android_kernel sibling mount derived from --aaos-src below can land on the same path a
-# --aaos-kernel-ref already claimed. So record every container path that has been mounted
-# and skip repeats instead of letting `docker run` fail after the build has already started.
+# flags legitimately overlap: --aaos-ref and --aaos-kernel-ref can name one mirror. So
+# record every container path that has been mounted and skip repeats instead of letting
+# `docker run` fail after the build has already started.
 #
 # The same container path from the same host path is the harmless repeat described
 # above. The same container path from a DIFFERENT host path is a real conflict -- docker
@@ -1181,12 +1180,12 @@ check_repo_mirror "$XT_AAOS_KERNEL_REF" --aaos-kernel-ref kernel
 add_cache_mount "$XT_AAOS_REF"
 add_cache_mount "$XT_AAOS_KERNEL_REF"
 
-# When --aaos-src points OUTSIDE the workspace, the ninja doma/doma_kernel
-# components (run in the sodev-builder-rpi container) reach the AOSP tree via the
-# android/ symlink (-> AAOS_SRC_DIR) and ../android_kernel. in_docker only mounts
-# $workdir + the cache dirs, so those symlinks dangle in-container and
-# `mkdir -p android/.` fails. Mount the external tree (and android_kernel's real
-# target) so they resolve. (--aaos-src of an in-workspace dir is a no-op here.)
+# When --aaos-src points OUTSIDE the workspace, the ninja doma/doma_kernel components
+# (run in the sodev-builder-rpi container) reach the AOSP tree via the android/ symlink
+# (-> AAOS_SRC_DIR), and android_kernel may be a symlink too. in_docker only mounts
+# $workdir + the cache dirs, so those symlinks dangle in-container and `mkdir -p
+# android/.` fails. Mount the external tree (and android_kernel's real target) so they
+# resolve. (--aaos-src of an in-workspace dir is a no-op here.)
 if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "$AAOS_SRC_DIR" ]; then
   # Validate first, as every other cache flag does: add_cache_mount's `mkdir -p` would turn
   # a mistyped --aaos-src into an empty directory, and an empty AOSP checkout is not an
@@ -1195,16 +1194,6 @@ if [ "${ENABLE_ANDROID}" = "yes" ] && [ "$AAOS_MODE" = "source" ] && [ -n "$AAOS
   add_cache_mount "$AAOS_SRC_DIR"
   akdir="$(readlink -f "$workdir/$AAOS_KERNEL_DIR_NAME" 2>/dev/null || true)"
   [ -n "$akdir" ] && [ -d "$akdir" ] && add_cache_mount "$akdir"
-  # AOSP soong references ../android_kernel relative to android/ (-> AAOS_SRC_DIR),
-  # i.e. AAOS_SRC_DIR's sibling. moulin builds android_kernel INSIDE the workspace
-  # ($workdir/android_kernel, created later by the doma_kernel bazel step), so with
-  # an external --aaos-src that sibling path is empty in-container and droidcore
-  # fails "Image missing". Bind the workspace android_kernel onto the sibling path
-  # (both container paths -> the same host dir). Pre-create it so the -v mount works
-  # before moulin populates it.
-  ak_sib="$(dirname "$AAOS_SRC_DIR")/$AAOS_KERNEL_DIR_NAME"
-  mkdir -p "$workdir/$AAOS_KERNEL_DIR_NAME"
-  case "$ak_sib/" in "$workdir"/*) ;; *) mount_at "$workdir/$AAOS_KERNEL_DIR_NAME" "$ak_sib" ;; esac
 fi
 
 # moulin.conf resolves DL_DIR/SSTATE_DIR via os.getenv('XT_DL_DIR'/'XT_SSTATE_DIR');

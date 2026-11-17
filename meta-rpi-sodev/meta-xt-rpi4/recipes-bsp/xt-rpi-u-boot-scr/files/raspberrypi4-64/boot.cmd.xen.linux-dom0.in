@@ -803,7 +803,7 @@ fdt set /chosen/dom0/module@1 reg <0x0 0xb0000000 0x0 0x${dom0_initramfs_size}>
 # (domain_build.c), and DomD does not inherit this tree at all — it gets its own
 # partial DT, which declares genet with its own mdio/phy nodes.
 #
-# The u-boot cfg fragment additionally drops CONFIG_VIDEO/VIDEO_BCM2835, so
+# The u-boot cfg fragment additionally drops CONFIG_VIDEO_BCM2835, so
 # U-Boot never asks the VideoCore for a framebuffer either. This line is the
 # belt to that suspenders: it holds even if a future defconfig re-enables video.
 setenv skip_board_fixup 1

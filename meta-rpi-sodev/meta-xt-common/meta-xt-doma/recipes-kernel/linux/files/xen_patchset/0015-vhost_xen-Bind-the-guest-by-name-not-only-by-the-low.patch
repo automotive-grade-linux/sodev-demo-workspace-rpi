@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 14:51:06 +0900
+Subject: [PATCH] vhost_xen: Bind the guest by name, not only by the lowest
+ domid
+
+vhost_xen keeps one guest domid for the whole module, and since the
+previous patch it binds the lowest live domid whose device model is
+running. That relies on DomA, the only guest that uses vhost, being
+created first. Destroying and re-creating DomA while DomU stays up breaks
+it: DomA comes back with a domid above DomU's, and the rule binds DomU.
+
+Seen on a Raspberry Pi 5 after xl destroy DomA: the binding moved to
+DomU ("Set new domid: 9") as soon as DomA was gone, the re-created DomA
+(domid 15) stayed in its boot animation with
+
+  vhost_xen_map_desc: Failed to map pages from dom9 (ret=-22)
+
+and DomU ended up corrupted (a stream of systemd-coredump messages, no
+ssh), most likely because DomA's vhost-net and vhost-vsock mapped DomU's
+memory at DomA's addresses. Writing 15 to guest_domid by hand let DomA
+boot.
+
+Add a guest_name module parameter, "DomA" by default, set at boot. Only a
+candidate whose /local/domain/<domid>/name is guest_name is bound, and it
+wins over the lowest-domid rule; of two (an old DomA whose tree is not
+removed yet, and the new one) the higher domid, the newer. With no such
+candidate, for example right after DomA is destroyed, the existing rule
+keeps the last binding instead of moving it to DomU. A name read that
+fails with -EACCES (xenstore VM separation, as with the liveness probe)
+leaves the candidate to the lowest-domid rule, so a DomD that cannot read
+names behaves as before; any other failure skips the candidate, so that a
+transient error reading DomU's name while DomA is gone cannot bind DomU.
+An empty guest_name turns the check off.
+
+Keeping the binding while DomA is gone is now the common case, and the
+warning it logs fired on every device-model write: 150 lines over one
+destroy and re-create of DomA. Log it once each time the scan stops
+qualifying a candidate.
+
+Checked on the same board: after xl destroy DomA the binding stayed on
+the old domid, with one warning line, the re-created DomA was bound
+within a second of its device model starting and booted to its home
+screen, and DomU, restarted afterwards, stayed up and kept DomA's
+binding. An earlier revision (the lowest named domid, every failed name
+read left to the old rule, every warning logged) passed the same steps
+with five DomU restarts; the handling of failed reads other than -EACCES
+is checked on a PC only.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork; drivers/vhost/xen.c exists only in the xen-troops/linux fork, not in mainline]
+---
+ drivers/vhost/xen.c | 76 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 66 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/vhost/xen.c b/drivers/vhost/xen.c
+index b924c65..fb91329 100644
+--- a/drivers/vhost/xen.c
++++ b/drivers/vhost/xen.c
+@@ -28,6 +28,18 @@ module_param(guest_domid, ushort, 0644);
+ MODULE_PARM_DESC(guest_domid,
+ 		 "Current guest domid used for Xen mappings (writable for manual recovery)");
+ 
++/*
++ * The guest vhost serves. vhost_xen keeps a single guest domid for the whole
++ * module, so it must never end up on a guest that does not use vhost: DomA's
++ * vhost-vsock and vhost-net would then map that guest's memory. Binding by name
++ * keeps it on DomA when DomA is re-created with a domid above another guest's.
++ * Empty: the lowest domid whose device model runs, as before.
++ */
++static char *guest_name = "DomA";
++module_param(guest_name, charp, 0444);
++MODULE_PARM_DESC(guest_name,
++		 "Name of the guest vhost serves, set at boot (empty: lowest domid with a running device model)");
++
+ static bool nogrant;
+ module_param(nogrant, bool, 0444);
+ MODULE_PARM_DESC(nogrant, "Disable Xen grant mappings");
+@@ -509,12 +521,18 @@ static const struct vhost_xen_ops vhost_xen_foreign_ops = {
+ 	.unmap_pages = vhost_xen_foreign_unmap_pages,
+ };
+ 
++/*
++ * The kept binding whose warning was logged. The watch callbacks run one at a
++ * time on the xenwatch thread, so it needs no lock.
++ */
++static domid_t warned_domid = DOMID_INVALID;
++
+ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 		const char *path, const char *token)
+ {
+ 	char **dm_dir;
+ 	unsigned int i, n = 0;
+-	domid_t new_domid = DOMID_INVALID;
++	domid_t new_domid = DOMID_INVALID, named_domid = DOMID_INVALID;
+ 
+ 	dm_dir = xenbus_directory(XBT_NIL, "device-model", "", &n);
+ 	if (IS_ERR(dm_dir))
+@@ -586,13 +604,14 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 			continue;
+ 
+ 		dom_dir = xenbus_directory(XBT_NIL, dm_path, "", &m);
+-		kfree(dm_path);
+ 		if (!IS_ERR(dom_dir)) {
+ 			kfree(dom_dir);
+ 		} else if (PTR_ERR(dom_dir) == -ENOENT) {
+ 			/* Positively gone: the toolstack removed the tree. Skip. */
++			kfree(dm_path);
+ 			continue;
+ 		}
++
+ 		/*
+ 		 * Any other error (notably -EACCES: this DomD is built with
+ 		 * DISTRO_FEATURES += vmsep, so xenstore VM separation can deny
+@@ -611,18 +630,46 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 		 * way a highest-domid rule would (an earlier revision of this
+ 		 * change used one; the symptom was seen on hardware).
+ 		 *
+-		 * Known limitation: if DomA were destroyed and re-created while
+-		 * DomU stayed up, DomA would come back with a HIGHER domid and
+-		 * this rule would keep pointing at DomU. That case is out of
+-		 * scope by design -- destroying DomA is not supported on this
+-		 * platform (the single global binding below is exactly why) --
+-		 * but a topology with several vhost guests would need the domid
+-		 * to be a per-device property instead of a module-global.
++		 * That order does not survive DomA being destroyed and
++		 * re-created while DomU stays up: DomA comes back with a HIGHER
++		 * domid. So only a guest whose name is guest_name is bound, and
++		 * it wins over the rule above; of two such guests (an old DomA
++		 * whose tree the toolstack has not removed yet, and the new one)
++		 * the higher domid, the newer. Only -EACCES (the same vmsep case)
++		 * leaves a guest whose name cannot be read to the lowest-domid
++		 * rule: any other failure skips it, so that a transient error
++		 * reading DomU's name while DomA is gone cannot bind DomU.
++		 * A topology with several vhost guests would still need the
++		 * domid to be a per-device property instead of a module-global.
+ 		 */
++		if (guest_name && guest_name[0]) {
++			char *name = (char *)xenbus_read(XBT_NIL, dm_path, "name", NULL);
++			bool match = false;
++
++			if (IS_ERR(name)) {
++				if (PTR_ERR(name) != -EACCES) {
++					kfree(dm_path);
++					continue;
++				}
++			} else {
++				match = !strcmp(name, guest_name);
++				kfree(name);
++				if (!match) {
++					kfree(dm_path);
++					continue;
++				}
++			}
++			if (match && (named_domid == DOMID_INVALID || domid > named_domid))
++				named_domid = domid;
++		}
++		kfree(dm_path);
++
+ 		if (new_domid == DOMID_INVALID || domid < new_domid)
+ 			new_domid = domid;
+ 
+ 	}
++	if (named_domid != DOMID_INVALID)
++		new_domid = named_domid;
+ 
+ 	/*
+ 	 * Only tear the binding down when the directory is genuinely empty. If it
+@@ -631,10 +678,19 @@ static void vhost_xen_get_guest_domid(struct xenbus_watch *watch,
+ 	 * known good binding is strictly better than clearing it: clearing makes
+ 	 * every subsequent vhost_xen_map_desc() fail for all guests at once.
+ 	 */
++	if (new_domid != DOMID_INVALID)
++		warned_domid = DOMID_INVALID;
+ 	if (new_domid == DOMID_INVALID && n > 0) {
+-		if (guest_domid != DOMID_INVALID)
++		/*
++		 * Once each time the scan stops qualifying anything: while DomA
++		 * is gone, every device-model write lands here (150 lines over
++		 * one destroy and re-create of DomA on a Raspberry Pi 5).
++		 */
++		if (guest_domid != DOMID_INVALID && guest_domid != warned_domid) {
+ 			pr_warn("%s: no qualifying device-model among %u entries; keeping dom%u\n",
+ 				__func__, n, guest_domid);
++			warned_domid = guest_domid;
++		}
+ 	} else if (new_domid != guest_domid) {
+ 		WRITE_ONCE(guest_domid, new_domid);
+ 		if (new_domid == DOMID_INVALID)

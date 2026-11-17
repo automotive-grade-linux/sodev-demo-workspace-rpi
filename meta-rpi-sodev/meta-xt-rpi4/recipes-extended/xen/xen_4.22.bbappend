@@ -73,10 +73,10 @@
 #              build no guest (DomA).
 #   4.22-0013  xen/arm: Fix evaluation of parameters for SMCCC calls. NOT
 #              board-specific; a backport of stable-4.22 781b60f951 (master
-#              95302b3943), which the pinned SRCREV predates. It is what brings
-#              SCMI back on rpi5 (Wi-Fi/Bluetooth pin control); nothing on this
-#              board forwards SCMI, so here it only keeps the two boards on the
-#              same SMCCC helper.
+#              95302b3943), which the pinned SRCREV predates. Without it an
+#              SMCCC call whose arguments are function calls can reach EL3 with
+#              the argument registers clobbered. Both boards carry it so that
+#              they share one SMCCC helper.
 #   4.22-0014  ns16550-leave-the-bcm2835-mini-UART-s-divisor-alone. rpi4 ONLY
 #              (the only board whose Xen console is the mini UART). Xen 4.22 reads
 #              the divisor through DLAB, which on the mini UART returned 0 on some
@@ -143,9 +143,9 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # that both this hypervisor bbappend and the xen-tools bbappend point at; the Venus
 # lane adds 4.22-0008 to both from there as well, and keeps the hypervisor-only
 # 4.22-0007 there too so the two boards carry one copy rather than two;
-# 4.22-0006 and 4.22-0013, also hypervisor-only, live there for the same reason.
-# Only the hypervisor-only 0025, the rpi4-only 4.22-0011/0012/0014 and the Kconfig
-# .cfg fragments remain in ./files here.
+# 0025, 4.22-0006 and 4.22-0013, also hypervisor-only, live there for the same
+# reason, as does xen-config-ioreq.cfg. Only the rpi4-only 4.22-0011/0012/0014,
+# xen-hyp-config.cfg and xen-config-rpi4-passthrough.cfg remain in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series ---
@@ -223,9 +223,7 @@ SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://
 # built in but idle: BCM2711 has no SCMI -- clocks and power come from the
 # VideoCore firmware mailbox (raspberrypi,firmware) -- and the host DT has no
 # arm,scmi-smc node for it to bind. Switching the choice to ARM_SCI_NONE here is a
-# board measurement that has not been made, so the default stays. The rest of the
-# rpi5 SCMI plumbing (TF-A's SCMI_SERVER_SUPPORT, the *-scmi.dtso overlays, the
-# SCMI dtbo deploy list) is absent from this layer.
+# board measurement that has not been made, so the default stays.
 
 # --- patch-fuzz QA: left at ERROR (the OE default) ---------------------------
 # [4.22] The 4.21 revision of this bbappend demoted patch-fuzz to a warning here

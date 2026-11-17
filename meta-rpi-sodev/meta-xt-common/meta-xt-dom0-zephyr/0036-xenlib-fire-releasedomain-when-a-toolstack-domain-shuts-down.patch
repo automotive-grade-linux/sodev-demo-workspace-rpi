@@ -1,0 +1,161 @@
+From 3c8512b8aa206bd0aa28fb570e7b613c3e6106c4 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 16 Nov 2026 08:53:13 +0900
+Subject: [PATCH] xenlib: fire @releaseDomain when a toolstack domain shuts
+ down
+
+libxl learns that a guest has shut down from the "@releaseDomain"
+watch: domain_death_xswatch_callback() then reads the domain's state
+and reports the shutdown, and xl runs on_poweroff, on_reboot or
+on_crash. The stock xenstored fires that watch the first time it sees
+a domain shut down (tools/xenstored/domain.c, do_check_domain()). This
+server did not, so a guest that powered off or rebooted by itself
+stayed shut down, and `xl shutdown -w` did not see it go.
+
+On each VIRQ_DOM_EXC (0035), fire "@releaseDomain" once for a
+toolstack-introduced domain that has shut down. The shutdown reason
+is kept with the flag: Xen resumes a suspended domain without sending
+the VIRQ, and this server has no XS_RESUME to clear the flag, so a
+poweroff after a resumed suspend is told apart from the suspend by
+its reason. The flag is cleared when the domain is seen running.
+
+This changes what happens on the board when a guest shuts down by
+itself: xl now applies the guest's on_poweroff/on_reboot/on_crash
+setting (default destroy/restart/destroy) instead of leaving it shut
+down.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ Kconfig                         | 10 ++++---
+ xen-dom-mgmt/include/domain.h   |  5 ++++
+ xen-dom-mgmt/src/xen-dom-mgmt.c | 48 +++++++++++++++++++++++++++------
+ 3 files changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/Kconfig b/Kconfig
+index 10034cc..4d98459 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -38,10 +38,12 @@ config XEN_DOM_EXC_RELEASE
+ 	default y
+ 	help
+ 	  Bind VIRQ_DOM_EXC and, on each event, release the toolstack-introduced
+-	  domains (XS_INTRODUCE) that the hypervisor reports dead or gone, as the
+-	  stock xenstored does. libxl sends XS_RELEASE only on a soft reset, so
+-	  without this a domain destroyed with `xl destroy` keeps its store ring
+-	  mapped here, stays dead in Xen and holds a CONFIG_DOMU_MAX slot.
++	  domains (XS_INTRODUCE) that the hypervisor reports dead or gone, and
++	  fire "@releaseDomain" when one shuts down, as the stock xenstored does.
++	  libxl sends XS_RELEASE only on a soft reset, so without this a domain
++	  destroyed with `xl destroy` keeps its store ring mapped here, stays
++	  dead in Xen and holds a CONFIG_DOMU_MAX slot, and libxl never hears
++	  that a guest shut down by itself.
+ 
+ config XEN_DOM_EXC_RELEASE_STACK_SIZE
+ 	int "Stack size of the VIRQ_DOM_EXC release thread"
+diff --git a/xen-dom-mgmt/include/domain.h b/xen-dom-mgmt/include/domain.h
+index 04b2992..23d2710 100644
+--- a/xen-dom-mgmt/include/domain.h
++++ b/xen-dom-mgmt/include/domain.h
+@@ -247,6 +247,11 @@ struct xen_domain {
+ 	 * borrower's reference, and the borrower that drops the last reference
+ 	 * runs the teardown. */
+ 	bool f_released:1;
++	/* Last seen shut down by the VIRQ_DOM_EXC scan, and the reason, so
++	 * "@releaseDomain" is fired once per shutdown. Set and read under
++	 * dl_mutex. */
++	bool f_shutdown:1;
++	uint8_t shutdown_code;
+ };
+ 
+ struct xen_domain *get_domain(uint32_t domid);
+diff --git a/xen-dom-mgmt/src/xen-dom-mgmt.c b/xen-dom-mgmt/src/xen-dom-mgmt.c
+index f5e1ff4..ade92f8 100644
+--- a/xen-dom-mgmt/src/xen-dom-mgmt.c
++++ b/xen-dom-mgmt/src/xen-dom-mgmt.c
+@@ -1582,9 +1582,11 @@ int xs_release_domain(uint32_t domid)
+  * (set_xs_domain(dom0) in xen/arch/arm/domain_build.c).
+  *
+  * This mirrors the stock xenstored (tools/xenstored/domain.c check_domains()):
+- * on every event look at all the domains it tracks, and release the ones the
+- * hypervisor reports dead (XEN_DOMINF_dying is set only for DOMDYING_dead) or
+- * gone. One that has only shut down is still there and is not released. Only
++ * on every event look at all the domains it tracks. One the hypervisor reports
++ * dead (XEN_DOMINF_dying is set only for DOMDYING_dead) or gone is released.
++ * One that has just shut down is still there and is not released, but
++ * "@releaseDomain" is fired once for it, because that watch is how libxl learns
++ * of the shutdown and runs on_poweroff/on_reboot/on_crash. Only
+  * toolstack-introduced domains are looked at: dom0less domains and the ones
+  * Zephyr creates itself have their own owners.
+  *
+@@ -1609,6 +1611,31 @@ static void dom_exc_kick(void)
+ 	k_sem_give(&dom_exc_sem);
+ }
+ 
++/* Record whether a tracked domain is shut down, and why; return true when a
++ * shutdown is new: the domain was not shut down at the last look, or it was for
++ * another reason. Xen resumes a suspended domain without sending this VIRQ and
++ * this server has no XS_RESUME, so the reason is what tells a poweroff after a
++ * resumed suspend from the suspend. A suspend, a resume and a second suspend
++ * with no scan in between still read as one; nothing on these boards suspends
++ * a guest (no save or migrate). */
++static bool note_shutdown(uint32_t domid, bool shut, uint8_t code)
++{
++	struct xen_domain *iter;
++	bool new_shutdown = false;
++
++	k_mutex_lock(&dl_mutex, K_FOREVER);
++	SYS_DLIST_FOR_EACH_CONTAINER(&domain_list, iter, node) {
++		if (iter->domid == domid && iter->f_toolstack && !iter->f_released) {
++			new_shutdown = shut && (!iter->f_shutdown || iter->shutdown_code != code);
++			iter->f_shutdown = shut;
++			iter->shutdown_code = code;
++			break;
++		}
++	}
++	k_mutex_unlock(&dl_mutex);
++	return new_shutdown;
++}
++
+ /* Return true when a domain could not be looked up, so the caller tries again:
+  * if that was its last VIRQ (it is dead and its ring still mapped here), no
+  * later event comes for it. `again` is true on such a retry, which logs the
+@@ -1618,7 +1645,7 @@ static bool dom_exc_scan(bool again)
+ 	uint32_t ids[CONFIG_DOMU_MAX];
+ 	struct xen_domctl_getdomaininfo info;
+ 	struct xen_domain *iter;
+-	bool released = false, retry = false;
++	bool notify = false, retry = false;
+ 	int i, n = 0, rc;
+ 
+ 	/* Copy the domids out under dl_mutex: release_domain() takes it again. */
+@@ -1636,6 +1663,11 @@ static bool dom_exc_scan(bool again)
+ 		 * sysctl list would make a live domain look gone.) */
+ 		rc = xen_domctl_getdomaininfo(ids[i], &info);
+ 		if (rc == 0 && !(info.flags & XEN_DOMINF_dying)) {
++			if (note_shutdown(ids[i], info.flags & XEN_DOMINF_shutdown,
++					  (info.flags >> XEN_DOMINF_shutdownshift) &
++						  XEN_DOMINF_shutdownmask)) {
++				notify = true;
++			}
+ 			continue;
+ 		}
+ 		if (rc != 0 && rc != -ESRCH) {
+@@ -1650,12 +1682,12 @@ static bool dom_exc_scan(bool again)
+ 			continue;
+ 		}
+ 		release_domain(ids[i], rc ? "gone" : "dead");
+-		released = true;
++		notify = true;
+ 	}
+ 
+-	if (released) {
+-		/* Same watch the XS_RELEASE handler fires, so backends and libxl's
+-		 * domain-death watchers see the domain go. */
++	if (notify) {
++		/* Same watch the XS_RELEASE handler fires; watchers (backends,
++		 * libxl's domain-death watch) then check which domain changed. */
+ 		xss_notify_release_domain();
+ 	}
+ 	return retry;

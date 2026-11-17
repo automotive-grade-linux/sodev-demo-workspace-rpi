@@ -15,7 +15,7 @@
 # every SoC-specific value re-derived for BCM2711: the dtuart path, the passthrough
 # node paths, the MMIO addresses, the GIC SPIs and the whole physical memory map.
 # Their source is meta-xt-rpi4/BCM2711-DT-TRUTH.md, which records those values as
-# measured from the shipped bcm2711-rpi-4-b.dtb. RP1, MIP and SCMI do not exist on
+# measured from the shipped bcm2711-rpi-4-b.dtb. RP1 and MIP do not exist on
 # this SoC and are absent here rather than remapped.
 #
 # STATUS. Both flavours build and assemble a full.img (`--board=rpi4 --dom0=linux`
@@ -97,9 +97,6 @@ variables:
   # --- DomD / DomU build dirs + machines + image names (copied from rpi5.yaml) ---
   DOMU_MACHINE: "virtio-armv8-xt"
   XT_XEN_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen.dtbo"
-  # No XEN_DT_SCMI_NAME here, unlike rpi5-sodev.yaml: BCM2711 has no SCMI at all —
-  # clocks and power come from the VideoCore firmware mailbox — so this layer carries
-  # neither the SCMI overlays nor the SCMI Kconfig fragment.
   # DomD = V4H sodev pattern (weston + qemu virtio-gpu backend + xen-tools-devd +
   #   V4H helpers) so the DomU/DomA -> DomD weston -> HDMI display chain renders.
   #   The -v4h recipe lives in the linux-dom0-poc layer (added to the domd
@@ -501,14 +498,6 @@ parameters:
                 # DOMD_CAN_TYPE is unset the inline-python SRC_URI fails to expand
                 # (ExpansionError). Match the domd component.
                 - [DOMD_CAN_TYPE, "%{DOMD_CAN_TYPE}"]
-                # No [XEN_DT_SCMI, ...] here (rpi5-sodev.yaml sets it in its domd
-                # component only, for xt-prod-devel's pristine bbappend): BCM2711 has
-                # no SCMI, so there is no bcm2711-*-xen-scmi.dtso to name.
-                # meta-xt-driver-domain's linux-raspberrypi_6.18.bbappend used to add
-                # five SCMI/WiFi .dtso entries to SRC_URI unconditionally, which made
-                # do_fetch look for bcm2711-raspberrypi4-64-domd-scmi.dtso and fail the
-                # parse; they are gone from that bbappend altogether (nothing loaded
-                # them on either board).
                 # [Case-C] Select the Xen 4.22 recipes (xen_4.22.bb / xen-tools_4.22.bb,
                 # SRCREV d45d5687f1, branch stable-4.22). [4.22] These are INTERIM
                 # LOCAL recipes in meta-xt-common/meta-xt-domx (shared by both board
@@ -1304,7 +1293,6 @@ components:
         # xen-tools_4.22.bb does not require the xen-source.inc chain that
         # appended those patches). See the dom0 component comment.
         - [PREFERRED_VERSION_u-boot, "2024.04"]
-        # Not set on this board: [XEN_DT_SCMI, ...]. No SCMI on BCM2711.
         - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
         # weston and virglrenderer: a newer recipe for either in meta-xt-driver-domain
         # would, as the higher-priority layer, win over poky's 15.0.0 / 1.2.0 without a
@@ -1459,15 +1447,15 @@ components:
         # xt-prod-devel-rpi5-domd is DELIBERATELY NOT HERE, unlike rpi5-sodev.yaml.
         # Its trusted-firmware-a_git.bbappend replaces SRC_URI_TRUSTED_FIRMWARE_A,
         # SRCREV_tfa and SRCBRANCH with the xen-troops arm-trusted-firmware fork's
-        # rpi5_dev branch, because that fork carries the RPi5 platform and its SCMI
-        # server. This board builds PLAT=rpi4 from upstream TF-A master instead
+        # rpi5_dev branch, because that fork carries the RPi5 platform's OP-TEE
+        # support. This board builds PLAT=rpi4 from upstream TF-A master instead
         # (meta-xt-rpi4/recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb), so
         # letting that bbappend attach would silently swap the source tree out.
         #
         # Nothing else in that layer is needed: nothing on this board reads its
         # include/dt_config.inc, and its xt-rpi-u-boot-scr.bbappend only
-        # appends SCMI overlays, which this board has none of. rpi5-image-minimal-domd
-        # comes from meta-xt-rpi4, above.
+        # appends the scmi and domd_wifi overlays, which this board has none
+        # of. rpi5-image-minimal-domd comes from meta-xt-rpi4, above.
         # DomU integration layer: provides xt-xen-cfg-domu
         # (domu.cfg + xl-create-domu.service), now installed into the DomD image
         # (DomD is the toolstack domain that runs xl create). The DomU AGL guest
@@ -1510,9 +1498,6 @@ components:
         # xen-tools is configured --disable-xsmpolicy. The artifact is not wanted here
         # either: XSM Flask is off (xsm=dummy) and boot.cmd does `fdt rm /chosen/xenpolicy`.
         - "tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
-        # NOT PRODUCED on this board: the SCMI host overlay (rpi5-sodev.yaml's
-        # %{XT_SCMI_HOST_DTBO_NAME}). BCM2711 has no SCMI and this layer carries no
-        # *-scmi*.dtso sources.
         - "tmp/deploy/images/%{MACHINE}/u-boot-%{MACHINE}.bin"
         - "tmp/deploy/images/%{MACHINE}/boot.scr"
         - "tmp/deploy/images/%{MACHINE}/bcm2711-rpi-4-b.dtb"

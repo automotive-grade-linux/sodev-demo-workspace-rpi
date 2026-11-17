@@ -12,10 +12,11 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # Upstream attribution (Signed-off-by preserved verbatim inside each .patch):
 #   0004-0008 = Oleksandr Tyshchenko / Dmytro Firsov (EPAM), Acked-by V. Babchuk
 #   0011      = Yuya Hamamachi (Renesas)
-#   0012-0014 = Yuichi Kusakabe (EXPORT_SYMBOL_GPL for VHOST_XEN=y with
+#   0012-0015 = Yuichi Kusakabe (EXPORT_SYMBOL_GPL for VHOST_XEN=y with
 #               VHOST_NET=m, which both boards' configs produce; the domid
 #               rebind; the review hardening, which also carries the fixes to
-#               lines the EPAM patches added so that 0004-0011 stay as fetched)
+#               lines the EPAM patches added so that 0004-0011 stay as fetched;
+#               binding the guest by name, so a re-created DomA is bound again)
 # 0007's message describes the fork's defconfig (VHOST_NET=y, TAP=y, MACVLAN=y,
 # MACVTAP=y); in this build those four are =m, see vsock.cfg.
 # inline-python in SRC_URI breaks wrynose's
@@ -34,5 +35,6 @@ python __anonymous() {
             file://xen_patchset/0011-vhost_xen-Fix-build-error.patch \
             file://xen_patchset/0012-vhost_xen-EXPORT_SYMBOL_GPL-for-module-use.patch \
             file://xen_patchset/0013-vhost_xen-Rebind-guest-domid-on-every-device-model-c.patch \
-            file://xen_patchset/0014-vhost_xen-adversarial-hardening.patch')
+            file://xen_patchset/0014-vhost_xen-adversarial-hardening.patch \
+            file://xen_patchset/0015-vhost_xen-Bind-the-guest-by-name-not-only-by-the-low.patch')
 }

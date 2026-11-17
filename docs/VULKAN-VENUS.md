@@ -2687,13 +2687,11 @@ Two method points worth keeping:
   `V3D_DEBUG=db` drop-in), not by the unit that runs `xl create`. So that negative result is
   void, not a finding. Same shape as the `VN_DEBUG=wsi` trap in 7d, one layer down.
 * **Recreating DomU is the only way to change a DomD binary the device model
-  execs**, and `systemctl restart xl-create-domu.service` does not do it: its
-  `ExecStop` is `xl shutdown -w DomU`, this guest never acknowledges the
-  pvcontrol request, and the following `xl create` then fails on the name still
-  being taken while the old domain keeps running. What works is: quiesce the GPU
-  clients, let the guest power itself off, release the device model, reap, then
-  create -- and the unit is `RemainAfterExit=yes`, so `systemctl start` on it is
-  a silent no-op until it is stopped.
+  execs.** `systemctl restart xl-create-domu.service` does it: its `ExecStop`
+  is `xl shutdown -w DomU` and then waits for DomU and its device model to go
+  (zephyr-xenlib 0038 makes the guest's acknowledgement reach libxl). The unit
+  is `RemainAfterExit=yes`, so `systemctl start` on it is a silent no-op until
+  it is stopped.
 
 ## 7f. Where the remaining GPU time goes, and the one saving that is blocked (2026-09-04)
 

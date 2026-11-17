@@ -56,12 +56,10 @@
 #
 #   4.22-0013  xen/arm: Fix evaluation of parameters for SMCCC calls. NOT
 #              board-specific; a backport of stable-4.22 781b60f951 (master
-#              95302b3943), which the pinned SRCREV predates. Without it
-#              scmi_handle_smc() reaches TF-A with the wrong SMCCC function ID
-#              (evaluating the arguments clobbers x0), DomD's arm-scmi fails with
-#              -EOPNOTSUPP, the SCMI pinctrl never registers, and the Wi-Fi SDIO
-#              host and the Bluetooth UART stay in deferred probe: no Wi-Fi and
-#              no Bluetooth on this board. Measured on hardware 2026-09-24.
+#              95302b3943), which the pinned SRCREV predates. Without it an
+#              SMCCC call whose arguments are function calls can reach EL3 with
+#              the argument registers clobbered. Both boards carry it so that
+#              they share one SMCCC helper.
 # NOTE on ThumbEE: [4.22] no longer relevant. In 4.21 the stock xen_4.21.bb
 # SRC_URI carried 0001-ARM-Drop-ThumbEE-support.patch (Andrew Cooper 5bbe1fe413,
 # binutils/gcc15 fix) and this bbappend documented that it was therefore not
@@ -124,12 +122,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # copy of each -- both SRC_URI lists name those same 28 files, plus 4.22-0008
 # which the Venus lane adds to both (4.22-0007 is hypervisor-only but lives in the
 # shared dir too, so the two boards carry one copy rather than two). This bbappend adds
-# three hypervisor-only ones (xen/ only, no tools/ hunk) -- 0025 from ./files, and
-# 4.22-0006 and 4.22-0013 from the shared dir -- and the Vulkan lane adds a
+# three hypervisor-only ones (xen/ only, no tools/ hunk) -- 0025, 4.22-0006 and
+# 4.22-0013, all from the shared dir -- and the Vulkan lane adds a
 # fourth, 4.22-0007. That is why it fetches 31 (33 in the default Vulkan lane)
 # where the toolstack fetches 28 of the shared set plus its own lane additions.
-# Only 0025 and the Kconfig .cfg fragments live in
-# ./files here.
+# Only xen-hyp-config.cfg and xen-config-rpi5-passthrough.cfg live in ./files
+# here; xen-config-ioreq.cfg is in the shared dir.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series (order matters; matches the verified git-apply order) ---
@@ -190,6 +188,8 @@ SRC_URI:append = " file://xen-hyp-config.cfg file://xen-config-ioreq.cfg file://
 # No SCMI fragment: stable-4.22's xen/arch/arm/firmware/Kconfig makes SCMI_SMC the
 # default of the "ARM SCI driver type" choice (it selects ARM_SCI), so
 # CONFIG_ARM_SCI=y / CONFIG_SCMI_SMC=y are in the .config with nothing added here.
+# The mediator is built in but idle: the host DT has no arm,scmi-smc node for it
+# to bind.
 
 # --- patch-fuzz QA: left at ERROR (the OE default) ---------------------------
 # [4.22] The 4.21 bbappend demoted patch-fuzz to a warning here:

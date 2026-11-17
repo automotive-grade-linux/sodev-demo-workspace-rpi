@@ -335,14 +335,27 @@ Run from the toolstack domain after boot:
 | `xl list` | responds immediately and shows all 4 domains |
 | xenstore burst: `for i in 1 2 3 4 5; do xenstore-write /local/domain/1/data/p$i v$i && xenstore-read /local/domain/1/data/p$i && xenstore-rm /local/domain/1/data/p$i; done` | completes without stalling (bursts like this used to wedge the xenstore server) |
 | `dmesg \| grep -E 'error -5\|while (read\|writ)ing message'` in DomD | no output (no xenstore ring corruption) |
-| `xl destroy DomU` then `xl create /etc/xen/domu.cfg` | destroy returns promptly and the re-created guest comes up (never destroy DomA — see Known issues) |
+| `xl destroy DomU` then `xl create /etc/xen/domu.cfg` | destroy returns promptly and the re-created guest comes up (DomA too with the Zephyr Dom0, with its own unit — see Known issues) |
 
 ## Known issues
-- **DomA re-create**: the DomD vhost-Xen patch tracks a single guest domid, so
-  `xl destroy` + `xl create` of DomA breaks vhost-vsock/-net mappings
-  (`vhost_xen_map_desc: Failed to map pages`). Reboot the board to restart DomA
-  (this is also why DomA is created before DomU). A per-device domid fix is
-  future work.
+- **DomA re-create** (Zephyr Dom0, where DomD is the toolstack): `xl destroy
+  DomA`, then `systemctl restart xl-create-doma`, both in DomD, brings DomA back
+  without a board reboot (Raspberry Pi 5: the destroy took 4 s, DomA reached its
+  home screen again). xen-tools' 0064 stops DomA's QEMU, and
+  `xen_patchset/0015` keeps the DomD vhost binding on the guest named DomA
+  (`vhost_xen.guest_name`). Without 0015 the binding moved to DomU, the
+  re-created DomA stayed in its boot animation
+  (`vhost_xen_map_desc: Failed to map pages`) and DomU was corrupted. Destroy
+  DomA first: a running DomA is expected not to power off on `xl shutdown` (its
+  kernel acknowledges and calls `orderly_poweroff()`, and Android has no
+  `/sbin/poweroff`; not tried on a board), so `systemctl restart` would wait out
+  systemd's 90 s and then fail to create a second DomA. The destroy
+  is a power cut for Android: what it has not written to `/data` is lost. A
+  reboot from inside Android leaves DomA shut down (`on_reboot = 'preserve'` in
+  doma.cfg); re-create it the same way. With the Linux Dom0 this is not tried:
+  there the binding falls back to the lowest-domid rule whenever DomD cannot
+  read the guests' names, which would bind DomU, so reboot the board to restart
+  DomA.
 - **AAOS guest niceties** (guest-image side): where DomD has no Bluetooth
   controller to hand over (for example the Raspberry Pi 5 with
   `DOM0_OS=linux`), leave Bluetooth off in DomA: it has nothing to talk to. A
@@ -352,8 +365,11 @@ Run from the toolstack domain after boot:
   Bluetooth starts off on a fresh `/data`; `settings put global bluetooth_on 0`
   turns it off again (NOT `pm disable com.android.bluetooth`, which crashes
   system_server). Also a benign boot-window dropbox race.
-- Occasional qemu cleanup timeouts leave a zombie domain on `xl destroy`; a
-  board reboot recovers.
+- With the Zephyr Dom0, `xl destroy` of a guest whose virtio backends run in the
+  QEMU that `xl devd` spawned in DomD left that QEMU running and the domain
+  `(null) --p--d`. xen-tools' 0064 has the toolstack write the backend's
+  `online=0` and `Closed`, on which devd stops the QEMU (checked on both boards).
+  If a `(null)` domain stays anyway, a board reboot recovers.
 - **DomA's AAOS home screen intermittently fails to appear, and the real cause is a
   `vhost_xen` domid race — not `/data`.** Measured across five consecutive boots of
   a byte-identical image with a pristine `userdata`: two succeeded, three left the
@@ -406,8 +422,8 @@ Run from the toolstack domain after boot:
   `/local/domain/<DomD>/device-model/<domid>` nodes behind — `libxl__destroy_device_model()`
   only cleans the Dom0 path — and those can keep a last recorded state of `running`,
   so no ordering of domids can distinguish them. The `domd-vhost-xen-domid` daemon
-  that papered over it has been removed; the kernel-side fix in `xen_patchset/0013`
-  is the only mechanism now.
+  that papered over it has been removed; the kernel-side fix in `xen_patchset/0013`,
+  with `0015` binding by name, is the only mechanism now.
 
   The V4H reference has the identical single-global-`guest_domid` limitation and no
   workaround at all; it avoids the symptom purely by creating DomA first

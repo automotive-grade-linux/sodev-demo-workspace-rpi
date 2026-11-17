@@ -182,9 +182,6 @@ python __anonymous() {
         hdmi = d.getVar('HDMI_DT_NAME')
         hdmi_pt = d.getVar('HDMI_PASSTHROUGH_NAME')
         d.appendVar('SRC_URI', ' file://%s.dtso;%s file://%s.dtso;%s' % (hdmi, subdir, hdmi_pt, subdir))
-    # NOT CARRIED FROM meta-xt-rpi5: the `scmi` MACHINE_FEATURE branch that appends
-    # scmi-config.cfg. BCM2711 has no SCMI at all -- clocks and power come from the
-    # VideoCore firmware mailbox -- so the fragment is not in this layer.
 }
 
 # Apply the shared Dom0/DomD Image config to the Dom0 build as well.

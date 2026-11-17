@@ -241,10 +241,12 @@ cmd_check() {
 # Prerequisites:
 #   - p4 must not be open on DomD. DomA's device model (qemu on DomD) opens it
 #     directly (doma.cfg: -drive file=/dev/mmcblk0p4), so DomA must not have been
-#     created in this boot, or must have been stopped. Do NOT `xl destroy` it to
-#     get there: docs/TROUBLESHOOTING.md (Known issues) -- the vhost domid
-#     mapping breaks and the domain can be left a zombie. The board is rebooted
-#     after a reinit anyway, which is also how DomA comes back.
+#     created in this boot, or must have been stopped with `xl destroy DomA` on
+#     DomD (the reinit discards /data anyway; `systemctl stop` is not expected
+#     to stop a running DomA). After the reinit,
+#     `systemctl restart xl-create-doma` on DomD starts DomA again, or a board
+#     reboot does (docs/TROUBLESHOOTING.md, Known issues: with the Linux Dom0,
+#     reboot the board).
 #   - pristine material: $PRISTINE_GZ (gzip of the first 64MiB of userdata.pristine.raw)
 # ============================================================================
 cmd_reinit() {
@@ -291,7 +293,7 @@ cmd_reinit() {
   # be gone from `xl list` while its device model still holds the device.
   if printf '%s\n' "$xl_out" | awk 'NR>1{print $1}' | grep -qx DomA; then
     echo "NG: DomA is running and its device model holds p4. Reinit needs a boot in which DomA"
-    echo "    was not created, or has been stopped. Do not 'xl destroy' it (docs/TROUBLESHOOTING.md, Known issues)."
+    echo "    was not created, or has been stopped: 'xl destroy DomA' on $DOMD (docs/TROUBLESHOOTING.md, Known issues)."
     exit 1
   fi
   if "${SSH[@]}" "fuser $DEV >/dev/null 2>&1"; then
@@ -378,7 +380,7 @@ cmd_reinit() {
   echo
   echo "DONE: the next DomA boot is equivalent to a first boot (metadata key regeneration + /data rebuild)."
   echo "      Duration is comparable to the first boot (measured: scanout ~62s)."
-  echo "      Reboot the board to start DomA: it is not re-created in place (docs/TROUBLESHOOTING.md)."
+  echo "      Start DomA: 'systemctl restart xl-create-doma' on $DOMD, or reboot the board."
 }
 
 case "${1:-}" in
